@@ -3,7 +3,7 @@ import SwiftUI
 struct HomeView: View {
     private enum Mode: String {
         case terminal = "Terminal"
-        case markdown = "Markdown"
+        case markdown = "Files"
     }
 
     @State private var mode: Mode = .terminal
@@ -26,7 +26,7 @@ struct HomeView: View {
                     MarkdownListView()
                 }
             }
-            .navigationTitle(mode == .terminal ? "Servers" : "Markdown")
+            .navigationTitle(mode == .terminal ? "Servers" : "Files")
             #if os(iOS) || os(visionOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif

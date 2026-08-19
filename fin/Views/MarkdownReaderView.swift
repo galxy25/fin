@@ -15,6 +15,9 @@ struct MarkdownReaderView: View {
     @State private var saveError: String?
     @State private var showingTheme = false
     @State private var isEditing: Bool
+    #if os(macOS)
+    @FocusState private var isRenderFocused: Bool
+    #endif
 
     init(document: MarkdownDocument, isRoot: Bool = false, startInEditMode: Bool = false) {
         self.document = document
@@ -24,6 +27,12 @@ struct MarkdownReaderView: View {
 
     private var theme: AppTheme {
         AppTheme(backgroundHex: backgroundHex, foregroundHex: foregroundHex)
+    }
+
+    private static let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd", "mkdn", "mdwn"]
+
+    private var isMarkdownFile: Bool {
+        Self.markdownExtensions.contains(URL(fileURLWithPath: document.name).pathExtension.lowercased())
     }
 
     var body: some View {
@@ -36,6 +45,13 @@ struct MarkdownReaderView: View {
                     .font(.system(.body, design: .monospaced))
                     .autocorrectionDisabled()
                     .padding(4)
+                    #if os(macOS)
+                    .onKeyPress(.escape) {
+                        save()
+                        isEditing = false
+                        return .handled
+                    }
+                    #endif
             } else {
                 ScrollView {
                     Group {
@@ -54,6 +70,27 @@ struct MarkdownReaderView: View {
                         }
                     }
                 }
+                .contentShape(Rectangle())
+                // Best-effort: on macOS, .textSelection's own double-click-to-select-word
+                // handling appears to claim the event ahead of SwiftUI's gesture system
+                // regardless of gesture priority, so this isn't reliable there — Cmd+E
+                // below is the dependable path on Mac. May still work for iOS/visionOS touch.
+                .highPriorityGesture(
+                    TapGesture(count: 2).onEnded {
+                        isEditing = true
+                    }
+                )
+                #if os(macOS)
+                .focusable()
+                .focusEffectDisabled()
+                .focused($isRenderFocused)
+                .onAppear { isRenderFocused = true }
+                .onKeyPress("e", phases: .down) { press in
+                    guard press.modifiers.contains(.command) else { return .ignored }
+                    isEditing = true
+                    return .handled
+                }
+                #endif
             }
         }
         .background(theme.backgroundColor.ignoresSafeArea())
@@ -147,8 +184,57 @@ struct MarkdownReaderView: View {
     }
 
     private func render(_ text: String) {
-        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        content = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        guard isMarkdownFile else {
+            content = AttributedString(text)
+            return
+        }
+        // AttributedString(markdown:) discards the blank-line gaps between blocks —
+        // parsing "# Title\n\nBody" as one call yields "TitleBody" with no separator
+        // when Text renders it flat. Splitting on blank lines and parsing each block
+        // on its own, then rejoining with an explicit paragraph break, keeps blocks
+        // (headers, paragraphs, fenced code) visually distinct the way the source is.
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
+        var result = AttributedString()
+        let blocks = text.components(separatedBy: "\n\n")
+        for (index, block) in blocks.enumerated() {
+            if index > 0 {
+                result += AttributedString("\n\n")
+            }
+            result += (try? AttributedString(markdown: block, options: options)) ?? AttributedString(block)
+        }
+        styleBlocks(&result)
+        content = result
+    }
+
+    // AttributedString(markdown:) with .full syntax only attaches semantic
+    // PresentationIntent metadata for block structure (headers, code blocks,
+    // block quotes) — Text doesn't turn that into visual styling on its own, so
+    // headers/code blocks render as plain body text unless we apply fonts/colors
+    // per run ourselves based on that metadata.
+    private func styleBlocks(_ attributed: inout AttributedString) {
+        for run in attributed.runs {
+            guard let intent = run.presentationIntent else { continue }
+            for component in intent.components {
+                switch component.kind {
+                case .header(let level):
+                    let font: Font = switch level {
+                    case 1: .title.bold()
+                    case 2: .title2.bold()
+                    case 3: .title3.bold()
+                    default: .headline
+                    }
+                    attributed[run.range].font = font
+                case .codeBlock:
+                    attributed[run.range].font = .system(.body, design: .monospaced)
+                    attributed[run.range].backgroundColor = theme.foregroundColor.opacity(0.12)
+                case .blockQuote:
+                    attributed[run.range].font = (attributed[run.range].font ?? .body).italic()
+                    attributed[run.range].foregroundColor = theme.foregroundColor.opacity(0.7)
+                default:
+                    break
+                }
+            }
+        }
     }
 
     private func save() {
