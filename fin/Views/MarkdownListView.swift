@@ -52,7 +52,7 @@ struct MarkdownListView: View {
         .overlay {
             if documents.isEmpty {
                 ContentUnavailableView(
-                    "No Markdown Files",
+                    "No Files",
                     systemImage: "doc.text",
                     description: Text("Tap + to open one.")
                 )
