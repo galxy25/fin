@@ -58,7 +58,7 @@ TEAM_ID="EC27UF79GL"
 SCHEME="fin"
 ARCHIVE="build-release/fin.xcarchive"
 EXPORT_DIR="build-release/export"
-BUILD_NUMBER="${BUILD_NUMBER:-$(date +%s)}"   # monotonic; App Store Connect rejects dupes
+BUILD_NUMBER="${BUILD_NUMBER:-}"              # empty ⇒ auto-incremented below
 ASC_KEY_PATH="${ASC_KEY_PATH:-$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID:-UNSET}.p8}"
 
 # --- preflight ---------------------------------------------------------------
@@ -70,6 +70,38 @@ fi
 : "${ASC_KEY_ID:?set ASC_KEY_ID (App Store Connect API Key ID)}"
 : "${ASC_ISSUER_ID:?set ASC_ISSUER_ID (App Store Connect Issuer ID)}"
 [ -f "$ASC_KEY_PATH" ] || { echo "ERROR: API key not found at $ASC_KEY_PATH" >&2; exit 1; }
+
+# --- auto-increment build number --------------------------------------------
+# Ask App Store Connect for the highest build number on the app record (across all
+# platforms) and use max+1, so re-uploads are always monotonic without hand-bumping.
+# Falls back to a unix timestamp if the API is unreachable. Pass BUILD_NUMBER=N to
+# override. CFBundleVersion resolves this via $(CURRENT_PROJECT_VERSION) — see project.yml.
+if [ -z "$BUILD_NUMBER" ]; then
+  BUILD_NUMBER="$(python3 - "$ASC_KEY_ID" "$ASC_ISSUER_ID" "$ASC_KEY_PATH" <<'PY'
+import sys, time, json, urllib.request
+try:
+    import jwt
+    kid, iss, keypath = sys.argv[1], sys.argv[2], sys.argv[3]
+    tok = jwt.encode(
+        {"iss": iss, "iat": int(time.time()), "exp": int(time.time()) + 300,
+         "aud": "appstoreconnect-v1"},
+        open(keypath).read(), algorithm="ES256", headers={"kid": kid})
+    def get(p):
+        r = urllib.request.Request("https://api.appstoreconnect.apple.com" + p,
+                                   headers={"Authorization": "Bearer " + tok})
+        return json.load(urllib.request.urlopen(r))
+    apps = get("/v1/apps?filter[bundleId]=dev.levischoen.fin&fields[apps]=bundleId")
+    app_id = apps["data"][0]["id"]
+    builds = get(f"/v1/builds?filter[app]={app_id}&limit=200&fields[builds]=version")
+    nums = [int(b["attributes"]["version"]) for b in builds["data"]
+            if b["attributes"]["version"].isdigit()]
+    print(max(nums) + 1 if nums else int(time.time()))
+except Exception:
+    print(int(time.time()))
+PY
+)"
+fi
+echo "==> Build number: $BUILD_NUMBER"
 
 echo "==> Regenerating project from project.yml"
 xcodegen generate

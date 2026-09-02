@@ -65,6 +65,13 @@ targets:
     info:
       path: Generated/Info.plist
       properties:
+        # Reference the build settings so a CURRENT_PROJECT_VERSION override at
+        # archive time (the testflight scripts' timestamp/auto-increment) actually
+        # lands in CFBundleVersion. Without these explicit references XcodeGen bakes
+        # the literal current value ("1"), and App Store Connect rejects a re-upload
+        # as non-monotonic.
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -181,6 +188,10 @@ targets:
     info:
       path: Generated/Info-tvOS.plist
       properties:
+        # See the fin target's note — reference the build settings so the
+        # testflight-tvos.sh build number lands instead of a baked literal "1".
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleDisplayName: "Fin"
         # CloudKit's silent import pushes wake the mirror, same as iOS.
         UIBackgroundModes:
