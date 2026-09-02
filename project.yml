@@ -192,7 +192,17 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin
-        CODE_SIGN_STYLE: Automatic
+        # Manual App Store signing on the DEVICE SDK only: this account has no
+        # registered Apple TV, so automatic signing can't mint a tvOS Development
+        # profile at archive time (it needs a device). App Store distribution
+        # profiles need no device list — the fin-tv-only scope keeps these settings
+        # off the SPM package targets (which reject provisioning profiles) and off
+        # the simulator SDK (which signs with nothing). See scripts/testflight-tvos.sh.
+        CODE_SIGN_STYLE: Manual
+        "CODE_SIGN_IDENTITY[sdk=appletvos*]": "Apple Distribution"
+        "PROVISIONING_PROFILE_SPECIFIER[sdk=appletvos*]": "Fin tvOS App Store (fin-tv)"
+        "CODE_SIGN_IDENTITY[sdk=appletvsimulator*]": ""
+        "PROVISIONING_PROFILE_SPECIFIER[sdk=appletvsimulator*]": ""
         DEVELOPMENT_TEAM: EC27UF79GL
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
