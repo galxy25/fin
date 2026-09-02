@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Same private CloudKit container as every other Fin platform — the Apple TV
+	     mirrors the synced Server/KeyMetadata/pairing records from it. No
+	     CloudDocuments/ubiquity here: iCloud Drive doesn't exist on tvOS. -->
+	<key>com.apple.developer.icloud-container-identifiers</key>
+	<array>
+		<string>iCloud.dev.levischoen.fin</string>
+	</array>
+	<key>com.apple.developer.icloud-services</key>
+	<array>
+		<string>CloudKit</string>
+	</array>
+	<!-- CloudKit's silent import pushes ride APNs, same as iOS/macOS; without this
+	     the TV only pulls on foreground launch. Flipped to production at submission. -->
+	<key>aps-environment</key>
+	<string>development</string>
+</dict>
+</plist>

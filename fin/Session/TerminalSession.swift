@@ -28,9 +28,39 @@ struct ServerCredentials {
 final class TerminalSession: ObservableObject, Identifiable {
     let id: UUID
     let terminalView: FinTerminalView
+    /// Timestamped, chunked record of everything typed and received — the agent's actual
+    /// window onto the session; see `TerminalEventLog` for why this exists alongside
+    /// SwiftTerm's own buffer rather than replacing the tail-of-buffer read with more of
+    /// the same thing.
+    let eventLog = TerminalEventLog()
 
-    @Published private(set) var state: SessionState = .disconnected
+    @Published private(set) var state: SessionState = .disconnected {
+        didSet {
+            // Lifecycle audit in one place so no transition site can forget it:
+            // entering .connected, and leaving it for any reason (an explicit
+            // disconnect, a drop, or a wake-forced reconnect), each audit once.
+            guard oldValue != state else { return }
+            let name = lastServer?.name ?? ""
+            if state == .connected {
+                onConnectionAudit("[session] connected to \(name)")
+            } else if oldValue == .connected {
+                onConnectionAudit("[session] disconnected from \(name)")
+            }
+        }
+    }
     @Published private(set) var lastError: String?
+
+    /// Fired with a ready-made audit line on connect/disconnect transitions; wired
+    /// by `SessionManager` to the lifecycle recorder.
+    var onConnectionAudit: (String) -> Void = { _ in }
+
+    #if DEBUG
+    /// Test seam: the watchdog's connected-session gate must be table-testable
+    /// without a live SSH transport.
+    func simulateConnectedStateForTesting() {
+        state = .connected
+    }
+    #endif
     #if os(iOS) || os(visionOS)
     /// Whether the on-screen keyboard (and its accessory row) is currently showing.
     /// Starts false — the terminal isn't first responder until tapped or explicitly shown.
@@ -42,6 +72,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var client: SSHClient?
     private var stdinWriter: TTYStdinWriter?
     private var runTask: Task<Void, Never>?
+    /// Tail of the outbound write chain — see `send(bytes:)` for why writes are serialized.
+    private var writeChain: Task<Void, Never>?
+    /// Cached so an unexpected drop (see `run()`'s cleanup) can reconnect itself without
+    /// waiting for `SessionManager` to be told to do so via a foreground/wake trigger.
+    private var lastServer: Server?
+    private var lastCredentials: ServerCredentials?
+    private var lastEnvironment: [String: String] = [:]
     /// Bumped on every connect()/disconnect(). A `run()` invocation checks its captured
     /// generation before touching shared state, so a superseded (stale) connection attempt
     /// can never clobber a newer one's `client`/`stdinWriter`/`state` once it finally unwinds.
@@ -98,10 +135,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         client?.isConnected ?? false
     }
 
-    func connect(server: Server, credentials: ServerCredentials) {
+    /// `environment` is sent as SSH env requests with the PTY; the server's sshd only
+    /// honors names its AcceptEnv allows (macOS default: LANG and LC_*). Used by the test
+    /// harness to mark its sessions so the dev machine's shell profile can tell them apart
+    /// from a real interactive login.
+    func connect(server: Server, credentials: ServerCredentials, environment: [String: String] = [:]) {
         guard state == .disconnected || state == .reconnecting else { return }
         state = state == .reconnecting ? .reconnecting : .connecting
         lastError = nil
+        lastServer = server
+        lastCredentials = credentials
+        lastEnvironment = environment
 
         generation += 1
         let myGeneration = generation
@@ -118,9 +162,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         client = nil
         stdinWriter = nil
+        // Queued writes belong to the connection being replaced; letting them drain into
+        // the new one would deliver stale keystrokes to a fresh shell.
+        writeChain?.cancel()
+        writeChain = nil
 
         runTask = Task { [weak self] in
-            await self?.run(server: server, credentials: credentials, generation: myGeneration)
+            await self?.run(server: server, credentials: credentials, environment: environment, generation: myGeneration)
         }
     }
 
@@ -136,6 +184,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     func disconnect() {
         generation += 1
         runTask?.cancel()
+        writeChain?.cancel()
+        writeChain = nil
         let closingClient = client
         client = nil
         stdinWriter = nil
@@ -143,13 +193,37 @@ final class TerminalSession: ObservableObject, Identifiable {
         Task { try? await closingClient?.close() }
     }
 
+    /// Transport-level write. Every caller — keystrokes, the accessory row, pasted
+    /// clippings, the agent — funnels through here.
+    ///
+    /// Writes are chained rather than each getting its own detached `Task`: unstructured
+    /// tasks are scheduled independently, so two calls in quick succession could reach the
+    /// channel out of order. With a human typing that's a rare cosmetic glitch; with
+    /// something writing programmatically (the agent sending a command, or a multi-line
+    /// paste) reordering corrupts the command itself, so ordering has to be guaranteed.
     func send(bytes: [UInt8]) {
         guard let stdinWriter else { return }
-        Task { try? await stdinWriter.write(ByteBuffer(bytes: bytes)) }
+        eventLog.recordInput(bytes)
+        let previousWrite = writeChain
+        writeChain = Task {
+            await previousWrite?.value
+            try? await stdinWriter.write(ByteBuffer(bytes: bytes))
+        }
     }
 
     func send(text: String) {
         send(bytes: Array(text.utf8))
+    }
+
+    /// Input originating from the agent rather than the keyboard.
+    ///
+    /// Routed through SwiftTerm's `sendUserInput` instead of straight to `send(bytes:)`
+    /// so the terminal's own OSC 133 interaction state advances exactly as it does for
+    /// typed input. `sendUserInput` registers the input and then calls back through the
+    /// view delegate into `send(bytes:)` above, so this still results in a single write.
+    func sendAgentInput(_ text: String) {
+        guard !text.isEmpty else { return }
+        terminalView.getTerminal().sendUserInput(Array(text.utf8)[...])
     }
 
     func resize(cols: Int, rows: Int) {
@@ -159,15 +233,26 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    private func run(server: Server, credentials: ServerCredentials, generation myGeneration: Int) async {
+    private func run(server: Server, credentials: ServerCredentials, environment: [String: String], generation myGeneration: Int) async {
         do {
             let authMethod = try Self.authenticationMethod(credentials: credentials)
+            // Citadel has no SSH-level keepalive, so a session that goes silently dead
+            // (network drop, NAT/router idle timeout — not just macOS sleep, which is
+            // handled separately via RootView's wake observer) never tells anyone it died;
+            // the channel's `isActive`/close events just never fire. tmux's default
+            // 15-second status-bar chatter means a genuinely healthy connection almost
+            // always has some server->client traffic, so a 90-second read-idle threshold
+            // catches a truly dead connection without false-positiving on a quiet-but-alive
+            // one. Closing the channel here is what lets the existing reconnect logic (and
+            // the auto-reconnect below) actually detect and recover instead of trusting a
+            // stale `isConnected` flag.
             let client = try await SSHClient.connect(
                 host: server.host,
                 port: server.port,
                 authenticationMethod: authMethod,
                 hostKeyValidator: .acceptAnything(),
-                reconnect: .never
+                reconnect: .never,
+                channelHandlers: [IdleStateHandler(readTimeout: .seconds(90)), IdleConnectionCloser()]
             )
 
             guard myGeneration == generation else {
@@ -189,7 +274,10 @@ final class TerminalSession: ObservableObject, Identifiable {
                 terminalModes: SSHTerminalModes([:])
             )
 
-            try await client.withPTY(ptyRequest) { [weak self] inbound, outbound in
+            let environmentRequests = environment.map {
+                SSHChannelRequestEvent.EnvironmentRequest(wantReply: false, name: $0.key, value: $0.value)
+            }
+            try await client.withPTY(ptyRequest, environment: environmentRequests) { [weak self] inbound, outbound in
                 guard let self, myGeneration == self.generation else { return }
                 self.stdinWriter = outbound
                 self.state = .connected
@@ -216,16 +304,26 @@ final class TerminalSession: ObservableObject, Identifiable {
         // A superseded attempt must not clobber whatever a newer connect()/disconnect()
         // has since done to `client`/`stdinWriter`/`state`.
         guard myGeneration == generation else { return }
+        // `.connected` here (as opposed to `.connecting`, meaning the initial handshake
+        // itself failed) means this was a working session that dropped unexpectedly —
+        // worth one silent auto-reconnect. A failed handshake is not: retrying a bad host/
+        // credentials immediately would just spin, so that case is left for the user or an
+        // explicit foreground/wake trigger to retry.
+        let shouldAutoReconnect = state == .connected
         client = nil
         stdinWriter = nil
         if state != .disconnected {
             state = .disconnected
+        }
+        if shouldAutoReconnect, let server = lastServer, let credentials = lastCredentials {
+            connect(server: server, credentials: credentials, environment: lastEnvironment)
         }
     }
 
     private func feed(_ buffer: ByteBuffer) {
         var buffer = buffer
         guard let bytes = buffer.readBytes(length: buffer.readableBytes) else { return }
+        eventLog.recordOutput(bytes)
         terminalView.feed(byteArray: bytes[...])
     }
 
@@ -301,5 +399,21 @@ extension TerminalSession: TerminalViewDelegate {
             UIPasteboard.general.string?.data(using: .utf8)
             #endif
         }
+    }
+}
+
+/// Turns `IdleStateHandler`'s idle event into an actual channel close. `IdleStateHandler`
+/// only fires a `userInboundEventTriggered` notification on idle — on its own it does
+/// nothing observable to the rest of the app, so nothing would ever learn the connection is
+/// suspect without this closing the channel and letting the resulting close cascade through
+/// Citadel's `SSHClient` and this file's `run()` loop the same way any other disconnect does.
+private final class IdleConnectionCloser: ChannelInboundHandler {
+    typealias InboundIn = Any
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if event is IdleStateHandler.IdleStateEvent {
+            context.close(promise: nil)
+        }
+        context.fireUserInboundEventTriggered(event)
     }
 }

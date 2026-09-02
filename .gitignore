@@ -8,6 +8,7 @@ DerivedData/
 .swiftpm/
 .playwright-mcp/
 *.log
+.claude/
 
 # One-time App Store Connect setup screenshots from initial TestFlight bring-up —
 # not project source, some show developer-account/business details.
@@ -16,3 +17,4 @@ add-testers-dialog.png
 dev-account-membership.png
 tester-added.png
 testflight-group.png
+scripts/cloud-agent/dist/

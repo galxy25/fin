@@ -14,6 +14,7 @@ struct ServerEditView: View {
     @State private var username: String
     @State private var tmuxSessionName: String
     @State private var connectCommand: String
+    @State private var keepScreenAwake: Bool
     @State private var selectedKeyID: UUID?
     @State private var isImportingKey = false
     @State private var isAdvancedExpanded = false
@@ -26,6 +27,7 @@ struct ServerEditView: View {
         _username = State(initialValue: server?.username ?? "")
         _tmuxSessionName = State(initialValue: server?.tmuxSessionName ?? "main")
         _connectCommand = State(initialValue: server?.connectCommand ?? "")
+        _keepScreenAwake = State(initialValue: server?.keepScreenAwake ?? false)
         _selectedKeyID = State(initialValue: server?.keyID)
     }
 
@@ -54,6 +56,13 @@ struct ServerEditView: View {
                         isImportingKey = true
                     }
                 }
+                #if os(iOS)
+                Section {
+                    Toggle("Keep Screen Awake", isOn: $keepScreenAwake)
+                } footer: {
+                    Text("Prevents the display from auto-locking while this session is on screen. Uses more battery.")
+                }
+                #endif
                 Section {
                     DisclosureGroup("Advanced", isExpanded: $isAdvancedExpanded) {
                         TextField("tmux session name", text: $tmuxSessionName)
@@ -105,6 +114,7 @@ struct ServerEditView: View {
             server.username = username
             server.tmuxSessionName = tmuxSessionName
             server.connectCommand = connectCommand
+            server.keepScreenAwake = keepScreenAwake
             server.keyID = selectedKeyID
         } else {
             let newServer = Server(
@@ -114,7 +124,8 @@ struct ServerEditView: View {
                 username: username,
                 keyID: selectedKeyID,
                 tmuxSessionName: tmuxSessionName,
-                connectCommand: connectCommand
+                connectCommand: connectCommand,
+                keepScreenAwake: keepScreenAwake
             )
             modelContext.insert(newServer)
         }

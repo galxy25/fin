@@ -8,6 +8,7 @@ options:
     # @available(macOS 15.0, *) regardless — a quirk in Citadel itself, not a
     # choice we're making. 15.0 is the real floor for this app on macOS.
     macOS: "15.0"
+    visionOS: "26.0"
   createIntermediateGroups: true
 packages:
   SwiftTerm:
@@ -25,12 +26,29 @@ packages:
   SwiftCrypto:
     url: https://github.com/apple/swift-crypto.git
     from: 3.12.3
+  Wax:
+    url: https://github.com/christopherkarani/Wax.git
+    # Exact pin, three constraints at once (verified against upstream 2026-08-28):
+    # - 0.2.x does not exist upstream (newest library tag is 0.1.35).
+    # - 0.1.28+ broke iOS: broker code references Foundation.Process in an
+    #   unguarded signature (terminateLaunchedBroker), which iOS lacks.
+    # - `from:` would auto-resolve onto those broken releases; exactVersion holds
+    #   the last tag whose broker guards keep iOS compiling.
+    # visionOS never compiles (the broker's platform guard omits it entirely), so
+    # the dependency below is destination-filtered and Wax callers are wrapped in
+    # `#if canImport(Wax)`.
+    exactVersion: 0.1.27
 targets:
   fin:
     type: application
-    supportedDestinations: [iOS, macOS]
+    supportedDestinations: [iOS, macOS, visionOS]
     sources:
       - path: fin
+      # Shared agent core, extracted for the headless fin-agentd daemon. These files
+      # compile directly into the app target (same module, internal access still works);
+      # daemon/Package.swift builds the same directory as the FinAgentCore library.
+      # Single source of truth — edit there, both products pick it up.
+      - path: daemon/Sources/FinAgentCore
     dependencies:
       - package: SwiftTerm
       - package: Citadel
@@ -40,6 +58,10 @@ targets:
         product: NIO
       - package: SwiftCrypto
         product: Crypto
+      # visionOS filtered out: no Wax release compiles there (see the package pin
+      # comment). Sources guard with `#if canImport(Wax)`; visionOS runs keyword-only.
+      - package: Wax
+        destinationFilters: [iOS, macOS]
     info:
       path: Generated/Info.plist
       properties:
@@ -53,7 +75,25 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        NSLocalNetworkUsageDescription: "Fin connects to SSH servers on your local network, including this Mac, over a direct TCP connection."
+        NSLocalNetworkUsageDescription: "Fin connects to SSH servers on your local network, including this Mac, over a direct TCP connection — and, when you use the TV Remote Keyboard, to Fin on your Apple TV."
+        # Required for the iOS companion to browse for Fin on Apple TV (the
+        # TV Remote Keyboard feature); Bonjour browsing is gated on this exact list.
+        NSBonjourServices:
+          - _fin-input._tcp
+        # CloudKit sync is push-driven between devices: the SwiftData/CloudKit mirror
+        # registers a silent-push subscription so a change on one device wakes the
+        # others to import it. Without this background mode a second device only pulls
+        # on foreground launch — which reads as "stuck syncing" on a device that's
+        # rarely opened.
+        UIBackgroundModes:
+          - remote-notification
+        # A custom agent endpoint is very often a plain-HTTP server on the LAN or a
+        # Tailscale address (e.g. LM Studio) with no certificate at all — ATS blocks that
+        # by default. NSAllowsLocalNetworking only exempts IP-literal hosts and .local
+        # domains (there's no hostname for a cert to validate against anyway), not
+        # arbitrary internet HTTP, so this doesn't weaken ATS for anything else the app does.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         UIViewControllerBasedStatusBarAppearance: false
         UIStatusBarStyle: UIStatusBarStyleLightContent
         # Required by the Mac App Store validator (LSApplicationCategoryType);
@@ -67,6 +107,20 @@ targets:
         # TestFlight stops asking the per-build "export compliance" question — uploads
         # from scripts/testflight.sh land "Ready to Submit" immediately.
         ITSAppUsesNonExemptEncryption: false
+        # Makes the iCloud Drive container's Documents folder show up in Files as
+        # "Fin" — where AgentLogMirror drops redacted JSONL audit trails for a
+        # Mac-side supervisor to read.
+        NSUbiquitousContainers:
+          iCloud.dev.levischoen.fin:
+            NSUbiquitousContainerIsDocumentScopePublic: true
+            NSUbiquitousContainerSupportedFolderLevels: Any
+            NSUbiquitousContainerName: "Fin"
+        # Remote-supervision seeds and the Debug auto-session flag, resolved from
+        # build settings whose target-level defaults are empty — a normal build
+        # carries empty values and every one of these features stays dormant.
+        FinDirectiveURL: "$(FIN_DIRECTIVE_URL)"
+        FinStatusURL: "$(FIN_STATUS_URL)"
+        FinAutoSession: "$(FIN_AUTO_SESSION)"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin
@@ -82,10 +136,77 @@ targets:
         # is implicit, so this is scoped to the macOS SDK only.
         CODE_SIGN_ENTITLEMENTS: fin/fin-iOS.entitlements
         "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": fin/fin-macOS.entitlements
+        # Empty defaults keep the Info.plist's remote-supervision/auto-session keys
+        # resolving to "" (dormant) unless a build passes real values.
+        FIN_DIRECTIVE_URL: ""
+        FIN_STATUS_URL: ""
+        FIN_AUTO_SESSION: ""
+  fin-tv:
+    type: application
+    platform: tvOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: fin-tv
+      # SwiftTerm's UIKit view layer excludes tvOS, so the headless engine is
+      # vendored (MIT, see vendor/SwiftTermEngine/ATTRIBUTION.md) and compiled
+      # into this module directly — the iOS/macOS targets keep the upstream
+      # SwiftTerm package pin untouched.
+      - path: vendor/SwiftTermEngine
+      # Synced-schema models shared verbatim with the other platforms (schema
+      # parity with finApp's "Synced" ModelConfiguration), plus the theme and
+      # device identity. Local-only models (Clipping/Markdown/AgentLog) and the
+      # FileDocument shim stay out — their features don't exist on tvOS.
+      - path: fin/Models
+        includes:
+          - Server.swift
+          - KeyMetadata.swift
+          - Agent.swift
+          - AgentMemory.swift
+          - AgentSignal.swift
+          - AgentRelayMessage.swift
+          - RemoteInputPairing.swift
+          - AppTheme.swift
+          - DeviceIdentity.swift
+      - path: fin/Persistence/KeychainStore.swift
+      - path: fin/RemoteInput
+      - path: daemon/Sources/FinAgentCore/TerminalEventLog.swift
+    dependencies:
+      - package: Citadel
+      - package: SwiftNIOSSHFork
+        product: NIOSSH
+      - package: SwiftNIO
+        product: NIO
+      - package: SwiftCrypto
+        product: Crypto
+    info:
+      path: Generated/Info-tvOS.plist
+      properties:
+        CFBundleDisplayName: "Fin"
+        # CloudKit's silent import pushes wake the mirror, same as iOS.
+        UIBackgroundModes:
+          - remote-notification
+        # Same export-compliance analysis as the iOS target (standard/exempt
+        # encryption only: SSH + HTTPS), declared fresh here.
+        ITSAppUsesNonExemptEncryption: false
+        LSApplicationCategoryType: public.app-category.developer-tools
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: EC27UF79GL
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "3"
+        CODE_SIGN_ENTITLEMENTS: fin/fin-tvOS.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
   finTests:
     type: bundle.unit-test
-    platform: iOS
-    deploymentTarget: "17.0"
+    # Multiplatform on purpose: SwiftUI's macOS backend is a different implementation, so
+    # a view that lays out cleanly on iOS can still trap on Mac. Running the same suite on
+    # both is the only way those get caught before a user does.
+    supportedDestinations: [iOS, macOS, visionOS]
     sources:
       - path: finTests
     dependencies:
@@ -94,7 +215,14 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin.tests
         GENERATE_INFOPLIST_FILE: "YES"
+        # Simulator/macOS runs don't care, but running the suite on a physical device
+        # (the on-device CloudKit diagnostics) needs the test bundle signed too.
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: EC27UF79GL
+        # The host binary sits at a different path inside the bundle on each platform —
+        # flat on iOS, under Contents/MacOS on macOS.
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/fin.app/fin"
+        "TEST_HOST[sdk=macosx*]": "$(BUILT_PRODUCTS_DIR)/fin.app/Contents/MacOS/fin"
         BUNDLE_LOADER: "$(TEST_HOST)"
 schemes:
   fin:

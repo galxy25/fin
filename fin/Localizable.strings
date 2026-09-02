@@ -1,0 +1,3 @@
+/* Cross-device agent signal push: the alert body is the signal's redacted preview,
+   substituted by CloudKit via alertLocalizationArgs (see AgentSignalSubscriber). */
+"AGENT_SIGNAL_PREVIEW" = "%1$@";

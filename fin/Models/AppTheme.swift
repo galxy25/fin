@@ -63,7 +63,7 @@ extension PlatformColor {
     }
 }
 
-extension Color {
+extension SwiftUI.Color {
     init(hex: String) {
         #if os(macOS)
         self.init(nsColor: PlatformColor(hex: hex))

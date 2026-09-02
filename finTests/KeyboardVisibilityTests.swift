@@ -1,3 +1,6 @@
+// The keyboard accessory path this covers is iOS-only (there is no software
+// keyboard to dismiss on Mac), so the whole file compiles out there.
+#if os(iOS) || os(visionOS)
 import XCTest
 @testable import fin
 
@@ -86,3 +89,5 @@ final class KeyboardVisibilityTests: XCTestCase {
         XCTAssertFalse(session.isKeyboardVisible)
     }
 }
+
+#endif

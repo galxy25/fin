@@ -9,6 +9,17 @@
 	<key>com.apple.developer.icloud-services</key>
 	<array>
 		<string>CloudKit</string>
+		<string>CloudDocuments</string>
 	</array>
+	<key>com.apple.developer.ubiquity-container-identifiers</key>
+	<array>
+		<string>iCloud.dev.levischoen.fin</string>
+	</array>
+	<!-- CloudKit's cross-device sync pushes ride APNs; without this entitlement the
+	     silent-push subscription is never delivered and a second device only syncs on
+	     foreground launch. "development" is flipped to "production" automatically at
+	     App Store/TestFlight submission. -->
+	<key>aps-environment</key>
+	<string>development</string>
 </dict>
 </plist>

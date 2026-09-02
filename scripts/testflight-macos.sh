@@ -66,12 +66,17 @@ rm -rf "$ARCHIVE" "$EXPORT_DIR"
 # Cloud signing via the ASC key: -allowProvisioningUpdates mints the Apple Distribution
 # cert + Mac App Store provisioning profile (the key must be Admin role), so no Apple ID
 # needs to be signed into Xcode (headless).
+# ARCHS=arm64: the default universal archive dies compiling Wax's MetalANNS for
+# x86_64 (Float16 storage types don't exist on Intel Apple platforms). Fin's
+# macOS audience is Apple Silicon; an arm64-only archive is fully App
+# Store-valid and sidesteps the whole slice.
 xcodebuild \
   -project fin.xcodeproj \
   -scheme "$SCHEME" \
   -configuration Release \
   -destination 'generic/platform=macOS' \
   -archivePath "$ARCHIVE" \
+  ARCHS=arm64 \
   CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
   -authenticationKeyPath "$ASC_KEY_PATH" \
   -authenticationKeyID "$ASC_KEY_ID" \

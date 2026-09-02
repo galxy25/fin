@@ -14,6 +14,10 @@ final class Server {
     /// send nothing — for hosts (like one set up with a shell-profile tmux/mosh
     /// auto-attach) where anything we type would just be redundant input to erase.
     var connectCommand: String = ""
+    /// Keeps the device screen from idle-locking while this server's session is on
+    /// screen (iOS/iPadOS; the Mac manages its own display sleep). Off by default —
+    /// burning the battery of everyone who didn't ask is worse than one person relocking.
+    var keepScreenAwake: Bool = false
     var createdAt: Date = Date()
 
     init(
@@ -23,7 +27,8 @@ final class Server {
         username: String,
         keyID: UUID? = nil,
         tmuxSessionName: String = "main",
-        connectCommand: String = ""
+        connectCommand: String = "",
+        keepScreenAwake: Bool = false
     ) {
         self.id = UUID()
         self.name = name
@@ -33,6 +38,7 @@ final class Server {
         self.keyID = keyID
         self.tmuxSessionName = tmuxSessionName
         self.connectCommand = connectCommand
+        self.keepScreenAwake = keepScreenAwake
         self.createdAt = Date()
     }
 }

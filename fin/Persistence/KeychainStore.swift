@@ -4,6 +4,7 @@ import Security
 enum KeychainStore {
     private static let keyService = "dev.levischoen.fin.privatekey"
     private static let passphraseService = "dev.levischoen.fin.passphrase"
+    private static let agentAPIKeyService = "dev.levischoen.fin.agentapikey"
 
     enum KeychainError: Error {
         case unhandled(OSStatus)
@@ -28,6 +29,29 @@ enum KeychainStore {
     static func deleteKeyMaterial(for keyID: UUID) {
         delete(service: keyService, account: keyID.uuidString)
         delete(service: passphraseService, account: keyID.uuidString)
+    }
+
+    /// Agent endpoint bearer tokens. Kept out of SwiftData (which mirrors to CloudKit
+    /// in plaintext) for the same reason private keys are. Local endpoints like
+    /// LM Studio are typically keyless, so this is legitimately empty for most agents.
+    static func saveAgentAPIKey(_ key: String, for agentID: UUID) throws {
+        guard let data = key.data(using: .utf8), !key.isEmpty else {
+            delete(service: agentAPIKeyService, account: agentID.uuidString)
+            return
+        }
+        try save(data, service: agentAPIKeyService, account: agentID.uuidString)
+    }
+
+    static func loadAgentAPIKey(for agentID: UUID) -> String? {
+        guard let data = load(service: agentAPIKeyService, account: agentID.uuidString),
+              let key = String(data: data, encoding: .utf8),
+              !key.isEmpty
+        else { return nil }
+        return key
+    }
+
+    static func deleteAgentAPIKey(for agentID: UUID) {
+        delete(service: agentAPIKeyService, account: agentID.uuidString)
     }
 
     // `WhenUnlocked` (not `...ThisDeviceOnly`) plus `kSecAttrSynchronizable` is what makes

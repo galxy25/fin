@@ -1,0 +1,37 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 22,
+    "username": "youruser",
+    "privateKeyPath": "~/.ssh/id_ed25519",
+    "connectCommand": "tmux new-session -A -s fin-agentd \\; set status off",
+    "environment": { "LC_FIN_AGENT": "1" }
+  },
+  "agent": {
+    "endpointURL": "http://localhost:1234/v1",
+    "modelIdentifier": "google/gemma-4-12b-qat",
+    "contextWindowTokens": 8192,
+    "maxOutputTokens": 640,
+    "temperature": 0.2,
+    "heartbeatSeconds": 60
+  },
+  "task": "Watch the build in this terminal; if it fails, summarize the first error. When the build has finished successfully, end your reply with TASK COMPLETE.",
+  "notifyCommand": "echo \"$FIN_EVENT :: $FIN_MESSAGE\" >> ~/fin-agentd-notify.log",
+  "auditLogPath": "~/fin-agentd-audit.jsonl",
+  "stayResident": true,
+  "agentID": "3F2504E0-4F89-11D3-9A0C-0305E82C3301",
+  "deviceToken8": "cloud001",
+  "supervision": {
+    "_note": "Presigned URLs MUST be SigV4 — boto3 Config(signature_version='s3v4'). A SigV2 URL 403s any PUT because the daemon sends a Content-Type header.",
+    "directiveURL": "https://your-bucket.s3.amazonaws.com/fin/directives.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-...",
+    "statusURL": "https://your-bucket.s3.amazonaws.com/fin/agentd-status.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-...",
+    "inboxURL": "https://your-bucket.s3.amazonaws.com/fin/agentd-inbox.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-...",
+    "agentName": "fin-agentd-1",
+    "pollSeconds": 30
+  },
+  "transcript": {
+    "putURL": "https://your-bucket.s3.amazonaws.com/fin/agentd-transcript.jsonl?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-...",
+    "flushSeconds": 15,
+    "maxLines": 2000
+  }
+}

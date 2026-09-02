@@ -1,14 +1,21 @@
 import SwiftUI
+import SwiftData
 
 struct ControlStripView: View {
     let server: Server
     @ObservedObject var session: TerminalSession
+    /// Owned by `TerminalScreen`, which is what actually lays the panel out.
+    @Binding var isAgentPanelVisible: Bool
+    let prefersSidePanel: Bool
+
     @EnvironmentObject private var sessionManager: SessionManager
+    @Query(sort: \Agent.createdAt) private var agents: [Agent]
 
     @State private var showingServers = false
     @State private var showingClipboard = false
     @State private var showingTheme = false
     @State private var showingPageButtons = false
+    @State private var showingAgent = false
     #if os(iOS) || os(visionOS)
     @State private var pendingKeyboardHide = false
     #endif
@@ -32,6 +39,33 @@ struct ControlStripView: View {
                 showingServers = true
             } label: {
                 Image(systemName: "server.rack")
+            }
+            if let agent = agents.first {
+                Button {
+                    // A cloud-hosted agent has no local runtime to panel-embed;
+                    // its console is the remote view, always a sheet.
+                    if prefersSidePanel, agent.hostsLocally {
+                        isAgentPanelVisible.toggle()
+                    } else {
+                        showingAgent = true
+                    }
+                } label: {
+                    Image(systemName: agent.hostsLocally ? "sparkles" : "cloud")
+                        .foregroundStyle(
+                            prefersSidePanel && isAgentPanelVisible ? Color.accentColor : Color.white
+                        )
+                }
+                .sheet(isPresented: $showingAgent) {
+                    if let runtime = sessionManager.agentRuntime(
+                        for: session,
+                        agent: agent,
+                        serverName: server.name
+                    ) {
+                        AgentConsoleView(runtime: runtime)
+                    } else {
+                        AgentRemoteConsoleView(agent: agent)
+                    }
+                }
             }
             Button {
                 showingClipboard = true
@@ -101,11 +135,41 @@ struct ControlStripView: View {
         .sheet(isPresented: $showingServers) {
             HomeView()
         }
+        // Notification-tap deep link: the tapped agent's console opens in whichever
+        // presentation this layout uses. Checked on appear too, for taps that landed
+        // before this screen existed.
+        .onAppear { openPendingAgentIfNeeded() }
+        .onChange(of: sessionManager.pendingAgentOpen) { _, _ in openPendingAgentIfNeeded() }
         .sheet(isPresented: $showingClipboard) {
             ClipboardManagerView(session: session)
         }
         .sheet(isPresented: $showingTheme) {
             ThemeSettingsView()
+        }
+    }
+
+    private func openPendingAgentIfNeeded() {
+        // `SessionManager.notificationTapRoute` is the routing fork shared with
+        // RootView: this consumer claims the `.localConsole` half (the tap's
+        // signal originated HERE — or, for old origin-less pushes, the
+        // residence fallback: a live runtime, or a cold launch where the armed
+        // runtime hasn't been recreated yet), RootView claims `.remoteConsole`
+        // (the conversation provably lives on the tap's origin device) —
+        // mutually exclusive by construction on the same decision, so the two
+        // never race for the same tap.
+        guard let pending = sessionManager.pendingAgentOpen,
+              let agent = agents.first, agent.id == pending.agentID,
+              // Cloud-hosted: never a local claim — RootView's remote half
+              // takes every tap for an agent no device hosts.
+              agent.hostsLocally,
+              sessionManager.notificationTapRoute(
+                  for: agent, originDeviceID8: pending.originDeviceID8
+              ) == .localConsole else { return }
+        sessionManager.pendingAgentOpen = nil
+        if prefersSidePanel {
+            isAgentPanelVisible = true
+        } else {
+            showingAgent = true
         }
     }
 

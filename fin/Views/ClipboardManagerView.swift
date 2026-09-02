@@ -1,5 +1,10 @@
 import SwiftUI
 import SwiftData
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 struct ClipboardManagerView: View {
     let session: TerminalSession
@@ -44,6 +49,30 @@ struct ClipboardManagerView: View {
                                 modelContext.delete(clipping)
                             }
                         }
+                        // Tap pastes into the terminal; this is the other direction —
+                        // out of Fin's clipboard onto the system one, so a captured
+                        // terminal snippet can land anywhere else (the agent composer,
+                        // another app) instead of only back into the shell.
+                        .swipeActions(edge: .leading) {
+                            Button {
+                                copyToSystemClipboard(clipping)
+                            } label: {
+                                Label("Copy", systemImage: "doc.on.doc")
+                            }
+                            .tint(.blue)
+                        }
+                        .contextMenu {
+                            Button {
+                                copyToSystemClipboard(clipping)
+                            } label: {
+                                Label("Copy to Clipboard", systemImage: "doc.on.doc")
+                            }
+                            Button {
+                                paste(clipping)
+                            } label: {
+                                Label("Paste into Terminal", systemImage: "arrow.right.square")
+                            }
+                        }
                     }
                 }
                 .listStyle(.plain)
@@ -77,6 +106,15 @@ struct ClipboardManagerView: View {
     private func paste(_ clipping: Clipping) {
         session.send(text: clipping.text)
         dismiss()
+    }
+
+    private func copyToSystemClipboard(_ clipping: Clipping) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(clipping.text, forType: .string)
+        #else
+        UIPasteboard.general.string = clipping.text
+        #endif
     }
 }
 
