@@ -15,7 +15,9 @@ struct HomeView: View {
         }
     }
 
+    @EnvironmentObject private var entitlementStore: EntitlementStore
     @State private var mode: Mode = .terminal
+    @State private var showsPaywall = false
     #if os(iOS)
     @State private var showsRemoteKeyboard = false
     #endif
@@ -45,6 +47,27 @@ struct HomeView: View {
             #if os(iOS) || os(visionOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            // Always-available way to reach the Fin Pro subscription — the paywall
+            // otherwise only appears once the 14-day trial lapses, so during the
+            // trial (or for a reviewer on a fresh install) there was no way to see
+            // or buy the subscription. Hidden once the user already has Pro.
+            .toolbar {
+                if !entitlementStore.isSubscribed && !entitlementStore.ownsLifetime {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            showsPaywall = true
+                        } label: {
+                            Label("Fin Pro", systemImage: "crown")
+                        }
+                        .labelStyle(.titleAndIcon)
+                        .accessibilityLabel("Fin Pro subscription")
+                    }
+                }
+            }
+            .sheet(isPresented: $showsPaywall) {
+                PaywallView()
+                    .environmentObject(entitlementStore)
+            }
             #if os(iOS)
             // Apple TV remote keyboard: the phone as input for Fin on tvOS.
             .toolbar {
