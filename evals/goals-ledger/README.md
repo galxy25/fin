@@ -61,32 +61,32 @@ tick reads first.
 
 ## Tick contract
 
-A tick policy is any function with this signature (the baseline is
-`tick_baseline.py`; the production tick is fin's model + `prompts/tick.md`,
+A tick policy is any module exposing `decide(tick_input)` (the baseline is
+`policy_baseline.py`; the production tick is fin's model + `prompts/tick.md`,
 which must emit the same JSON):
 
 ```
 input:  { "ledger": {…}, "inbox": [ {"id", "at", "text"}, … ],
-          "activity": str, "now": iso8601 }
+          "activity": str, "now": iso8601, "stall_seconds"?: int }
 output: { "decision": "ingest|drive|report|idle|clarify",
-          "goal"?: str|null, "message_id"?: str, "reason": str }
+          "goal_id"?: str|null, "message_id"?: str, "reason": str }
 ```
 
 `inbox` is the stream of user messages not yet folded into the ledger (in
 production: the app's message queue / the daemon's S3 inbox channel).
-`activity` is a short summary of what the agent did recently. `"goal": null`
-on an ingest means *create a new goal*; a goal id means *update that one*.
+`activity` is a short summary of what the agent did recently. `"goal_id":
+null` on an ingest means *create a new goal*; an id means *update that one*.
 One decision per tick — the cheapest correct one.
 
 ### Decision taxonomy (the classification the evals score)
 
 | decision  | meaning                                                            | fields |
 |-----------|--------------------------------------------------------------------|--------|
-| `ingest`  | a new user message creates a goal or updates an existing one       | `goal` (null = create), `message_id` |
-| `drive`   | pick the most important drivable goal and execute its `next_action`| `goal` |
-| `report`  | progress, blocker, stall, or closure worth surfacing to the user   | `goal` |
+| `ingest`  | a new user message creates a goal or updates an existing one       | `goal_id` (null = create), `message_id` |
+| `drive`   | pick the most important drivable goal and execute its `next_action`| `goal_id` |
+| `report`  | progress, blocker, stall, or closure worth surfacing to the user   | `goal_id` |
 | `idle`    | nothing to do — say so cheaply, spend nothing                      |        |
-| `clarify` | message or goal genuinely ambiguous — ask, don't guess             | `goal`?, `message_id`? |
+| `clarify` | message or goal genuinely ambiguous — ask, don't guess             | `goal_id`?, `message_id`? |
 
 ### Prioritization rules
 
@@ -137,10 +137,18 @@ traps, deadline judgment, explained waits, activity-vs-progress) that exist
 to separate a model tick from the deterministic floor; they report but never
 fail the run. Baseline numbers live in `RESULTS.md`.
 
+Run (no tmux, no network, no display — pure classification, safe any time):
+
 ```sh
-python3 evals/goals-ledger/run_evals.py                       # baseline
-python3 evals/goals-ledger/run_evals.py --policy my_tick.py   # any policy
+python3 evals/goals-ledger/run_evals.py                        # baseline
+python3 evals/goals-ledger/run_evals.py --policy my_tick.py    # any policy
+python3 evals/goals-ledger/run_evals.py --corpus other.json    # other corpus
 ```
+
+Output is tiered like tmux-routing: overall pass count, core vs hard split,
+a per-decision breakdown, and every miss printed with its expected/actual
+JSON and the scenario's note. Exit status is 0 iff **core** is fully green
+(hard misses never fail the run), so the command gates CI as-is.
 
 Corpus coverage: new message → ingest-create; message updates existing goal
 (incl. delivering a `blocked_on` item and announcing the `why` came true);
@@ -182,9 +190,10 @@ question and starts being a ledger-driven decision.
 
 - [x] Ledger schema + example (`ledger.example.json`)
 - [x] Tick decision taxonomy + priority rules
-- [x] Baseline tick policy (deterministic rules, `tick_baseline.py`)
+- [x] Baseline tick policy (deterministic rules, `policy_baseline.py`)
 - [x] Scenario corpus v1 (35 scenarios: 21 core, 14 hard — `scenarios.json`)
 - [x] Offline scorer with tiered core/hard scoring (`run_evals.py`)
+- [x] Core fully green on the baseline (21/21; hard 3/14 by design — `RESULTS.md`)
 - [x] Prompt block draft (`prompts/tick.md`)
 - [ ] Model-backed tick adapter scored on the same corpus
 - [ ] Ledger read/write in FinAgentCore (agent working memory + daemon disk)

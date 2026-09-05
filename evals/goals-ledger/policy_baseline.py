@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 """Deterministic baseline tick policy for the goals ledger.
 
-Implements the tick contract from README.md with plain rules — no model.
-It exists to (a) prove the harness and corpus end-to-end, and (b) set the
-floor a model-backed tick must beat on the same scenarios.
+Implements the tick contract from README.md with plain rules — no model, no
+imports beyond the stdlib, no I/O. It exists to (a) prove the harness and
+corpus end-to-end, and (b) set the floor a model-backed tick must beat on
+the same scenarios.
+
+Contract:
+
+    decide(tick_input) -> {"decision": "ingest|drive|report|idle|clarify",
+                           "goal_id"?: str|None, "message_id"?: str,
+                           "reason": str}
+
+where tick_input = {"ledger": {...}, "inbox": [{"id","at","text"}, ...],
+"activity": str, "now": iso8601, "stall_seconds"?: int}. On an ingest,
+`goal_id: None` means create a new goal; an id means update that goal.
 
 Rules, in priority order (one decision per tick — the cheapest correct one):
 
@@ -12,7 +23,7 @@ Rules, in priority order (one decision per tick — the cheapest correct one):
      phrases outweigh shorter, like the tmux router). Unique best -> ingest
      that goal (report instead when the message is a question — a status ask
      is answered from the ledger, not re-filed into it). Tie -> clarify.
-     No match: a substantial statement is a NEW goal (ingest, goal null);
+     No match: a substantial statement is a NEW goal (ingest, goal_id None);
      a question or a fragment too short to define work -> clarify.
   2. CLOSURE: a goal in state done with no "close" update still owes the
      user its closing report -> report.
@@ -87,13 +98,14 @@ def _by_priority(goals: list[dict], ledger: dict) -> list[dict]:
     return sorted(goals, key=lambda g: (g.get("priority", 99), order[id(g)]))
 
 
-def decide(
-    ledger: dict,
-    inbox: list[dict],
-    activity: str,
-    now: str,
-    stall_seconds: int = DEFAULT_STALL_SECONDS,
-) -> dict:
+def decide(tick_input: dict) -> dict:
+    ledger = tick_input.get("ledger", {})
+    inbox = tick_input.get("inbox", [])
+    now = tick_input["now"]
+    stall_seconds = tick_input.get("stall_seconds", DEFAULT_STALL_SECONDS)
+    # tick_input.get("activity") is deliberately unread: the baseline cannot
+    # judge activity-vs-progress (see h08/h12) — that is model territory.
+
     goals = ledger.get("goals", [])
     now_dt = _ts(now)
 
@@ -115,7 +127,7 @@ def decide(
                 }
             return {
                 "decision": "ingest",
-                "goal": None,
+                "goal_id": None,
                 "message_id": message["id"],
                 "reason": "message matches no goal and states work: create a new goal",
             }
@@ -130,13 +142,13 @@ def decide(
         if is_question:
             return {
                 "decision": "report",
-                "goal": goal["id"],
+                "goal_id": goal["id"],
                 "message_id": message["id"],
                 "reason": "status question about a known goal: answer from the ledger",
             }
         return {
             "decision": "ingest",
-            "goal": goal["id"],
+            "goal_id": goal["id"],
             "message_id": message["id"],
             "reason": f"message updates existing goal '{goal['id']}'",
         }
@@ -152,7 +164,7 @@ def decide(
         goal = _by_priority(unclosed, ledger)[0]
         return {
             "decision": "report",
-            "goal": goal["id"],
+            "goal_id": goal["id"],
             "reason": "goal is done but the user has not been told: close it out",
         }
 
@@ -166,7 +178,7 @@ def decide(
         goal = _by_priority(unsurfaced, ledger)[0]
         return {
             "decision": "report",
-            "goal": goal["id"],
+            "goal_id": goal["id"],
             "reason": "blocked and never surfaced: tell the user what it waits on",
         }
 
@@ -181,7 +193,7 @@ def decide(
         goal = _by_priority(stalled, ledger)[0]
         return {
             "decision": "report",
-            "goal": goal["id"],
+            "goal_id": goal["id"],
             "reason": "no progress inside the stall window: surface it",
         }
 
@@ -194,7 +206,7 @@ def decide(
             goal = _by_priority(drivable, ledger)[0]
             return {
                 "decision": "drive",
-                "goal": goal["id"],
+                "goal_id": goal["id"],
                 "reason": f"{state} goal with a clear next_action: execute it",
             }
 
@@ -208,7 +220,7 @@ def decide(
         goal = _by_priority(vague, ledger)[0]
         return {
             "decision": "clarify",
-            "goal": goal["id"],
+            "goal_id": goal["id"],
             "reason": "live goal with no next_action: ask the user to define one",
         }
 
@@ -217,7 +229,7 @@ def decide(
 
 
 if __name__ == "__main__":
-    # One-off: tick_baseline.py ledger.json now-iso [inbox.json]
+    # One-off: policy_baseline.py ledger.json now-iso [inbox.json]
     ledger_path, now, *rest = sys.argv[1:]
     with open(ledger_path) as f:
         ledger = json.load(f)
@@ -225,4 +237,5 @@ if __name__ == "__main__":
     if rest:
         with open(rest[0]) as f:
             inbox = json.load(f)
-    print(json.dumps(decide(ledger, inbox, "", now), indent=2))
+    print(json.dumps(decide({"ledger": ledger, "inbox": inbox,
+                             "activity": "", "now": now}), indent=2))

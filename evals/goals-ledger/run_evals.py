@@ -9,8 +9,9 @@ asks the policy for one decision.
 Usage:
   run_evals.py [--policy path/to/module.py] [--corpus scenarios.json]
 
-A custom policy module must expose
-decide(ledger, inbox, activity, now, stall_seconds).
+A policy module must expose decide(tick_input) taking
+{"ledger", "inbox", "activity", "now", "stall_seconds"} and returning
+{"decision", "goal_id"?, "message_id"?, "reason"} (see policy_baseline.py).
 Exit status: 0 if every CORE scenario passes, 1 otherwise — so this can gate
 CI. Scenarios marked "hard": true are the discriminative benchmark (judgment
 calls a deterministic policy misses by construction); they report but never
@@ -56,8 +57,8 @@ def build_ledger(default_ledger: dict, scenario: dict) -> dict:
 def matches(expected: dict, actual: dict) -> bool:
     if expected["decision"] != actual.get("decision"):
         return False
-    # `"goal": null` in expected asserts create-new (no existing goal chosen).
-    if "goal" in expected and expected["goal"] != actual.get("goal"):
+    # `"goal_id": null` in expected asserts create-new (no existing goal chosen).
+    if "goal_id" in expected and expected["goal_id"] != actual.get("goal_id"):
         return False
     if "message_id" in expected and expected["message_id"] != actual.get("message_id"):
         return False
@@ -66,7 +67,7 @@ def matches(expected: dict, actual: dict) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy", default=str(HERE / "tick_baseline.py"))
+    parser.add_argument("--policy", default=str(HERE / "policy_baseline.py"))
     parser.add_argument("--corpus", default=str(HERE / "scenarios.json"))
     args = parser.parse_args()
 
@@ -87,7 +88,13 @@ def main() -> int:
         activity = scenario.get("activity", corpus.get("default_activity", ""))
         now = scenario.get("now", corpus["default_now"])
         expected = scenario["expected"]
-        actual = decide(ledger, inbox, activity, now, stall_seconds)
+        actual = decide({
+            "ledger": ledger,
+            "inbox": inbox,
+            "activity": activity,
+            "now": now,
+            "stall_seconds": stall_seconds,
+        })
         per_decision[expected["decision"]] += 1
         ok = matches(expected, actual)
 

@@ -61,5 +61,5 @@ tick — on any device, after any restart — picks up exactly where this one
 left off.
 
 **Emit JSON:** `{ "decision": "ingest|drive|report|idle|clarify",
-"goal"?: "<id or null for a new goal>", "message_id"?: "<inbox id>",
+"goal_id"?: "<id or null for a new goal>", "message_id"?: "<inbox id>",
 "reason": "<one line>" }` — then carry the decision out.

@@ -10,7 +10,7 @@
       "inbox": [
         { "id": "m-201", "at": "2026-09-05T16:59:00Z", "text": "the reviewer replied - they want the demo video reshot in landscape" }
       ],
-      "expected": { "decision": "ingest", "goal": "g-appstore-rejection" },
+      "expected": { "decision": "ingest", "goal_id": "g-appstore-rejection" },
       "note": "new information about an existing goal updates it - no second rejection goal, ever"
     },
     {
@@ -18,7 +18,7 @@
       "inbox": [
         { "id": "m-202", "at": "2026-09-05T16:59:00Z", "text": "new goal: the tv app needs a screensaver mode for the dashboard" }
       ],
-      "expected": { "decision": "ingest", "goal": null },
+      "expected": { "decision": "ingest", "goal_id": null },
       "note": "matches nothing in the ledger and states a task -> create a new goal (goal null = create)"
     },
     {
@@ -26,7 +26,7 @@
       "inbox": [
         { "id": "m-203", "at": "2026-09-05T16:58:00Z", "text": "recorded the demo video for the app store - it's in icloud drive" }
       ],
-      "expected": { "decision": "ingest", "goal": "g-appstore-rejection" },
+      "expected": { "decision": "ingest", "goal_id": "g-appstore-rejection" },
       "note": "the user delivering what a goal is blocked_on is an update to that goal (unblocks it)"
     },
     {
@@ -34,7 +34,7 @@
       "inbox": [
         { "id": "m-204", "at": "2026-09-05T16:57:00Z", "text": "let's get the routing registry wired into the daemon this week" }
       ],
-      "expected": { "decision": "ingest", "goal": "g-routing-registry" },
+      "expected": { "decision": "ingest", "goal_id": "g-routing-registry" },
       "note": "urgency about an open goal updates it (deadline, maybe priority) rather than creating a twin"
     },
     {
@@ -43,12 +43,12 @@
         { "id": "m-310", "at": "2026-09-05T16:50:00Z", "text": "the voice intent demo went well btw" },
         { "id": "m-311", "at": "2026-09-05T16:55:00Z", "text": "new: export session logs to csv" }
       ],
-      "expected": { "decision": "ingest", "goal": "g-voice-intent", "message_id": "m-310" },
+      "expected": { "decision": "ingest", "goal_id": "g-voice-intent", "message_id": "m-310" },
       "note": "inbox is FIFO: the oldest unprocessed message is handled first; the second waits for the next tick"
     },
     {
       "id": "d01",
-      "expected": { "decision": "drive", "goal": "g-voice-intent" },
+      "expected": { "decision": "drive", "goal_id": "g-voice-intent" },
       "note": "the motivating case: no user message, an active goal with a clear next_action -> execute it"
     },
     {
@@ -62,7 +62,7 @@
           ]
         }
       },
-      "expected": { "decision": "drive", "goal": "g-routing-registry" },
+      "expected": { "decision": "drive", "goal_id": "g-routing-registry" },
       "note": "top goal closed -> promote the next open goal and drive its next_action"
     },
     {
@@ -75,7 +75,7 @@
           ]
         }
       },
-      "expected": { "decision": "drive", "goal": "g-voice-intent" },
+      "expected": { "decision": "drive", "goal_id": "g-voice-intent" },
       "note": "two active goals -> drive the higher priority one (p1 voice intent over p2 registry)"
     },
     {
@@ -89,7 +89,7 @@
           ]
         }
       },
-      "expected": { "decision": "drive", "goal": "g-routing-registry" },
+      "expected": { "decision": "drive", "goal_id": "g-routing-registry" },
       "note": "a goal without a next_action never stalls the tick: drive what is drivable, raise the gap later"
     },
     {
@@ -102,7 +102,7 @@
           ]
         }
       },
-      "expected": { "decision": "drive", "goal": "g-voice-intent" },
+      "expected": { "decision": "drive", "goal_id": "g-voice-intent" },
       "note": "a surfaced stall is surfaced ONCE - the next tick goes back to driving, not re-reporting"
     },
     {
@@ -114,7 +114,7 @@
           ]
         }
       },
-      "expected": { "decision": "report", "goal": "g-appstore-rejection" },
+      "expected": { "decision": "report", "goal_id": "g-appstore-rejection" },
       "note": "a goal blocked on the user that has NOT been surfaced yet -> report before anything else runs"
     },
     {
@@ -126,7 +126,7 @@
           ]
         }
       },
-      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "expected": { "decision": "report", "goal_id": "g-voice-intent" },
       "note": "active goal with no update in 3.5h (stall threshold 30m) -> surface the stall instead of silently spinning"
     },
     {
@@ -139,7 +139,7 @@
           ]
         }
       },
-      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "expected": { "decision": "report", "goal_id": "g-voice-intent" },
       "note": "done but not yet closed -> the closure report to the user is the remaining work"
     },
     {
@@ -147,7 +147,7 @@
       "inbox": [
         { "id": "m-210", "at": "2026-09-05T16:59:00Z", "text": "how's the voice intent coming along?" }
       ],
-      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "expected": { "decision": "report", "goal_id": "g-voice-intent" },
       "note": "a status question about a known goal is answered from the ledger - report, not ingest, and never re-ask"
     },
     {
@@ -225,7 +225,7 @@
           ]
         }
       },
-      "expected": { "decision": "clarify", "goal": "g-voice-intent" },
+      "expected": { "decision": "clarify", "goal_id": "g-voice-intent" },
       "note": "the only live goal has no next_action -> ask the user to define one rather than idling forever or inventing work"
     },
     {
@@ -241,7 +241,7 @@
       "inbox": [
         { "id": "m-230", "at": "2026-09-05T16:59:00Z", "text": "apple got back to us overnight" }
       ],
-      "expected": { "decision": "ingest", "goal": "g-appstore-rejection" },
+      "expected": { "decision": "ingest", "goal_id": "g-appstore-rejection" },
       "note": "HARD paraphrase, zero tag overlap: 'apple got back to us' is the app review responding; baseline creates a duplicate goal",
       "hard": true
     },
@@ -250,7 +250,7 @@
       "inbox": [
         { "id": "m-231", "at": "2026-09-05T16:59:00Z", "text": "the seery thing crashed on my phone again" }
       ],
-      "expected": { "decision": "ingest", "goal": "g-voice-intent" },
+      "expected": { "decision": "ingest", "goal_id": "g-voice-intent" },
       "note": "HARD voice-transcription typo: 'seery' is Siri; a human reads through it, whole-word tag matching cannot",
       "hard": true
     },
@@ -259,7 +259,7 @@
       "inbox": [
         { "id": "m-232", "at": "2026-09-05T16:59:00Z", "text": "we should really fix that app store rejection" }
       ],
-      "expected": { "decision": "report", "goal": "g-appstore-rejection" },
+      "expected": { "decision": "report", "goal_id": "g-appstore-rejection" },
       "note": "HARD ball-in-your-court: the goal is blocked on LEVI's demo video - the right move is to say so (report), not to pretend to act on the nudge. Baseline ingests",
       "hard": true
     },
@@ -290,7 +290,7 @@
           ]
         }
       ],
-      "expected": { "decision": "drive", "goal": "g-phased-rollout" },
+      "expected": { "decision": "drive", "goal_id": "g-phased-rollout" },
       "note": "HARD priority judgment: two p1 actives, but one's why states an 18:00 cutoff and now is 17:00 - the deadline outranks ledger order. Baseline ties and takes the first",
       "hard": true
     },
@@ -299,7 +299,7 @@
       "inbox": [
         { "id": "m-233", "at": "2026-09-05T16:59:00Z", "text": "add a cancel button to the capture sheet" }
       ],
-      "expected": { "decision": "ingest", "goal": "g-voice-intent" },
+      "expected": { "decision": "ingest", "goal_id": "g-voice-intent" },
       "note": "HARD scope-creep attach: the capture sheet is named in g-voice-intent's own updates - this is a subtask of shipping voice intent, not a new goal",
       "hard": true
     },
@@ -308,7 +308,7 @@
       "inbox": [
         { "id": "m-234", "at": "2026-09-05T16:59:00Z", "text": "the review of the RACC grant application is due friday - draft it" }
       ],
-      "expected": { "decision": "ingest", "goal": null },
+      "expected": { "decision": "ingest", "goal_id": null },
       "note": "HARD ordinary-word trap: 'review' here is a grant review, not the app review - a genuinely new goal. Baseline attaches it to the rejection",
       "hard": true
     },
@@ -342,7 +342,7 @@
           ]
         }
       },
-      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "expected": { "decision": "report", "goal_id": "g-voice-intent" },
       "note": "HARD activity-is-not-progress: timestamps are fresh so the stall clock never fires, but three identical failures in a row is a spin - surface it. Baseline happily drives a fourth attempt",
       "hard": true
     },
@@ -351,7 +351,7 @@
       "inbox": [
         { "id": "m-235", "at": "2026-09-05T16:59:00Z", "text": "video's uploaded" }
       ],
-      "expected": { "decision": "ingest", "goal": "g-appstore-rejection" },
+      "expected": { "decision": "ingest", "goal_id": "g-appstore-rejection" },
       "note": "HARD terse unblock: two words, no tag matches - but the ledger says exactly one goal is waiting on a video from Levi, so the referent is unambiguous",
       "hard": true
     },
@@ -360,7 +360,7 @@
       "inbox": [
         { "id": "m-236", "at": "2026-09-05T16:59:00Z", "text": "are we still stuck with apple?" }
       ],
-      "expected": { "decision": "report", "goal": "g-appstore-rejection" },
+      "expected": { "decision": "report", "goal_id": "g-appstore-rejection" },
       "note": "HARD status paraphrase: 'stuck with apple' is the blocked rejection goal; answer from the ledger. Baseline finds no tag and clarifies - re-asking what it already knows",
       "hard": true
     },
@@ -369,7 +369,7 @@
       "inbox": [
         { "id": "m-237", "at": "2026-09-05T16:59:00Z", "text": "just triggered a run from the action button on my phone - worked" }
       ],
-      "expected": { "decision": "ingest", "goal": "g-voice-intent" },
+      "expected": { "decision": "ingest", "goal_id": "g-voice-intent" },
       "note": "HARD definition-of-done met: the message is g-voice-intent's own 'why' clause coming true - ingest it (marking the goal done); the closure report is the next tick's job",
       "hard": true
     },
@@ -407,7 +407,7 @@
           ]
         }
       },
-      "expected": { "decision": "ingest", "goal": null },
+      "expected": { "decision": "ingest", "goal_id": null },
       "note": "model trap, baseline passes: a done goal awaits its closure report AND a user message is waiting - the user message preempts, closure goes next tick",
       "hard": true
     },
@@ -416,7 +416,7 @@
       "inbox": [
         { "id": "m-239", "at": "2026-09-05T16:59:00Z", "text": "the app store thing is stuck, so make sure the voice intent doesn't slip - what's next there?" }
       ],
-      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "expected": { "decision": "report", "goal_id": "g-voice-intent" },
       "note": "model trap, baseline passes: two goals named but 'there' binds to voice intent and the ask is a status question - report its next step from the ledger",
       "hard": true
     }

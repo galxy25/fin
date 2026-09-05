@@ -1,6 +1,6 @@
 # Results
 
-## Deterministic baseline (`tick_baseline.py`)
+## Deterministic baseline (`policy_baseline.py`)
 
 ```
 goals-ledger evals: 24/35 passed (69%)  [offline]
