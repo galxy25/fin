@@ -107,6 +107,9 @@ Worked examples:
 clauses ("while X runs, ...", "once X finishes, ...", "unlike X, ...",
 "like we did for X") and asides are scenery: they may name other sessions,
 but they never set the target, and they never make a request "two targets".
+In a contrastive frame — "unlike X, Y needs ..." — the target is whichever
+session owns *Y*; X is named precisely as the thing this is *not* about, so
+routing to X's session is exactly backwards.
 Likewise words for the physical world (a window opened for air, a demo given
 in a room, a dj hired for a party) are mentions, not session pointers. The
 same discipline cuts every way:
@@ -117,8 +120,11 @@ same discipline cuts every way:
   artifact that session owns counts fully. But never claim a match that
   isn't real: generic engineering words every project shares ("tests",
   "build", "logs", "push", "status") carry no signal by themselves — with no
-  domain word to anchor them, **clarify**. Do not imagine registry contents
-  the printed registry does not show.
+  domain word to anchor them, **clarify**. The test: would the phrase read
+  equally well against two or more sessions? Then it is generic — clarify,
+  even if one session feels like a slightly better fit; "rerun the linter",
+  standing alone, belongs to no one, because every project lints. Do not
+  imagine registry contents the printed registry does not show.
 - **Never refuse on a word collision.** An ordinary English word that happens
   to equal a live unregistered session's name only trips the guardrail when
   the user points at that session *as a terminal* ("the X session", "the X
