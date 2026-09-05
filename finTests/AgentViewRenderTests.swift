@@ -105,6 +105,29 @@ final class AgentViewRenderTests: XCTestCase {
         )
     }
 
+    /// Connected Services with no control plane configured — the first-run
+    /// state, where the list can only report that it has nowhere to call. The
+    /// `.task` reload runs during the render window, so this also exercises the
+    /// not-configured branch of the client without a server.
+    func testRendersConnectedServicesWithoutAControlPlane() throws {
+        let container = try makeContainer()
+        container.mainContext.insert(Agent(name: "Nimbus", modelIdentifier: "test-model"))
+        try container.mainContext.save()
+        let endpoint = CloudControlPlaneConfig.endpointURL
+        let token = CloudControlPlaneConfig.token
+        CloudControlPlaneConfig.setEndpointURL("")
+        CloudControlPlaneConfig.setToken("")
+        defer {
+            CloudControlPlaneConfig.setEndpointURL(endpoint)
+            CloudControlPlaneConfig.setToken(token)
+        }
+
+        render(
+            NavigationStack { ConnectedServicesView() }
+                .modelContainer(container)
+        )
+    }
+
     /// The "add a new one" path — a bare agent with every field at its default.
     func testRendersAgentEditorForBrandNewAgent() throws {
         let container = try makeContainer()

@@ -37,6 +37,7 @@ struct AgentEditView: View {
             limitsSection
             remoteSupervisionSection
             helpImproveSection
+            connectedServicesSection
             promptSection
         }
         .navigationTitle(agent.name.isEmpty ? "Agent" : agent.name)
@@ -460,6 +461,26 @@ struct AgentEditView: View {
         }
         .sheet(isPresented: $showsFeedbackComposer) {
             FeedbackComposerView()
+        }
+    }
+
+    // MARK: - Connected Services
+
+    /// Device-wide like the two sections above it: credentials live in the
+    /// control plane's store keyed by scope, not on any one agent, so the entry
+    /// point is the same from whichever agent's editor you opened.
+    private var connectedServicesSection: some View {
+        Section {
+            NavigationLink("Connected Services") {
+                ConnectedServicesView()
+            }
+        } header: {
+            Text("Connected Services")
+        } footer: {
+            Text("Third-party credentials a cloud worker uses while driving a task "
+                + "— a Gmail app password, an API key. They're encrypted in your "
+                + "own AWS Secrets Manager; the app can store them but can never "
+                + "read them back.")
         }
     }
 
