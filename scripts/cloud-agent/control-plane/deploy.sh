@@ -87,6 +87,9 @@ fi
 # AutoProvisionConfigs is fenced to *.json under fin/agentd/ on purpose: the
 # Lambda instantiates per-agent configs from the template, but it can never
 # replace the fin-agentd binary that lives beside them.
+# SeeMissingAgentObjects (s3:ListBucket, fin/* prefix only) exists so a
+# HeadObject/GetObject of an absent key answers 404/NoSuchKey instead of 403
+# Forbidden — without it the auto-provision head-check can never see a miss.
 cat > "$BUILD/policy.json" <<JSON
 {
   "Version": "2012-10-17",
@@ -147,6 +150,13 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": "s3:GetObject",
       "Resource": "arn:aws:s3:::$BUCKET/fin/*"
+    },
+    {
+      "Sid": "SeeMissingAgentObjects",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::$BUCKET",
+      "Condition": {"StringLike": {"s3:prefix": "fin/*"}}
     },
     {
       "Effect": "Allow",
