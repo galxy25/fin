@@ -3,13 +3,21 @@ import Foundation
 import UIKit
 #endif
 
-/// Device-local configuration for remote supervision — a Claude Code session on
-/// another machine driving this device's Fin agent through two presigned S3 URLs:
-/// one it writes directives to (polled here), one this device PUTs status to.
+/// Configuration for remote supervision — a Claude Code session on another
+/// machine driving this device's Fin agent through two presigned S3 URLs: one it
+/// writes directives to (polled here), one this device PUTs status to.
 ///
-/// UserDefaults only, never the CloudKit-synced models: schema promotion is
-/// expensive, and a presigned URL is a per-device capability grant, not portable
-/// configuration — syncing it would hand every device the same writable bucket key.
+/// Split storage, on purpose. The ENABLED flag is portable intent ("supervise my
+/// devices") and syncs across them via iCloud KVS (`SyncedDeviceConfig`): with
+/// the control-plane pair synced too (`CloudControlPlaneConfig`), a brand-new
+/// device that receives enabled=true self-vends its own directive/status URLs
+/// through `POST /presign` (see `performPoll`) and comes up supervised with zero
+/// pastes. The URLs themselves stay in device-local UserDefaults: a presigned
+/// URL is a short-lived per-device capability grant that every device can
+/// re-vend on demand — syncing one would be pointless (it dies within the hour,
+/// and each device refreshes its own) while still handing every device the same
+/// writable bucket key in plaintext KVS. Never the CloudKit-synced models
+/// either: schema promotion is expensive and none of this is model data.
 enum RemoteSupervisionConfig {
     static let directiveURLKey = "fin.remote.directiveURL"
     static let statusURLKey = "fin.remote.statusURL"
@@ -57,6 +65,9 @@ enum RemoteSupervisionConfig {
 
     static func setEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: enabledKey)
+        // Mirrored to iCloud KVS so the user's other devices adopt the decision
+        // (both directions — an explicit OFF propagates too).
+        SyncedDeviceConfig.push(enabled, forKey: enabledKey)
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 

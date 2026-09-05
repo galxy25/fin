@@ -21,6 +21,10 @@
 	<array>
 		<string>iCloud.dev.levischoen.fin</string>
 	</array>
+	<!-- Device-wide config sync (SyncedDeviceConfig), same as the iOS entitlement:
+	     iCloud Key-Value Storage needs this on top of the CloudKit container. -->
+	<key>com.apple.developer.ubiquity-kvstore-identifier</key>
+	<string>$(TeamIdentifierPrefix)$(CFBundleIdentifier)</string>
 	<!-- Same purpose as the iOS aps-environment entitlement: CloudKit's silent sync
 	     pushes need APNs; macOS spells the key with the full prefix. -->
 	<key>com.apple.developer.aps-environment</key>

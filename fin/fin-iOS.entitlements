@@ -15,6 +15,12 @@
 	<array>
 		<string>iCloud.dev.levischoen.fin</string>
 	</array>
+	<!-- Device-wide config sync (SyncedDeviceConfig): the control-plane endpoint and
+	     the supervision enabled flag ride iCloud Key-Value Storage, which needs its
+	     own entitlement on top of the CloudKit container. Without it, KVS's
+	     synchronize() returns false and the app silently runs config local-only. -->
+	<key>com.apple.developer.ubiquity-kvstore-identifier</key>
+	<string>$(TeamIdentifierPrefix)$(CFBundleIdentifier)</string>
 	<!-- CloudKit's cross-device sync pushes ride APNs; without this entitlement the
 	     silent-push subscription is never delivered and a second device only syncs on
 	     foreground launch. "development" is flipped to "production" automatically at

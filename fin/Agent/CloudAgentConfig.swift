@@ -3,9 +3,12 @@ import Foundation
 /// Device-local capability URLs for a CLOUD-hosted agent (`AgentHostingMode.cloud`):
 /// the presigned S3 GET the remote console reads the harness's rolling transcript
 /// from, and the presigned PUT/GET pair the composer appends inbox messages
-/// through. UserDefaults only, keyed per agent, never the synced store — same
-/// reasoning as `RemoteSupervisionConfig`: a presigned URL is a capability grant,
-/// and syncing it would hand every device (and every future device) the bucket key.
+/// through. UserDefaults only, keyed per agent, never synced — deliberately
+/// exempt from the device-config sync (`SyncedDeviceConfig`): a presigned URL is
+/// a short-lived per-device capability grant that any device re-vends on demand
+/// through `POST /presign` once the SYNCED control-plane pair
+/// (`CloudControlPlaneConfig`) lands, so syncing one would be pointless where it
+/// matters and would still hand every device the bucket key in plaintext KVS.
 enum CloudAgentConfig {
     private static func transcriptKey(_ agentID: UUID) -> String {
         "fin.cloud.transcriptURL.\(agentID.uuidString)"

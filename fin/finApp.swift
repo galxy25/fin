@@ -302,6 +302,15 @@ struct FinApp: App {
         // the device-local config once; a user-pasted URL always wins.
         RemoteSupervisionConfig.seedFromInfoPlist()
 
+        // Device-wide config sync: pull the iCloud KVS replica (AFTER plist
+        // seeding, so a stamped build's seed can promote to the account) and keep
+        // pulling on external changes — a control-plane endpoint pasted on the
+        // Mac reaches the phone without a relaunch. Secrets ride iCloud Keychain
+        // instead of KVS; `SyncedDeviceConfig` documents the split and the
+        // deliberate non-goals (capability URLs, machine-scoped files, telemetry
+        // opt-ins).
+        SyncedDeviceConfig.activate()
+
         let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
         manager.recordLifecycleEvent("[app] launched build \(buildNumber)")
 

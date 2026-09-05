@@ -5,6 +5,7 @@ enum KeychainStore {
     private static let keyService = "dev.levischoen.fin.privatekey"
     private static let passphraseService = "dev.levischoen.fin.passphrase"
     private static let agentAPIKeyService = "dev.levischoen.fin.agentapikey"
+    private static let deviceConfigService = "dev.levischoen.fin.deviceconfig"
 
     enum KeychainError: Error {
         case unhandled(OSStatus)
@@ -54,17 +55,51 @@ enum KeychainStore {
         delete(service: agentAPIKeyService, account: agentID.uuidString)
     }
 
+    /// Device-WIDE synced secrets (today: the control-plane bearer token), keyed
+    /// by the same defaults key the value once lived under so call sites keep one
+    /// name per value. Synchronizable like the private keys, but
+    /// `AfterFirstUnlock`: this credential backs refresh paths that can fire
+    /// before the first unlock after a reboot (presign re-vends on early launch),
+    /// and it protects a remote capability, not local data at rest — the weaker
+    /// accessibility is the correct trade here. An empty value deletes, mirroring
+    /// `saveAgentAPIKey`, so clearing the field on one device clears the account.
+    static func saveDeviceSecret(_ value: String, forKey key: String) throws {
+        guard !value.isEmpty else {
+            delete(service: deviceConfigService, account: key)
+            return
+        }
+        try save(
+            Data(value.utf8), service: deviceConfigService, account: key,
+            accessible: kSecAttrAccessibleAfterFirstUnlock
+        )
+    }
+
+    static func loadDeviceSecret(forKey key: String) -> String? {
+        guard let data = load(service: deviceConfigService, account: key),
+              let value = String(data: data, encoding: .utf8),
+              !value.isEmpty
+        else { return nil }
+        return value
+    }
+
+    static func deleteDeviceSecret(forKey key: String) {
+        delete(service: deviceConfigService, account: key)
+    }
+
     // `WhenUnlocked` (not `...ThisDeviceOnly`) plus `kSecAttrSynchronizable` is what makes
     // an item eligible for iCloud Keychain sync, so private keys follow the server list
     // they belong to onto every device signed into the same iCloud account.
-    private static func save(_ data: Data, service: String, account: String) throws {
+    private static func save(
+        _ data: Data, service: String, account: String,
+        accessible: CFString = kSecAttrAccessibleWhenUnlocked
+    ) throws {
         delete(service: service, account: account)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
+            kSecAttrAccessible as String: accessible,
             kSecAttrSynchronizable as String: true,
         ]
         let status = SecItemAdd(query as CFDictionary, nil)
