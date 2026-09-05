@@ -514,6 +514,113 @@ final class AgentLogicTests: XCTestCase {
         )
     }
 
+    // MARK: - Goals ledger prompt wiring
+
+    /// Bootstrap contract: with no ledger file on disk, a runtime wired exactly like
+    /// finApp wires it (readGoalsLedger → loadIfPresent) composes a system prompt
+    /// byte-identical to a runtime with no goals wired at all.
+    @MainActor
+    func testAbsentGoalsLedgerFileLeavesSystemPromptUnchanged() {
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fin-goals-absent-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(LedgerDocument.standardFileName)
+        var access = AgentMemoryAccess.noop
+        access.readGoalsLedger = { LedgerDocument.loadIfPresent(at: missing) }
+
+        let wired = AgentRuntime(
+            agent: Agent(name: "Fin", systemPrompt: "BASE PROMPT"),
+            session: TerminalSession(serverID: UUID()),
+            serverName: "box",
+            memory: access
+        )
+        let unwired = AgentRuntime(
+            agent: Agent(name: "Fin", systemPrompt: "BASE PROMPT"),
+            session: TerminalSession(serverID: UUID()),
+            serverName: "box"
+        )
+        XCTAssertEqual(systemPrompt(of: wired), "BASE PROMPT")
+        XCTAssertEqual(systemPrompt(of: wired), systemPrompt(of: unwired))
+    }
+
+    /// A ledger file on disk turns the mission section on, naming each goal — and a
+    /// file that appears after the runtime exists is picked up at the next
+    /// conversation boundary (clearConversation), the same staleness window as the
+    /// routing registry. With both files present the mission renders AFTER the
+    /// routing section, matching the daemon's order.
+    @MainActor
+    func testGoalsLedgerFileEntersSystemPromptAtConversationBoundary() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fin-goals-present-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let ledgerURL = directory.appendingPathComponent(LedgerDocument.standardFileName)
+        let registryURL = directory.appendingPathComponent(RegistryDocument.standardFileName)
+
+        var access = AgentMemoryAccess.noop
+        access.readGoalsLedger = { LedgerDocument.loadIfPresent(at: ledgerURL) }
+        access.readRoutingRegistry = { RegistryDocument.loadIfPresent(at: registryURL) }
+        let runtime = AgentRuntime(
+            agent: Agent(name: "Fin", systemPrompt: "BASE PROMPT"),
+            session: TerminalSession(serverID: UUID()),
+            serverName: "box",
+            memory: access
+        )
+        // No files at init → no mission section yet.
+        XCTAssertEqual(systemPrompt(of: runtime), "BASE PROMPT")
+
+        try JSONEncoder().encode(LedgerDocument(goals: [
+            Goal(id: "g-voice-intent", title: "Ship the voice intent flow", state: .active),
+            Goal(id: "g-appstore-rejection", title: "Clear the App Store 2.1 rejection", state: .blocked),
+        ])).write(to: ledgerURL)
+        try JSONEncoder().encode(RegistryDocument(sessions: [
+            SessionRegistration(session: "fin", tasks: ["fin", "widget"]),
+        ])).write(to: registryURL)
+
+        runtime.clearConversation()
+        let prompt = try XCTUnwrap(systemPrompt(of: runtime))
+        // Goals are strictly additive: the base prompt survives untouched up front.
+        XCTAssertTrue(prompt.hasPrefix("BASE PROMPT"))
+        XCTAssertTrue(prompt.contains("Mission ledger:"))
+        XCTAssertTrue(prompt.contains("Ship the voice intent flow"))
+        XCTAssertTrue(prompt.contains("Clear the App Store 2.1 rejection"))
+        let routing = try XCTUnwrap(prompt.range(of: "Session routing:"))
+        let mission = try XCTUnwrap(prompt.range(of: "Mission ledger:"))
+        XCTAssertTrue(routing.lowerBound < mission.lowerBound)
+    }
+
+    /// The path itself is part of the contract: the app reads the ledger at
+    /// Application Support/fin/goals-ledger.json — same directory convention as the
+    /// routing registry, shared basename with fin-agentd.
+    func testGoalsLedgerLocationFollowsAppSupportConvention() {
+        XCTAssertTrue(
+            GoalsLedgerLocation.fileURL.path
+                .hasSuffix("/Application Support/fin/goals-ledger.json")
+        )
+    }
+
+    /// The beat-text fork: no ledger (or an empty one) keeps the reflective heartbeat
+    /// byte-identical; a ledger with goals swaps in the mission tick, which preserves
+    /// the "[heartbeat]" prefix and the completion contract while carrying the goals.
+    func testHeartbeatTextSwapsToMissionTickOnlyWhenLedgerPresent() {
+        XCTAssertEqual(
+            AgentRuntime.heartbeatPromptText(goals: nil),
+            AgentRuntime.heartbeatPrompt
+        )
+        XCTAssertEqual(
+            AgentRuntime.heartbeatPromptText(goals: LedgerDocument()),
+            AgentRuntime.heartbeatPrompt
+        )
+
+        let tick = AgentRuntime.heartbeatPromptText(goals: LedgerDocument(goals: [
+            Goal(id: "g-voice-intent", title: "Ship the voice intent flow", state: .active),
+        ]))
+        XCTAssertNotEqual(tick, AgentRuntime.heartbeatPrompt)
+        XCTAssertTrue(tick.hasPrefix("[heartbeat]"))
+        XCTAssertTrue(tick.contains("TASK COMPLETE"))
+        XCTAssertTrue(tick.contains("request_input"))
+        XCTAssertTrue(tick.contains("Ship the voice intent flow"))
+    }
+
     // MARK: - Transcript compaction
 
     func testCompactionLeavesShortTranscriptsAlone() {

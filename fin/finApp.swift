@@ -200,6 +200,16 @@ struct FinApp: App {
             RegistryDocument.loadIfPresent(at: RoutingRegistryLocation.fileURL)
         }
 
+        // The goals ledger rides the same seam: a plain file in Application Support
+        // (GoalsLedgerLocation), no cache. The system prompt re-reads it at runtime
+        // creation and Clear Conversation like the registry; the heartbeat re-reads it
+        // at EVERY beat, so ledger edits reach the tick within one interval. An absent
+        // file reads as nil, which keeps both the system prompt and the beat text
+        // byte-identical to a build without goals.
+        manager.memoryAccess.readGoalsLedger = {
+            LedgerDocument.loadIfPresent(at: GoalsLedgerLocation.fileURL)
+        }
+
         manager.loadAgentHistory = { agentID in
             // Rebuilds the conversation from the persisted trail. Bounded to the recent
             // tail so a long-lived agent doesn't reopen with a transcript that instantly

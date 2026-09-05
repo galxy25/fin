@@ -36,6 +36,11 @@ struct AgentMemoryAccess {
     /// without a registry see zero change. Optional and defaulted so existing
     /// constructions (and `.noop`) stay registry-free.
     var readRoutingRegistry: (() -> RegistryDocument?)? = nil
+    /// The goals ledger, nil when none exists — nil (the default) keeps the mission
+    /// section out of the system prompt AND leaves the heartbeat's reflective text
+    /// untouched, so agents without a ledger see zero change. Optional and defaulted
+    /// so existing constructions (and `.noop`) stay ledger-free.
+    var readGoalsLedger: (() -> LedgerDocument?)? = nil
     /// The user profile, empty if none exists yet.
     var readCumulative: () -> String
     var writeCumulative: (_ content: String) -> Bool

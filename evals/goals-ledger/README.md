@@ -196,5 +196,5 @@ question and starts being a ledger-driven decision.
 - [x] Core fully green on the baseline (21/21; hard 3/14 by design — `RESULTS.md`)
 - [x] Prompt block draft (`prompts/tick.md`)
 - [ ] Model-backed tick adapter scored on the same corpus
-- [ ] Ledger read/write in FinAgentCore (agent working memory + daemon disk)
-- [ ] Prompt block wired into AgentRuntime's heartbeat turn
+- [x] Ledger read/write in FinAgentCore (agent working memory + daemon disk — `GoalsLedger.swift`)
+- [x] Prompt block wired into AgentRuntime's heartbeat turn (and fin-agentd's beat loop)

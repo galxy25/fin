@@ -205,23 +205,51 @@ final class Daemon {
         and you have verified it in the terminal, end your reply with the exact phrase TASK COMPLETE.
         """
 
-    static let heartbeatPrompt = """
+    // Nonisolated (immutable String) so `composedHeartbeatPrompt`'s no-ledger fork can
+    // return it from a nonisolated context.
+    nonisolated static let heartbeatPrompt = """
         [heartbeat] Ask yourself: what is the user trying to do? why? how can I help? how will I \
         know it is done? do I need to ask the user for input? Then: call read_terminal, act if \
         action is needed, and if fully complete and verified end with TASK COMPLETE.
         """
 
     /// The system prompt the engine actually runs: the configured (or stock) prompt,
-    /// plus the session-routing section when the registry file names any sessions.
-    /// Absent, empty, or unreadable registry → the base prompt byte-for-byte, so a
-    /// host that never registered a session sees zero prompt change. Nonisolated and
-    /// path-parameterized so tests drive the real absent/present fork.
-    nonisolated static func composedSystemPrompt(base: String, registryFileURL: URL) -> String {
-        guard let registry = RegistryDocument.loadIfPresent(at: registryFileURL),
-              let section = SessionRouter.promptSection(registry: registry) else {
-            return base
+    /// plus the session-routing section when the registry file names any sessions,
+    /// plus the mission-ledger section when the goals ledger holds any goals. Absent,
+    /// empty, or unreadable file → that section stays out, so a host with neither file
+    /// sees the base prompt byte-for-byte. Nonisolated and path-parameterized so tests
+    /// drive the real absent/present forks; the ledger URL defaults to nil so
+    /// routing-only callers stay unchanged.
+    nonisolated static func composedSystemPrompt(
+        base: String,
+        registryFileURL: URL,
+        goalsLedgerFileURL: URL? = nil
+    ) -> String {
+        var prompt = base
+        if let registry = RegistryDocument.loadIfPresent(at: registryFileURL),
+           let section = SessionRouter.promptSection(registry: registry) {
+            prompt += "\n\n" + section
         }
-        return base + "\n\n" + section
+        if let goalsLedgerFileURL,
+           let ledger = LedgerDocument.loadIfPresent(at: goalsLedgerFileURL),
+           let section = GoalsTick.promptSection(ledger: ledger) {
+            prompt += "\n\n" + section
+        }
+        return prompt
+    }
+
+    /// The prompt a due beat submits: the goal-driving tick when the goals ledger
+    /// holds any goals, the plain reflective heartbeat otherwise — byte-identical, so
+    /// a host without a ledger sees zero change. Re-read at every beat (the continuity
+    /// requirement: the ledger reloads into every turn), so ledger edits land on the
+    /// next tick, not the next daemon launch. Nonisolated and path-parameterized so
+    /// tests drive the real absent/present fork.
+    nonisolated static func composedHeartbeatPrompt(goalsLedgerFileURL: URL) -> String {
+        guard let ledger = LedgerDocument.loadIfPresent(at: goalsLedgerFileURL),
+              let tick = GoalsTick.heartbeatPrompt(ledger: ledger) else {
+            return heartbeatPrompt
+        }
+        return tick
     }
 
     init(config: DaemonConfig) {
@@ -273,6 +301,18 @@ final class Daemon {
             .path
     }
 
+    /// The goals ledger sits in that same state directory, under the basename the app
+    /// also uses. Unlike the registry it is not machine-scoped in principle — goals
+    /// belong to the user — but until the synced lane lands (evals/goals-ledger/
+    /// README.md) the daemon reads its local sibling file. Schema:
+    /// evals/goals-ledger/ledger.example.json.
+    private var goalsLedgerPath: String {
+        URL(fileURLWithPath: auditLogPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent(LedgerDocument.standardFileName)
+            .path
+    }
+
     func run() async {
         log("fin-agentd starting: \(config.server.username)@\(config.server.host) → \(config.agent.modelIdentifier)")
 
@@ -310,17 +350,24 @@ final class Daemon {
             await fail("shell never became ready: \(error.localizedDescription)")
         }
 
-        // Session routing rides in here, read once: the daemon composes its system
-        // prompt exactly once (engine construction — headless mode has no
-        // clear-conversation path), so edits to the registry file take effect on the
-        // next daemon launch, not mid-run.
+        // Session routing and the mission ledger ride in here, read once: the daemon
+        // composes its system prompt exactly once (engine construction — headless mode
+        // has no clear-conversation path), so edits to either file take effect on the
+        // next daemon launch, not mid-run. (The heartbeat's per-beat tick re-reads the
+        // ledger itself, so goal CONTENT stays fresh; only the taxonomy section is
+        // launch-pinned.) The marker checks are safe: both markers are load-bearing
+        // strings the prompt-gating tests key on.
         let basePrompt = config.agent.systemPrompt ?? Self.defaultSystemPrompt
         let systemPrompt = Self.composedSystemPrompt(
             base: basePrompt,
-            registryFileURL: URL(fileURLWithPath: routingRegistryPath)
+            registryFileURL: URL(fileURLWithPath: routingRegistryPath),
+            goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath)
         )
-        if systemPrompt != basePrompt {
+        if systemPrompt.contains("Session routing:") {
             log("session routing enabled: registry at \(routingRegistryPath)")
+        }
+        if systemPrompt.contains("Mission ledger:") {
+            log("goals ledger enabled: ledger at \(goalsLedgerPath)")
         }
 
         let engine = AgentTurnEngine(
@@ -480,7 +527,9 @@ final class Daemon {
 
             log("heartbeat")
             inFlightDirectiveID = nil
-            outcome = await engine.submit(Self.heartbeatPrompt)
+            outcome = await engine.submit(
+                Self.composedHeartbeatPrompt(goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath))
+            )
         }
     }
 

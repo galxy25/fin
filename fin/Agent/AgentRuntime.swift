@@ -301,7 +301,8 @@ final class AgentRuntime: ObservableObject {
             base: agent.systemPrompt,
             profile: memory.readCumulative(),
             provider: agent.provider,
-            routing: memory.readRoutingRegistry?() ?? nil
+            routing: memory.readRoutingRegistry?() ?? nil,
+            goals: memory.readGoalsLedger?() ?? nil
         )
         transcript.reset(systemPrompt: activeSystemPrompt)
         // Restores the conversation from the durable audit trail, so quitting the app
@@ -683,7 +684,8 @@ final class AgentRuntime: ObservableObject {
             base: agent.systemPrompt,
             profile: memory.readCumulative(),
             provider: agent.provider,
-            routing: memory.readRoutingRegistry?() ?? nil
+            routing: memory.readRoutingRegistry?() ?? nil,
+            goals: memory.readGoalsLedger?() ?? nil
         )
         transcript.reset(systemPrompt: activeSystemPrompt)
         state = .idle
@@ -757,11 +759,22 @@ final class AgentRuntime: ObservableObject {
     // MARK: - Heartbeat
 
     /// Rides in every heartbeat turn: a short reflection first, then the action loop.
-    static let heartbeatPrompt = "[heartbeat] Ask yourself: what is the user trying to do? "
+    /// Nonisolated (immutable String) so `heartbeatPromptText`'s no-ledger fork can
+    /// return it from a nonisolated context.
+    nonisolated static let heartbeatPrompt = "[heartbeat] Ask yourself: what is the user trying to do? "
         + "why? how can I help? how will I know it is done? do I need to ask the user for "
         + "any input? Then act: call read_terminal to check the task; send input if it "
         + "needs a push; call request_input if you need the user; if fully complete and "
         + "verified, end with TASK COMPLETE."
+
+    /// The text a beat actually submits: the goal-driving tick over the ledger when one
+    /// has goals, the reflective prompt above otherwise — byte-identical, so no-ledger
+    /// agents see zero change. Nonisolated and value-parameterized so tests pin the
+    /// fork without running a turn (same testability seam as the daemon's
+    /// `composedSystemPrompt`).
+    nonisolated static func heartbeatPromptText(goals: LedgerDocument?) -> String {
+        goals.flatMap { GoalsTick.heartbeatPrompt(ledger: $0) } ?? heartbeatPrompt
+    }
 
     /// Forward to the shared implementation in FinAgentCore, so the daemon's completion
     /// detection can never drift from the app's.
@@ -904,10 +917,13 @@ final class AgentRuntime: ObservableObject {
         lastHeartbeatFiredAt = Date()
         guard configurationBlocker == nil else { return }
         beatUsedSendInput = false
-        transcript.append(AgentMessage(role: .user, text: Self.heartbeatPrompt, isHeartbeat: true))
+        // Re-read fresh each beat (the continuity requirement: the ledger reloads into
+        // every turn), so ledger edits land on the next tick, not the next conversation.
+        let beatPrompt = Self.heartbeatPromptText(goals: memory.readGoalsLedger?() ?? nil)
+        transcript.append(AgentMessage(role: .user, text: beatPrompt, isHeartbeat: true))
         currentRunID = UUID()
         runSequence = 0
-        record(.userMessage, Self.heartbeatPrompt)
+        record(.userMessage, beatPrompt)
         state = .thinking
         // Same grace window a submitted turn gets — a locked screen otherwise kills
         // the check mid-flight and the loop wakes to a transport failure.
@@ -1953,7 +1969,8 @@ final class AgentRuntime: ObservableObject {
         base: String,
         profile: String,
         provider: AgentProvider,
-        routing: RegistryDocument? = nil
+        routing: RegistryDocument? = nil,
+        goals: LedgerDocument? = nil
     ) -> String {
         var prompt = base
         var trimmed = profile.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1971,6 +1988,12 @@ final class AgentRuntime: ObservableObject {
         // registered sessions keep a byte-identical system prompt — routing is
         // strictly additive until someone registers a session.
         if let routing, let section = SessionRouter.promptSection(registry: routing) {
+            prompt += "\n\n" + section
+        }
+        // Same gate as routing: `promptSection` is nil for a nil/empty ledger, so
+        // agents without a goals ledger keep a byte-identical system prompt — the
+        // mission section is strictly additive until a ledger file exists.
+        if let goals, let section = GoalsTick.promptSection(ledger: goals) {
             prompt += "\n\n" + section
         }
         return prompt
