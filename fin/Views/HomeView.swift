@@ -20,6 +20,7 @@ struct HomeView: View {
     @State private var showsPaywall = false
     #if os(iOS)
     @State private var showsRemoteKeyboard = false
+    @State private var showsVoiceSetup = false
     #endif
 
     var body: some View {
@@ -69,6 +70,22 @@ struct HomeView: View {
                     .environmentObject(entitlementStore)
             }
             #if os(iOS)
+            // The voice-first pillar's discovery point: how to make "press the
+            // Action Button → talk → Fin receives it" real. Sits with the other
+            // iOS-only device affordance (the TV remote keyboard).
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showsVoiceSetup = true
+                    } label: {
+                        Image(systemName: "waveform.badge.mic")
+                    }
+                    .accessibilityLabel("Set up voice button")
+                }
+            }
+            .sheet(isPresented: $showsVoiceSetup) {
+                VoiceSetupView()
+            }
             // Apple TV remote keyboard: the phone as input for Fin on tvOS.
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
