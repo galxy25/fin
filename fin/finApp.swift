@@ -101,6 +101,10 @@ struct FinApp: App {
             fatalError("Failed to create SwiftData model container: \(error)")
         }
         modelContainer = container
+        // In-app App Intents (Siri "Message Fin") read the store through this
+        // bridge — see FinSharedState. Assigned exactly once, before any intent
+        // can possibly run.
+        FinSharedState.modelContainer = container
 
         let manager = SessionManager()
         let context = container.mainContext
