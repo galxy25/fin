@@ -29,6 +29,10 @@ review notes, and feature priorities should reinforce it, not dilute it.
 - Tracked filename is `fin/finApp.swift` (lowercase f) — case-insensitive
   filesystem will happily read `FinApp.swift`, but `git add` needs the real
   path.
+- Upstream Wax re-tagged `0.1.27` (revision `f6c7e1e` vs the recorded
+  `0d837cf`), so a FRESH SPM resolve fails with a fingerprint mismatch.
+  Workaround: seed the generated project's `Package.resolved` from an
+  existing working tree (which pins the recorded revision) before building.
 - TestFlight: `scripts/testflight.sh` (iOS), `-tvos.sh`, `-macos.sh`,
   `-visionos.sh`. Build numbers auto-increment from ASC. See the
   `apple-publish` skill for signing/keychain details.
