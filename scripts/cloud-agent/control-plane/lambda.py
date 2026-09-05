@@ -12,8 +12,12 @@ must carry `authorization: Bearer $FIN_CP_TOKEN`, and a direct EventBridge invok
 `{"source": "sweep-schedule"}`, which carries no headers and is authorized by the
 invoke permission on the function instead.
 
-Presigned URLs and the bearer token must never reach a log line or a response
-body; error strings are truncated and scrubbed of SigV4 query parameters.
+The bearer token must never reach a log line or a response body, and presigned
+URLs must never be logged; error strings are truncated and scrubbed of SigV4
+query parameters. The one deliberate exception is `POST /presign`, whose whole
+purpose is to hand freshly signed URLs back to an authenticated caller in the
+response body — so it returns them plainly (never through `_scrub`) and still
+never logs them.
 """
 
 import base64
@@ -39,6 +43,12 @@ BINARY_KEY = "fin/agentd/fin-agentd"
 CONFIG_KEY = "fin/agentd/{agent}.json"
 STATUS_KEY = "fin/status-{agent}.json"
 INBOX_KEY = "fin/inbox/{agent}.json"
+TRANSCRIPT_KEY = "fin/transcripts/{agent}.jsonl"
+
+# The app-wide supervision channel: two objects with no agent slug — the directive
+# document the app reads and the supervision status the app writes back.
+SUPERVISION_DIRECTIVE_KEY = "fin/directives.json"
+SUPERVISION_STATUS_KEY = "fin/status.json"
 
 
 def _key_slug(agent):
@@ -504,6 +514,78 @@ def usage(_event):
     })
 
 
+# --- presigned-URL vending ---------------------------------------------------
+
+# Kinds that mint an agent-scoped key (an agent is required), and the app-wide
+# supervision kinds that ignore the agent entirely.
+AGENT_KINDS = ("transcript", "inbox", "status")
+SUPERVISION_KINDS = ("supervisionDirective", "supervisionStatus")
+PRESIGN_KINDS = AGENT_KINDS + SUPERVISION_KINDS
+
+
+def _presign(method, key):
+    """One short-lived presigned URL. These are signed with the Lambda's temporary
+    credentials, so they die with those even before ExpiresIn — the app re-requests
+    on demand rather than leaning on the stated TTL."""
+    return S3.generate_presigned_url(
+        method,
+        Params={"Bucket": BUCKET, "Key": key},
+        ExpiresIn=PRESIGN_TTL_SECONDS,
+    )
+
+
+def presign(event):
+    body = _body(event)
+
+    agent = str(body.get("agent") or "").strip()
+
+    requested = body.get("kinds")
+    if requested is None:
+        # Omitted: every kind the request can satisfy — supervision always, the
+        # agent-scoped kinds only when an agent is supplied.
+        kinds = (list(AGENT_KINDS) if agent else []) + list(SUPERVISION_KINDS)
+    else:
+        if not isinstance(requested, list) or not all(isinstance(k, str) for k in requested):
+            raise ApiError(400, "kinds must be an array of strings")
+        kinds = []
+        for kind in requested:
+            if kind not in PRESIGN_KINDS:
+                raise ApiError(400, "unknown kind {}; valid kinds are {}".format(kind, ", ".join(PRESIGN_KINDS)))
+            if kind not in kinds:
+                kinds.append(kind)
+
+    # Validate the agent only when an agent-scoped kind is in play; supervision
+    # kinds never touch the agent name, so a request for them alone needs none.
+    slug = None
+    if any(kind in AGENT_KINDS for kind in kinds):
+        if not AGENT_NAME.match(agent):
+            raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+        slug = _key_slug(agent)
+
+    urls = {}
+    for kind in kinds:
+        if kind == "transcript":
+            urls["transcriptGet"] = _presign("get_object", TRANSCRIPT_KEY.format(agent=slug))
+        elif kind == "inbox":
+            inbox_key = INBOX_KEY.format(agent=slug)
+            urls["inboxGet"] = _presign("get_object", inbox_key)
+            urls["inboxPut"] = _presign("put_object", inbox_key)
+        elif kind == "status":
+            urls["statusGet"] = _presign("get_object", STATUS_KEY.format(agent=slug))
+        elif kind == "supervisionDirective":
+            urls["supervisionDirectiveGet"] = _presign("get_object", SUPERVISION_DIRECTIVE_KEY)
+        elif kind == "supervisionStatus":
+            urls["supervisionStatusPut"] = _presign("put_object", SUPERVISION_STATUS_KEY)
+
+    now = _now()
+    return _response(200, {
+        "generatedAt": _iso(now),
+        "expiresAt": _iso(now + timedelta(seconds=PRESIGN_TTL_SECONDS)),
+        "ttlSeconds": PRESIGN_TTL_SECONDS,
+        "urls": urls,
+    })
+
+
 # --- sweep -------------------------------------------------------------------
 
 
@@ -636,6 +718,8 @@ def _route(event):
         return usage(event)
     if method == "POST" and parts == ["sweep"]:
         return _response(200, sweep(event))
+    if method == "POST" and parts == ["presign"]:
+        return presign(event)
     raise ApiError(404, "no route for {} {}".format(method or "?", path))
 
 

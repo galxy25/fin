@@ -229,11 +229,13 @@ struct AgentRemoteConsoleView: View {
     /// as "syncing" — with the honest caveat for the case that never fills in.
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if isCloudHosted, CloudAgentConfig.transcriptURL(agentID: agentID).isEmpty {
-                // Not a syncing problem — nothing is configured to sync FROM.
+            if isCloudHosted, CloudAgentConfig.transcriptURL(agentID: agentID).isEmpty,
+               !CloudControlPlaneConfig.isConfigured {
+                // Not a syncing problem and nothing to auto-vend from — the control
+                // plane is unset, so a hand-pasted URL is the only source.
                 Label("No transcript URL configured", systemImage: "cloud.slash")
                     .font(.headline)
-                Text("Paste the harness's Transcript URL in this agent's Hosting settings to see its conversation here.")
+                Text("Paste the harness's Transcript URL in this agent's Hosting settings, or set the control plane so Fin can fetch it automatically.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -518,8 +520,7 @@ struct AgentRemoteConsoleView: View {
         let agentName = self.agentName
         Task {
             let delivered = await CloudAgentChannel.sendMessage(
-                inboxGetURL: CloudAgentConfig.inboxGetURL(agentID: agentID),
-                inboxPutURL: CloudAgentConfig.inboxPutURL(agentID: agentID),
+                agentID: agentID,
                 agentName: agentName,
                 text: text
             )
@@ -538,7 +539,7 @@ struct AgentRemoteConsoleView: View {
         let loaded: [AgentMirrorRecord]
         if isCloudHosted {
             loaded = await CloudAgentChannel.fetchTranscript(
-                urlString: CloudAgentConfig.transcriptURL(agentID: agentID)
+                agentID: agentID, agentName: agentName
             )
         } else {
             let reader = self.reader

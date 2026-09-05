@@ -19,6 +19,11 @@ enum RemoteSupervisionConfig {
     static let deferredOrdinalsKey = "fin.remote.deferredOrdinals"
     static let lastPollAtKey = "fin.remote.lastPollAt"
     static let lastPollStatusKey = "fin.remote.lastPollStatus"
+    /// When the last auto-vended directive/status URLs are stated to expire (seconds
+    /// since 1970). An upper bound only: URLs signed by the Lambda role die with its
+    /// temporary credentials, often sooner — a 403 on poll/PUT is the real trigger to
+    /// re-vend. Not a URL, so it is safe to keep in an inspectable defaults value.
+    static let urlExpiresAtKey = "fin.remote.urlExpiresAt"
 
     /// Posted by every setter, so the channel starts/stops on an edit without ever
     /// polling UserDefaults from a timer — the disabled path must cost nothing.
@@ -63,6 +68,27 @@ enum RemoteSupervisionConfig {
     static func setStatusURL(_ url: String) {
         UserDefaults.standard.set(url, forKey: statusURLKey)
         NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+
+    static func urlExpiresAt() -> Date? {
+        let stamp = UserDefaults.standard.double(forKey: urlExpiresAtKey)
+        return stamp > 0 ? Date(timeIntervalSince1970: stamp) : nil
+    }
+
+    /// Stores auto-vended directive/status URLs (and their expiry) WITHOUT posting
+    /// `changedNotification`. A presigned refresh retargets the same directive/status
+    /// object with fresh credentials, so unlike a user paste it must NOT restart the
+    /// poller or invalidate the in-memory ETag (the ETag belongs to the S3 object, not
+    /// the signature) — `AgentDirectiveChannel` drives the refresh inline and keeps its
+    /// own cache key coherent. Only a non-nil URL overwrites, so a partial vend never
+    /// blanks a URL the channel still needs. The manual-paste setters stay the way a
+    /// user replaces a URL, and still notify.
+    static func applyPresigned(directiveGet: String?, statusPut: String?, expiresAt: Date?) {
+        if let directiveGet { UserDefaults.standard.set(directiveGet, forKey: directiveURLKey) }
+        if let statusPut { UserDefaults.standard.set(statusPut, forKey: statusURLKey) }
+        if let expiresAt {
+            UserDefaults.standard.set(expiresAt.timeIntervalSince1970, forKey: urlExpiresAtKey)
+        }
     }
 
     /// Editor display form: host plus a truncated path. A presigned URL's query
@@ -448,6 +474,12 @@ final class AgentDirectiveChannel {
     /// The directive URL the in-memory `etag`/`cachedDocument` belong to; a change
     /// invalidates both (the cache key is semantically (URL, ETag)).
     private var lastDirectiveURL: String
+    /// When this channel last asked the control plane to re-vend supervision URLs, so
+    /// a persistently-dead endpoint (or two 403s in one poll cycle) can't hammer
+    /// `/presign`. A presigned refresh vends BOTH URLs at once, so one call per short
+    /// window covers a GET-then-PUT failure pair.
+    private var lastPresignRefreshAt: Date?
+    static let presignRefreshCooldown: TimeInterval = 30
     private var configObserver: NSObjectProtocol?
 
     init(
@@ -612,8 +644,23 @@ final class AgentDirectiveChannel {
     }
 
     private func performPoll() async {
-        if let url = URL(string: RemoteSupervisionConfig.directiveURL),
-           !RemoteSupervisionConfig.directiveURL.isEmpty {
+        // No directive URL yet, but an enabled channel with a configured control plane
+        // can vend one on demand instead of idling — the manual paste becomes a
+        // fallback, not a prerequisite.
+        if RemoteSupervisionConfig.directiveURL.isEmpty,
+           RemoteSupervisionConfig.isEnabled, CloudControlPlaneConfig.isConfigured {
+            _ = await refreshSupervisionURLsIfAllowed()
+        }
+
+        var attemptedRefresh = false
+        while true {
+            let urlString = RemoteSupervisionConfig.directiveURL
+            guard !urlString.isEmpty, let url = URL(string: urlString) else {
+                if !urlString.isEmpty {
+                    registerFailure("[s3] poll failed: invalid directive URL")
+                }
+                break
+            }
             var request = URLRequest(url: url)
             request.timeoutInterval = Self.requestTimeout
             if let etag { request.setValue(etag, forHTTPHeaderField: "If-None-Match") }
@@ -622,10 +669,18 @@ final class AgentDirectiveChannel {
                 // The user may have disabled the channel (or backgrounded the app)
                 // while the fetch was in flight; a fetched document must not be
                 // applied past that decision.
-                guard RemoteSupervisionConfig.isEnabled, isActive else { return }
+                guard RemoteSupervisionConfig.isEnabled, isActive else { break }
                 let http = response as? HTTPURLResponse
+                let statusCode = http?.statusCode ?? 200
+                // An expired presigned URL reads as 403 (401 defensively): re-vend once
+                // and retry with the fresh URL before recording a failure.
+                if (statusCode == 403 || statusCode == 401), !attemptedRefresh,
+                   await refreshSupervisionURLsIfAllowed() {
+                    attemptedRefresh = true
+                    continue
+                }
                 switch RemoteFetchDisposition.classify(
-                    statusCode: http?.statusCode ?? 200,
+                    statusCode: statusCode,
                     etag: http?.value(forHTTPHeaderField: "ETag")
                 ) {
                 case .notModified:
@@ -666,11 +721,34 @@ final class AgentDirectiveChannel {
                 registerFailure("[s3] poll failed: \(reason)")
                 recordPollOutcome("failed: \(reason)")
             }
-        } else if !RemoteSupervisionConfig.directiveURL.isEmpty {
-            registerFailure("[s3] poll failed: invalid directive URL")
+            break
         }
 
         await uplinkStatus()
+    }
+
+    /// Re-vends the device-wide supervision URLs through the control plane and stores
+    /// them (silently — same object, fresh credentials). Cooldown-gated so a dead
+    /// endpoint, or a GET and PUT failing in the same cycle, can't hammer `/presign`;
+    /// returns true only when fresh URLs actually landed, i.e. a retry is worthwhile.
+    /// A no-op with no control plane configured, which keeps the reactive path inert
+    /// on installs that only ever paste URLs by hand.
+    private func refreshSupervisionURLsIfAllowed(now: Date = Date()) async -> Bool {
+        guard CloudControlPlaneConfig.isConfigured else { return false }
+        if let last = lastPresignRefreshAt,
+           now.timeIntervalSince(last) < Self.presignRefreshCooldown {
+            // Just re-vended (typically earlier in this same poll cycle); the stored
+            // URLs are already the freshest the control plane will give us.
+            return false
+        }
+        lastPresignRefreshAt = now
+        let before = RemoteSupervisionConfig.directiveURL
+        guard await PresignedURLService.refreshSupervisionURLs() else { return false }
+        // Same S3 object, new signature: keep the ETag and cached document, just point
+        // the cache key at the new URL so a later user paste still reads as a change.
+        let after = RemoteSupervisionConfig.directiveURL
+        if after != before { lastDirectiveURL = after }
+        return true
     }
 
     // MARK: - Application
@@ -782,7 +860,7 @@ final class AgentDirectiveChannel {
         // flush task both land here — neither may PUT after resign-active.
         guard RemoteSupervisionConfig.isEnabled, isActive,
               !RemoteSupervisionConfig.statusURL.isEmpty,
-              let url = URL(string: RemoteSupervisionConfig.statusURL) else { return }
+              URL(string: RemoteSupervisionConfig.statusURL) != nil else { return }
         guard putThrottle.shouldSend(now: now, interval: statusPutWindow) else {
             scheduleTrailingFlush(now: now)
             return
@@ -791,18 +869,30 @@ final class AgentDirectiveChannel {
         putFlushTask?.cancel()
         putFlushTask = nil
 
-        var request = URLRequest(url: url)
-        request.timeoutInterval = Self.requestTimeout
-        request.httpMethod = "PUT"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = Data(statusBody(now: now).utf8)
-        do {
-            let response = try await put(request)
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                registerFailure("[s3] put failed: HTTP \(http.statusCode)")
+        let body = Data(statusBody(now: now).utf8)
+        var attemptedRefresh = false
+        while true {
+            guard let url = URL(string: RemoteSupervisionConfig.statusURL) else { return }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = Self.requestTimeout
+            request.httpMethod = "PUT"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = body
+            do {
+                let response = try await put(request)
+                if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                    // An expired presigned URL reads as 403: re-vend once and retry.
+                    if (http.statusCode == 403 || http.statusCode == 401), !attemptedRefresh,
+                       await refreshSupervisionURLsIfAllowed() {
+                        attemptedRefresh = true
+                        continue
+                    }
+                    registerFailure("[s3] put failed: HTTP \(http.statusCode)")
+                }
+            } catch {
+                registerFailure("[s3] put failed: \(Self.shortError(error))")
             }
-        } catch {
-            registerFailure("[s3] put failed: \(Self.shortError(error))")
+            break
         }
     }
 

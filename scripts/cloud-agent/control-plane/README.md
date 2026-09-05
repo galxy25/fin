@@ -45,6 +45,10 @@ curl -sS "$API/usage" -H "$AUTH"
 
 # run the idle sweep now instead of waiting for the schedule
 curl -sS -X POST "$API/sweep" -H "$AUTH"
+
+# vend short-lived presigned S3 URLs (kinds and agent both optional)
+curl -sS -X POST "$API/presign" -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"agent": "Nimbus", "kinds": ["inbox", "supervisionDirective"]}'
 ```
 
 `POST /workers` refuses with 409 when the agent already has a live worker, and
@@ -53,6 +57,37 @@ boot, fail the fetch, and bill for nothing). `instanceType` is restricted to the
 priced t4g sizes below. Note the default is `t4g.nano`, one size below
 `launch.sh`'s manual `t4g.micro` — nano's 0.5 GiB is tight for the harness, so
 pass `instanceType` explicitly if a worker dies on memory.
+
+## Presigned URLs
+
+`POST /presign` hands the app the same kind of short-lived S3 URLs the launch
+bootstrap uses, so the app can read and write the agent's channel objects without
+holding any S3 permission of its own. The body is `{ "agent": "<name>", "kinds":
+[...] }` and both fields are optional:
+
+- `kinds` omitted returns every kind the request can satisfy — the agent-scoped
+  kinds only when `agent` is present, the supervision kinds always.
+- `agent` must match the `[A-Za-z0-9][A-Za-z0-9._-]{0,62}` name rule (the same one
+  `POST /workers` enforces, so a presign can never traverse out of the key space).
+  It is required for `transcript`, `inbox`, and `status`, and ignored for the
+  app-wide supervision kinds.
+
+The five kinds map to these objects and methods:
+
+| kind | object | response fields |
+| --- | --- | --- |
+| `transcript` | `fin/transcripts/<agent>.jsonl` | `transcriptGet` |
+| `inbox` | `fin/inbox/<agent>.json` | `inboxGet`, `inboxPut` |
+| `status` | `fin/status-<agent>.json` | `statusGet` |
+| `supervisionDirective` | `fin/directives.json` | `supervisionDirectiveGet` |
+| `supervisionStatus` | `fin/status.json` | `supervisionStatusPut` |
+
+The 200 body is `{ "generatedAt", "expiresAt", "ttlSeconds", "urls": {...} }`,
+with only the requested (or applicable) fields present under `urls`. The URLs are
+signed by the Lambda role and expire in an hour — but like the boot URLs they die
+with the Lambda's temporary credentials even before that, so the app re-requests
+on demand rather than caching them. An unknown kind, or an agent-scoped kind with
+a missing or malformed `agent`, is a 400.
 
 ## How the sweep decides
 
