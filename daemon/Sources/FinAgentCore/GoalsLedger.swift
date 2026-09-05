@@ -320,35 +320,64 @@ public enum GoalsTick {
         """
     }
 
-    /// One compact block per goal: identity and state on the first line, then only the
-    /// facts the tick's decisions hinge on — the next action, the blocker and whether it
-    /// was already surfaced, whether a done goal was closed out, and the latest update
-    /// (what the stall judgment reads).
+    /// Render bounds. The ledger is unbounded (user-editable, append-forever), but the
+    /// prompt must not be: a 50-goal ledger, or one hand-edited goal with a paragraph
+    /// in `why`, must never blow up every future system prompt and heartbeat. Worst
+    /// case with these caps: 20 detailed blocks × ~6 clipped lines + one-liners for
+    /// the rest + a count line — a few KB, not a context window.
+    static let maxDetailedGoals = 20
+    static let maxTitleLength = 120
+    static let maxFieldLength = 200
+
+    private static func clip(_ text: String, to limit: Int) -> String {
+        text.count <= limit ? text : text.prefix(limit) + "…"
+    }
+
+    /// One compact block per goal needing attention: identity and state on the first
+    /// line, then only the facts the tick's decisions hinge on — the next action, the
+    /// blocker and whether it was already surfaced, whether a done goal was closed out,
+    /// and the latest update (what the stall judgment reads).
+    ///
+    /// Bounded on purpose: done goals already closed out are pure history — they can
+    /// no longer change any tick decision (never drivable, blocker moot, report owed
+    /// and paid) — so they collapse into a single count line. Past
+    /// `maxDetailedGoals`, remaining goals render as one-liners (id + state + title
+    /// stay visible so ingest can still match them and never duplicates a hidden
+    /// goal). Ledger order is preserved throughout — the tie-break rule the prompt
+    /// teaches reads order off this render.
     private static func renderGoals(_ ledger: LedgerDocument) -> String {
-        ledger.goals.map { goal -> String in
-            var lines = ["- \(goal.id) [\(goal.state.rawValue), p\(goal.priority)] \(goal.title)"]
+        let attention = ledger.goals.filter { !($0.state == .done && $0.hasCloseUpdate) }
+        let closedOutCount = ledger.goals.count - attention.count
+
+        var blocks = attention.prefix(maxDetailedGoals).map { goal -> String in
+            var lines = ["- \(goal.id) [\(goal.state.rawValue), p\(goal.priority)] \(clip(goal.title, to: maxTitleLength))"]
             if let why = goal.why, !why.isEmpty {
-                lines.append("  why: \(why)")
+                lines.append("  why: \(clip(why, to: maxFieldLength))")
             }
             if let next = goal.nextAction, !next.isEmpty {
-                lines.append("  next: \(next)")
+                lines.append("  next: \(clip(next, to: maxFieldLength))")
             }
             if let blocked = goal.blockedOn, !blocked.isEmpty {
-                lines.append("  blocked on: \(blocked)"
+                lines.append("  blocked on: \(clip(blocked, to: maxFieldLength))"
                     + (goal.needsBlockerSurface
                         ? " (NOT yet surfaced to the user)"
                         : " (already surfaced — sit quiet)"))
             }
             if goal.state == .done {
-                lines.append(goal.hasCloseUpdate
-                    ? "  closed out with the user"
-                    : "  done but NOT yet reported — owes its closing report")
+                lines.append("  done but NOT yet reported — owes its closing report")
             }
             if let last = goal.updates.last {
-                lines.append("  last update (\(last.kind.rawValue), \(last.at)): \(last.text)")
+                lines.append("  last update (\(last.kind.rawValue), \(last.at)): \(clip(last.text, to: maxFieldLength))")
             }
             return lines.joined(separator: "\n")
-        }.joined(separator: "\n")
+        }
+        for goal in attention.dropFirst(maxDetailedGoals) {
+            blocks.append("- \(goal.id) [\(goal.state.rawValue), p\(goal.priority)] \(clip(goal.title, to: maxTitleLength)) (details trimmed — read the ledger file if this goal needs driving)")
+        }
+        if closedOutCount > 0 {
+            blocks.append("- \(closedOutCount) done goal\(closedOutCount == 1 ? "" : "s") closed out with the user (not shown)")
+        }
+        return blocks.joined(separator: "\n")
     }
 }
 

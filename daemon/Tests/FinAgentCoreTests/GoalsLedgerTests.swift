@@ -241,4 +241,51 @@ final class GoalsLedgerTests: XCTestCase {
         XCTAssertTrue(tick.contains("Ship the voice intent flow"))
         XCTAssertTrue(tick.contains(#""decision": "ingest|drive|report|idle|clarify""#))
     }
+
+    /// The ledger is unbounded (user-editable, append-forever); the prompt must not
+    /// be. 50 goals with paragraph-length fields render bounded: closed-out done goals
+    /// collapse to a count line, goals past the detail cap keep one matchable
+    /// id+title line (so ingest never duplicates a hidden goal), and every rendered
+    /// field clips.
+    func testPromptStaysBoundedForALargeLedger() throws {
+        let giantWhy = String(repeating: "w", count: 10_000)
+        var goals: [Goal] = []
+        for i in 0..<25 {
+            goals.append(Goal(
+                id: "g-live-\(i)",
+                title: "Live goal \(i)",
+                state: i % 2 == 0 ? .active : .open,
+                why: giantWhy,
+                nextAction: String(repeating: "n", count: 5_000)
+            ))
+        }
+        for i in 0..<25 {
+            goals.append(Goal(
+                id: "g-closed-\(i)",
+                title: "Closed goal \(i)",
+                state: .done,
+                updates: [Update(kind: .close, text: "closed out")]
+            ))
+        }
+        let document = LedgerDocument(goals: goals)
+
+        let section = try XCTUnwrap(GoalsTick.promptSection(ledger: document))
+        // Every live goal stays matchable — detailed or one-lined, id and title render.
+        for i in 0..<25 {
+            XCTAssertTrue(section.contains("g-live-\(i)"))
+            XCTAssertTrue(section.contains("Live goal \(i)"))
+        }
+        // Past the detail cap, the overflow one-liner points back at the ledger file.
+        XCTAssertTrue(section.contains("details trimmed"))
+        // Closed-out history is counted, never rendered.
+        XCTAssertFalse(section.contains("Closed goal"))
+        XCTAssertTrue(section.contains("25 done goals closed out with the user (not shown)"))
+        // Fields clip: the 10K-char why never lands in the prompt whole.
+        XCTAssertFalse(section.contains(giantWhy))
+        XCTAssertLessThan(section.count, 32_000)
+
+        let tick = try XCTUnwrap(GoalsTick.heartbeatPrompt(ledger: document))
+        XCTAssertFalse(tick.contains(giantWhy))
+        XCTAssertLessThan(tick.count, 32_000)
+    }
 }
