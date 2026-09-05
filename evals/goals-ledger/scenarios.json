@@ -1,0 +1,424 @@
+{
+  "default_ledger": "ledger.example.json",
+  "default_now": "2026-09-05T17:00:00Z",
+  "default_inbox": [],
+  "default_activity": "Last tick drove g-voice-intent: extension target rebuilt clean.",
+  "stall_seconds": 1800,
+  "scenarios": [
+    {
+      "id": "i01",
+      "inbox": [
+        { "id": "m-201", "at": "2026-09-05T16:59:00Z", "text": "the reviewer replied - they want the demo video reshot in landscape" }
+      ],
+      "expected": { "decision": "ingest", "goal": "g-appstore-rejection" },
+      "note": "new information about an existing goal updates it - no second rejection goal, ever"
+    },
+    {
+      "id": "i02",
+      "inbox": [
+        { "id": "m-202", "at": "2026-09-05T16:59:00Z", "text": "new goal: the tv app needs a screensaver mode for the dashboard" }
+      ],
+      "expected": { "decision": "ingest", "goal": null },
+      "note": "matches nothing in the ledger and states a task -> create a new goal (goal null = create)"
+    },
+    {
+      "id": "i03",
+      "inbox": [
+        { "id": "m-203", "at": "2026-09-05T16:58:00Z", "text": "recorded the demo video for the app store - it's in icloud drive" }
+      ],
+      "expected": { "decision": "ingest", "goal": "g-appstore-rejection" },
+      "note": "the user delivering what a goal is blocked_on is an update to that goal (unblocks it)"
+    },
+    {
+      "id": "i04",
+      "inbox": [
+        { "id": "m-204", "at": "2026-09-05T16:57:00Z", "text": "let's get the routing registry wired into the daemon this week" }
+      ],
+      "expected": { "decision": "ingest", "goal": "g-routing-registry" },
+      "note": "urgency about an open goal updates it (deadline, maybe priority) rather than creating a twin"
+    },
+    {
+      "id": "i05",
+      "inbox": [
+        { "id": "m-310", "at": "2026-09-05T16:50:00Z", "text": "the voice intent demo went well btw" },
+        { "id": "m-311", "at": "2026-09-05T16:55:00Z", "text": "new: export session logs to csv" }
+      ],
+      "expected": { "decision": "ingest", "goal": "g-voice-intent", "message_id": "m-310" },
+      "note": "inbox is FIFO: the oldest unprocessed message is handled first; the second waits for the next tick"
+    },
+    {
+      "id": "d01",
+      "expected": { "decision": "drive", "goal": "g-voice-intent" },
+      "note": "the motivating case: no user message, an active goal with a clear next_action -> execute it"
+    },
+    {
+      "id": "d02",
+      "goal_overrides": {
+        "g-voice-intent": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:00:00Z", "kind": "progress", "text": "Intent triggers a run end to end." },
+            { "at": "2026-09-05T16:05:00Z", "kind": "close", "text": "Closed and reported: voice intent shipped in build 215." }
+          ]
+        }
+      },
+      "expected": { "decision": "drive", "goal": "g-routing-registry" },
+      "note": "top goal closed -> promote the next open goal and drive its next_action"
+    },
+    {
+      "id": "d03",
+      "goal_overrides": {
+        "g-routing-registry": {
+          "state": "active",
+          "updates": [
+            { "at": "2026-09-05T16:50:00Z", "kind": "progress", "text": "RegistryStore skeleton committed." }
+          ]
+        }
+      },
+      "expected": { "decision": "drive", "goal": "g-voice-intent" },
+      "note": "two active goals -> drive the higher priority one (p1 voice intent over p2 registry)"
+    },
+    {
+      "id": "d04",
+      "goal_overrides": {
+        "g-voice-intent": { "next_action": null },
+        "g-routing-registry": {
+          "state": "active",
+          "updates": [
+            { "at": "2026-09-05T16:50:00Z", "kind": "progress", "text": "RegistryStore skeleton committed." }
+          ]
+        }
+      },
+      "expected": { "decision": "drive", "goal": "g-routing-registry" },
+      "note": "a goal without a next_action never stalls the tick: drive what is drivable, raise the gap later"
+    },
+    {
+      "id": "d05",
+      "goal_overrides": {
+        "g-voice-intent": {
+          "updates": [
+            { "at": "2026-09-05T15:30:00Z", "kind": "progress", "text": "Submit wiring half done." },
+            { "at": "2026-09-05T16:50:00Z", "kind": "report", "text": "Surfaced stall to Levi: no progress in 40m, investigating the signing step." }
+          ]
+        }
+      },
+      "expected": { "decision": "drive", "goal": "g-voice-intent" },
+      "note": "a surfaced stall is surfaced ONCE - the next tick goes back to driving, not re-reporting"
+    },
+    {
+      "id": "r01",
+      "goal_overrides": {
+        "g-appstore-rejection": {
+          "updates": [
+            { "at": "2026-09-05T16:40:00Z", "kind": "blocker", "text": "Resolution Center wants a demo video showing login on hardware; needs Levi's device." }
+          ]
+        }
+      },
+      "expected": { "decision": "report", "goal": "g-appstore-rejection" },
+      "note": "a goal blocked on the user that has NOT been surfaced yet -> report before anything else runs"
+    },
+    {
+      "id": "r02",
+      "goal_overrides": {
+        "g-voice-intent": {
+          "updates": [
+            { "at": "2026-09-05T13:30:00Z", "kind": "progress", "text": "Submit wiring half done." }
+          ]
+        }
+      },
+      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "note": "active goal with no update in 3.5h (stall threshold 30m) -> surface the stall instead of silently spinning"
+    },
+    {
+      "id": "r03",
+      "goal_overrides": {
+        "g-voice-intent": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:45:00Z", "kind": "progress", "text": "Triggered a run from the Action Button on device - definition of done met." }
+          ]
+        }
+      },
+      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "note": "done but not yet closed -> the closure report to the user is the remaining work"
+    },
+    {
+      "id": "r04",
+      "inbox": [
+        { "id": "m-210", "at": "2026-09-05T16:59:00Z", "text": "how's the voice intent coming along?" }
+      ],
+      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "note": "a status question about a known goal is answered from the ledger - report, not ingest, and never re-ask"
+    },
+    {
+      "id": "q01",
+      "goal_overrides": {
+        "g-voice-intent": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:00:00Z", "kind": "close", "text": "Closed and reported: shipped in build 215." }
+          ]
+        },
+        "g-routing-registry": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:10:00Z", "kind": "close", "text": "Closed and reported: RegistryStore merged." }
+          ]
+        }
+      },
+      "expected": { "decision": "idle" },
+      "note": "everything closed or blocked-and-surfaced -> say so cheaply and burn no tokens"
+    },
+    {
+      "id": "q02",
+      "goals": [],
+      "expected": { "decision": "idle" },
+      "note": "empty ledger -> idle; an empty ledger is a valid state, not an error"
+    },
+    {
+      "id": "q03",
+      "goal_overrides": {
+        "g-voice-intent": {
+          "state": "blocked",
+          "blocked_on": "Apple Developer portal outage - profiles endpoint down.",
+          "updates": [
+            { "at": "2026-09-05T16:20:00Z", "kind": "blocker", "text": "Developer portal down; cannot refresh provisioning profile." },
+            { "at": "2026-09-05T16:22:00Z", "kind": "report", "text": "Surfaced to Levi: waiting out the portal outage." }
+          ]
+        },
+        "g-routing-registry": {
+          "state": "blocked",
+          "blocked_on": "Waiting on the daemon-cloud branch to merge first.",
+          "updates": [
+            { "at": "2026-09-05T15:00:00Z", "kind": "blocker", "text": "RegistryStore collides with daemon-cloud refactor; wait for its merge." },
+            { "at": "2026-09-05T15:02:00Z", "kind": "report", "text": "Surfaced to Levi: registry work parked behind daemon-cloud." }
+          ]
+        }
+      },
+      "expected": { "decision": "idle" },
+      "note": "all goals blocked and already surfaced -> idle; blocked goals must not spin and must not be re-nagged every tick"
+    },
+    {
+      "id": "c01",
+      "inbox": [
+        { "id": "m-220", "at": "2026-09-05T16:59:00Z", "text": "it's still broken" }
+      ],
+      "expected": { "decision": "clarify" },
+      "note": "pronoun-only message with zero ledger context - ask, don't guess a goal"
+    },
+    {
+      "id": "c02",
+      "inbox": [
+        { "id": "m-221", "at": "2026-09-05T16:59:00Z", "text": "can you fix the build?" }
+      ],
+      "expected": { "decision": "clarify" },
+      "note": "'the build' could belong to several goals; guessing wrong wastes the next N ticks"
+    },
+    {
+      "id": "c03",
+      "goal_overrides": {
+        "g-voice-intent": { "next_action": null },
+        "g-routing-registry": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:10:00Z", "kind": "close", "text": "Closed and reported: RegistryStore merged." }
+          ]
+        }
+      },
+      "expected": { "decision": "clarify", "goal": "g-voice-intent" },
+      "note": "the only live goal has no next_action -> ask the user to define one rather than idling forever or inventing work"
+    },
+    {
+      "id": "c04",
+      "inbox": [
+        { "id": "m-222", "at": "2026-09-05T16:59:00Z", "text": "the ios work is top priority now" }
+      ],
+      "expected": { "decision": "clarify" },
+      "note": "'ios' matches two goals about equally (voice intent and the rejection) - ask which"
+    },
+    {
+      "id": "h01",
+      "inbox": [
+        { "id": "m-230", "at": "2026-09-05T16:59:00Z", "text": "apple got back to us overnight" }
+      ],
+      "expected": { "decision": "ingest", "goal": "g-appstore-rejection" },
+      "note": "HARD paraphrase, zero tag overlap: 'apple got back to us' is the app review responding; baseline creates a duplicate goal",
+      "hard": true
+    },
+    {
+      "id": "h02",
+      "inbox": [
+        { "id": "m-231", "at": "2026-09-05T16:59:00Z", "text": "the seery thing crashed on my phone again" }
+      ],
+      "expected": { "decision": "ingest", "goal": "g-voice-intent" },
+      "note": "HARD voice-transcription typo: 'seery' is Siri; a human reads through it, whole-word tag matching cannot",
+      "hard": true
+    },
+    {
+      "id": "h03",
+      "inbox": [
+        { "id": "m-232", "at": "2026-09-05T16:59:00Z", "text": "we should really fix that app store rejection" }
+      ],
+      "expected": { "decision": "report", "goal": "g-appstore-rejection" },
+      "note": "HARD ball-in-your-court: the goal is blocked on LEVI's demo video - the right move is to say so (report), not to pretend to act on the nudge. Baseline ingests",
+      "hard": true
+    },
+    {
+      "id": "h04",
+      "goal_overrides": {
+        "g-routing-registry": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:10:00Z", "kind": "close", "text": "Closed and reported: RegistryStore merged." }
+          ]
+        }
+      },
+      "extra_goals": [
+        {
+          "id": "g-phased-rollout",
+          "title": "Turn on phased rollout before tonight's release cutoff",
+          "state": "active",
+          "priority": 1,
+          "why": "Release train cutoff is 18:00 today; missing it slips the release a week.",
+          "next_action": "Enable phased release on the 214 submission in App Store Connect.",
+          "blocked_on": null,
+          "tags": ["phased rollout", "release"],
+          "source": "m-140",
+          "created_at": "2026-09-05T14:00:00Z",
+          "updates": [
+            { "at": "2026-09-05T16:40:00Z", "kind": "progress", "text": "Submission ready; toggle not yet flipped." }
+          ]
+        }
+      ],
+      "expected": { "decision": "drive", "goal": "g-phased-rollout" },
+      "note": "HARD priority judgment: two p1 actives, but one's why states an 18:00 cutoff and now is 17:00 - the deadline outranks ledger order. Baseline ties and takes the first",
+      "hard": true
+    },
+    {
+      "id": "h05",
+      "inbox": [
+        { "id": "m-233", "at": "2026-09-05T16:59:00Z", "text": "add a cancel button to the capture sheet" }
+      ],
+      "expected": { "decision": "ingest", "goal": "g-voice-intent" },
+      "note": "HARD scope-creep attach: the capture sheet is named in g-voice-intent's own updates - this is a subtask of shipping voice intent, not a new goal",
+      "hard": true
+    },
+    {
+      "id": "h06",
+      "inbox": [
+        { "id": "m-234", "at": "2026-09-05T16:59:00Z", "text": "the review of the RACC grant application is due friday - draft it" }
+      ],
+      "expected": { "decision": "ingest", "goal": null },
+      "note": "HARD ordinary-word trap: 'review' here is a grant review, not the app review - a genuinely new goal. Baseline attaches it to the rejection",
+      "hard": true
+    },
+    {
+      "id": "h07",
+      "goal_overrides": {
+        "g-voice-intent": {
+          "updates": [
+            { "at": "2026-09-05T15:40:00Z", "kind": "progress", "text": "Uploaded build 214 to App Store Connect; processing ETA ~2h - nothing to do until it flips." }
+          ]
+        },
+        "g-routing-registry": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:10:00Z", "kind": "close", "text": "Closed and reported: RegistryStore merged." }
+          ]
+        }
+      },
+      "expected": { "decision": "idle" },
+      "note": "HARD explained wait: 80m without an update trips the stall clock, but the last update SAYS it is waiting on a ~2h external ETA still in window - reporting would be noise",
+      "hard": true
+    },
+    {
+      "id": "h08",
+      "goal_overrides": {
+        "g-voice-intent": {
+          "updates": [
+            { "at": "2026-09-05T16:40:00Z", "kind": "progress", "text": "xcodebuild failed: signing identity not found." },
+            { "at": "2026-09-05T16:50:00Z", "kind": "progress", "text": "xcodebuild failed: signing identity not found." },
+            { "at": "2026-09-05T16:58:00Z", "kind": "progress", "text": "xcodebuild failed: signing identity not found." }
+          ]
+        }
+      },
+      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "note": "HARD activity-is-not-progress: timestamps are fresh so the stall clock never fires, but three identical failures in a row is a spin - surface it. Baseline happily drives a fourth attempt",
+      "hard": true
+    },
+    {
+      "id": "h09",
+      "inbox": [
+        { "id": "m-235", "at": "2026-09-05T16:59:00Z", "text": "video's uploaded" }
+      ],
+      "expected": { "decision": "ingest", "goal": "g-appstore-rejection" },
+      "note": "HARD terse unblock: two words, no tag matches - but the ledger says exactly one goal is waiting on a video from Levi, so the referent is unambiguous",
+      "hard": true
+    },
+    {
+      "id": "h10",
+      "inbox": [
+        { "id": "m-236", "at": "2026-09-05T16:59:00Z", "text": "are we still stuck with apple?" }
+      ],
+      "expected": { "decision": "report", "goal": "g-appstore-rejection" },
+      "note": "HARD status paraphrase: 'stuck with apple' is the blocked rejection goal; answer from the ledger. Baseline finds no tag and clarifies - re-asking what it already knows",
+      "hard": true
+    },
+    {
+      "id": "h11",
+      "inbox": [
+        { "id": "m-237", "at": "2026-09-05T16:59:00Z", "text": "just triggered a run from the action button on my phone - worked" }
+      ],
+      "expected": { "decision": "ingest", "goal": "g-voice-intent" },
+      "note": "HARD definition-of-done met: the message is g-voice-intent's own 'why' clause coming true - ingest it (marking the goal done); the closure report is the next tick's job",
+      "hard": true
+    },
+    {
+      "id": "h12",
+      "goal_overrides": {
+        "g-voice-intent": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:00:00Z", "kind": "close", "text": "Closed and reported: shipped in build 215." }
+          ]
+        },
+        "g-routing-registry": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:10:00Z", "kind": "close", "text": "Closed and reported: RegistryStore merged." }
+          ]
+        }
+      },
+      "activity": "worker-ui landed dark mode; daemon-cloud merged usage metering - busy hour across the other sessions.",
+      "expected": { "decision": "idle" },
+      "note": "model trap, baseline passes: exciting activity elsewhere tempts a chatty report, but no goal warrants surfacing - idle discipline holds",
+      "hard": true
+    },
+    {
+      "id": "h13",
+      "inbox": [
+        { "id": "m-238", "at": "2026-09-05T16:59:00Z", "text": "new: add a fin-tv build to the nightly" }
+      ],
+      "goal_overrides": {
+        "g-voice-intent": {
+          "state": "done",
+          "updates": [
+            { "at": "2026-09-05T16:45:00Z", "kind": "progress", "text": "Definition of done met on device." }
+          ]
+        }
+      },
+      "expected": { "decision": "ingest", "goal": null },
+      "note": "model trap, baseline passes: a done goal awaits its closure report AND a user message is waiting - the user message preempts, closure goes next tick",
+      "hard": true
+    },
+    {
+      "id": "h14",
+      "inbox": [
+        { "id": "m-239", "at": "2026-09-05T16:59:00Z", "text": "the app store thing is stuck, so make sure the voice intent doesn't slip - what's next there?" }
+      ],
+      "expected": { "decision": "report", "goal": "g-voice-intent" },
+      "note": "model trap, baseline passes: two goals named but 'there' binds to voice intent and the ask is a status question - report its next step from the ledger",
+      "hard": true
+    }
+  ]
+}

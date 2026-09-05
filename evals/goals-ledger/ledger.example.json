@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "updated_at": "2026-09-05T16:45:00Z",
+  "goals": [
+    {
+      "id": "g-voice-intent",
+      "title": "Ship the voice intent flow",
+      "state": "active",
+      "priority": 1,
+      "why": "Levi wants to fire agent runs hands-free; done when he can trigger a run from the Action Button on his phone.",
+      "next_action": "Wire StartAgentTaskIntent to AgentRuntime.submit, then apple-build to the device and trigger it once.",
+      "blocked_on": null,
+      "tags": ["voice intent", "voice", "siri", "intent", "ios"],
+      "source": "m-101",
+      "created_at": "2026-09-03T18:20:00Z",
+      "updates": [
+        { "at": "2026-09-04T15:00:00Z", "kind": "progress", "text": "Intent definition added; extension target builds." },
+        { "at": "2026-09-05T16:45:00Z", "kind": "progress", "text": "Voice capture sheet UI done; StartAgentTaskIntent stub compiles - submit wiring is next." }
+      ]
+    },
+    {
+      "id": "g-appstore-rejection",
+      "title": "Clear the App Store 2.1 rejection",
+      "state": "blocked",
+      "priority": 1,
+      "why": "Build 213 rejected under Guideline 2.1; external TestFlight testing is frozen until it clears.",
+      "next_action": "Attach the demo video in Resolution Center and resubmit build 213.",
+      "blocked_on": "Levi must record the demo video (SSH login on a physical device) - only he has the hardware.",
+      "tags": ["app store", "rejection", "review", "resolution center", "2.1", "demo video", "ios"],
+      "source": "m-102",
+      "created_at": "2026-09-04T13:55:00Z",
+      "updates": [
+        { "at": "2026-09-04T14:10:00Z", "kind": "blocker", "text": "Resolution Center wants a demo video showing login on hardware; needs Levi's device." },
+        { "at": "2026-09-04T14:12:00Z", "kind": "report", "text": "Surfaced to Levi: waiting on his demo video, nothing to drive until it lands." }
+      ]
+    },
+    {
+      "id": "g-routing-registry",
+      "title": "Wire the tmux routing registry into FinAgentCore",
+      "state": "open",
+      "priority": 2,
+      "why": "evals/tmux-routing corpus is green; production needs the registry in agent working memory and the guarded executor around send-keys.",
+      "next_action": "Add RegistryStore to FinAgentCore: load/persist the task-to-session registry and port the guarded send-keys allow-list.",
+      "blocked_on": null,
+      "tags": ["routing", "registry", "tmux", "session routing"],
+      "source": "m-103",
+      "created_at": "2026-09-04T09:00:00Z",
+      "updates": [
+        { "at": "2026-09-04T09:00:00Z", "kind": "note", "text": "Queued behind voice intent by Levi's call." }
+      ]
+    },
+    {
+      "id": "g-cloud-worker",
+      "title": "Cloud-worker control plane",
+      "state": "done",
+      "priority": 2,
+      "why": "On-demand launch and idle autoscale-down for the resident cloud harness.",
+      "next_action": null,
+      "blocked_on": null,
+      "tags": ["cloud worker", "control plane", "autoscale"],
+      "source": "m-090",
+      "created_at": "2026-08-30T10:00:00Z",
+      "updates": [
+        { "at": "2026-09-05T11:02:00Z", "kind": "progress", "text": "Idle autoscale-down verified against a live worker." },
+        { "at": "2026-09-05T11:05:00Z", "kind": "close", "text": "Closed and reported to Levi: control plane merged (d3dd962)." }
+      ]
+    }
+  ]
+}
