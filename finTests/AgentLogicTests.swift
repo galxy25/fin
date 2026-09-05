@@ -502,6 +502,18 @@ final class AgentLogicTests: XCTestCase {
         XCTAssertTrue(prompt.contains("OFF-LIMITS"))
     }
 
+    /// The path itself is part of the contract: docs tell users to drop the registry
+    /// at Application Support/fin/routing-registry.json, so the URL the app actually
+    /// reads (the one finApp hands to loadIfPresent) must resolve exactly there —
+    /// same machine-scoped directory convention as VectorMemoryIndexManager, shared
+    /// basename with fin-agentd.
+    func testRoutingRegistryLocationFollowsAppSupportConvention() {
+        XCTAssertTrue(
+            RoutingRegistryLocation.fileURL.path
+                .hasSuffix("/Application Support/fin/routing-registry.json")
+        )
+    }
+
     // MARK: - Transcript compaction
 
     func testCompactionLeavesShortTranscriptsAlone() {
