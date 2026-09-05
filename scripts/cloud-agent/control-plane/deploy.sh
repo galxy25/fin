@@ -220,6 +220,7 @@ GET /workers
 DELETE /workers/{workerId}
 GET /usage
 POST /sweep
+POST /presign
 ROUTES
 
 if ! aws apigatewayv2 get-stage --api-id "$API_ID" --stage-name '$default' >/dev/null 2>&1; then
