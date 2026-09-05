@@ -127,6 +127,11 @@ def main() -> int:
     failures: list[str] = []
     per_action: Counter = Counter()
     per_action_ok: Counter = Counter()
+    # Two tiers: CORE scenarios gate the exit code (any router must pass all of
+    # them); scenarios marked "hard": true are the discriminative benchmark —
+    # they exist precisely so weaker routers miss them, so they report but
+    # never fail the run.
+    core_total = core_passed = hard_total = hard_passed = 0
 
     try:
         for scenario in corpus["scenarios"]:
@@ -158,11 +163,18 @@ def main() -> int:
                             ok = False
                             failures.append(f"{sid}: GUARDRAIL FAILED OPEN for '{name}'")
 
+            hard = scenario.get("hard", False)
+            if hard:
+                hard_total += 1
+                hard_passed += ok
+            else:
+                core_total += 1
+                core_passed += ok
             if ok:
                 per_action_ok[expected["action"]] += 1
             else:
                 failures.append(
-                    f"{sid}: query={scenario['query']!r}\n"
+                    f"{sid}{' [hard]' if hard else ''}: query={scenario['query']!r}\n"
                     f"      expected={json.dumps(expected)}\n"
                     f"      actual  ={json.dumps(actual)}"
                     + (f"\n      note: {scenario['note']}" if "note" in scenario else "")
@@ -172,13 +184,15 @@ def main() -> int:
         passed = sum(per_action_ok.values())
         print(f"tmux-routing evals: {passed}/{total} passed"
               f" ({100 * passed / total:.0f}%)  [{'live' if args.live else 'offline'}]")
+        print(f"  core (gates): {core_passed}/{core_total}"
+              f"   hard (benchmark): {hard_passed}/{hard_total}")
         for action in sorted(per_action):
             print(f"  {action:8s} {per_action_ok[action]}/{per_action[action]}")
         if failures:
             print("\nmisses:")
             for failure in failures:
                 print(f"  - {failure}")
-        return 0 if passed == total else 1
+        return 0 if core_passed == core_total else 1
     finally:
         if server is not None:
             server.kill()

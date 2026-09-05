@@ -92,7 +92,12 @@ Two modes:
 - **Offline (default):** pure classification. Each scenario in
   `scenarios.json` supplies a query + registry + live-session list and a
   labeled expected decision; `run_evals.py` scores the router and reports
-  overall + per-action accuracy and every miss.
+  overall + per-action accuracy and every miss. Scenarios come in two tiers:
+  **core** (no marker) gates the exit code — any router must pass all of
+  them — while `"hard": true` scenarios are the discriminative benchmark
+  (paraphrases, voice-transcription typos, misdirection) that exist to
+  separate strong routers from weak ones; they report but never fail the
+  run. Baseline vs model comparison lives in `RESULTS.md`.
 - **Live (`--live`):** additionally boots the private-socket server, creates
   the scenario's sessions running `fake_agent.sh`, executes `route` decisions
   through the guarded executor, and verifies with `capture-pane` that the

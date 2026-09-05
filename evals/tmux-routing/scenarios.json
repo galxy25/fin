@@ -1,61 +1,514 @@
 {
   "default_registry": "registry.example.json",
-  "default_live_sessions": ["fin", "pocketdj", "africanintellect"],
+  "default_live_sessions": [
+    "fin",
+    "pocketdj",
+    "africanintellect"
+  ],
   "scenarios": [
-    { "id": "r01", "query": "fix the fin widget build", "expected": { "action": "route", "session": "fin" }, "note": "the motivating case: fin task words must land on the fin session" },
-    { "id": "r02", "query": "the testflight upload failed again, take a look", "expected": { "action": "route", "session": "fin" } },
-    { "id": "r03", "query": "add a crossfade to the audio engine", "expected": { "action": "route", "session": "pocketdj" } },
-    { "id": "r04", "query": "update the newsletter template", "expected": { "action": "route", "session": "africanintellect" } },
-    { "id": "r05", "query": "check on the grants deadlines", "expected": { "action": "route", "session": "africanintellect" } },
-    { "id": "r06", "query": "in the pocketdj session, rerun the tests", "expected": { "action": "route", "session": "pocketdj" }, "note": "direct registered-name mention" },
-    { "id": "r07", "query": "tell fin to rebuild the tvos target", "expected": { "action": "route", "session": "fin" } },
-    { "id": "r08", "query": "the app store review got rejected, dig in", "expected": { "action": "route", "session": "fin" } },
-    { "id": "r09", "query": "resume the board packet edits", "expected": { "action": "route", "session": "africanintellect" } },
-    { "id": "r10", "query": "voice intent needs a home screen launcher", "expected": { "action": "route", "session": "fin" } },
-    { "id": "r11", "query": "the main thing is the widget - fix it in fin", "live_sessions": ["fin", "pocketdj", "africanintellect", "main"], "expected": { "action": "route", "session": "fin" }, "note": "negative guardrail test: 'main' mentioned without session context must NOT trip refuse" },
-
-    { "id": "s01", "query": "start a new agent to prototype a rust rewrite", "expected": { "action": "start" } },
-    { "id": "s02", "query": "spin up a fresh session for the newsletter work", "expected": { "action": "start" }, "note": "explicit 'new' outranks an existing task match" },
-    { "id": "s03", "query": "launch another terminal for experiments", "expected": { "action": "start" } },
-    { "id": "s04", "query": "open a new coding session in the fin repo", "expected": { "action": "start" } },
-    { "id": "s05", "query": "work on the pocketdj mixing bug", "live_sessions": ["fin", "africanintellect"], "expected": { "action": "start" }, "note": "task matches a registered session that is not running -> recreate" },
-    { "id": "s06", "query": "in the pocketdj session, continue where we left off", "live_sessions": ["fin", "africanintellect"], "expected": { "action": "start" }, "note": "direct name, registered but dead -> recreate" },
-
-    { "id": "c01", "query": "run the tests", "expected": { "action": "clarify" }, "note": "no vocabulary matches; guessing would be worse than asking" },
-    { "id": "c02", "query": "fix the build", "expected": { "action": "clarify" } },
-    { "id": "c03", "query": "sync ideas between pocketdj and africanintellect", "expected": { "action": "clarify" }, "note": "KNOWN-HARD: two sessions named; baseline routes to the first mention — a model router should ask" },
-    { "id": "c04", "query": "what's the status?", "expected": { "action": "clarify" } },
-    { "id": "c05", "query": "push the latest changes", "expected": { "action": "clarify" } },
-
-    { "id": "f01", "query": "type ls into the main window", "live_sessions": ["fin", "pocketdj", "africanintellect", "main"], "expected": { "action": "refuse" }, "note": "live but unregistered -> off-limits, surface instead" },
-    { "id": "f02", "query": "send the build command to the scratch session", "live_sessions": ["fin", "pocketdj", "africanintellect", "scratch"], "expected": { "action": "refuse" } },
-    { "id": "f03", "query": "use tmux to talk to the deploy window", "live_sessions": ["fin", "pocketdj", "africanintellect", "deploy"], "expected": { "action": "refuse" } },
-    { "id": "f04", "query": "restart the fake thing in the demo terminal", "live_sessions": ["fin", "pocketdj", "africanintellect", "demo"], "expected": { "action": "refuse" } },
-
-    { "id": "h01", "query": "the apple review saga continues", "expected": { "action": "route", "session": "fin" }, "note": "HARD paraphrase, zero vocab overlap: 'apple review' is the app store review from r08 with none of fin's task words; baseline has nothing to match and asks" },
-    { "id": "h02", "query": "the beat-matching feature still drops out on long tracks", "expected": { "action": "route", "session": "pocketdj" }, "note": "HARD paraphrase: beat-matching on tracks is dj/audio-engine work but shares no vocabulary with the registry" },
-    { "id": "h03", "query": "did the september issue go out to the subscriber list?", "expected": { "action": "route", "session": "africanintellect" }, "note": "HARD paraphrase: an 'issue' reaching 'subscribers' is the newsletter, but the word 'newsletter' never appears" },
-    { "id": "h04", "query": "pockerdj is stuck on the migration again", "expected": { "action": "route", "session": "pocketdj" }, "note": "HARD typo/voice noise: 'pockerdj' defeats whole-word matching; a human reads through the transcription error" },
-    { "id": "h05", "query": "the test flight build is stuck in processing", "expected": { "action": "route", "session": "fin" }, "note": "HARD voice transcription: 'test flight' split into two words no longer matches the 'testflight' task phrase" },
-    { "id": "h06", "query": "the african intellect board pack it needs edits before monday", "expected": { "action": "route", "session": "africanintellect" }, "note": "HARD voice transcription: 'africanintellect' split and 'packet' heard as 'pack it' — every vocab phrase misses" },
-    { "id": "h07", "query": "while the pocketdj tests run, check whether the testflight build finished", "expected": { "action": "route", "session": "fin" }, "note": "HARD multi-clause: pocketdj is scenery in a subordinate clause; the actual ask is testflight -> fin. Baseline's direct-name rule grabs pocketdj" },
-    { "id": "h08", "query": "unlike the newsletter rollout, the widget release needs a phased rollout - set that up", "expected": { "action": "route", "session": "fin" }, "note": "HARD multi-clause: newsletter appears only as a contrast; the imperative targets the widget. Longer-phrase scoring drags baseline to africanintellect" },
-    { "id": "h09", "query": "the grants doc mentions the ios app - anyway, fix the grants doc formatting", "expected": { "action": "route", "session": "africanintellect" }, "note": "HARD multi-clause: 'ios app' is quoted content inside the grants doc; the work is on the doc. 'ios app' (7) outscores 'grants' (6) in the baseline" },
-    { "id": "h10", "query": "the deploy of the newsletter site failed - check the logs in that session", "live_sessions": ["fin", "pocketdj", "africanintellect", "deploy"], "expected": { "action": "route", "session": "africanintellect" }, "note": "HARD ordinary-word trap: 'deploy' is a verb-noun about the newsletter site, not the live 'deploy' session; baseline's guardrail false-fires refuse" },
-    { "id": "h11", "query": "glare is killing the demo - open the window blinds, then have fin rerun the ui tests", "live_sessions": ["fin", "pocketdj", "africanintellect", "demo"], "expected": { "action": "route", "session": "fin" }, "note": "HARD ordinary-word trap: 'demo' is an event and 'window' is physical; the routable ask names fin. Baseline refuses on demo+window co-occurrence" },
-    { "id": "h12", "query": "the terminal keeps beeping in the main build loop - it's the fin one, silence it", "live_sessions": ["fin", "pocketdj", "africanintellect", "main"], "expected": { "action": "route", "session": "fin" }, "note": "HARD negative guardrail (r11's evil twin): 'main' is an adjective but a session word IS present, so baseline's refuse heuristic fires; 'the fin one' names the real target" },
-    { "id": "h13", "query": "book a dj for the november reception", "expected": { "action": "clarify" }, "note": "HARD ordinary-word trap: this dj is a person, not the pocketdj project, and nothing here is terminal work at all - a human would ask. Baseline confidently routes pocketdj on 'dj'" },
-    { "id": "h14", "query": "could you have someone look at the grants thing when you get a chance", "expected": { "action": "route", "session": "africanintellect" }, "note": "model trap, baseline passes: polite indirection - 'have someone' tempts a model router into start, but the grants session already exists for exactly this" },
-    { "id": "h15", "query": "kick off another claude for the registry refactor", "expected": { "action": "start" }, "note": "HARD explicit-new variant: 'kick off another claude' is unmistakably a new agent, but 'kick off' is not in the baseline's verb list" },
-    { "id": "h16", "query": "boot up a second agent to chase that flaky simulator test", "expected": { "action": "start" }, "note": "HARD explicit-new variant: 'boot up a second agent' - no start/spin up/new/fresh token for the regex" },
-    { "id": "h17", "query": "get me a clean slate session for the metal experiments", "expected": { "action": "start" }, "note": "HARD explicit-new variant: 'clean slate' means new, but the regex only knows new/fresh/another" },
-    { "id": "h18", "query": "spin one up for the docs overhaul", "expected": { "action": "start" }, "note": "HARD explicit-new variant: split phrasal verb - 'spin one up' no longer matches the literal 'spin up'" },
-    { "id": "h19", "query": "kick off another claude on the fin widget - don't touch the running one", "expected": { "action": "start" }, "note": "HARD explicit-new + direct name: the user explicitly protects the running fin session, but baseline's direct-name rule routes straight into it" },
-    { "id": "h20", "query": "bring back the crossfade work from yesterday", "live_sessions": ["fin", "africanintellect"], "expected": { "action": "start" }, "note": "HARD indirect dead-session recreation: crossfade is audio-engine work (r03), pocketdj is dead, and 'bring back' shares no vocab - baseline can only shrug and clarify" },
-    { "id": "h21", "query": "my phone build session went away - get it back where it was", "live_sessions": ["pocketdj", "africanintellect"], "expected": { "action": "start" }, "note": "HARD indirect dead-session recreation: 'phone build' means the ios app session (fin), which is gone; no registry phrase matches" },
-    { "id": "h22", "query": "it's still doing it, same error as before", "expected": { "action": "clarify" }, "note": "model trap, baseline passes: pronoun-only follow-up with zero routable context - a model must resist hallucinating a target" },
-    { "id": "h23", "query": "yes, do it like we did for the newsletter last month", "expected": { "action": "clarify" }, "note": "HARD analogy mention: 'the newsletter' is only the template for how to do an unknown 'it' - the actual task and target are unstated. Baseline routes africanintellect on the vocab hit" },
-    { "id": "h24", "query": "and push it up once it's green", "expected": { "action": "clarify" }, "note": "model trap, baseline passes: context-free continuation; 'it' could be any session's branch" },
-    { "id": "h25", "query": "the widget and the newsletter both need the new branding - start with whichever", "expected": { "action": "clarify" }, "note": "HARD two genuine targets: work is really wanted in both sessions, so a single route is wrong either way; baseline picks africanintellect because 'newsletter' outscores 'widget'" }
+    {
+      "id": "r01",
+      "query": "fix the fin widget build",
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      },
+      "note": "the motivating case: fin task words must land on the fin session"
+    },
+    {
+      "id": "r02",
+      "query": "the testflight upload failed again, take a look",
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      }
+    },
+    {
+      "id": "r03",
+      "query": "add a crossfade to the audio engine",
+      "expected": {
+        "action": "route",
+        "session": "pocketdj"
+      }
+    },
+    {
+      "id": "r04",
+      "query": "update the newsletter template",
+      "expected": {
+        "action": "route",
+        "session": "africanintellect"
+      }
+    },
+    {
+      "id": "r05",
+      "query": "check on the grants deadlines",
+      "expected": {
+        "action": "route",
+        "session": "africanintellect"
+      }
+    },
+    {
+      "id": "r06",
+      "query": "in the pocketdj session, rerun the tests",
+      "expected": {
+        "action": "route",
+        "session": "pocketdj"
+      },
+      "note": "direct registered-name mention"
+    },
+    {
+      "id": "r07",
+      "query": "tell fin to rebuild the tvos target",
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      }
+    },
+    {
+      "id": "r08",
+      "query": "the app store review got rejected, dig in",
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      }
+    },
+    {
+      "id": "r09",
+      "query": "resume the board packet edits",
+      "expected": {
+        "action": "route",
+        "session": "africanintellect"
+      }
+    },
+    {
+      "id": "r10",
+      "query": "voice intent needs a home screen launcher",
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      }
+    },
+    {
+      "id": "r11",
+      "query": "the main thing is the widget - fix it in fin",
+      "live_sessions": [
+        "fin",
+        "pocketdj",
+        "africanintellect",
+        "main"
+      ],
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      },
+      "note": "negative guardrail test: 'main' mentioned without session context must NOT trip refuse"
+    },
+    {
+      "id": "s01",
+      "query": "start a new agent to prototype a rust rewrite",
+      "expected": {
+        "action": "start"
+      }
+    },
+    {
+      "id": "s02",
+      "query": "spin up a fresh session for the newsletter work",
+      "expected": {
+        "action": "start"
+      },
+      "note": "explicit 'new' outranks an existing task match"
+    },
+    {
+      "id": "s03",
+      "query": "launch another terminal for experiments",
+      "expected": {
+        "action": "start"
+      }
+    },
+    {
+      "id": "s04",
+      "query": "open a new coding session in the fin repo",
+      "expected": {
+        "action": "start"
+      }
+    },
+    {
+      "id": "s05",
+      "query": "work on the pocketdj mixing bug",
+      "live_sessions": [
+        "fin",
+        "africanintellect"
+      ],
+      "expected": {
+        "action": "start"
+      },
+      "note": "task matches a registered session that is not running -> recreate"
+    },
+    {
+      "id": "s06",
+      "query": "in the pocketdj session, continue where we left off",
+      "live_sessions": [
+        "fin",
+        "africanintellect"
+      ],
+      "expected": {
+        "action": "start"
+      },
+      "note": "direct name, registered but dead -> recreate"
+    },
+    {
+      "id": "c01",
+      "query": "run the tests",
+      "expected": {
+        "action": "clarify"
+      },
+      "note": "no vocabulary matches; guessing would be worse than asking"
+    },
+    {
+      "id": "c02",
+      "query": "fix the build",
+      "expected": {
+        "action": "clarify"
+      }
+    },
+    {
+      "id": "c03",
+      "query": "sync ideas between pocketdj and africanintellect",
+      "expected": {
+        "action": "clarify"
+      },
+      "note": "KNOWN-HARD: two sessions named; baseline routes to the first mention \u2014 a model router should ask"
+    },
+    {
+      "id": "c04",
+      "query": "what's the status?",
+      "expected": {
+        "action": "clarify"
+      }
+    },
+    {
+      "id": "c05",
+      "query": "push the latest changes",
+      "expected": {
+        "action": "clarify"
+      }
+    },
+    {
+      "id": "f01",
+      "query": "type ls into the main window",
+      "live_sessions": [
+        "fin",
+        "pocketdj",
+        "africanintellect",
+        "main"
+      ],
+      "expected": {
+        "action": "refuse"
+      },
+      "note": "live but unregistered -> off-limits, surface instead"
+    },
+    {
+      "id": "f02",
+      "query": "send the build command to the scratch session",
+      "live_sessions": [
+        "fin",
+        "pocketdj",
+        "africanintellect",
+        "scratch"
+      ],
+      "expected": {
+        "action": "refuse"
+      }
+    },
+    {
+      "id": "f03",
+      "query": "use tmux to talk to the deploy window",
+      "live_sessions": [
+        "fin",
+        "pocketdj",
+        "africanintellect",
+        "deploy"
+      ],
+      "expected": {
+        "action": "refuse"
+      }
+    },
+    {
+      "id": "f04",
+      "query": "restart the fake thing in the demo terminal",
+      "live_sessions": [
+        "fin",
+        "pocketdj",
+        "africanintellect",
+        "demo"
+      ],
+      "expected": {
+        "action": "refuse"
+      }
+    },
+    {
+      "id": "h01",
+      "query": "the apple review saga continues",
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      },
+      "note": "HARD paraphrase, zero vocab overlap: 'apple review' is the app store review from r08 with none of fin's task words; baseline has nothing to match and asks",
+      "hard": true
+    },
+    {
+      "id": "h02",
+      "query": "the beat-matching feature still drops out on long tracks",
+      "expected": {
+        "action": "route",
+        "session": "pocketdj"
+      },
+      "note": "HARD paraphrase: beat-matching on tracks is dj/audio-engine work but shares no vocabulary with the registry",
+      "hard": true
+    },
+    {
+      "id": "h03",
+      "query": "did the september issue go out to the subscriber list?",
+      "expected": {
+        "action": "route",
+        "session": "africanintellect"
+      },
+      "note": "HARD paraphrase: an 'issue' reaching 'subscribers' is the newsletter, but the word 'newsletter' never appears",
+      "hard": true
+    },
+    {
+      "id": "h04",
+      "query": "pockerdj is stuck on the migration again",
+      "expected": {
+        "action": "route",
+        "session": "pocketdj"
+      },
+      "note": "HARD typo/voice noise: 'pockerdj' defeats whole-word matching; a human reads through the transcription error",
+      "hard": true
+    },
+    {
+      "id": "h05",
+      "query": "the test flight build is stuck in processing",
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      },
+      "note": "HARD voice transcription: 'test flight' split into two words no longer matches the 'testflight' task phrase",
+      "hard": true
+    },
+    {
+      "id": "h06",
+      "query": "the african intellect board pack it needs edits before monday",
+      "expected": {
+        "action": "route",
+        "session": "africanintellect"
+      },
+      "note": "HARD voice transcription: 'africanintellect' split and 'packet' heard as 'pack it' \u2014 every vocab phrase misses",
+      "hard": true
+    },
+    {
+      "id": "h07",
+      "query": "while the pocketdj tests run, check whether the testflight build finished",
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      },
+      "note": "HARD multi-clause: pocketdj is scenery in a subordinate clause; the actual ask is testflight -> fin. Baseline's direct-name rule grabs pocketdj",
+      "hard": true
+    },
+    {
+      "id": "h08",
+      "query": "unlike the newsletter rollout, the widget release needs a phased rollout - set that up",
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      },
+      "note": "HARD multi-clause: newsletter appears only as a contrast; the imperative targets the widget. Longer-phrase scoring drags baseline to africanintellect",
+      "hard": true
+    },
+    {
+      "id": "h09",
+      "query": "the grants doc mentions the ios app - anyway, fix the grants doc formatting",
+      "expected": {
+        "action": "route",
+        "session": "africanintellect"
+      },
+      "note": "HARD multi-clause: 'ios app' is quoted content inside the grants doc; the work is on the doc. 'ios app' (7) outscores 'grants' (6) in the baseline",
+      "hard": true
+    },
+    {
+      "id": "h10",
+      "query": "the deploy of the newsletter site failed - check the logs in that session",
+      "live_sessions": [
+        "fin",
+        "pocketdj",
+        "africanintellect",
+        "deploy"
+      ],
+      "expected": {
+        "action": "route",
+        "session": "africanintellect"
+      },
+      "note": "HARD ordinary-word trap: 'deploy' is a verb-noun about the newsletter site, not the live 'deploy' session; baseline's guardrail false-fires refuse",
+      "hard": true
+    },
+    {
+      "id": "h11",
+      "query": "glare is killing the demo - open the window blinds, then have fin rerun the ui tests",
+      "live_sessions": [
+        "fin",
+        "pocketdj",
+        "africanintellect",
+        "demo"
+      ],
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      },
+      "note": "HARD ordinary-word trap: 'demo' is an event and 'window' is physical; the routable ask names fin. Baseline refuses on demo+window co-occurrence",
+      "hard": true
+    },
+    {
+      "id": "h12",
+      "query": "the terminal keeps beeping in the main build loop - it's the fin one, silence it",
+      "live_sessions": [
+        "fin",
+        "pocketdj",
+        "africanintellect",
+        "main"
+      ],
+      "expected": {
+        "action": "route",
+        "session": "fin"
+      },
+      "note": "HARD negative guardrail (r11's evil twin): 'main' is an adjective but a session word IS present, so baseline's refuse heuristic fires; 'the fin one' names the real target",
+      "hard": true
+    },
+    {
+      "id": "h13",
+      "query": "book a dj for the november reception",
+      "expected": {
+        "action": "clarify"
+      },
+      "note": "HARD ordinary-word trap: this dj is a person, not the pocketdj project, and nothing here is terminal work at all - a human would ask. Baseline confidently routes pocketdj on 'dj'",
+      "hard": true
+    },
+    {
+      "id": "h14",
+      "query": "could you have someone look at the grants thing when you get a chance",
+      "expected": {
+        "action": "route",
+        "session": "africanintellect"
+      },
+      "note": "model trap, baseline passes: polite indirection - 'have someone' tempts a model router into start, but the grants session already exists for exactly this",
+      "hard": true
+    },
+    {
+      "id": "h15",
+      "query": "kick off another claude for the registry refactor",
+      "expected": {
+        "action": "start"
+      },
+      "note": "HARD explicit-new variant: 'kick off another claude' is unmistakably a new agent, but 'kick off' is not in the baseline's verb list",
+      "hard": true
+    },
+    {
+      "id": "h16",
+      "query": "boot up a second agent to chase that flaky simulator test",
+      "expected": {
+        "action": "start"
+      },
+      "note": "HARD explicit-new variant: 'boot up a second agent' - no start/spin up/new/fresh token for the regex",
+      "hard": true
+    },
+    {
+      "id": "h17",
+      "query": "get me a clean slate session for the metal experiments",
+      "expected": {
+        "action": "start"
+      },
+      "note": "HARD explicit-new variant: 'clean slate' means new, but the regex only knows new/fresh/another",
+      "hard": true
+    },
+    {
+      "id": "h18",
+      "query": "spin one up for the docs overhaul",
+      "expected": {
+        "action": "start"
+      },
+      "note": "HARD explicit-new variant: split phrasal verb - 'spin one up' no longer matches the literal 'spin up'",
+      "hard": true
+    },
+    {
+      "id": "h19",
+      "query": "kick off another claude on the fin widget - don't touch the running one",
+      "expected": {
+        "action": "start"
+      },
+      "note": "HARD explicit-new + direct name: the user explicitly protects the running fin session, but baseline's direct-name rule routes straight into it",
+      "hard": true
+    },
+    {
+      "id": "h20",
+      "query": "bring back the crossfade work from yesterday",
+      "live_sessions": [
+        "fin",
+        "africanintellect"
+      ],
+      "expected": {
+        "action": "start"
+      },
+      "note": "HARD indirect dead-session recreation: crossfade is audio-engine work (r03), pocketdj is dead, and 'bring back' shares no vocab - baseline can only shrug and clarify",
+      "hard": true
+    },
+    {
+      "id": "h21",
+      "query": "my phone build session went away - get it back where it was",
+      "live_sessions": [
+        "pocketdj",
+        "africanintellect"
+      ],
+      "expected": {
+        "action": "start"
+      },
+      "note": "HARD indirect dead-session recreation: 'phone build' means the ios app session (fin), which is gone; no registry phrase matches",
+      "hard": true
+    },
+    {
+      "id": "h22",
+      "query": "it's still doing it, same error as before",
+      "expected": {
+        "action": "clarify"
+      },
+      "note": "model trap, baseline passes: pronoun-only follow-up with zero routable context - a model must resist hallucinating a target",
+      "hard": true
+    },
+    {
+      "id": "h23",
+      "query": "yes, do it like we did for the newsletter last month",
+      "expected": {
+        "action": "clarify"
+      },
+      "note": "HARD analogy mention: 'the newsletter' is only the template for how to do an unknown 'it' - the actual task and target are unstated. Baseline routes africanintellect on the vocab hit",
+      "hard": true
+    },
+    {
+      "id": "h24",
+      "query": "and push it up once it's green",
+      "expected": {
+        "action": "clarify"
+      },
+      "note": "model trap, baseline passes: context-free continuation; 'it' could be any session's branch",
+      "hard": true
+    },
+    {
+      "id": "h25",
+      "query": "the widget and the newsletter both need the new branding - start with whichever",
+      "expected": {
+        "action": "clarify"
+      },
+      "note": "HARD two genuine targets: work is really wanted in both sessions, so a single route is wrong either way; baseline picks africanintellect because 'newsletter' outscores 'widget'",
+      "hard": true
+    }
   ]
 }
