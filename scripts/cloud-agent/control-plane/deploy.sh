@@ -84,6 +84,9 @@ fi
 # ServiceCredsWrite is deliberately WITHOUT secretsmanager:GetSecretValue: the
 # API is write-only in IAM, not just in code — reads belong to the worker role
 # (fin-agent-ssm, granted in ../launch.sh).
+# AutoProvisionConfigs is fenced to *.json under fin/agentd/ on purpose: the
+# Lambda instantiates per-agent configs from the template, but it can never
+# replace the fin-agentd binary that lives beside them.
 cat > "$BUILD/policy.json" <<JSON
 {
   "Version": "2012-10-17",
@@ -149,6 +152,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": "s3:PutObject",
       "Resource": "arn:aws:s3:::$BUCKET/fin/inbox/*"
+    },
+    {
+      "Sid": "AutoProvisionConfigs",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::$BUCKET/fin/agentd/*.json"
     },
     {
       "Sid": "ModelFactoryIngest",

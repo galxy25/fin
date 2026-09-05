@@ -69,14 +69,62 @@ curl -sS "$API/secrets" -H "$AUTH"
 curl -sS -X DELETE "$API/secrets/gmail?agentScope=Nimbus" -H "$AUTH"
 ```
 
-`POST /workers` refuses with 409 when the agent already has a live worker, and
-with 400 when there is no config at `fin/agentd/<agent>.json` (the instance would
-boot, fail the fetch, and bill for nothing). `instanceType` is restricted to the
-priced t4g sizes below. Note the default is `t4g.nano`, one size below
-`launch.sh`'s manual `t4g.micro` — nano's 0.5 GiB is tight for the harness, so
-pass `instanceType` explicitly if a worker dies on memory. The agent name
-`shared` (any case) is refused: it is reserved as the everyone-readable secret
-scope (below).
+`POST /workers` refuses with 409 when the agent already has a live worker. When
+there is no config at `fin/agentd/<agent>.json`, it **auto-provisions** one from
+the template (next section); only when the template is missing too does it
+refuse, with a 400 that says so plainly (the instance would boot, fail the
+fetch, and bill for nothing). `instanceType` is restricted to the priced t4g
+sizes below. Note the default is `t4g.nano`, one size below `launch.sh`'s manual
+`t4g.micro` — nano's 0.5 GiB is tight for the harness, so pass `instanceType`
+explicitly if a worker dies on memory. The agent name `shared` (any case) is
+refused: it is reserved as the everyone-readable secret scope (below).
+
+## Auto-provisioning
+
+The app lets any agent be set to Cloud Harness and delivers mail to its
+per-name inbox, so `POST /workers` has to work for any agent name — not just
+the hand-provisioned ones. On a config head-check miss the Lambda instantiates
+`s3://<bucket>/fin/agentd/_template.json`: it parses the template, substitutes
+the `{{…}}` placeholders at the JSON level (never by templating the raw text,
+so substitution cannot corrupt the document), and PUTs the result to
+`fin/agentd/<slug>.json` with bucket-default SSE, a
+`fin-autoprovisioned` metadata marker, and an `If-None-Match` guard — an
+existing config is **never** overwritten, even by a concurrent launch losing a
+race. The launch then proceeds exactly as if the config had been there all
+along; the Lambda logs one line, `auto-provisioned config for <agent>`.
+
+`../make-config-template.sh [source-slug]` (default `nimbus`) generates the
+template from a live hand-provisioned config and uploads it S3-to-S3, so the
+shared LLM bearer token inside never lands in git. The placeholders and what
+fills them:
+
+| placeholder | filled with |
+| --- | --- |
+| `{{AGENT}}` | display name as given to `POST /workers` |
+| `{{AGENT_SLUG}}` | lowercased name (tmux session; the key slug) |
+| `{{AGENT_ID}}` | fresh UUID (the daemon requires a parseable `agentID`) |
+| `{{DEVICE_TOKEN8}}` | fresh 8-char device stamp |
+| `{{DIRECTIVE_GET_URL}}` | presigned GET `fin/directives.json` |
+| `{{STATUS_PUT_URL}}` | presigned PUT `fin/status-<slug>.json` |
+| `{{INBOX_GET_URL}}` | presigned GET `fin/inbox/<slug>.json` |
+| `{{TRANSCRIPT_PUT_URL}}` | presigned PUT `fin/transcripts/<slug>.jsonl` |
+
+Sharp edges:
+
+- **Auto-provisioned agents share the template's LLM route.** The template
+  preserves `agent.endpointURL`, `agent.apiKey`, and the model parameters from
+  its source config as shared infrastructure — every auto-provisioned agent
+  talks to the same backend with the same token. An agent that needs its own
+  route still needs a hand-provisioned config.
+- **The presigned URLs inside an auto-provisioned config are signed by the
+  Lambda role's temporary credentials** and die with them (hours in practice,
+  whatever the stated week-long expiry says) — unlike the operator-minted URLs
+  in a hand-provisioned config. And since an existing config is never
+  overwritten, a *relaunch* days later boots against dead supervision URLs and
+  gets swept for silence. For a long-lived or frequently relaunched agent,
+  hand-provision the config; to force a fresh instantiation, delete
+  `fin/agentd/<slug>.json` and launch again (the `fin-autoprovisioned` object
+  metadata tells you which configs are safe to delete that way).
 
 ## Browser workers
 

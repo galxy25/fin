@@ -52,6 +52,20 @@ STATUS_KEY = "fin/status-{agent}.json"
 INBOX_KEY = "fin/inbox/{agent}.json"
 TRANSCRIPT_KEY = "fin/transcripts/{agent}.jsonl"
 
+# Auto-provisioning: when POST /workers finds no config for an agent, it
+# instantiates this template — the hand-provisioned config shape with every
+# per-agent value replaced by a {{PLACEHOLDER}} token. The operator generates it
+# from a live config with scripts/cloud-agent/make-config-template.sh (S3 to S3,
+# so the shared LLM bearer token inside never lands in git).
+TEMPLATE_KEY = "fin/agentd/_template.json"
+
+# Presign lifetime for the supervision/transcript URLs baked into an
+# auto-provisioned config: the SigV4 maximum. The stated week is an upper bound,
+# not a promise — these are signed with the Lambda role's temporary credentials
+# and die with them (hours), unlike the operator-minted URLs in a
+# hand-provisioned config. See "Auto-provisioning" in control-plane/README.md.
+TEMPLATE_URL_TTL_SECONDS = 7 * 24 * 3600
+
 # The app-wide supervision channel: two objects with no agent slug — the directive
 # document the app reads and the supervision status the app writes back.
 SUPERVISION_DIRECTIVE_KEY = "fin/directives.json"
@@ -405,6 +419,92 @@ def _tag(instance, key):
     return ""
 
 
+# --- config auto-provisioning ------------------------------------------------
+
+
+def _fill_placeholders(node, values):
+    """Replaces {{TOKEN}} placeholders inside string values, recursively. The
+    substitution happens on the parsed document — never on raw JSON text — so a
+    substituted value can never corrupt the re-serialized config."""
+    if isinstance(node, dict):
+        return {key: _fill_placeholders(value, values) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_fill_placeholders(value, values) for value in node]
+    if isinstance(node, str):
+        for token, replacement in values.items():
+            node = node.replace(token, replacement)
+    return node
+
+
+def _provision_config(agent, config_key):
+    """Instantiates the template as this agent's daemon config, so any agent the
+    app names just works instead of refusing agents nobody hand-provisioned.
+    Never overwrites: the caller only lands here on a head-check miss, and the
+    PUT itself is conditional, so an existing config — hand-provisioned or from
+    a concurrent launch — can never be clobbered."""
+    slug = _key_slug(agent)
+    try:
+        raw = S3.get_object(Bucket=BUCKET, Key=TEMPLATE_KEY)["Body"].read()
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            # Without a config the instance would boot, fail the fetch, and bill
+            # for nothing; refuse before spending the launch — and say why in
+            # words the app can surface (the old refusal read as "forbidden").
+            raise ApiError(400, (
+                "agent {} has no cloud harness config and no template exists to auto-provision one; "
+                "upload s3://{}/{} with scripts/cloud-agent/make-config-template.sh, "
+                "or hand-provision s3://{}/{}"
+            ).format(agent, BUCKET, TEMPLATE_KEY, BUCKET, config_key))
+        raise
+    try:
+        template = json.loads(raw)
+    except ValueError:
+        template = None
+    if not isinstance(template, dict):
+        raise ApiError(500, "config template s3://{}/{} is not a JSON object; regenerate it with make-config-template.sh".format(BUCKET, TEMPLATE_KEY))
+
+    def sign(method, key):
+        return S3.generate_presigned_url(
+            method, Params={"Bucket": BUCKET, "Key": key}, ExpiresIn=TEMPLATE_URL_TTL_SECONDS
+        )
+
+    config = _fill_placeholders(template, {
+        "{{AGENT}}": agent,
+        "{{AGENT_SLUG}}": slug,
+        # A fresh identity per agent: the daemon requires agentID to parse as a
+        # UUID (uppercase matches the hand-provisioned convention), and
+        # deviceToken8 is the 8-char device stamp in its status uplink.
+        "{{AGENT_ID}}": str(uuid.uuid4()).upper(),
+        "{{DEVICE_TOKEN8}}": uuid.uuid4().hex[:8],
+        "{{DIRECTIVE_GET_URL}}": sign("get_object", SUPERVISION_DIRECTIVE_KEY),
+        "{{STATUS_PUT_URL}}": sign("put_object", STATUS_KEY.format(agent=slug)),
+        "{{INBOX_GET_URL}}": sign("get_object", INBOX_KEY.format(agent=slug)),
+        "{{TRANSCRIPT_PUT_URL}}": sign("put_object", TRANSCRIPT_KEY.format(agent=slug)),
+    })
+
+    try:
+        S3.put_object(
+            Bucket=BUCKET,
+            Key=config_key,
+            Body=json.dumps(config, indent=2).encode("utf-8"),
+            ContentType="application/json",
+            # Bucket-default SSE applies; the marker lets an operator tell an
+            # instantiated config from a hand-provisioned one.
+            Metadata={"fin-autoprovisioned": "1"},
+            IfNoneMatch="*",
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("PreconditionFailed", "ConditionalRequestConflict"):
+            raise
+        # A concurrent launch won the conditional PUT; its config is as good as
+        # ours, and the boot fetch below reads whatever is there.
+        LOG.info("config for %s was provisioned concurrently", agent)
+        return
+    LOG.info("auto-provisioned config for %s", agent)
+
+
 # --- routes ------------------------------------------------------------------
 
 
@@ -460,11 +560,11 @@ def create_worker(event):
         S3.head_object(Bucket=BUCKET, Key=config_key)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
-        if code in ("404", "NoSuchKey", "NotFound"):
-            # Without a config the instance boots, fails the fetch, and bills for
-            # nothing; refuse before spending the launch.
-            raise ApiError(400, "no daemon config at s3://{}/{}".format(BUCKET, config_key))
-        raise
+        if code not in ("404", "NoSuchKey", "NotFound"):
+            raise
+        # No hand-provisioned config: instantiate the template so the launch
+        # proceeds (400s only when the template is missing too).
+        _provision_config(agent, config_key)
 
     user_data = USER_DATA.format(
         binary_url=S3.generate_presigned_url(
