@@ -1,0 +1,13 @@
+{
+  "tmux-routing": {
+    "modelId": "google/gemma-4-e4b",
+    "note": "untuned local model via LM Studio; the score to beat until a fine-tuned candidate promotes",
+    "recordedAt": "2026-09-05",
+    "source": "evals/tmux-routing/RESULTS.md",
+    "scores": {
+      "core": {"passed": 21, "total": 26},
+      "hard": {"passed": 15, "total": 25},
+      "overall": {"passed": 36, "total": 51}
+    }
+  }
+}

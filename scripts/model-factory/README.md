@@ -19,6 +19,31 @@ decision trajectories flow in through the control plane, become datasets,
 train candidates, and only a candidate that beats the champion on the evals
 ships back to the app as the local model.
 
+## Status
+
+- [x] Architecture + frozen `POST /feedback` ingest contract (this doc)
+- [x] Ingest deployed and verified live — bucket
+      `fin-model-factory-011183829623` created (public access blocked,
+      `raw/` 180-day lifecycle), Lambda write policy `raw/*` only, 201/400/401
+      paths exercised end-to-end
+- [x] Dataset builder — `build_dataset.py` (routing corpus + synced `raw/`
+      trajectories → chat JSONL; byte-stable; goals-ledger track auto-joins
+      when present). **Leakage caveat:** the seed build derives from the eval
+      corpus itself; synthetic variants + telemetry must replace it before a
+      real training run (see Leakage rule below)
+- [x] QLoRA recipe + validator — `train/qlora_config.yaml`,
+      `train/run_finetune.py` (`--dry-run` is pure-python: no torch, no
+      downloads; real mode refuses without `FIN_FACTORY_GO=1`)
+- [x] mlx-lm local-run alternative — `train/README-local.md`
+- [x] Eval gate + champion record — `eval_gate.py`,
+      `evals-champions.json` (seeded: untuned gemma-4-e4b 36/51)
+- [ ] Synthetic expansion of the routing taxonomy (satisfies the leakage
+      rule; unblocks the first real fine-tune)
+- [ ] First fine-tune run (**human go required** — see Hard rule)
+- [ ] Merge → GGUF export, `models/` registry upload, `champion.json` flip
+- [ ] goals-ledger eval joins the gate (that branch has not merged)
+- [ ] App-side opt-in feedback UI posting to `/feedback`
+
 ```
 fin app (iOS/macOS)                        control plane (existing Lambda)
   opt-in, pre-redacted signals ──POST /feedback──▶ validate ──▶ S3 data lake

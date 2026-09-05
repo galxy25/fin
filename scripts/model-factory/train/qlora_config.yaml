@@ -1,0 +1,37 @@
+# QLoRA recipe for the fin foreman fine-tune.
+# Contract: scripts/model-factory/README.md "Training" (r=16, alpha=32,
+# lr 1e-4..2e-4, 2-3 epochs, seq len 2-4k, 4-bit NF4 base).
+# Kept FLAT (scalar keys only) so run_finetune.py --dry-run can validate it
+# without PyYAML installed.
+
+base_model: google/gemma-3-4b-it
+output_dir: models/candidates/fin-foreman-4b
+seed: 17
+
+# Sequence / schedule
+max_seq_len: 4096
+num_epochs: 2
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+
+# LoRA
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+
+# 4-bit base (bitsandbytes)
+bnb_4bit: true
+bnb_4bit_quant_type: nf4
+bnb_4bit_compute_dtype: bfloat16
+bnb_4bit_use_double_quant: true
+
+# Runtime
+bf16: true
+gradient_checkpointing: true
+logging_steps: 10
+save_steps: 100
+val_split: 0.05
