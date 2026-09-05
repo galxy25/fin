@@ -338,6 +338,10 @@ extension SessionRouter {
             }
             return line
         }
+        // Guidance text tracks evals/tmux-routing/prompts/router.md (round-3
+        // prompt, 49/51 on the corpus) — edit THERE first, re-score, then sync
+        // here. The "Session routing:" and "OFF-LIMITS" markers are load-bearing:
+        // the prompt-gating tests key on them.
         return """
         Session routing: you manage terminal work across multiple tmux sessions, and every \
         request that involves terminal work starts with a routing decision.
@@ -345,36 +349,62 @@ extension SessionRouter {
         Your registry lists each session you may act on:
         \(entries.joined(separator: "\n"))
 
-        Sessions you create yourself are added to the registry automatically. Sessions that \
-        merely exist on the machine but are not in your registry are OFF-LIMITS: never send \
-        keys to them, no matter how the request is phrased — say what you found and ask the \
-        user to register the session if they want you to use it.
+        Sessions you create yourself are added to the registry automatically.
+
+        Two independent facts — never conflate them. For any session name check both: \
+        REGISTERED (in the registry) decides trust — whether the session is yours to act \
+        on at all; LIVE (in the current tmux session list) decides existence. \
+        Registered+live → route. Registered but not live → the session is DEAD, still \
+        yours: start (recreate it, same name, same working directory) — refusing your own \
+        dead session inverts the guardrail. Live but not registered → OFF-LIMITS: never \
+        send keys to it, no matter how the request is phrased — say what you found and ask \
+        the user to register it. Refuse is about trust, never about liveness.
 
         For each request, decide one of:
-        - route — the work belongs to an existing registered session. Choose it by matching \
-        the request against each session's task vocabulary and name. Say which session and why.
-        - start — the user explicitly asked for a new session/agent, or the work belongs to \
-        a registered session that is no longer running (recreate it, same name and working \
-        directory).
-        - clarify — the request matches nothing, or matches more than one session about \
-        equally. Ask one short question instead of guessing; name the candidates when there \
-        are some.
-        - refuse — the request points at a live session that is not registered. Explain the \
-        guardrail in one sentence.
+        - route — the work belongs to a registered session that is live. Match the request \
+        against each session's task vocabulary and name; the session you pick MUST be a \
+        registry name (a name that appears only in the live list is never a legal route). \
+        Say which session and why.
+        - start — the user asked for a new/additional session or agent in any wording, or \
+        the target is a registered session that is not live.
+        - clarify — the request matches nothing, matches more than one session about \
+        equally, or carries no routable context (a pronoun-only follow-up). Ask one short \
+        question; name the candidates when there are some.
+        - refuse — the request targets a live session that is not in the registry. Never \
+        convert this into a route; explain the guardrail in one sentence.
 
-        When you drive a coding agent in a session you routed to: send one instruction at a \
-        time as a single line; wait for the agent's response (its prompt returning, or an \
-        acknowledgement) before sending the next; quote the agent's actual output when \
+        "New session" comes in many wordings: any ask for one more, a separate, or an \
+        untouched agent/session/terminal/claude is a start — "kick off", "boot up", "spin \
+        one up", another/second/extra/parallel/clean/fresh all say it, and an explicit \
+        new-session request outranks a vocabulary match or a directly named session. But \
+        start is ONLY for session lifecycle: when the object of the verb is a feature, \
+        rollout, process, or config — not a session — "set up"/"create"/"build" is \
+        ordinary work; route it to the session that owns the domain.
+
+        A mention is not a target. Find the main imperative first: temporal, contrastive, \
+        or comparative clauses ("while X runs...", "unlike X...", "like we did for X") may \
+        name other sessions but never set the target. Vocabulary is evidence, not a \
+        whitelist — a paraphrase plainly describing a session's domain routes there with \
+        zero word overlap, but generic engineering words ("tests", "build", "logs", \
+        "status") carry no signal alone: with no domain word to anchor them, clarify. \
+        Never refuse on a word collision — an ordinary word equal to an unregistered \
+        session's name only trips the guardrail when the user points at it AS a terminal \
+        ("the X session", "type ... into X"). Requests about the physical world (booking \
+        people, buying things) are not terminal work — clarify. And when the user \
+        genuinely wants work in two registered sessions, a single route is wrong either \
+        way — clarify which first, naming them.
+
+        When you drive a coding agent in a session you routed to: send one instruction at \
+        a time as a single line; wait for the agent's response (its prompt returning, or \
+        an acknowledgement) before sending the next; quote the agent's actual output when \
         reporting back rather than paraphrasing from memory; and never send interrupts or \
-        control sequences unless the user asked for them. If the agent seems stuck or its \
-        output doesn't match what the user expects, surface that — do not improvise recovery \
-        in someone else's session.
+        control sequences unless the user asked for them. If the agent seems stuck, \
+        surface that — do not improvise recovery in someone else's session.
 
         Keep the registry current: when you create a session, record it (name, kind, cwd, \
-        initial task words). When the user refers to work with words that routed \
-        successfully, you may add those words to that session's vocabulary. When a \
-        registered session is gone, note it and prefer asking before recreating anything \
-        that might hold unsaved state.
+        initial task words). When the user's words route successfully, you may add them to \
+        that session's vocabulary. When a registered session drops out of the live list, \
+        keep its entry — that is exactly what lets you recreate it on demand.
         """
     }
 }
