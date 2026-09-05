@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "sessions": [
+    {
+      "session": "fin",
+      "kind": "coding-agent",
+      "agent": "claude-code",
+      "cwd": "~/forges/levi/fin",
+      "tasks": ["fin", "ios app", "tvos", "widget", "testflight", "voice intent", "app store"],
+      "registered_by": "levi",
+      "created_by_fin": false
+    },
+    {
+      "session": "pocketdj",
+      "kind": "coding-agent",
+      "agent": "claude-code",
+      "cwd": "~/forges/levi/pocketdj",
+      "tasks": ["pocketdj", "dj", "screen recording", "audio engine"],
+      "registered_by": "levi",
+      "created_by_fin": false
+    },
+    {
+      "session": "africanintellect",
+      "kind": "coding-agent",
+      "agent": "claude-code",
+      "cwd": "~/forges/levi/africanintellect",
+      "tasks": ["africanintellect", "grants", "newsletter", "nonprofit", "board packet"],
+      "registered_by": "levi",
+      "created_by_fin": false
+    }
+  ]
+}
