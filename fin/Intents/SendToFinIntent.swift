@@ -23,8 +23,11 @@ enum FinSharedState {
 /// refresh and all). No new transport, no audio payloads.
 struct SendToFinIntent: AppIntent {
     static let title: LocalizedStringResource = "Send Message to Fin"
+    // NOTE: Apple rejects binaries whose App Intent metadata mentions "Siri"
+    // (ITMS-90626, learned on build 42) — keep that word out of every
+    // user-facing string here; code comments are fine.
     static let description = IntentDescription(
-        "Sends a message to your cloud-hosted Fin agent. Use from Siri, the Action button, or a Home Screen shortcut — dictate the message and it lands in the agent's inbox.",
+        "Sends a message to your cloud-hosted Fin agent. Trigger it by voice, the Action button, or a Home Screen shortcut — dictate or type the message and it lands in the agent's inbox.",
         categoryName: "Agent"
     )
     /// Background delivery is the whole point — a voice message shouldn't yank
