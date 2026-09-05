@@ -92,6 +92,24 @@ final class SessionRoutingTests: XCTestCase {
         XCTAssertEqual(task, "unspecified")
     }
 
+    func testS01bExplicitNewWithEmptyFirstTaskSeedsUnspecified() {
+        // Baseline parity: Python's `task or "unspecified"` treats an empty-string
+        // first task as falsy. A registry whose matched session leads with "" must
+        // still seed "unspecified", not "".
+        let degenerate = RegistryDocument(sessions: [
+            SessionRegistration(session: "deploys", tasks: ["", "deploy work"])
+        ])
+        let decision = SessionRouter.decide(
+            query: "start a new agent for deploy work",
+            registry: degenerate,
+            liveSessions: ["deploys"]
+        )
+        guard case .start(let task, _) = decision else {
+            return XCTFail("expected start, got \(decision)")
+        }
+        XCTAssertEqual(task, "unspecified")
+    }
+
     func testS02ExplicitNewOutranksExistingTaskMatch() {
         // "newsletter" matches africanintellect, but "spin up a fresh session" is an
         // explicit start and must win.

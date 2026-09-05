@@ -211,8 +211,11 @@ public enum SessionRouter {
                     bestFirstTask = entry.tasks.first
                 }
             }
+            // `?? "unspecified"` alone would keep an empty-string first task; the
+            // baseline's `task or "unspecified"` treats "" as falsy, so mirror that.
+            let seed = bestScore > 0 ? bestFirstTask : nil
             return .start(
-                task: (bestScore > 0 ? bestFirstTask : nil) ?? "unspecified",
+                task: seed.flatMap { $0.isEmpty ? nil : $0 } ?? "unspecified",
                 reason: "query explicitly asks for a new session/agent"
             )
         }
