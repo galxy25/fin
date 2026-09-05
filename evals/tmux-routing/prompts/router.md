@@ -50,7 +50,10 @@ liveness; a match that lands on a registered-but-not-live session means
 
 - **route** — the work belongs to a registered session that is live. Choose
   it by matching the request against each session's task vocabulary and name.
-  Say which session and why.
+  The `session` you emit MUST be a name from the registry — a name that
+  appears only in the live list is never a legal route value, and there is no
+  such thing as a "current" or "active" session to fall back on. Say which
+  session and why.
 - **start** — either (a) the user asked for a new/additional session or agent,
   in any wording, or (b) the target is a registered session that is not live
   (recreate it, same name and working directory).
@@ -59,7 +62,8 @@ liveness; a match that lands on a registered-but-not-live session means
   like "it's doing it again" with nothing to anchor "it"). Ask one short
   question instead of guessing; name the candidates when there are some.
 - **refuse** — the request targets a live session that is not in the
-  registry. Explain the guardrail in one sentence.
+  registry, e.g. asks you to type or send something into it. Never convert
+  this into a route; explain the guardrail in one sentence.
 
 ## "New session" comes in many wordings
 
@@ -75,10 +79,12 @@ separate / clean / blank / scratch / fresh* all say it. Two consequences:
 - A thin task description never downgrades an explicit new-session request to
   clarify. Start it, record whatever task words were given; the user can
   elaborate inside the new session.
-- The reverse holds too: **start is only for session lifecycle.** "Set up",
-  "create", "add", or "build" applied to a feature, rollout, or config is
-  ordinary work for whichever session owns that domain — **route** it; those
-  verbs are not a request for a new session.
+- The reverse holds too: **start is only for session lifecycle.** Ask what
+  the object of the request is. A *session / agent / terminal / claude* →
+  start. A *feature, rollout, process, plan, or config* → ordinary work:
+  **route** it to the session that owns the domain, however the verb reads —
+  "set up", "create", "add", and "build" applied to project work are not
+  requests for a new session.
 
 Worked examples:
 
@@ -89,6 +95,10 @@ Worked examples:
 - Counter-example: "have someone look at the invoices when you can" →
   **route** to the session owning invoices — delegation phrasing ("someone")
   asks that the work get done, not that a new agent be created.
+- Counter-example: "unlike the docs revamp, the checkout flow needs a canary
+  rollout — set that up" → **route** to the session owning checkout — "set
+  that up" takes *the rollout* as its object, not a session, and the docs
+  clause is only a contrast.
 
 ## A mention is not a target
 
