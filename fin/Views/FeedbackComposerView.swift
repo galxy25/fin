@@ -28,9 +28,9 @@ struct FeedbackComposerView: View {
                     TextField("What's working? What isn't? (optional)", text: $comment, axis: .vertical)
                         .lineLimit(3...8)
                 } footer: {
-                    Text("Sends your rating and comment with the app version and "
-                        + "platform — nothing else. Secret-shaped text in comments is "
-                        + "redacted before anything is stored.")
+                    Text("Sends your rating and comment with the app version, "
+                        + "platform, and a timestamp — nothing else. Secret-shaped "
+                        + "text in comments is redacted before anything is stored.")
                 }
                 if !sharingEnabled {
                     Section {

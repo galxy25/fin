@@ -50,7 +50,7 @@ struct FeedbackCardView: View {
 
                 if sharingEnabled {
                     HStack {
-                        Text("Sends your rating, comment, app version, and platform — nothing else.")
+                        Text("Sends your rating, comment, app version, platform, and a timestamp — nothing else.")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                         Spacer()

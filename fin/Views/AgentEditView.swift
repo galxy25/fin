@@ -451,7 +451,9 @@ struct AgentEditView: View {
                 + "platform. Comments are scrubbed of secret-shaped text before "
                 + "they're stored. Share Redacted Activity Summaries sends counts "
                 + "about finished agent conversations — turns, tool calls per tool, "
-                + "duration, outcome, transcript length, model, and hosting mode. "
+                + "duration, outcome, transcript length, model, and hosting mode — "
+                + "plus a random conversation ID, the app version, the platform, "
+                + "and a timestamp. "
                 + "Your messages and terminal output never leave the device: terminal "
                 + "content is redacted before anything is stored, and summaries are "
                 + "built from counts alone, quoting none of it.")
