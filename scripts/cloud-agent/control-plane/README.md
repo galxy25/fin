@@ -49,6 +49,13 @@ curl -sS -X POST "$API/sweep" -H "$AUTH"
 # vend short-lived presigned S3 URLs (kinds and agent both optional)
 curl -sS -X POST "$API/presign" -H "$AUTH" -H 'content-type: application/json' \
   -d '{"agent": "Nimbus", "kinds": ["inbox", "supervisionDirective"]}'
+
+# model-factory ingest: opt-in, pre-redacted app telemetry (FROZEN contract —
+# see scripts/model-factory/README.md for the full spec and privacy rules)
+curl -sS -X POST "$API/feedback" -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"kind": "user_feedback", "rating": 1, "comment": "routed correctly",
+       "payload": null, "appVersion": "1.4.0", "platform": "ios",
+       "createdAt": "2026-09-05T17:00:00Z"}'
 ```
 
 `POST /workers` refuses with 409 when the agent already has a live worker, and
@@ -88,6 +95,18 @@ signed by the Lambda role and expire in an hour — but like the boot URLs they 
 with the Lambda's temporary credentials even before that, so the app re-requests
 on demand rather than caching them. An unknown kind, or an agent-scoped kind with
 a missing or malformed `agent`, is a 400.
+
+## Model-factory ingest
+
+`POST /feedback` is the app's one door into the model-factory data lake
+(`fin-model-factory-011183829623` — a separate bucket from the agent channel,
+with a 180-day expiry on `raw/`). The body contract is **frozen** and specified
+in `scripts/model-factory/README.md`; the Lambda validates it, wraps it with a
+server `receivedAt` and an id, and writes one JSON object to
+`raw/feedback/YYYY/MM/DD/<uuid>.json` (or `raw/trajectories/...` for
+`"kind": "trajectory"`). 400 on a contract violation, 401 unauthenticated, 413
+over 1 MiB. Everything the app sends is opt-in and pre-redacted before upload;
+comment and payload content is never logged.
 
 ## How the sweep decides
 

@@ -19,6 +19,7 @@ TABLE=fin-cloud-workers
 API_NAME=fin-control-plane
 RULE=fin-worker-sweep
 BUCKET=fin-agent-directives-011183829623
+FACTORY_BUCKET=fin-model-factory-011183829623
 AGENT_ROLE=fin-agent-ssm
 TOKEN_FILE="$HOME/.fin-control-plane-token"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,6 +43,32 @@ if ! aws dynamodb describe-table --table-name "$TABLE" >/dev/null 2>&1; then
   aws dynamodb wait table-exists --table-name "$TABLE"
   echo "==> Created DynamoDB table $TABLE (on-demand)"
 fi
+
+# --- model-factory data lake -------------------------------------------------
+# Private bucket for training telemetry (see scripts/model-factory/README.md).
+# raw/ expires after 180 days; datasets/, models/, and evals/ persist.
+if ! aws s3api head-bucket --bucket "$FACTORY_BUCKET" >/dev/null 2>&1; then
+  aws s3api create-bucket --bucket "$FACTORY_BUCKET" \
+    --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
+  echo "==> Created S3 bucket $FACTORY_BUCKET"
+fi
+aws s3api put-public-access-block --bucket "$FACTORY_BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+cat > "$BUILD/lifecycle.json" <<'JSON'
+{
+  "Rules": [
+    {
+      "ID": "expire-raw-180d",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "raw/"},
+      "Expiration": {"Days": 180}
+    }
+  ]
+}
+JSON
+aws s3api put-bucket-lifecycle-configuration --bucket "$FACTORY_BUCKET" \
+  --lifecycle-configuration "file://$BUILD/lifecycle.json"
 
 # --- IAM role ----------------------------------------------------------------
 if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
@@ -119,6 +146,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": "s3:PutObject",
       "Resource": "arn:aws:s3:::$BUCKET/fin/inbox/*"
+    },
+    {
+      "Sid": "ModelFactoryIngest",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::$FACTORY_BUCKET/raw/*"
     },
     {
       "Sid": "Logs",
@@ -221,6 +254,7 @@ DELETE /workers/{workerId}
 GET /usage
 POST /sweep
 POST /presign
+POST /feedback
 ROUTES
 
 if ! aws apigatewayv2 get-stage --api-id "$API_ID" --stage-name '$default' >/dev/null 2>&1; then

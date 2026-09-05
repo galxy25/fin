@@ -586,6 +586,90 @@ def presign(event):
     })
 
 
+# --- model-factory ingest ----------------------------------------------------
+
+# The model-factory data lake is a separate bucket from the agent channel on
+# purpose: training telemetry and supervision traffic never share a key space
+# or a lifecycle. raw/ objects expire after 180 days (bucket lifecycle rule,
+# set by deploy.sh); datasets/, models/, and evals/ persist.
+FACTORY_BUCKET = "fin-model-factory-011183829623"
+
+# kind -> key template. The date partition is the SERVER receive date (client
+# clocks lie); the client's own createdAt stays inside the document.
+FEEDBACK_KEYS = {
+    "user_feedback": "raw/feedback/{date}/{uid}.json",
+    "trajectory": "raw/trajectories/{date}/{uid}.json",
+}
+
+# One stored document. Trajectories bigger than this are chunked app-side.
+MAX_FEEDBACK_BYTES = 1024 * 1024
+
+
+def ingest_feedback(event):
+    """POST /feedback — the FROZEN ingest contract the app team builds against.
+
+    Body: {"kind": "user_feedback"|"trajectory", "rating": 1|-1|null,
+           "comment": str|null, "payload": object|null, "appVersion": str,
+           "platform": str, "createdAt": iso8601}
+    400 on a bad kind (or any other field violating the contract), 401
+    unauthenticated (enforced before routing), 413 over MAX_FEEDBACK_BYTES.
+    Unknown extra fields are dropped, never stored. All app-side data is
+    opt-in and pre-redacted before upload; nothing here logs or echoes the
+    comment or payload content.
+    """
+    body = _body(event)
+
+    kind = body.get("kind")
+    if kind not in FEEDBACK_KEYS:
+        raise ApiError(400, "kind must be one of: {}".format(", ".join(sorted(FEEDBACK_KEYS))))
+
+    rating = body.get("rating")
+    if rating is not None and (isinstance(rating, bool) or rating not in (1, -1)):
+        raise ApiError(400, "rating must be 1, -1, or null")
+
+    comment = body.get("comment")
+    if comment is not None and not isinstance(comment, str):
+        raise ApiError(400, "comment must be a string or null")
+
+    payload = body.get("payload")
+    if payload is not None and not isinstance(payload, dict):
+        raise ApiError(400, "payload must be a JSON object or null")
+
+    app_version = body.get("appVersion")
+    if not isinstance(app_version, str) or not app_version.strip():
+        raise ApiError(400, "appVersion must be a non-empty string")
+
+    platform = body.get("platform")
+    if not isinstance(platform, str) or not platform.strip():
+        raise ApiError(400, "platform must be a non-empty string")
+
+    created_at = body.get("createdAt")
+    if _parse_iso(created_at) is None:
+        raise ApiError(400, "createdAt must be an ISO8601 timestamp")
+
+    now = _now()
+    uid = str(uuid.uuid4())
+    document = {
+        "id": uid,
+        "receivedAt": _iso(now),
+        "kind": kind,
+        "rating": rating,
+        "comment": comment,
+        "payload": payload,
+        "appVersion": app_version.strip(),
+        "platform": platform.strip(),
+        "createdAt": created_at,
+    }
+    encoded = json.dumps(document).encode("utf-8")
+    if len(encoded) > MAX_FEEDBACK_BYTES:
+        raise ApiError(413, "document exceeds {} bytes".format(MAX_FEEDBACK_BYTES))
+
+    key = FEEDBACK_KEYS[kind].format(date=now.strftime("%Y/%m/%d"), uid=uid)
+    S3.put_object(Bucket=FACTORY_BUCKET, Key=key, Body=encoded, ContentType="application/json")
+    LOG.info("ingested %s %s", kind, uid)
+    return _response(201, {"id": uid, "kind": kind, "receivedAt": document["receivedAt"]})
+
+
 # --- sweep -------------------------------------------------------------------
 
 
@@ -720,6 +804,8 @@ def _route(event):
         return _response(200, sweep(event))
     if method == "POST" and parts == ["presign"]:
         return presign(event)
+    if method == "POST" and parts == ["feedback"]:
+        return ingest_feedback(event)
     raise ApiError(404, "no route for {} {}".format(method or "?", path))
 
 
