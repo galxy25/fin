@@ -56,6 +56,17 @@ curl -sS -X POST "$API/feedback" -H "$AUTH" -H 'content-type: application/json' 
   -d '{"kind": "user_feedback", "rating": 1, "comment": "routed correctly",
        "payload": null, "appVersion": "1.4.0", "platform": "ios",
        "createdAt": "2026-09-05T17:00:00Z"}'
+
+# store or rotate a service credential (write-only; see below)
+curl -sS -X PUT "$API/secrets/gmail" -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"agentScope": "Nimbus", "kind": "app-password", "username": "levi@example.com",
+       "value": "abcd efgh ijkl mnop", "note": "Gmail app password for Nimbus"}'
+
+# list credential METADATA (never values); ?agentScope=Nimbus to filter
+curl -sS "$API/secrets" -H "$AUTH"
+
+# schedule a credential for deletion (7-day recovery window)
+curl -sS -X DELETE "$API/secrets/gmail?agentScope=Nimbus" -H "$AUTH"
 ```
 
 `POST /workers` refuses with 409 when the agent already has a live worker, and
@@ -63,7 +74,127 @@ with 400 when there is no config at `fin/agentd/<agent>.json` (the instance woul
 boot, fail the fetch, and bill for nothing). `instanceType` is restricted to the
 priced t4g sizes below. Note the default is `t4g.nano`, one size below
 `launch.sh`'s manual `t4g.micro` — nano's 0.5 GiB is tight for the harness, so
-pass `instanceType` explicitly if a worker dies on memory.
+pass `instanceType` explicitly if a worker dies on memory. The agent name
+`shared` (any case) is refused: it is reserved as the everyone-readable secret
+scope (below).
+
+## Browser workers
+
+`POST /workers` takes an optional `"browser": true`, which appends a bootstrap
+block installing headless chromium + playwright (python) on the AL2023 instance
+— after the harness is enabled, so the chromium download never delays the
+status object the sweep's boot grace waits on. It requires `instanceType` of at
+least `t4g.small` (400 otherwise): chromium in nano/micro's 0.5–1 GiB dies on
+memory and bills for nothing, the same refuse-before-spending logic as the
+config head-check. The default stays browserless, so nano workers keep their
+90-second boot. Browser workers are tagged `fin-browser=1` and their records
+carry `"browser": true`.
+
+The boot runs an inline smoke check (load `https://example.com`, assert the
+title) and logs `BROWSER SMOKE OK` / `BROWSER SMOKE FAILED` to
+`/var/log/cloud-init-output.log` without failing the boot. The same check lives
+in `../browser-smoke.py` as a standalone script — the empirical-verification
+primitive: run it on the worker over SSM whenever you need proof the browser
+stack really works, rather than trusting that the install succeeded. The manual
+path has it too: `../launch.sh <agent> <config-key> t4g.small browser`.
+
+## Service credentials (write-only secret store)
+
+Third-party credentials a worker needs — a Gmail app password, an API key, an
+OAuth refresh token — live in AWS Secrets Manager under
+`fin/service-creds/<agentScope>/<service>`:
+
+- `agentScope` is the agent's key slug (the display name validated against the
+  same rule as `POST /workers`, then lowercased: `Nimbus` → `nimbus`), or the
+  reserved scope `shared`, readable by every worker. Omitted anywhere it is
+  accepted, it defaults to `shared`.
+- `service` matches `[a-z0-9][a-z0-9-]{0,39}` — e.g. `gmail`,
+  `app-store-connect`.
+- Encryption is the default `aws/secretsmanager` KMS key: same-account access
+  needs zero extra KMS policy, nothing to deploy.
+
+**The API is write-only, and not just in code.** No route ever returns a secret
+value, no handler logs one, and the Lambda role holds no
+`secretsmanager:GetSecretValue` at all — even a code regression in `lambda.py`
+could not leak a value through this API. The read path belongs to the workers
+alone: `launch.sh` grants the `fin-agent-ssm` instance role `GetSecretValue`
+scoped to `fin/service-creds/*` and nothing else (re-run `launch.sh` once after
+this change so an existing role picks the policy up). On a worker:
+
+```sh
+aws secretsmanager get-secret-value \
+  --secret-id fin/service-creds/shared/gmail \
+  --query SecretString --output text
+```
+
+The SecretString is a flat JSON object of string fields —
+`{"value": "…", "username": "…"}` — the shape a runner's `{{secret:…}}`
+placeholder resolution addresses. Today every worker can read every scope (all
+workers share the one `fin-agent-ssm` role); per-agent read isolation means
+per-agent instance roles and is future work.
+
+### The routes
+
+- `PUT /secrets/{service}` — body `{"value": "…", "username"?: "…",
+  "note"?: "…", "agentScope"?: "Nimbus", "kind"?: "app-password"}`. `value` is
+  required; each field is capped at 4 KB and the whole secret at 64 KB (the
+  Secrets Manager hard limit). `kind` is one of `app-password | oauth |
+  api-key | password` (default `password`) and is stored as a tag, so listing
+  never touches values. 201 on create, 200 on update; the response is
+  `{"service", "agentScope", "kind", "lastUpdated"}` — never the value, never
+  the ARN. A re-PUT during a pending deletion restores the secret first, then
+  overwrites it. **`note` (≤ 200 chars) is stored as the Secrets Manager
+  Description and comes back as `label` from `GET /secrets`: it is metadata,
+  visible to anything that can list secrets and NOT encrypted like the value —
+  never put a credential in it.**
+- `GET /secrets[?agentScope=Nimbus]` — metadata only: `service`, `agentScope`,
+  `kind`, `label`, `lastUpdated`, `lastAccessed` (day granularity, from
+  Secrets Manager's `LastAccessedDate` — the app's "the worker actually read
+  this" signal), plus `deletionScheduled` while a delete is pending.
+- `DELETE /secrets/{service}?agentScope=Nimbus` — schedules deletion with a
+  7-day recovery window, never force-delete; 200 `{"service", "agentScope",
+  "deletionDate"}`, 404 when absent, and idempotent — deleting an
+  already-scheduled secret answers the same 200.
+
+### Rotation and staleness
+
+There is no rotation Lambda on purpose: these are third-party credentials AWS
+cannot rotate. Rotation is a user-driven re-PUT from the settings page, and
+Secrets Manager versioning keeps `AWSPREVIOUS` automatically. The app should
+badge staleness from `lastUpdated` — a nudge at ~180 days is the suggested
+default.
+
+### Which credential shape to store
+
+Prefer, in this order: **OAuth** (a refresh token the service minted for this
+exact purpose), an **app password** (a per-app secret like Gmail's, minted
+under the account's 2FA), an **API key** — and the account's primary password
+only as a last resort. App passwords and OAuth tokens are revocable without
+touching the account, skip interactive 2FA at use time entirely, and cap the
+blast radius of a compromised worker to one service instead of one identity.
+For Gmail specifically: an app password (requires 2-Step Verification on the
+account) is the recommended shape for SMTP/IMAP; OAuth for anything using the
+Gmail API.
+
+### 2FA relay (design, not yet implemented)
+
+Some browser flows will still hit an interactive second factor no stored
+credential can answer. The worker never holds a TOTP seed or a recovery code —
+that would turn a per-service secret into account takeover material. The design
+instead relays the human factor through the channel that already exists:
+
+1. The harness's browser flow hits a 2FA prompt and parks.
+2. The harness surfaces `needs-2fa` (service + prompt context, never
+   credentials) through its status object and transcript, which the app renders
+   as a push to Levi.
+3. Levi answers through the agent's inbox (`fin/inbox/<agent>.json`) with the
+   one-time code; the harness types it into the parked flow and discards it.
+
+Relaying a code this way is materially different from storing a credential:
+codes are single-use and expire in seconds-to-minutes, so nothing durable ever
+rides the channel or rests on the instance. Implementing the park/resume state
+machine in the daemon is follow-up work; nothing in this API needs to change
+for it.
 
 ## Presigned URLs
 

@@ -18,6 +18,13 @@ query parameters. The one deliberate exception is `POST /presign`, whose whole
 purpose is to hand freshly signed URLs back to an authenticated caller in the
 response body — so it returns them plainly (never through `_scrub`) and still
 never logs them.
+
+The service-credential store under Secrets Manager `fin/service-creds/*` is
+WRITE-ONLY from here: no route ever returns a secret value, no handler logs one
+(the PUT body's credential fields must never reach a log line or an ApiError
+message), and the Lambda role deliberately holds no secretsmanager:GetSecretValue
+— the read path belongs to the worker instance role alone, so even a code
+regression in this file cannot leak a value through the API.
 """
 
 import base64
@@ -92,6 +99,24 @@ IDLE_STATES = ("idle", "task-complete")
 # characters that can do neither key traversal nor tag-filter surprises.
 AGENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 
+# --- service-credential store (Secrets Manager) ------------------------------
+# Secrets live at fin/service-creds/<agentScope>/<service>. The scope is the
+# agent's key slug (lowercased display name), or the reserved scope "shared",
+# which every worker may read — and which POST /workers refuses as an agent
+# name so the two can never collide.
+SECRET_PREFIX = "fin/service-creds"
+SECRET_SCOPE_SHARED = "shared"
+SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+SECRET_KINDS = ("app-password", "oauth", "api-key", "password")
+SECRET_RECOVERY_DAYS = 7
+MAX_SECRET_FIELD_BYTES = 4 * 1024
+MAX_SECRET_BYTES = 64 * 1024  # the Secrets Manager hard limit
+
+# Browser workers get chromium + playwright at boot; chromium in nano/micro's
+# 0.5–1 GiB dies on memory and bills for nothing, so refuse before spending —
+# the same logic as the config head-check.
+BROWSER_MIN_INSTANCE_TYPE = "t4g.small"
+
 # Reads are capped rather than paginated to exhaustion: one item per worker ever
 # launched keeps this table in the hundreds, which is also why a Scan beats
 # maintaining a GSI here.
@@ -102,6 +127,7 @@ _SESSION = boto3.session.Session(region_name=REGION)
 EC2 = _SESSION.client("ec2")
 SSM = _SESSION.client("ssm")
 S3 = _SESSION.client("s3", config=Config(signature_version="s3v4"))
+SECRETS = _SESSION.client("secretsmanager")
 TABLE = _SESSION.resource("dynamodb").Table(TABLE_NAME)
 
 # Byte-for-byte the bootstrap from launch.sh; the two presigned URLs are the only
@@ -143,6 +169,36 @@ WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
 systemctl enable --now fin-agentd
+"""
+
+# Byte-for-byte the optional browser block from launch.sh (same doctrine as
+# USER_DATA above). Appended AFTER .format() runs — it must stay out of the
+# template so nothing here is treated as a placeholder — and after the harness
+# is enabled, so the chromium download never delays the status object the
+# sweep's boot grace waits on.
+BROWSER_USER_DATA = """
+# --- headless browser (playwright + chromium) --------------------------------
+# Idempotent: dnf and pip skip what is already present; playwright install is a
+# no-op once the pinned chromium build is cached under ~fin-agent.
+dnf install -y python3 python3-pip \\
+  alsa-lib at-spi2-atk at-spi2-core atk cairo cups-libs dbus-libs expat glib2 \\
+  libdrm libX11 libXcomposite libXdamage libXext libXfixes libXrandr libxcb \\
+  libxkbcommon mesa-libgbm nspr nss pango liberation-fonts
+sudo -u fin-agent -H python3 -m pip install --user --quiet playwright
+sudo -u fin-agent -H python3 -m playwright install chromium
+
+# Boot-time smoke: mirrors scripts/cloud-agent/browser-smoke.py (keep in sync).
+# Failure lands in cloud-init-output.log and is never fatal to the boot.
+sudo -u fin-agent -H python3 - <<'PYSMOKE' || echo 'BROWSER SMOKE FAILED'
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    page.goto("https://example.com", wait_until="load", timeout=30000)
+    assert "Example Domain" in page.title()
+    browser.close()
+print("BROWSER SMOKE OK")
+PYSMOKE
 """
 
 
@@ -256,7 +312,7 @@ def _live_workers():
     )
 
 
-def _record(worker_id, agent, instance_id, instance_type, launched_at, idle_minutes, managed):
+def _record(worker_id, agent, instance_id, instance_type, launched_at, idle_minutes, managed, browser=False):
     item = {
         "workerId": worker_id,
         "agent": agent,
@@ -266,6 +322,7 @@ def _record(worker_id, agent, instance_id, instance_type, launched_at, idle_minu
         "idleMinutes": int(idle_minutes),
         "status": "live",
         "managed": managed,
+        "browser": bool(browser),
     }
     TABLE.put_item(Item=item)
     return item
@@ -357,10 +414,22 @@ def create_worker(event):
     agent = str(body.get("agent") or "").strip()
     if not AGENT_NAME.match(agent):
         raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    if _key_slug(agent) == SECRET_SCOPE_SHARED:
+        # Reserved as the everyone-readable secret scope; an agent by this name
+        # would collide with fin/service-creds/shared/*.
+        raise ApiError(400, "agent name '{}' is reserved for the shared secret scope".format(SECRET_SCOPE_SHARED))
 
     instance_type = str(body.get("instanceType") or DEFAULT_INSTANCE_TYPE).strip()
     if instance_type not in PRICE_USD_PER_HOUR:
         raise ApiError(400, "instanceType must be one of: {}".format(", ".join(sorted(PRICE_USD_PER_HOUR))))
+
+    browser = body.get("browser")
+    if browser not in (None, True, False):
+        raise ApiError(400, "browser must be a boolean")
+    browser = bool(browser)
+    if browser and PRICE_USD_PER_HOUR[instance_type] < PRICE_USD_PER_HOUR[BROWSER_MIN_INSTANCE_TYPE]:
+        raise ApiError(400, "browser workers need {} or larger; chromium on {} dies on memory and bills for nothing".format(
+            BROWSER_MIN_INSTANCE_TYPE, instance_type))
 
     supplied_idle = body.get("idleMinutes")
     try:
@@ -409,6 +478,8 @@ def create_worker(event):
             ExpiresIn=PRESIGN_TTL_SECONDS,
         ),
     )
+    if browser:
+        user_data += BROWSER_USER_DATA
 
     # A fresh worker starts with an empty applied-id ledger (it lives on the
     # instance and dies with it), so any message still in the inbox document
@@ -421,6 +492,15 @@ def create_worker(event):
         ContentType="application/json",
     )
 
+    tags = [
+        {"Key": "Name", "Value": "fin-agent-{}".format(agent)},
+        {"Key": "fin-agent", "Value": agent},
+        {"Key": "fin-managed", "Value": "control-plane"},
+        {"Key": "fin-idle-minutes", "Value": str(idle_minutes)},
+    ]
+    if browser:
+        tags.append({"Key": "fin-browser", "Value": "1"})
+
     instance = EC2.run_instances(
         ImageId=_ami_id(),
         InstanceType=instance_type,
@@ -430,23 +510,13 @@ def create_worker(event):
         IamInstanceProfile={"Name": INSTANCE_PROFILE_NAME},
         UserData=user_data,
         MetadataOptions={"HttpTokens": "required"},
-        TagSpecifications=[
-            {
-                "ResourceType": "instance",
-                "Tags": [
-                    {"Key": "Name", "Value": "fin-agent-{}".format(agent)},
-                    {"Key": "fin-agent", "Value": agent},
-                    {"Key": "fin-managed", "Value": "control-plane"},
-                    {"Key": "fin-idle-minutes", "Value": str(idle_minutes)},
-                ],
-            }
-        ],
+        TagSpecifications=[{"ResourceType": "instance", "Tags": tags}],
     )["Instances"][0]
 
     worker_id = str(uuid.uuid4())
     launched_at = _iso(instance.get("LaunchTime") or now)
-    _record(worker_id, agent, instance["InstanceId"], instance_type, launched_at, idle_minutes, "control-plane")
-    LOG.info("launched %s for agent %s (%s)", instance["InstanceId"], agent, instance_type)
+    _record(worker_id, agent, instance["InstanceId"], instance_type, launched_at, idle_minutes, "control-plane", browser)
+    LOG.info("launched %s for agent %s (%s%s)", instance["InstanceId"], agent, instance_type, ", browser" if browser else "")
 
     return _response(201, {
         "workerId": worker_id,
@@ -454,6 +524,7 @@ def create_worker(event):
         "agent": agent,
         "instanceType": instance_type,
         "launchedAt": launched_at,
+        "browser": browser,
     })
 
 
@@ -670,6 +741,179 @@ def ingest_feedback(event):
     return _response(201, {"id": uid, "kind": kind, "receivedAt": document["receivedAt"]})
 
 
+# --- service credentials (write-only) ----------------------------------------
+#
+# Doctrine (mirrors the bearer-token rule in the module docstring): credential
+# field VALUES never reach a log line, an ApiError message, or a response body.
+# Field NAMES may appear in validation errors; values never may.
+
+
+def _secret_scope(raw):
+    """Normalizes an agentScope to its key slug; absent means the shared scope."""
+    scope = str(raw or SECRET_SCOPE_SHARED).strip()
+    if _key_slug(scope) == SECRET_SCOPE_SHARED:
+        return SECRET_SCOPE_SHARED
+    if not AGENT_NAME.match(scope):
+        raise ApiError(400, "agentScope must be '{}' or match [A-Za-z0-9][A-Za-z0-9._-]{{0,62}}".format(SECRET_SCOPE_SHARED))
+    return _key_slug(scope)
+
+
+def _require_service(service):
+    if not SERVICE_NAME.match(service):
+        raise ApiError(400, "service must match [a-z0-9][a-z0-9-]{0,39}")
+
+
+def _secret_name(scope, service):
+    return "{}/{}/{}".format(SECRET_PREFIX, scope, service)
+
+
+def put_secret(event, service):
+    _require_service(service)
+    body = _body(event)
+    scope = _secret_scope(body.get("agentScope"))
+
+    kind = str(body.get("kind") or "password").strip()
+    if kind not in SECRET_KINDS:
+        raise ApiError(400, "kind must be one of: {}".format(", ".join(SECRET_KINDS)))
+
+    # The SecretString is a flat JSON object of string fields — the shape the
+    # runner's placeholder resolution addresses. Written once, then discarded;
+    # nothing below this block may carry a field value anywhere else.
+    fields = {}
+    for field in ("value", "username"):
+        raw = body.get(field)
+        if raw is None:
+            continue
+        if not isinstance(raw, str) or not raw.strip():
+            raise ApiError(400, "{} must be a non-empty string".format(field))
+        if len(raw.encode("utf-8")) > MAX_SECRET_FIELD_BYTES:
+            raise ApiError(400, "{} exceeds {} bytes".format(field, MAX_SECRET_FIELD_BYTES))
+        fields[field] = raw
+    if "value" not in fields:
+        raise ApiError(400, "value is required")
+
+    note = body.get("note")
+    if note is not None:
+        if not isinstance(note, str):
+            raise ApiError(400, "note must be a string")
+        if len(note) > 200:
+            raise ApiError(400, "note must be 200 characters or fewer")
+        note = note.strip()
+
+    secret_string = json.dumps(fields)
+    if len(secret_string.encode("utf-8")) > MAX_SECRET_BYTES:
+        raise ApiError(400, "secret exceeds {} bytes".format(MAX_SECRET_BYTES))
+
+    name = _secret_name(scope, service)
+    tags = [
+        {"Key": "fin-scope", "Value": scope},
+        {"Key": "fin-service", "Value": service},
+        {"Key": "fin-kind", "Value": kind},
+    ]
+
+    created = False
+    try:
+        kwargs = {"Name": name, "SecretString": secret_string, "Tags": tags}
+        if note:
+            # The Description is METADATA — visible to anything that can list
+            # secrets, not encrypted like the value. Docs warn accordingly.
+            kwargs["Description"] = note
+        SECRETS.create_secret(**kwargs)
+        created = True
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code == "InvalidRequestException":
+            # Scheduled for deletion (a prior DELETE's recovery window): bring
+            # it back, then overwrite below.
+            SECRETS.restore_secret(SecretId=name)
+        elif code != "ResourceExistsException":
+            raise
+    if not created:
+        SECRETS.put_secret_value(SecretId=name, SecretString=secret_string)
+        SECRETS.tag_resource(SecretId=name, Tags=tags)
+        if note is not None:
+            SECRETS.update_secret(SecretId=name, Description=note)
+
+    LOG.info("stored service credential %s/%s (%s)", scope, service, kind)
+    return _response(201 if created else 200, {
+        "service": service,
+        "agentScope": scope,
+        "kind": kind,
+        "lastUpdated": _iso(_now()),
+    })
+
+
+def list_secrets(event):
+    """Metadata only — names, tags, and timestamps; never a value (the role
+    could not fetch one even if this code tried)."""
+    params = event.get("queryStringParameters") or {}
+    prefix = SECRET_PREFIX + "/"
+    requested_scope = str(params.get("agentScope") or "").strip()
+    if requested_scope:
+        prefix += _secret_scope(requested_scope) + "/"
+
+    entries, token = [], None
+    while len(entries) < MAX_LIST_ITEMS:
+        kwargs = {
+            "Filters": [{"Key": "name", "Values": [prefix]}],
+            "MaxResults": min(100, MAX_LIST_ITEMS - len(entries)),
+            "IncludePlannedDeletion": True,
+        }
+        if token:
+            kwargs["NextToken"] = token
+        page = SECRETS.list_secrets(**kwargs)
+        entries.extend(page.get("SecretList", []))
+        token = page.get("NextToken")
+        if not token:
+            break
+
+    secrets = []
+    for entry in entries[:MAX_LIST_ITEMS]:
+        tags = {t.get("Key"): t.get("Value") for t in entry.get("Tags") or []}
+        name_parts = str(entry.get("Name") or "").split("/")
+        row = {
+            "service": tags.get("fin-service") or (name_parts[3] if len(name_parts) > 3 else ""),
+            "agentScope": tags.get("fin-scope") or (name_parts[2] if len(name_parts) > 2 else ""),
+            "kind": tags.get("fin-kind") or "password",
+            "label": entry.get("Description") or "",
+            "lastUpdated": _iso(entry["LastChangedDate"]) if entry.get("LastChangedDate") else None,
+            # Day granularity is all Secrets Manager records — this is the
+            # app's "the worker actually read this" signal.
+            "lastAccessed": entry["LastAccessedDate"].strftime("%Y-%m-%d") if entry.get("LastAccessedDate") else None,
+        }
+        if entry.get("DeletedDate"):
+            row["deletionScheduled"] = _iso(entry["DeletedDate"])
+        secrets.append(row)
+    secrets.sort(key=lambda r: (r["agentScope"], r["service"]))
+    return _response(200, {"generatedAt": _iso(_now()), "secrets": secrets})
+
+
+def delete_secret(event, service):
+    _require_service(service)
+    params = event.get("queryStringParameters") or {}
+    scope = _secret_scope(params.get("agentScope"))
+    name = _secret_name(scope, service)
+    try:
+        deletion = SECRETS.delete_secret(
+            SecretId=name, RecoveryWindowInDays=SECRET_RECOVERY_DAYS
+        ).get("DeletionDate")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code == "ResourceNotFoundException":
+            raise ApiError(404, "no secret for service {} in scope {}".format(service, scope))
+        if code != "InvalidRequestException":
+            raise
+        # Already scheduled: idempotent — answer 200 with the same clock.
+        marked = SECRETS.describe_secret(SecretId=name).get("DeletedDate")
+        deletion = (marked + timedelta(days=SECRET_RECOVERY_DAYS)) if marked else None
+    LOG.info("scheduled deletion of service credential %s/%s", scope, service)
+    return _response(200, {
+        "service": service,
+        "agentScope": scope,
+        "deletionDate": _iso(deletion) if deletion else None,
+    })
+
+
 # --- sweep -------------------------------------------------------------------
 
 
@@ -806,6 +1050,12 @@ def _route(event):
         return presign(event)
     if method == "POST" and parts == ["feedback"]:
         return ingest_feedback(event)
+    if method == "GET" and parts == ["secrets"]:
+        return list_secrets(event)
+    if method == "PUT" and len(parts) == 2 and parts[0] == "secrets":
+        return put_secret(event, parts[1])
+    if method == "DELETE" and len(parts) == 2 and parts[0] == "secrets":
+        return delete_secret(event, parts[1])
     raise ApiError(404, "no route for {} {}".format(method or "?", path))
 
 

@@ -26,6 +26,17 @@ flowing. In the app, set the agent's Hosting to Cloud Harness and paste the
 transcript GET + inbox GET/PUT URLs.
 
 Security posture: security group has no ingress; admin access is SSM Session
-Manager only; the instance role carries SSM only (no S3 — every S3 capability
-is a presigned URL with an expiry); IMDSv2 required. The per-agent config holds
-the LLM endpoint bearer token — treat configs as secrets, never commit one.
+Manager only; the instance role carries SSM plus exactly one credential grant —
+`secretsmanager:GetSecretValue` on `fin/service-creds/*` (no S3 — every S3
+capability is a presigned URL with an expiry); IMDSv2 required. The per-agent
+config holds the LLM endpoint bearer token — treat configs as secrets, never
+commit one.
+
+Service credentials (Gmail app passwords, API keys, …) are stored through the
+control plane's write-only `/secrets` API and read on-instance from Secrets
+Manager under `fin/service-creds/<scope>/<service>`; the control plane cannot
+read them back and never returns a value. Optional headless browser: pass the
+literal word `browser` as `launch.sh`'s 4th argument, or `"browser": true` on
+`POST /workers`, to install chromium + playwright (python) at boot — t4g.small
+or larger. `browser-smoke.py` is the empirical check that the browser stack
+works on a given instance. Details: `control-plane/README.md`.

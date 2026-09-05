@@ -1,7 +1,11 @@
 #!/bin/bash
 # Launches ONE isolated EC2 instance hosting ONE fin-agentd cloud agent.
 #
-#   launch.sh <agent-name> <config-s3-key> [instance-type]
+#   launch.sh <agent-name> <config-s3-key> [instance-type] [browser]
+#
+# Pass the literal word "browser" as the 4th argument to install headless
+# chromium + playwright (python) at boot — use t4g.small or larger for that;
+# chromium in 0.5–1 GiB dies on memory.
 #
 # The instance is the agent's whole sandbox: the daemon SSHes to ITSELF
 # (localhost) and works inside a local tmux session, so nothing else is
@@ -20,9 +24,24 @@ set -euo pipefail
 PROFILE=levi
 REGION=us-west-2
 BUCKET=fin-agent-directives-011183829623
-AGENT_NAME="${1:?usage: launch.sh <agent-name> <config-s3-key> [instance-type]}"
-CONFIG_KEY="${2:?usage: launch.sh <agent-name> <config-s3-key> [instance-type]}"
+AGENT_NAME="${1:?usage: launch.sh <agent-name> <config-s3-key> [instance-type] [browser]}"
+CONFIG_KEY="${2:?usage: launch.sh <agent-name> <config-s3-key> [instance-type] [browser]}"
 INSTANCE_TYPE="${3:-t4g.micro}"
+WITH_BROWSER="${4:-}"
+if [ -n "$WITH_BROWSER" ] && [ "$WITH_BROWSER" != "browser" ]; then
+  echo "4th argument must be the literal word 'browser' (or omitted)" >&2
+  exit 1
+fi
+if [ "$WITH_BROWSER" = "browser" ] && { [ "$INSTANCE_TYPE" = "t4g.nano" ] || [ "$INSTANCE_TYPE" = "t4g.micro" ]; }; then
+  echo "browser workers need t4g.small or larger; chromium on $INSTANCE_TYPE dies on memory" >&2
+  exit 1
+fi
+# "shared" is reserved as the everyone-readable secret scope under
+# fin/service-creds/; an agent by that name would collide with it.
+if [ "$(printf '%s' "$AGENT_NAME" | tr '[:upper:]' '[:lower:]')" = "shared" ]; then
+  echo "agent name 'shared' is reserved for the shared secret scope" >&2
+  exit 1
+fi
 
 aws() { command aws --profile "$PROFILE" --region "$REGION" "$@"; }
 
@@ -52,6 +71,24 @@ if ! aws iam get-instance-profile --instance-profile-name fin-agent-ssm >/dev/nu
   echo "==> Created IAM role/profile fin-agent-ssm (SSM only); waiting for propagation"
   sleep 12
 fi
+
+# --- worker read path for service credentials --------------------------------
+# The ONLY credential permission a worker holds: GetSecretValue on the
+# fin/service-creds/ prefix. Writes stay with the control-plane Lambda, which
+# itself cannot read — the write/read split is enforced in IAM, not code.
+# put-role-policy is idempotent and runs unconditionally so a role created by
+# an earlier version of this script picks the policy up on the next launch.
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+CREDS_READ_POLICY=$(cat <<JSON
+{"Version": "2012-10-17",
+ "Statement": [{"Sid": "ServiceCredsRead",
+   "Effect": "Allow",
+   "Action": "secretsmanager:GetSecretValue",
+   "Resource": "arn:aws:secretsmanager:$REGION:$ACCOUNT:secret:fin/service-creds/*"}]}
+JSON
+)
+aws iam put-role-policy --role-name fin-agent-ssm \
+  --policy-name fin-agent-service-creds --policy-document "$CREDS_READ_POLICY"
 
 # --- boot material: presigned fetch URLs for binary + config -----------------
 # 7-day expiry: the instance only fetches at boot; a rebuild re-presigns.
@@ -102,6 +139,39 @@ systemctl daemon-reload
 systemctl enable --now fin-agentd
 EOF
 )
+
+# Byte-for-byte the optional browser block from control-plane/lambda.py
+# (BROWSER_USER_DATA) — any change here belongs there too. Runs AFTER the
+# harness is enabled so the chromium download never delays the status object
+# the sweep's boot grace waits on.
+if [ "$WITH_BROWSER" = "browser" ]; then
+USER_DATA+="
+$(cat <<'BROWSER'
+# --- headless browser (playwright + chromium) --------------------------------
+# Idempotent: dnf and pip skip what is already present; playwright install is a
+# no-op once the pinned chromium build is cached under ~fin-agent.
+dnf install -y python3 python3-pip \
+  alsa-lib at-spi2-atk at-spi2-core atk cairo cups-libs dbus-libs expat glib2 \
+  libdrm libX11 libXcomposite libXdamage libXext libXfixes libXrandr libxcb \
+  libxkbcommon mesa-libgbm nspr nss pango liberation-fonts
+sudo -u fin-agent -H python3 -m pip install --user --quiet playwright
+sudo -u fin-agent -H python3 -m playwright install chromium
+
+# Boot-time smoke: mirrors scripts/cloud-agent/browser-smoke.py (keep in sync).
+# Failure lands in cloud-init-output.log and is never fatal to the boot.
+sudo -u fin-agent -H python3 - <<'PYSMOKE' || echo 'BROWSER SMOKE FAILED'
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    page.goto("https://example.com", wait_until="load", timeout=30000)
+    assert "Example Domain" in page.title()
+    browser.close()
+print("BROWSER SMOKE OK")
+PYSMOKE
+BROWSER
+)"
+fi
 
 INSTANCE_ID=$(aws ec2 run-instances \
   --image-id "$AMI_ID" \

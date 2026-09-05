@@ -81,6 +81,9 @@ fi
 # TerminateInstances is fenced to instances carrying a fin-agent tag: the control
 # plane can lose track of a worker, but it can never reach an unrelated instance.
 # CreateTags is fenced to the RunInstances call that creates them.
+# ServiceCredsWrite is deliberately WITHOUT secretsmanager:GetSecretValue: the
+# API is write-only in IAM, not just in code — reads belong to the worker role
+# (fin-agent-ssm, granted in ../launch.sh).
 cat > "$BUILD/policy.json" <<JSON
 {
   "Version": "2012-10-17",
@@ -152,6 +155,26 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": "s3:PutObject",
       "Resource": "arn:aws:s3:::$FACTORY_BUCKET/raw/*"
+    },
+    {
+      "Sid": "ServiceCredsWrite",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:UpdateSecret",
+        "secretsmanager:TagResource",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:RestoreSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:$REGION:$ACCOUNT:secret:fin/service-creds/*"
+    },
+    {
+      "Sid": "ServiceCredsList",
+      "Effect": "Allow",
+      "Action": "secretsmanager:ListSecrets",
+      "Resource": "*"
     },
     {
       "Sid": "Logs",
@@ -255,6 +278,9 @@ GET /usage
 POST /sweep
 POST /presign
 POST /feedback
+PUT /secrets/{service}
+GET /secrets
+DELETE /secrets/{service}
 ROUTES
 
 if ! aws apigatewayv2 get-stage --api-id "$API_ID" --stage-name '$default' >/dev/null 2>&1; then
