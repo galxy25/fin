@@ -125,8 +125,8 @@ final class DaemonDirectiveClient {
     static let failureAuditWindow: TimeInterval = 5 * 60
     static let userMessageKind = "user_message"
     /// Reported in the status document so a supervisor can tell which harness features
-    /// (stayResident, cloud transcript, inbox) this agent has.
-    static let daemonVersion = "1.1.0"
+    /// (stayResident, cloud transcript, inbox, push notify) this agent has.
+    static let daemonVersion = "1.2.0"
 
     #if !canImport(Darwin)
     /// Linux only: the default fetch's buffered read runs through this session, whose

@@ -19,6 +19,14 @@ purpose is to hand freshly signed URLs back to an authenticated caller in the
 response body — so it returns them plainly (never through `_scrub`) and still
 never logs them.
 
+Push notifications close the loop from a headless agent back to a human:
+`PUT /device-tokens` stores the APNs token the app registers on every launch,
+and `POST /notify` fans one alert out to every stored token over APNs' HTTP/2
+API. The APNs auth key (`APNS_KEY`) and the ES256 provider JWT minted from it
+are credentials exactly like the bearer token: never logged, never echoed in a
+response body. Deployed without the APNS_* environment, `/notify` answers 503
+and every other route is unaffected.
+
 The service-credential store under Secrets Manager `fin/service-creds/*` is
 WRITE-ONLY from here: no route ever returns a secret value, no handler logs one
 (the PUT body's credential fields must never reach a log line or an ApiError
@@ -28,11 +36,13 @@ regression in this file cannot leak a value through the API.
 """
 
 import base64
+import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -79,6 +89,10 @@ def _key_slug(agent):
     return agent.lower()
 
 TABLE_NAME = os.environ.get("FIN_CP_TABLE", "fin-cloud-workers")
+# Its own table, not an item-type in fin-cloud-workers: that table's rows ARE
+# workers (list_workers scans it whole), so a foreign item shape there would
+# leak into every worker listing. The token is the hash key — dedupe by design.
+DEVICE_TOKENS_TABLE_NAME = os.environ.get("FIN_CP_DEVICE_TOKENS_TABLE", "fin-device-tokens")
 SECURITY_GROUP_NAME = "fin-agent-egress"
 INSTANCE_PROFILE_NAME = "fin-agent-ssm"
 AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
@@ -142,7 +156,9 @@ EC2 = _SESSION.client("ec2")
 SSM = _SESSION.client("ssm")
 S3 = _SESSION.client("s3", config=Config(signature_version="s3v4"))
 SECRETS = _SESSION.client("secretsmanager")
-TABLE = _SESSION.resource("dynamodb").Table(TABLE_NAME)
+_DYNAMODB = _SESSION.resource("dynamodb")
+TABLE = _DYNAMODB.Table(TABLE_NAME)
+DEVICE_TOKENS_TABLE = _DYNAMODB.Table(DEVICE_TOKENS_TABLE_NAME)
 
 # Byte-for-byte the bootstrap from launch.sh; the two presigned URLs are the only
 # substitutions. Any change to launch.sh's user-data belongs here too.
@@ -305,12 +321,13 @@ def _body(event):
 # --- worker records ----------------------------------------------------------
 
 
-def _scan(**kwargs):
+def _scan(table=None, **kwargs):
+    table = TABLE if table is None else table
     items, start = [], None
     while len(items) < MAX_SCAN_ITEMS:
         if start:
             kwargs["ExclusiveStartKey"] = start
-        page = TABLE.scan(**kwargs)
+        page = table.scan(**kwargs)
         items.extend(page.get("Items", []))
         start = page.get("LastEvaluatedKey")
         if not start:
@@ -841,6 +858,240 @@ def ingest_feedback(event):
     return _response(201, {"id": uid, "kind": kind, "receivedAt": document["receivedAt"]})
 
 
+# --- push notifications (APNs) -----------------------------------------------
+#
+# POST /notify fans one alert out to every device token the app has registered
+# via PUT /device-tokens. Transport is APNs' token-based HTTP/2 API: the stdlib
+# has no HTTP/2 client and APNs speaks nothing else, so deploy.sh vendors
+# httpx+h2 into the zip, plus ecdsa for the ES256 provider JWT — all pure
+# python, no compiled wheels, so a zip built on any machine runs unchanged on
+# the arm64 python3.12 runtime. Both are imported lazily: a bundle missing them
+# fails only /notify, never the worker routes.
+
+APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "")
+APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "")
+APNS_KEY = os.environ.get("APNS_KEY", "")  # the .p8 auth key's PEM content, verbatim
+APNS_TOPIC = os.environ.get("APNS_TOPIC", "dev.levischoen.fin")
+
+# A TestFlight build's token lives in the production environment, a devicectl
+# debug build's in sandbox, and the registration carries no reliable marker of
+# which — so a token is tried against production first and swapped on APNs'
+# wrong-environment answer. The discovered environment is stored on the token
+# row so later notifies go straight there.
+APNS_HOSTS = {
+    "production": "https://api.push.apple.com",
+    "sandbox": "https://api.sandbox.push.apple.com",
+}
+APNS_WRONG_ENVIRONMENT = "BadDeviceToken"
+# Reasons that mean the token will never work again: drop the row — the app
+# re-PUTs a live token on its next launch anyway.
+APNS_DEAD_REASONS = ("Unregistered", "ExpiredToken", "DeviceTokenNotForTopic")
+
+# Apple accepts provider JWTs between 20 and 60 minutes old and throttles
+# refreshes under 20; 40 sits safely inside both fences. Cached per warm
+# container, like boto3's clients above.
+APNS_JWT_LIFETIME_SECONDS = 40 * 60
+APNS_REQUEST_TIMEOUT = 10
+
+# APNs tokens are 32 bytes (64 hex chars) today, but Apple documents the length
+# as opaque; the range keeps hex-ness without hardcoding today's size.
+DEVICE_TOKEN = re.compile(r"^[0-9a-f]{16,512}$")
+MAX_DEVICE_NAME_LENGTH = 80
+MAX_NOTIFY_TITLE_LENGTH = 120
+MAX_NOTIFY_BODY_LENGTH = 800
+
+_APNS_JWT_CACHE = {"token": "", "issued_at": 0.0}
+
+
+def _apns_configured():
+    return bool(APNS_KEY_ID and APNS_TEAM_ID and APNS_KEY)
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _apns_bearer(now_epoch=None):
+    """The ES256 provider JWT, cached per warm container. `ecdsa` is pure python,
+    reads the unencrypted PKCS#8 .p8 directly, and its raw r||s signature form is
+    exactly what a JWT wants — no DER wrangling. The JWT is a credential: it must
+    never reach a log line or a response body."""
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    if _APNS_JWT_CACHE["token"] and now_epoch - _APNS_JWT_CACHE["issued_at"] < APNS_JWT_LIFETIME_SECONDS:
+        return _APNS_JWT_CACHE["token"]
+    import ecdsa  # vendored by deploy.sh
+    from ecdsa.util import sigencode_string
+
+    header = _b64url(json.dumps({"alg": "ES256", "kid": APNS_KEY_ID}).encode())
+    claims = _b64url(json.dumps({"iss": APNS_TEAM_ID, "iat": int(now_epoch)}).encode())
+    key = ecdsa.SigningKey.from_pem(APNS_KEY, hashfunc=hashlib.sha256)
+    signature = key.sign_deterministic(
+        "{}.{}".format(header, claims).encode(), sigencode=sigencode_string
+    )
+    token = "{}.{}.{}".format(header, claims, _b64url(signature))
+    _APNS_JWT_CACHE.update(token=token, issued_at=now_epoch)
+    return token
+
+
+def _apns_push(client, environment, token, payload, bearer):
+    """One POST to one APNs environment. Returns (delivered, reason); the reason
+    is APNs' own enum string, or an HTTP status when the body carries none."""
+    try:
+        response = client.post(
+            "{}/3/device/{}".format(APNS_HOSTS[environment], token),
+            content=json.dumps(payload),
+            headers={
+                "authorization": "bearer {}".format(bearer),
+                "apns-topic": APNS_TOPIC,
+                "apns-push-type": "alert",
+                "apns-priority": "10",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - httpx transport errors are not ClientError
+        return False, _scrub(exc)
+    if response.status_code == 200:
+        return True, ""
+    try:
+        reason = str(response.json().get("reason") or "")
+    except ValueError:
+        reason = ""
+    return False, reason or "HTTP {}".format(response.status_code)
+
+
+def put_device_token(event):
+    """PUT /device-tokens — the app re-registers on every launch (APNs rotates
+    tokens); the token is the table's hash key, so a re-PUT is a dedupe-by-
+    overwrite. update_item rather than put_item on purpose: it preserves the
+    `environment` a past /notify discovered, so re-registration doesn't cost the
+    next push a wrong-environment round trip."""
+    body = _body(event)
+
+    token = str(body.get("token") or "").strip().lower()
+    if not DEVICE_TOKEN.match(token):
+        raise ApiError(400, "token must be the APNs device token as hex")
+
+    platform = str(body.get("platform") or "").strip()
+    if not platform or len(platform) > 40:
+        raise ApiError(400, "platform must be a non-empty string of at most 40 characters")
+
+    device_name = body.get("deviceName")
+    if device_name is not None and not isinstance(device_name, str):
+        raise ApiError(400, "deviceName must be a string")
+    device_name = (device_name or "").strip()[:MAX_DEVICE_NAME_LENGTH]
+
+    updated_at = _iso(_now())
+    names = {"#platform": "platform", "#updated": "updatedAt", "#name": "deviceName"}
+    values = {":platform": platform, ":updated": updated_at}
+    expression = "SET #platform = :platform, #updated = :updated"
+    if device_name:
+        expression += ", #name = :name"
+        values[":name"] = device_name
+    else:
+        expression += " REMOVE #name"
+    DEVICE_TOKENS_TABLE.update_item(
+        Key={"token": token},
+        UpdateExpression=expression,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
+    # The suffix identifies a device across log lines; a token alone moves no
+    # pushes without the auth key, but the whole thing still stays out of logs.
+    LOG.info("registered device token …%s (%s)", token[-8:], platform)
+    return _response(200, {
+        "platform": platform,
+        "deviceName": device_name or None,
+        "updatedAt": updated_at,
+    })
+
+
+def notify(event):
+    """POST /notify — {"title", "body", "agent"?}: one APNs alert to every
+    registered device. The response reports counts and APNs reason strings only —
+    never a token, never the auth key, never the JWT."""
+    if not _apns_configured():
+        raise ApiError(503, "APNs key is not configured; redeploy with FIN_APNS_KEY_PATH set (see control-plane/README.md)")
+    body = _body(event)
+
+    title = str(body.get("title") or "").strip()
+    if not title:
+        raise ApiError(400, "title must be a non-empty string")
+    text = str(body.get("body") or "").strip()
+    if not text:
+        raise ApiError(400, "body must be a non-empty string")
+    # A push is a summary; overlong input is truncated, not refused — the sender
+    # is an unattended daemon with nobody there to shorten and retry.
+    title = title[:MAX_NOTIFY_TITLE_LENGTH]
+    text = text[:MAX_NOTIFY_BODY_LENGTH]
+
+    agent = str(body.get("agent") or "").strip()
+    if agent and not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+
+    rows = _scan(table=DEVICE_TOKENS_TABLE)
+    if not rows:
+        return _response(200, {
+            "delivered": 0, "failed": 0, "removed": 0,
+            "note": "no device tokens registered; launch the app once with the control plane configured",
+        })
+
+    try:
+        import httpx  # vendored by deploy.sh
+    except ImportError:
+        raise ApiError(500, "push dependencies are missing from the bundle; rerun deploy.sh")
+    try:
+        bearer = _apns_bearer()
+    except ImportError:
+        raise ApiError(500, "push dependencies are missing from the bundle; rerun deploy.sh")
+    except Exception:  # noqa: BLE001 - a malformed key must not leak through the error
+        LOG.exception("APNs provider JWT signing failed")
+        raise ApiError(500, "APNs provider token signing failed; check the deployed APNS_* environment")
+
+    payload = {"aps": {"alert": {"title": title, "body": text}, "sound": "default"}}
+    if agent:
+        # Custom key for the app's future tap routing; harmless to older builds.
+        payload["finAgent"] = agent
+
+    delivered, removed, failures = 0, 0, []
+    with httpx.Client(http2=True, timeout=APNS_REQUEST_TIMEOUT) as client:
+        for row in rows:
+            token = str(row.get("token") or "")
+            if not token:
+                continue
+            first = "sandbox" if row.get("environment") == "sandbox" else "production"
+            second = "production" if first == "sandbox" else "sandbox"
+            environment = first
+            ok, reason = _apns_push(client, first, token, payload, bearer)
+            if not ok and reason == APNS_WRONG_ENVIRONMENT:
+                environment = second
+                ok, reason = _apns_push(client, second, token, payload, bearer)
+            if ok:
+                delivered += 1
+                if environment != row.get("environment"):
+                    DEVICE_TOKENS_TABLE.update_item(
+                        Key={"token": token},
+                        UpdateExpression="SET #env = :env",
+                        ExpressionAttributeNames={"#env": "environment"},
+                        ExpressionAttributeValues={":env": environment},
+                    )
+            elif reason in APNS_DEAD_REASONS or reason == APNS_WRONG_ENVIRONMENT:
+                # Dead in both environments, or gone for good: the row would only
+                # produce failures from here on.
+                DEVICE_TOKENS_TABLE.delete_item(Key={"token": token})
+                removed += 1
+            else:
+                failures.append(reason)
+
+    LOG.info("notify: delivered %d, failed %d, removed %d", delivered, len(failures), removed)
+    # 502 when tokens exist but nothing got through, so an unattended caller's
+    # audit trail records the outage instead of a hollow success.
+    return _response(200 if delivered else 502, {
+        "delivered": delivered,
+        "failed": len(failures),
+        "removed": removed,
+        "reasons": sorted(set(failures)),
+    })
+
+
 # --- service credentials (write-only) ----------------------------------------
 #
 # Doctrine (mirrors the bearer-token rule in the module docstring): credential
@@ -1150,6 +1401,10 @@ def _route(event):
         return presign(event)
     if method == "POST" and parts == ["feedback"]:
         return ingest_feedback(event)
+    if method == "PUT" and parts == ["device-tokens"]:
+        return put_device_token(event)
+    if method == "POST" and parts == ["notify"]:
+        return notify(event)
     if method == "GET" and parts == ["secrets"]:
         return list_secrets(event)
     if method == "PUT" and len(parts) == 2 and parts[0] == "secrets":

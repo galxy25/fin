@@ -2,9 +2,10 @@
 
 Headless extraction of Fin's agent runtime: a daemon that runs 24/7 on a Mac or a Linux
 box, driving an agent against a live SSH+tmux session with no app open. Phones and
-tablets become notification surfaces via the `notifyCommand` hook and the S3
-remote-supervision channel — and, with the cloud transcript and inbox, full remote
-consoles for an agent running somewhere they cannot reach.
+tablets become notification surfaces via APNs pushes through the control plane
+(`controlPlane` block), the `notifyCommand` hook, and the S3 remote-supervision
+channel — and, with the cloud transcript and inbox, full remote consoles for an agent
+running somewhere they cannot reach.
 
 ## Layout
 
@@ -34,7 +35,8 @@ consoles for an agent running somewhere they cannot reach.
   `config.example.json`), connects, submits the task, then heartbeats a reflective
   prompt until the model ends a reply with `TASK COMPLETE`. JSONL audit log; clean
   SIGINT/SIGTERM shutdown. `DaemonDirectiveClient` is the S3 supervision consumer;
-  `DaemonTranscriptUplink` is the cloud transcript writer.
+  `DaemonTranscriptUplink` is the cloud transcript writer; `DaemonNotifyClient` is the
+  push-notification uplink to the control plane.
 
 ## Config
 
@@ -49,6 +51,7 @@ Beyond `server`, `agent`, and `task`, every field is optional:
 | `deviceToken8` | `cloud001` | Short host id echoed as the status document's `device_id8` |
 | `supervision` | — | The S3 channel (below) |
 | `transcript` | — | The cloud transcript (below) |
+| `controlPlane` | — | Endpoint + bearer token of the serverless control plane; turns notify events into APNs pushes (below) |
 
 ### stayResident
 
@@ -172,7 +175,7 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
 
   ```json
   {"schema": 1, "device": "fin-agentd", "device_id8": "cloud001",
-   "daemon_version": "1.1.0", "agent": "fin-agentd-1", "state": "idle",
+   "daemon_version": "1.2.0", "agent": "fin-agentd-1", "state": "idle",
    "last_applied_id": "d-1", "last_turn_at": "…", "last_assistant_preview": "…",
    "last_error": null, "updated_at": "…"}
   ```
@@ -223,16 +226,29 @@ the local trail only (a transcript nobody can fetch is the one place its own fai
 could never be read), throttled to one line per 5 minutes per distinct error, and are
 otherwise swallowed.
 
-## Notify hook
+## Notify events
 
-`notifyCommand` runs via `/bin/sh -c` with two variables in its environment:
+Two events surface to a human, on two independent paths that both fire when both
+are configured:
 
-| Variable | Values |
+| Event | Fired when |
 |---|---|
-| `FIN_EVENT` | `request-input` (the model called `request_input`, or 5 consecutive turns failed) · `task-complete` (the model ended a reply with `TASK COMPLETE`) |
-| `FIN_MESSAGE` | The question, failure summary, or final reply text |
+| `request-input` | The model called `request_input`, or 5 consecutive turns failed |
+| `task-complete` | The model ended a reply with `TASK COMPLETE` |
 
-Launch failures are logged and swallowed — a broken notifier never takes down the agent.
+**Push notifications** (`controlPlane` block): `DaemonNotifyClient` POSTs the
+control plane's `/notify` route, which fans the alert out over APNs to every
+device token the app has registered (`scripts/cloud-agent/control-plane`). The
+message is redacted through `MemoryRedactor` and capped at 500 characters
+before it leaves the machine — the same rule as the cloud transcript — and the
+title comes from the event (`<agent> needs input` / `<agent>: task complete`).
+POST failures audit `[notify] post failed: <reason>` (throttled to one line per
+5 minutes per distinct error) and are otherwise swallowed. The bearer token
+never reaches a log line.
+
+**Shell hook** (`notifyCommand`): runs via `/bin/sh -c` with `FIN_EVENT` and
+`FIN_MESSAGE` in its environment. Launch failures are logged and swallowed — a
+broken notifier never takes down the agent.
 
 ## Test
 

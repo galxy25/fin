@@ -67,6 +67,15 @@ curl -sS "$API/secrets" -H "$AUTH"
 
 # schedule a credential for deletion (7-day recovery window)
 curl -sS -X DELETE "$API/secrets/gmail?agentScope=Nimbus" -H "$AUTH"
+
+# register this device's APNs token (the app does this itself on every launch)
+curl -sS -X PUT "$API/device-tokens" -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"token": "<64 hex chars>", "platform": "iOS", "deviceName": "iPad"}'
+
+# push one alert to every registered device (what fin-agentd's notify client calls)
+curl -sS -X POST "$API/notify" -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"title": "Nimbus needs input", "body": "Which branch should I deploy?",
+       "agent": "Nimbus"}'
 ```
 
 `POST /workers` refuses with 409 when the agent already has a live worker. When
@@ -114,8 +123,10 @@ Sharp edges:
 - **Auto-provisioned agents share the template's LLM route.** The template
   preserves `agent.endpointURL`, `agent.apiKey`, and the model parameters from
   its source config as shared infrastructure — every auto-provisioned agent
-  talks to the same backend with the same token. An agent that needs its own
-  route still needs a hand-provisioned config.
+  talks to the same backend with the same token. The same goes for a
+  `controlPlane` push block when the source config carries one: one control
+  plane serves every agent. An agent that needs its own route still needs a
+  hand-provisioned config.
 - **The presigned URLs inside an auto-provisioned config are signed by the
   Lambda role's temporary credentials** and die with them (hours in practice,
   whatever the stated week-long expiry says) — unlike the operator-minted URLs
@@ -145,6 +156,56 @@ in `../browser-smoke.py` as a standalone script — the empirical-verification
 primitive: run it on the worker over SSM whenever you need proof the browser
 stack really works, rather than trusting that the install succeeded. The manual
 path has it too: `../launch.sh <agent> <config-key> t4g.small browser`.
+
+## Push notifications (APNs)
+
+The loop from a headless agent back to a human. The app registers its APNs
+device token with `PUT /device-tokens` on every launch (tokens rotate; the
+token is the `fin-device-tokens` table's hash key, so re-registration is a
+dedupe-by-overwrite), and `POST /notify` — called by fin-agentd's
+`DaemonNotifyClient` when its config carries a `controlPlane` block — fans one
+alert out to every stored token.
+
+- **Routes.** `PUT /device-tokens` takes `{"token": "<hex>", "platform":
+  "iOS|macOS|visionOS", "deviceName"?: "…"}`; the token is validated as hex and
+  lowercased. `POST /notify` takes `{"title", "body", "agent"?}` — overlong
+  title/body are truncated (the sender is an unattended daemon with nobody
+  there to shorten and retry), and the 200/502 body reports `{"delivered",
+  "failed", "removed", "reasons"}`: counts and APNs reason strings only, never
+  a token. 502 means tokens exist but nothing got through, so the daemon's
+  audit trail records the outage.
+- **Transport.** APNs' token-based HTTP/2 API. The stdlib has no HTTP/2 client
+  and APNs speaks nothing else, so `deploy.sh` vendors `httpx[http2]` into the
+  Lambda zip, plus `ecdsa` to sign the ES256 provider JWT — all pure python,
+  no compiled wheels, so the zip builds identically on any machine. The JWT is
+  cached per warm container and refreshed after 40 minutes (Apple's window is
+  20–60).
+- **Environments.** A TestFlight build's token lives in APNs production, a
+  devicectl debug build's in the sandbox, and the registration carries no
+  reliable marker of which — so each token is tried against production first
+  and retried against sandbox on `BadDeviceToken`. The discovered environment
+  is stored on the token row; later notifies go straight there. Tokens APNs
+  declares dead (`Unregistered`, `ExpiredToken`, `DeviceTokenNotForTopic`, or
+  `BadDeviceToken` in both environments) are deleted — the app re-PUTs a live
+  token on its next launch.
+
+**The one manual step**: create an APNs auth key, once. At
+[developer.apple.com](https://developer.apple.com/account) → Certificates,
+Identifiers & Profiles → **Keys** → **+**, name it, check **Apple Push
+Notifications service (APNs)**, register, and download `AuthKey_<KEYID>.p8` —
+Apple hands the file out exactly once, at creation. Then either
+
+```sh
+mkdir -p ~/.appstoreconnect/apns && mv ~/Downloads/AuthKey_*.p8 ~/.appstoreconnect/apns/
+./deploy.sh
+```
+
+or point `FIN_APNS_KEY_PATH` at the file and run `./deploy.sh`. The key id is
+parsed from the filename; the team id (`EC27UF79GL`) and topic
+(`dev.levischoen.fin`, the app's bundle id) are baked-in defaults, overridable
+via `APNS_TEAM_ID` / `APNS_TOPIC`. Without the key the deploy still succeeds:
+token registration, storage, and every other route work — only `POST /notify`
+answers `503 APNs key is not configured`.
 
 ## Service credentials (write-only secret store)
 

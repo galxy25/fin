@@ -13,12 +13,24 @@ import UIKit
 /// foreground pushes present via `willPresent`, taps deep-link via `didReceive` —
 /// so the remote-notification callback here is deliberately not a router: on
 /// macOS it also fires on mere arrival, where hijacking navigation would be wrong.
+///
+/// The token callback forwards to `DeviceTokenUplink` on every launch (tokens
+/// rotate; the control plane dedupes), which is how the headless fin-agentd
+/// daemon gets a push path to this device. Registration failure is normal on
+/// simulators and boxes without push entitlements, so it stays silent.
 final class FinAppDelegate: NSObject {}
 
 #if os(macOS)
 extension FinAppDelegate: NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.registerForRemoteNotifications()
+    }
+
+    func application(
+        _ application: NSApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        DeviceTokenUplink.register(deviceToken: deviceToken)
     }
 }
 #else
@@ -29,6 +41,13 @@ extension FinAppDelegate: UIApplicationDelegate {
     ) -> Bool {
         application.registerForRemoteNotifications()
         return true
+    }
+
+    func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        DeviceTokenUplink.register(deviceToken: deviceToken)
     }
 }
 #endif

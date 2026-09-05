@@ -9,6 +9,10 @@
 # once and reused from ~/.fin-control-plane-token on later runs; rotating it on
 # every deploy would silently break every client. Export FIN_CP_TOKEN to force
 # a specific token.
+#
+# Push notifications need one manual prerequisite: an APNs auth key (.p8) —
+# see the "APNs auth key" section below. Absent, the deploy still succeeds and
+# only POST /notify is dark (503).
 set -euo pipefail
 
 PROFILE=levi
@@ -16,12 +20,15 @@ REGION=us-west-2
 FUNCTION=fin-control-plane
 ROLE=fin-control-plane
 TABLE=fin-cloud-workers
+TOKENS_TABLE=fin-device-tokens
 API_NAME=fin-control-plane
 RULE=fin-worker-sweep
 BUCKET=fin-agent-directives-011183829623
 FACTORY_BUCKET=fin-model-factory-011183829623
 AGENT_ROLE=fin-agent-ssm
 TOKEN_FILE="$HOME/.fin-control-plane-token"
+APNS_TEAM_ID="${APNS_TEAM_ID:-EC27UF79GL}"
+APNS_TOPIC="${APNS_TOPIC:-dev.levischoen.fin}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 aws() { command aws --profile "$PROFILE" --region "$REGION" "$@"; }
@@ -42,6 +49,19 @@ if ! aws dynamodb describe-table --table-name "$TABLE" >/dev/null 2>&1; then
     --billing-mode PAY_PER_REQUEST >/dev/null
   aws dynamodb wait table-exists --table-name "$TABLE"
   echo "==> Created DynamoDB table $TABLE (on-demand)"
+fi
+
+# APNs device tokens, one item per device, keyed by the token itself (dedupe by
+# design — the app re-PUTs on every launch). Its own table, not an item-type in
+# $TABLE: that table's rows ARE workers, and list_workers scans it whole.
+if ! aws dynamodb describe-table --table-name "$TOKENS_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$TOKENS_TABLE" \
+    --attribute-definitions AttributeName=token,AttributeType=S \
+    --key-schema AttributeName=token,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$TOKENS_TABLE"
+  echo "==> Created DynamoDB table $TOKENS_TABLE (on-demand)"
 fi
 
 # --- model-factory data lake -------------------------------------------------
@@ -146,6 +166,18 @@ cat > "$BUILD/policy.json" <<JSON
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$TABLE"
     },
     {
+      "Sid": "DeviceTokenRecords",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:Scan"
+      ],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$TOKENS_TABLE"
+    },
+    {
       "Sid": "AgentObjects",
       "Effect": "Allow",
       "Action": "s3:GetObject",
@@ -220,15 +252,66 @@ else
   echo "==> Generated a new API token and saved it to $TOKEN_FILE (chmod 600)"
 fi
 
-# The token goes to the CLI through a file inside the 0700 build dir, never on a
-# command line where ps would show it.
-printf '{"Variables":{"FIN_CP_TOKEN":"%s"}}\n' "$TOKEN" > "$BUILD/env.json"
+# --- APNs auth key (optional) ------------------------------------------------
+# The ONE manual prerequisite for push: an APNs auth key, created once at
+# developer.apple.com → Certificates, Identifiers & Profiles → Keys → "+",
+# with "Apple Push Notifications service (APNs)" checked, then downloaded as
+# AuthKey_<KEYID>.p8 — Apple hands the file out exactly once, at creation.
+# Point FIN_APNS_KEY_PATH at it, or drop it in ~/.appstoreconnect/apns/.
+# Absent, the deploy proceeds without the APNS_* env and POST /notify answers
+# 503; every other route is unaffected.
+APNS_KEY_FILE="${FIN_APNS_KEY_PATH:-}"
+if [ -z "$APNS_KEY_FILE" ]; then
+  APNS_KEY_FILE=$(ls -t "$HOME"/.appstoreconnect/apns/AuthKey_*.p8 2>/dev/null | head -n 1 || true)
+fi
+APNS_KEY_ID=""
+if [ -n "$APNS_KEY_FILE" ] && [ -s "$APNS_KEY_FILE" ]; then
+  APNS_KEY_ID=$(basename "$APNS_KEY_FILE" | sed -n 's/^AuthKey_\([A-Z0-9]\{10\}\)\.p8$/\1/p')
+  if [ -z "$APNS_KEY_ID" ]; then
+    echo "==> $APNS_KEY_FILE is not named AuthKey_<KEYID>.p8; deploying without push credentials" >&2
+    APNS_KEY_FILE=""
+  else
+    echo "==> APNs push enabled: key $APNS_KEY_ID, topic $APNS_TOPIC"
+  fi
+else
+  APNS_KEY_FILE=""
+  echo "==> No APNs auth key (set FIN_APNS_KEY_PATH or drop AuthKey_<KEYID>.p8 in ~/.appstoreconnect/apns/)"
+  echo "    Deploying without push credentials: POST /notify will answer 503."
+fi
+
+# The token and the .p8 content go to the CLI through a file inside the 0700
+# build dir, never on a command line where ps would show them.
+FIN_CP_TOKEN_VALUE="$TOKEN" APNS_KEY_FILE="$APNS_KEY_FILE" APNS_KEY_ID="$APNS_KEY_ID" \
+  APNS_TEAM_ID="$APNS_TEAM_ID" APNS_TOPIC="$APNS_TOPIC" \
+  python3 - "$BUILD/env.json" <<'PY'
+import json, os, sys
+
+variables = {"FIN_CP_TOKEN": os.environ["FIN_CP_TOKEN_VALUE"]}
+key_file = os.environ.get("APNS_KEY_FILE")
+if key_file:
+    with open(key_file) as handle:
+        variables.update(
+            APNS_KEY=handle.read(),
+            APNS_KEY_ID=os.environ["APNS_KEY_ID"],
+            APNS_TEAM_ID=os.environ["APNS_TEAM_ID"],
+            APNS_TOPIC=os.environ["APNS_TOPIC"],
+        )
+with open(sys.argv[1], "w") as handle:
+    json.dump({"Variables": variables}, handle)
+PY
 
 # --- Lambda ------------------------------------------------------------------
 # Packaged as lambda_function.py: `lambda` is a reserved word, so nothing that
 # parses the handler string has to cope with a module named after a keyword.
-cp "$HERE/lambda.py" "$BUILD/lambda_function.py"
-(cd "$BUILD" && zip -q lambda.zip lambda_function.py)
+# The zip vendors the /notify dependencies: APNs speaks only HTTP/2 and the
+# stdlib has no HTTP/2 client, so httpx+h2 ride along, plus ecdsa for the ES256
+# provider JWT. All pure python on purpose — no compiled wheels, so a zip built
+# on any machine runs unchanged on the arm64 python3.12 runtime.
+PKG="$BUILD/pkg"
+mkdir -p "$PKG"
+python3 -m pip install --quiet --no-compile --target "$PKG" 'httpx[http2]' ecdsa
+cp "$HERE/lambda.py" "$PKG/lambda_function.py"
+(cd "$PKG" && zip -qr "$BUILD/lambda.zip" . -x 'bin/*')
 
 if aws lambda get-function --function-name "$FUNCTION" >/dev/null 2>&1; then
   aws lambda update-function-code --function-name "$FUNCTION" \
@@ -300,6 +383,8 @@ POST /feedback
 PUT /secrets/{service}
 GET /secrets
 DELETE /secrets/{service}
+PUT /device-tokens
+POST /notify
 ROUTES
 
 if ! aws apigatewayv2 get-stage --api-id "$API_ID" --stage-name '$default' >/dev/null 2>&1; then

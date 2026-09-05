@@ -9,10 +9,11 @@ import Glibc
 /// Reads a JSON config (path as argv[1]), opens a real SSH+PTY session (typically into a
 /// durable tmux session), submits the configured task to an `AgentTurnEngine` driving an
 /// OpenAI-compatible endpoint, then keeps the agent alive on a reflective heartbeat until
-/// the model declares TASK COMPLETE. Phones and tablets become notification surfaces: the
-/// optional `notifyCommand` hook is invoked with $FIN_EVENT/$FIN_MESSAGE for
-/// request-input and task-complete events, which is where a push service or CloudKit
-/// writer plugs in later.
+/// the model declares TASK COMPLETE. Phones and tablets become notification surfaces two
+/// ways: the optional `controlPlane` block turns request-input and task-complete events
+/// into APNs pushes via the control plane's `/notify` route (`DaemonNotifyClient`), and
+/// the optional `notifyCommand` hook is invoked with $FIN_EVENT/$FIN_MESSAGE for the
+/// same events, for anything a shell one-liner can reach.
 @main
 struct FinAgentDaemon {
     @MainActor
@@ -79,6 +80,17 @@ struct DaemonConfig: Decodable {
         var pollSeconds: Int?
     }
 
+    /// The serverless control plane (scripts/cloud-agent/control-plane). Present = the
+    /// daemon's request-input and task-complete events become push notifications:
+    /// `DaemonNotifyClient` POSTs `/notify`, which fans out over APNs to every device
+    /// token the app has registered. Absent = the daemon is exactly as silent as before.
+    struct ControlPlaneConfig: Decodable {
+        /// The API Gateway endpoint, e.g. https://<api-id>.execute-api.us-west-2.amazonaws.com
+        var endpointURL: String
+        /// The control plane's bearer token — a credential; it must never reach a log line.
+        var token: String
+    }
+
     /// The cloud transcript the iOS app renders for a remote agent. Present = the daemon
     /// keeps a redacted rolling copy of its audit trail and PUTs it whole; absent = off.
     struct TranscriptConfig: Decodable {
@@ -113,6 +125,8 @@ struct DaemonConfig: Decodable {
     var supervision: SupervisionConfig?
     /// Optional cloud-transcript block; see `TranscriptConfig`.
     var transcript: TranscriptConfig?
+    /// Optional control-plane block for push notifications; see `ControlPlaneConfig`.
+    var controlPlane: ControlPlaneConfig?
 
     static let defaultDeviceToken8 = "cloud001"
     static let defaultTranscriptFlushSeconds = 15
@@ -164,6 +178,13 @@ final class Daemon {
     private var supervision: DaemonDirectiveClient?
     /// The cloud transcript uplink; nil when the config has no `transcript` block.
     private var transcript: DaemonTranscriptUplink?
+    /// The push-notification client; nil when the config has no `controlPlane` block.
+    private var notifyClient: DaemonNotifyClient?
+    /// The most recent push send, awaited on the exit paths: task-complete fires a push
+    /// moments before shutdown, and an exit 300ms later would kill the POST mid-flight —
+    /// the one alert a non-resident daemon exists to deliver. Bounded by the client's
+    /// own request timeout, so a dead control plane can't wedge a shutdown.
+    private var lastNotifyTask: Task<Void, Never>?
     /// The app-side Agent UUID from the config; validated at load, so nil here means
     /// "unset", never "malformed".
     private let agentID: UUID?
@@ -423,6 +444,20 @@ final class Daemon {
             log("cloud transcript enabled: last \(uplink.maxLines) lines, "
                 + "flushed at most every \(uplink.flushSeconds)s")
         }
+        if let block = config.controlPlane {
+            // The agent name doubles as the alert's identity; the transcript's
+            // fallback keeps the two surfaces consistent for an unnamed agent.
+            notifyClient = DaemonNotifyClient(
+                endpointURL: block.endpointURL,
+                token: block.token,
+                agentName: config.supervision?.agentName ?? "Agent",
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                }
+            )
+            log("push notifications enabled: control plane /notify as \"\(notifyClient?.agentName ?? "Agent")\"")
+        }
 
         var consecutiveFailures = 0
         /// The directive whose injected text produced the outcome being handled, if
@@ -638,9 +673,11 @@ final class Daemon {
         auditLog.close()
         // Give the disconnect's async close a moment before the process dies — and get
         // the last transcript lines up first, so a supervisor watching remotely sees why
-        // the agent stopped rather than a timeline that just ends.
+        // the agent stopped rather than a timeline that just ends. The in-flight push
+        // (task-complete rides right ahead of this) gets to land too.
         Task { @MainActor in
             await transcript?.flush()
+            await lastNotifyTask?.value
             try? await Task.sleep(for: .milliseconds(300))
             exit(exitCode)
         }
@@ -652,14 +689,21 @@ final class Daemon {
         log("fatal: \(message)")
         record(AgentAuditEvent(kind: "error", text: message, isFailure: true))
         await transcript?.flush()
+        // The giving-up push (5 consecutive failures) precedes some fail()s; let it land.
+        await lastNotifyTask?.value
         auditLog.close()
         session?.disconnect()
         exit(1)
     }
 
-    /// Runs the configured notify hook with the event in its environment. Failures are
-    /// logged and swallowed — a broken notifier must never take down the agent.
+    /// Surfaces one event to a human: the push path when a `controlPlane` block is
+    /// configured, and the shell hook when `notifyCommand` is. Both fire when both are
+    /// present; failures on either are logged and swallowed — a broken notifier must
+    /// never take down the agent.
     private func notify(event: String, message: String) {
+        if let client = notifyClient {
+            lastNotifyTask = Task { await client.send(event: event, message: message) }
+        }
         guard let command = config.notifyCommand, !command.isEmpty else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")

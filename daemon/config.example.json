@@ -33,5 +33,10 @@
     "putURL": "https://your-bucket.s3.amazonaws.com/fin/agentd-transcript.jsonl?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-...",
     "flushSeconds": 15,
     "maxLines": 2000
+  },
+  "controlPlane": {
+    "_note": "Optional. Present, request-input and task-complete events become APNs pushes via the control plane's POST /notify; absent, the daemon stays silent. The token is ~/.fin-control-plane-token on the deploy machine.",
+    "endpointURL": "https://your-api-id.execute-api.us-west-2.amazonaws.com",
+    "token": "the control plane bearer token"
   }
 }
