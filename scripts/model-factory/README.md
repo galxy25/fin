@@ -190,14 +190,20 @@ recipe, bigger runner (48 GB card or high-RAM Apple Silicon).
 
 Runner options:
 
-1. **Local Apple Silicon (mlx-lm)** — `mlx_lm.lora` with `--train` on the same
-   chat JSONL, 4-bit base. A 64 GB+ M-series box handles the 4B comfortably
-   and the 12B tolerably. Marginal cost ≈ $0; slower wall clock than an L4 but
-   no launch approval needed since it's not a GPU job in AWS. Note honestly:
-   MLX LoRA is not bit-identical to the HF QLoRA recipe — whichever runner
-   trains the candidate, the **eval gate is the arbiter**, so the difference
-   is measured, not assumed.
-2. **EC2 g6.xlarge spot** (L4 24 GB) — the default cloud runner. 4B QLoRA fits
+1. **Local Apple Silicon (mlx-lm) — THE DEFAULT RUNNER** (Levi, 2026-09-05:
+   run it on the current iMac if it finishes in "days … a week or two";
+   corpus-scale runs finish in hours). Verified hardware: **M4 iMac, 32 GB
+   unified, 10 cores** — a 4-bit 4B base + LoRA trains comfortably in 32 GB.
+   `mlx_lm.lora` with `--train` on the same chat JSONL. Marginal cost ≈ $0 and
+   no launch approval needed since it's not a GPU job in AWS. **Preflight:
+   check free disk** — the box had ~9 GB free at last check and a 4B
+   base + checkpoints wants ~15 GB (clearing `~/Library/Developer/Xcode/
+   DerivedData` usually frees tens of GB); the 12B is disk-blocked locally and
+   goes to the cloud runners below. Note honestly: MLX LoRA is not
+   bit-identical to the HF QLoRA recipe — whichever runner trains the
+   candidate, the **eval gate is the arbiter**, so the difference is measured,
+   not assumed.
+2. **EC2 g6.xlarge spot** (L4 24 GB) — the default *cloud* runner. 4B QLoRA fits
    easily; 12B fits in 24 GB at 4-bit but is tight at 4k seq — use g6.2xlarge
    or g6e.xlarge (L40S 48 GB) for the 12B.
 3. **SageMaker training job** (ml.g6.xlarge) — managed spot, automatic S3
@@ -289,3 +295,42 @@ For a promoted candidate:
 4. **Flip `models/champion.json`** to point at it. The app and the daemon load
    the champion by that pointer, so rollback is rewriting one small JSON
    object to the previous model id.
+
+## Serving roadmap
+
+Two stages, in order (Levi, 2026-09-05):
+
+1. **Now — local LM Studio.** The promoted GGUF serves from LM Studio on
+   Levi's own boxes (the exact runtime the eval gate scores against). The fin
+   app's existing custom-endpoint agent provider points at it; nothing new to
+   build.
+2. **Later — hosted endpoint for fin app users**: the promoted model served by
+   **vLLM on SageMaker endpoints behind an API gateway**, so app users who
+   don't run their own model get the foreman brain as a managed service.
+   Auth rides the same bearer-token pattern as the control plane (per-user
+   tokens when this goes multi-tenant); the endpoint serves the OpenAI dialect
+   so `router_llm.py`, the app's `openAICompatible` provider, and the eval
+   gate all work against it unchanged. Standing rule applies: a SageMaker
+   endpoint bills per-hour like a GPU job — **no endpoint is created without
+   an explicit human go**, and the deployment recipe lands here when stage 2
+   starts.
+
+## Fine-tune targets (the curriculum)
+
+The foreman model is tuned for fin's own jobs, each with an eval corpus as
+both gate and seed data:
+
+1. **tmux session management** — `evals/tmux-routing/` (live today, the
+   current gate).
+2. **Mission monitoring / context management** — `evals/goals-ledger/` (the
+   heartbeat tick corpus; joins the gate when its runner lands here).
+3. **Owner-feedback elicitation** — knowing when and how to ask the factory
+   owner for a decision, and when the ledger already answers it.
+4. **App tool-use** (Levi, 2026-09-05) — trajectories in the app's OWN tool
+   schema (FinAgentCore's tools), centered on **`request_input`**: hitting a
+   login wall, a 2FA challenge, or missing credentials means *prompt the
+   owner through the app* — never guess, never stall. Ties into the
+   cloud-browser + secret-store work: the tool call is what triggers the 2FA
+   relay. SFT examples for this track are tool-call transcripts, not
+   decision JSON — the dataset builder grows a track per target as each
+   corpus lands.
