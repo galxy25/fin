@@ -175,6 +175,26 @@ enum ServiceCredentialsClient {
         return listOutcome(status: status, body: data)
     }
 
+    /// Provisions Fin's SSH key to cloud workers: one PUT of the private key
+    /// (and the public half, for reference) under `AgentSSHKey.secretService`
+    /// in the shared scope, so every worker's bootstrap can install it at boot.
+    /// `api-key` is the least-wrong of the contract's kinds for a key pair.
+    /// Same value discipline as `storeSecret`: the key text lives only in this
+    /// call's frame — into the body, onto the wire, gone on return.
+    static func storeAgentSSHKey(
+        privateKey: String, publicKey: String
+    ) async -> Result<PutAck, Failure> {
+        guard let url = endpointURL(path: "/secrets/\(AgentSSHKey.secretService)") else {
+            return .failure(.notConfigured)
+        }
+        var request = authorizedRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = agentSSHKeyBody(privateKey: privateKey, publicKey: publicKey)
+        let (status, data) = await send(request)
+        return putOutcome(status: status, body: data)
+    }
+
     /// Schedules deletion with the store's 7-day recovery window (never a
     /// force-delete). Idempotent server-side: deleting an already-scheduled
     /// credential answers the same 200.
@@ -217,6 +237,23 @@ enum ServiceCredentialsClient {
         if !trimmedUsername.isEmpty { object["username"] = trimmedUsername }
         let trimmedNote = note?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !trimmedNote.isEmpty { object["note"] = trimmedNote }
+        return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    }
+
+    /// The key-provisioning PUT body: `{"agentScope": "shared", "kind":
+    /// "api-key", "privateKey", "publicKey", "note"}`. `privateKey`/`publicKey`
+    /// are contract fields the Lambda stores alongside `value`/`username` in
+    /// the flat SecretString object the worker bootstrap reads; the fixed note
+    /// becomes the row's label in `GET /secrets` (metadata, safe — it names the
+    /// credential, quoting no part of it).
+    static func agentSSHKeyBody(privateKey: String, publicKey: String) -> Data? {
+        let object: [String: Any] = [
+            "agentScope": sharedScope,
+            "kind": SecretKind.apiKey.rawValue,
+            "privateKey": privateKey,
+            "publicKey": publicKey,
+            "note": "Fin's SSH key, generated in the app",
+        ]
         return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 

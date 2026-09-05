@@ -245,9 +245,10 @@ per-agent instance roles and is future work.
 ### The routes
 
 - `PUT /secrets/{service}` — body `{"value": "…", "username"?: "…",
-  "note"?: "…", "agentScope"?: "Nimbus", "kind"?: "app-password"}`. `value` is
-  required; each field is capped at 4 KB and the whole secret at 64 KB (the
-  Secrets Manager hard limit). `kind` is one of `app-password | oauth |
+  "privateKey"?: "…", "publicKey"?: "…", "note"?: "…", "agentScope"?: "Nimbus",
+  "kind"?: "app-password"}`. `value` (or `privateKey` — the shape Fin's key
+  uses, below) is required; each field is capped at 4 KB and the whole secret
+  at 64 KB (the Secrets Manager hard limit). `kind` is one of `app-password | oauth |
   api-key | password` (default `password`) and is stored as a tag, so listing
   never touches values. 201 on create, 200 on update; the response is
   `{"service", "agentScope", "kind", "lastUpdated"}` — never the value, never
@@ -264,6 +265,31 @@ per-agent instance roles and is future work.
   7-day recovery window, never force-delete; 200 `{"service", "agentScope",
   "deletionDate"}`, 404 when absent, and idempotent — deleting an
   already-scheduled secret answers the same 200.
+
+### Fin's key (`fin-agent-ssh-key`)
+
+The reserved service `fin/service-creds/shared/fin-agent-ssh-key` is the SSH
+identity the app generates under **Fin's Key** (in any agent's editor): an
+ed25519 key pair stored with `kind: api-key` and fields
+`{"privateKey": "…", "publicKey": "…"}` instead of `value`/`username`. The user
+grants their Fin access to a computer by appending the public line to that
+computer's `~/.ssh/authorized_keys` (the app hands them the one-line command),
+and revokes it by deleting that line — the key's comment, `fins-key`, is the
+grep handle.
+
+At boot, **before** `fin-agentd` starts, the worker bootstrap (both copies —
+`launch.sh` and this Lambda's `USER_DATA`; `../check-userdata-parity.py`
+verifies they match) fetches the secret with the instance role's
+`GetSecretValue` and installs the private key at
+`/home/fin-agent/.ssh/fin_agent_ed25519` (0600, owned `fin-agent`). A config's
+`server.privateKeyPath` can point there to let a cloud worker reach the same
+computers the user granted. A missing secret is a clean no-op: workers without
+a provisioned key boot exactly as before.
+
+Write-only like every secret here: the app shows only `GET /secrets` metadata
+(provisioned/last-read dates) and re-provisions by re-PUT. Redeploy the Lambda
+(`./deploy.sh`) once after this change so `PUT /secrets` accepts the
+`privateKey`/`publicKey` fields.
 
 ### Rotation and staleness
 

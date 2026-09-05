@@ -38,6 +38,7 @@ struct AgentEditView: View {
             remoteSupervisionSection
             helpImproveSection
             connectedServicesSection
+            finKeySection
             promptSection
         }
         .navigationTitle(agent.name.isEmpty ? "Agent" : agent.name)
@@ -481,6 +482,26 @@ struct AgentEditView: View {
                 + "— a Gmail app password, an API key. They're encrypted in your "
                 + "own AWS Secrets Manager; the app can store them but can never "
                 + "read them back.")
+        }
+    }
+
+    // MARK: - Fin's Key
+
+    /// Account-wide, unlike the device-wide sections above it: the key belongs
+    /// to the user's Fin everywhere (metadata via CloudKit, private key via
+    /// iCloud Keychain), so the entry point is the same from whichever agent's
+    /// editor you opened.
+    private var finKeySection: some View {
+        Section {
+            NavigationLink("Fin's Key") {
+                AgentKeyView()
+            }
+        } header: {
+            Text("Fin's Key")
+        } footer: {
+            Text("Fin's own SSH key. Add its public half to a computer to let "
+                + "Fin work there — from this device, your other devices, or a "
+                + "cloud worker.")
         }
     }
 

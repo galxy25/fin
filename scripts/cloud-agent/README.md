@@ -39,7 +39,14 @@ commit one.
 Service credentials (Gmail app passwords, API keys, …) are stored through the
 control plane's write-only `/secrets` API and read on-instance from Secrets
 Manager under `fin/service-creds/<scope>/<service>`; the control plane cannot
-read them back and never returns a value. Optional headless browser: pass the
+read them back and never returns a value. One reserved service rides that
+store: `fin-agent-ssh-key` (shared scope) is Fin's own SSH identity, generated
+in the app under "Fin's Key" — when present, the boot script installs its
+private key at `/home/fin-agent/.ssh/fin_agent_ed25519` (0600, `fin-agent`)
+before the daemon starts, so a config's `server.privateKeyPath` can point
+there; absent, the boot is unchanged. The bootstrap lives in two copies
+(`launch.sh` and the Lambda's `USER_DATA`) — `check-userdata-parity.py`
+verifies they stay byte-identical. Optional headless browser: pass the
 literal word `browser` as `launch.sh`'s 4th argument, or `"browser": true` on
 `POST /workers`, to install chromium + playwright (python) at boot — t4g.small
 or larger. `browser-smoke.py` is the empirical check that the browser stack

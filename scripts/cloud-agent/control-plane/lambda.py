@@ -136,6 +136,11 @@ SECRET_PREFIX = "fin/service-creds"
 SECRET_SCOPE_SHARED = "shared"
 SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 SECRET_KINDS = ("app-password", "oauth", "api-key", "password")
+# The flat SecretString fields a PUT may carry. value/username are the generic
+# credential shape; privateKey/publicKey are what the app's "Fin's Key" screen
+# stores under the reserved service fin-agent-ssh-key (shared scope), which the
+# worker bootstrap installs at boot. A secret must carry value or privateKey.
+SECRET_FIELDS = ("value", "username", "privateKey", "publicKey")
 SECRET_RECOVERY_DAYS = 7
 MAX_SECRET_FIELD_BYTES = 4 * 1024
 MAX_SECRET_BYTES = 64 * 1024  # the Secrets Manager hard limit
@@ -161,7 +166,8 @@ TABLE = _DYNAMODB.Table(TABLE_NAME)
 DEVICE_TOKENS_TABLE = _DYNAMODB.Table(DEVICE_TOKENS_TABLE_NAME)
 
 # Byte-for-byte the bootstrap from launch.sh; the two presigned URLs are the only
-# substitutions. Any change to launch.sh's user-data belongs here too.
+# substitutions. Any change to launch.sh's user-data belongs here too —
+# scripts/cloud-agent/check-userdata-parity.py verifies the contract.
 USER_DATA = """#!/bin/bash
 set -euxo pipefail
 # NOT libcurl: AL2023 preinstalls libcurl-minimal, which provides libcurl.so.4
@@ -180,6 +186,31 @@ curl -fsSL -o /opt/fin-agentd/fin-agentd '{binary_url}'
 curl -fsSL -o /opt/fin-agentd/config.json '{config_url}'
 chmod +x /opt/fin-agentd/fin-agentd
 chown -R fin-agent:fin-agent /opt/fin-agentd
+
+# --- Fin's key (optional): the SSH identity the app provisions ---------------
+# When the app has stored fin/service-creds/shared/fin-agent-ssh-key ("Provision
+# to Cloud Workers" under Fin's Key), install the private key BEFORE the daemon
+# starts so a config's server.privateKeyPath can point at
+# /home/fin-agent/.ssh/fin_agent_ed25519. A missing secret (or a role without
+# the read grant) is a clean no-op: the worker boots exactly as before.
+if (umask 077 && aws --region us-west-2 secretsmanager get-secret-value --secret-id fin/service-creds/shared/fin-agent-ssh-key --query SecretString --output text > /run/fin-agent-key.json) 2>/dev/null; then
+  python3 - <<'PYKEY' || echo 'FIN AGENT KEY INSTALL FAILED'
+import json, os, pwd
+fields = json.load(open("/run/fin-agent-key.json"))
+key = (fields.get("privateKey") or "").strip()
+if key:
+    path = "/home/fin-agent/.ssh/fin_agent_ed25519"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, key.encode() + chr(10).encode())
+    os.close(fd)
+    entry = pwd.getpwnam("fin-agent")
+    os.chown(path, entry.pw_uid, entry.pw_gid)
+    print("installed fin agent key")
+else:
+    print("fin-agent-ssh-key has no privateKey field; nothing installed")
+PYKEY
+fi
+rm -f /run/fin-agent-key.json
 
 cat > /etc/systemd/system/fin-agentd.service <<'UNIT'
 [Unit]
@@ -1131,7 +1162,7 @@ def put_secret(event, service):
     # runner's placeholder resolution addresses. Written once, then discarded;
     # nothing below this block may carry a field value anywhere else.
     fields = {}
-    for field in ("value", "username"):
+    for field in SECRET_FIELDS:
         raw = body.get(field)
         if raw is None:
             continue
@@ -1140,8 +1171,8 @@ def put_secret(event, service):
         if len(raw.encode("utf-8")) > MAX_SECRET_FIELD_BYTES:
             raise ApiError(400, "{} exceeds {} bytes".format(field, MAX_SECRET_FIELD_BYTES))
         fields[field] = raw
-    if "value" not in fields:
-        raise ApiError(400, "value is required")
+    if "value" not in fields and "privateKey" not in fields:
+        raise ApiError(400, "value (or privateKey) is required")
 
     note = body.get("note")
     if note is not None:

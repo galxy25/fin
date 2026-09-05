@@ -119,6 +119,31 @@ curl -fsSL -o /opt/fin-agentd/config.json '$CONFIG_URL'
 chmod +x /opt/fin-agentd/fin-agentd
 chown -R fin-agent:fin-agent /opt/fin-agentd
 
+# --- Fin's key (optional): the SSH identity the app provisions ---------------
+# When the app has stored fin/service-creds/shared/fin-agent-ssh-key ("Provision
+# to Cloud Workers" under Fin's Key), install the private key BEFORE the daemon
+# starts so a config's server.privateKeyPath can point at
+# /home/fin-agent/.ssh/fin_agent_ed25519. A missing secret (or a role without
+# the read grant) is a clean no-op: the worker boots exactly as before.
+if (umask 077 && aws --region us-west-2 secretsmanager get-secret-value --secret-id fin/service-creds/shared/fin-agent-ssh-key --query SecretString --output text > /run/fin-agent-key.json) 2>/dev/null; then
+  python3 - <<'PYKEY' || echo 'FIN AGENT KEY INSTALL FAILED'
+import json, os, pwd
+fields = json.load(open("/run/fin-agent-key.json"))
+key = (fields.get("privateKey") or "").strip()
+if key:
+    path = "/home/fin-agent/.ssh/fin_agent_ed25519"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, key.encode() + chr(10).encode())
+    os.close(fd)
+    entry = pwd.getpwnam("fin-agent")
+    os.chown(path, entry.pw_uid, entry.pw_gid)
+    print("installed fin agent key")
+else:
+    print("fin-agent-ssh-key has no privateKey field; nothing installed")
+PYKEY
+fi
+rm -f /run/fin-agent-key.json
+
 cat > /etc/systemd/system/fin-agentd.service <<'UNIT'
 [Unit]
 Description=fin cloud agent harness
@@ -141,7 +166,8 @@ EOF
 )
 
 # Byte-for-byte the optional browser block from control-plane/lambda.py
-# (BROWSER_USER_DATA) — any change here belongs there too. Runs AFTER the
+# (BROWSER_USER_DATA) — any change here belongs there too;
+# check-userdata-parity.py verifies both blocks. Runs AFTER the
 # harness is enabled so the chromium download never delays the status object
 # the sweep's boot grace waits on.
 if [ "$WITH_BROWSER" = "browser" ]; then

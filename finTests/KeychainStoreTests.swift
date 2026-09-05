@@ -37,6 +37,30 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertNil(KeychainStore.loadPrivateKey(for: keyID))
     }
 
+    /// Fin's Key depends on the private key reaching every device through
+    /// iCloud Keychain, so assert the saved item really carries the
+    /// synchronizable attribute rather than trusting the save path's constant.
+    /// (Runs only where the entitled app host exists — the macOS skip above is
+    /// also the guard for environments without iCloud Keychain.)
+    func testSavedPrivateKeyItemIsFlaggedSynchronizable() throws {
+        let keyID = UUID()
+        defer { KeychainStore.deleteKeyMaterial(for: keyID) }
+        try KeychainStore.savePrivateKey(Data("sync-check".utf8), for: keyID)
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "dev.levischoen.fin.privatekey",
+            kSecAttrAccount as String: keyID.uuidString,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        XCTAssertEqual(SecItemCopyMatching(query as CFDictionary, &result), errSecSuccess)
+        let attributes = try XCTUnwrap(result as? [String: Any])
+        XCTAssertEqual(attributes[kSecAttrSynchronizable as String] as? Int, 1)
+    }
+
     func testMigratesLegacyDeviceOnlyItemForward() throws {
         let keyID = UUID()
         defer { KeychainStore.deleteKeyMaterial(for: keyID) }
