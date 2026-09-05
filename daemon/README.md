@@ -63,6 +63,19 @@ operation. Audited as `[monitor] task complete — staying resident, beats suspe
 cleanly; without a `supervision` block there is nothing that can wake a suspended agent,
 so pair the two.
 
+### Session routing registry
+
+If a `routing-registry.json` sits next to the audit log (the same directory that holds
+`fin-agentd-directives.json`), the daemon appends the tmux session-routing block to its
+system prompt at startup: the model learns which registered sessions it may route
+terminal work into, and that every other live session is off-limits. Schema:
+`evals/tmux-routing/registry.example.json`. The app reads the same basename from its own
+per-device spot, `Application Support/fin/routing-registry.json` — machine-scoped in both
+places on purpose, because a tmux session exists on exactly one host, so the file never
+rides CloudKit or any synced channel. Nothing creates the file automatically; absent (or
+empty) it changes nothing, and the prompt stays byte-identical to a registry-less build.
+Read once at startup, so edits take effect on the next launch.
+
 ## Run
 
 ```sh

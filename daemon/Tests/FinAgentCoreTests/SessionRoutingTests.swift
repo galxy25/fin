@@ -253,6 +253,32 @@ final class SessionRoutingTests: XCTestCase {
         XCTAssertEqual(reloaded.sessions.first?.createdByFin, true)
     }
 
+    // MARK: - synchronous load for prompt composition
+
+    /// Both "no file yet" and "file mangled beyond the lenient decoder" must read as
+    /// no registry: dropping the routing section beats bricking prompt composition.
+    func testLoadIfPresentTreatsAbsentAndCorruptFilesAsNoRegistry() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fin-routing-load-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent(RegistryDocument.standardFileName)
+
+        XCTAssertNil(RegistryDocument.loadIfPresent(at: url))
+        try Data("not a registry".utf8).write(to: url)
+        XCTAssertNil(RegistryDocument.loadIfPresent(at: url))
+    }
+
+    func testLoadIfPresentReadsAWrittenRegistry() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fin-routing-load-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try JSONEncoder().encode(registry).write(to: url)
+
+        let loaded = try XCTUnwrap(RegistryDocument.loadIfPresent(at: url))
+        XCTAssertEqual(loaded, registry)
+    }
+
     // MARK: - prompt gating
 
     func testPromptSectionIsNilForEmptyRegistry() {

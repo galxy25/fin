@@ -188,6 +188,18 @@ struct FinApp: App {
         manager.memoryAccess = MemoryStore(context: context).access
         #endif
 
+        // Session routing, layered onto whichever access the branches above installed:
+        // the registry is a plain machine-scoped file (see RoutingRegistryLocation for
+        // why it must never sync), so it deliberately bypasses MemoryStore/SwiftData.
+        // No cache, on purpose: composeSystemPrompt invokes this only at runtime
+        // creation and Clear Conversation, so each call re-reads the tiny file and the
+        // staleness window is the conversation itself — registry edits land at the
+        // next new conversation, never mid-conversation. An absent file reads as nil,
+        // which keeps the system prompt byte-identical to a build without routing.
+        manager.memoryAccess.readRoutingRegistry = {
+            RegistryDocument.loadIfPresent(at: RoutingRegistryLocation.fileURL)
+        }
+
         manager.loadAgentHistory = { agentID in
             // Rebuilds the conversation from the persisted trail. Bounded to the recent
             // tail so a long-lived agent doesn't reopen with a transcript that instantly

@@ -37,8 +37,11 @@ registration instead.
 
 Fin keeps a persistent mapping of tasks → terminal sessions in its working
 memory (`registry.example.json` is the schema). This is a first-class
-artifact, not prompt text: it survives restarts, syncs like other agent
-memory, and is what both the router and the guardrail consult.
+artifact, not prompt text: it survives restarts and is what both the router
+and the guardrail consult. Deliberately machine-scoped, unlike other agent
+memory — a tmux session exists on exactly one host, so the file never syncs
+(app: `Application Support/fin/routing-registry.json`; daemon: next to its
+audit log — see `daemon/README.md`).
 
 ```json
 {
@@ -133,5 +136,7 @@ same contract.
 - [x] Scenario corpus v1 (see `scenarios.json`)
 - [x] Offline scorer + hermetic live mode + guardrail executor
 - [ ] Model-backed router adapter scored on the same corpus
-- [ ] Registry read/write in FinAgentCore (agent working memory)
-- [ ] Prompt block wired into AgentRuntime
+- [x] Registry read/write in FinAgentCore (`SessionRoutingRegistry`)
+- [x] Prompt block wired into AgentRuntime and fin-agentd — reads a machine-scoped
+      `routing-registry.json` (app: `Application Support/fin/`; daemon: next to its
+      audit log). Absent file → zero prompt change; see `daemon/README.md`.

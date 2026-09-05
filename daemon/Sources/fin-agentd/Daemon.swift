@@ -211,6 +211,19 @@ final class Daemon {
         action is needed, and if fully complete and verified end with TASK COMPLETE.
         """
 
+    /// The system prompt the engine actually runs: the configured (or stock) prompt,
+    /// plus the session-routing section when the registry file names any sessions.
+    /// Absent, empty, or unreadable registry → the base prompt byte-for-byte, so a
+    /// host that never registered a session sees zero prompt change. Nonisolated and
+    /// path-parameterized so tests drive the real absent/present fork.
+    nonisolated static func composedSystemPrompt(base: String, registryFileURL: URL) -> String {
+        guard let registry = RegistryDocument.loadIfPresent(at: registryFileURL),
+              let section = SessionRouter.promptSection(registry: registry) else {
+            return base
+        }
+        return base + "\n\n" + section
+    }
+
     init(config: DaemonConfig) {
         self.config = config
         let auditPath = ((config.auditLogPath ?? "fin-agentd-audit.jsonl") as NSString).expandingTildeInPath
@@ -246,6 +259,17 @@ final class Daemon {
         URL(fileURLWithPath: auditLogPath)
             .deletingLastPathComponent()
             .appendingPathComponent("fin-agentd-directives.json")
+            .path
+    }
+
+    /// The session-routing registry sits in that same state directory, under the
+    /// basename the app also uses. Machine-scoped like everything else here: tmux
+    /// sessions exist on this host only, so the registry is a local sibling file and
+    /// never part of any synced channel. Schema: evals/tmux-routing/registry.example.json.
+    private var routingRegistryPath: String {
+        URL(fileURLWithPath: auditLogPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent(RegistryDocument.standardFileName)
             .path
     }
 
@@ -286,6 +310,19 @@ final class Daemon {
             await fail("shell never became ready: \(error.localizedDescription)")
         }
 
+        // Session routing rides in here, read once: the daemon composes its system
+        // prompt exactly once (engine construction — headless mode has no
+        // clear-conversation path), so edits to the registry file take effect on the
+        // next daemon launch, not mid-run.
+        let basePrompt = config.agent.systemPrompt ?? Self.defaultSystemPrompt
+        let systemPrompt = Self.composedSystemPrompt(
+            base: basePrompt,
+            registryFileURL: URL(fileURLWithPath: routingRegistryPath)
+        )
+        if systemPrompt != basePrompt {
+            log("session routing enabled: registry at \(routingRegistryPath)")
+        }
+
         let engine = AgentTurnEngine(
             configuration: AgentEngineConfiguration(
                 endpointURL: config.agent.endpointURL,
@@ -294,7 +331,7 @@ final class Daemon {
                 contextWindowTokens: config.agent.contextWindowTokens ?? 8192,
                 maxOutputTokens: config.agent.maxOutputTokens ?? 640,
                 temperature: config.agent.temperature ?? 0.2,
-                systemPrompt: config.agent.systemPrompt ?? Self.defaultSystemPrompt,
+                systemPrompt: systemPrompt,
                 terminalContextLines: config.agent.terminalContextLines ?? 160
             ),
             session: session,

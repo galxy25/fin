@@ -428,6 +428,80 @@ final class AgentLogicTests: XCTestCase {
         XCTAssertEqual(agent.defaultMode, .manual)
     }
 
+    // MARK: - Session routing prompt wiring
+
+    /// The system prompt the runtime actually reset its transcript with — the composed
+    /// prompt is private, but the transcript's system message is the same string and is
+    /// what the model really sees.
+    @MainActor
+    private func systemPrompt(of runtime: AgentRuntime) -> String? {
+        runtime.transcript.messages.first(where: { $0.role == .system })?.text
+    }
+
+    /// Bootstrap contract: with no registry file on disk, a runtime wired exactly like
+    /// finApp wires it (readRoutingRegistry → loadIfPresent) composes a system prompt
+    /// byte-identical to a runtime with no routing wired at all.
+    @MainActor
+    func testAbsentRoutingRegistryFileLeavesSystemPromptUnchanged() {
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fin-routing-absent-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(RegistryDocument.standardFileName)
+        var access = AgentMemoryAccess.noop
+        access.readRoutingRegistry = { RegistryDocument.loadIfPresent(at: missing) }
+
+        let wired = AgentRuntime(
+            agent: Agent(name: "Fin", systemPrompt: "BASE PROMPT"),
+            session: TerminalSession(serverID: UUID()),
+            serverName: "box",
+            memory: access
+        )
+        let unwired = AgentRuntime(
+            agent: Agent(name: "Fin", systemPrompt: "BASE PROMPT"),
+            session: TerminalSession(serverID: UUID()),
+            serverName: "box"
+        )
+        XCTAssertEqual(systemPrompt(of: wired), "BASE PROMPT")
+        XCTAssertEqual(systemPrompt(of: wired), systemPrompt(of: unwired))
+    }
+
+    /// A registry file on disk turns the routing section on, naming each registered
+    /// session — and a file that appears after the runtime exists is picked up at the
+    /// next conversation boundary (clearConversation), which is exactly the staleness
+    /// window the finApp wiring documents.
+    @MainActor
+    func testRoutingRegistryFileEntersSystemPromptAtConversationBoundary() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fin-routing-present-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent(RegistryDocument.standardFileName)
+
+        var access = AgentMemoryAccess.noop
+        access.readRoutingRegistry = { RegistryDocument.loadIfPresent(at: url) }
+        let runtime = AgentRuntime(
+            agent: Agent(name: "Fin", systemPrompt: "BASE PROMPT"),
+            session: TerminalSession(serverID: UUID()),
+            serverName: "box",
+            memory: access
+        )
+        // No file at init → no routing section yet.
+        XCTAssertEqual(systemPrompt(of: runtime), "BASE PROMPT")
+
+        try JSONEncoder().encode(RegistryDocument(sessions: [
+            SessionRegistration(session: "fin", cwd: "~/forges/levi/fin", tasks: ["fin", "widget"]),
+            SessionRegistration(session: "pocketdj", tasks: ["dj", "audio engine"]),
+        ])).write(to: url)
+
+        runtime.clearConversation()
+        let prompt = try XCTUnwrap(systemPrompt(of: runtime))
+        // Routing is strictly additive: the base prompt survives untouched up front.
+        XCTAssertTrue(prompt.hasPrefix("BASE PROMPT"))
+        XCTAssertTrue(prompt.contains("Session routing:"))
+        XCTAssertTrue(prompt.contains("fin"))
+        XCTAssertTrue(prompt.contains("pocketdj"))
+        XCTAssertTrue(prompt.contains("OFF-LIMITS"))
+    }
+
     // MARK: - Transcript compaction
 
     func testCompactionLeavesShortTranscriptsAlone() {

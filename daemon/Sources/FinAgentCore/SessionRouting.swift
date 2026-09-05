@@ -80,8 +80,27 @@ public struct RegistryDocument: Codable, Equatable, Sendable {
 
     public var isEmpty: Bool { sessions.isEmpty }
 
+    /// The registry's on-disk basename, identical on every platform. Each platform
+    /// picks its own MACHINE-SCOPED directory — a tmux session exists on exactly one
+    /// machine, so this file must never travel through CloudKit or any other synced
+    /// store, or every other device would learn to route into sessions it can't
+    /// reach. The app uses Application Support (`RoutingRegistryLocation`);
+    /// fin-agentd uses its state directory, next to the audit log.
+    public static let standardFileName = "routing-registry.json"
+
     public static func load(from url: URL) throws -> RegistryDocument {
         try JSONDecoder().decode(RegistryDocument.self, from: Data(contentsOf: url))
+    }
+
+    /// Synchronous best-effort read for prompt composition, where the async
+    /// `SessionRoutingRegistry` actor can't be awaited. Absent file → nil, the
+    /// "no registry, zero prompt change" gate. A file that exists but won't decode
+    /// is ALSO nil: the per-entry decoder is already lenient, so what's left here is
+    /// a registry mangled beyond salvage, and dropping the routing section beats
+    /// bricking prompt composition.
+    public static func loadIfPresent(at url: URL) -> RegistryDocument? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try? load(from: url)
     }
 }
 
