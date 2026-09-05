@@ -10,9 +10,11 @@ struct AgentConsoleView: View {
     var onClose: (() -> Void)?
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
 
     @State private var draft = ""
     @State private var exportURL: URL?
+    @State private var showsFeedbackCard = false
 
     private var isInline: Bool { onClose != nil }
 
@@ -59,6 +61,9 @@ struct AgentConsoleView: View {
             if !runtime.queuedPrompts.isEmpty {
                 queuedPromptsBar
             }
+            if showsFeedbackCard {
+                FeedbackCardView(onDone: { showsFeedbackCard = false })
+            }
             Divider()
             composer
         }
@@ -70,6 +75,30 @@ struct AgentConsoleView: View {
         .sheet(item: $exportURL) { url in
             TranscriptExportSheet(url: url)
         }
+        // A turn just finished on screen — the one moment the user is provably
+        // present AND has something fresh to rate. The gate keeps it rare (3+
+        // finished conversations, once per 7 days, never after "Don't Ask Again");
+        // the sweep piggybacks here because a completed turn is also when an older
+        // conversation may have crossed the quiet gap into "finished".
+        .onChange(of: runtime.state) { oldState, newState in
+            guard oldState == .thinking, newState == .idle else { return }
+            FeedbackService.shared.sweepTrajectories(context: modelContext)
+            if !showsFeedbackCard, FeedbackService.shared.gate.shouldPrompt() {
+                // Appearing is what spends the 7-day budget — ignoring the card
+                // costs the same quiet week answering it does.
+                FeedbackService.shared.gate.notePrompted()
+                showsFeedbackCard = true
+            }
+        }
+    }
+
+    /// Clearing is the explicit end of a conversation: sweep with the agent marked
+    /// ended so its trajectory digest doesn't wait out the quiet-gap heuristic.
+    private func clearConversation() {
+        runtime.clearConversation()
+        FeedbackService.shared.sweepTrajectories(
+            context: modelContext, endingAgentID: runtime.agent.id
+        )
     }
 
     @ToolbarContentBuilder
@@ -82,7 +111,7 @@ struct AgentConsoleView: View {
         }
         ToolbarItem(placement: .primaryAction) {
             Button {
-                runtime.clearConversation()
+                clearConversation()
             } label: {
                 Image(systemName: "trash")
             }
@@ -100,7 +129,7 @@ struct AgentConsoleView: View {
             exportButton
                 .buttonStyle(.plain)
             Button {
-                runtime.clearConversation()
+                clearConversation()
             } label: {
                 Image(systemName: "trash")
             }

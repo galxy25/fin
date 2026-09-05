@@ -11,6 +11,9 @@ struct AgentEditView: View {
     @State private var remoteEnabled = RemoteSupervisionConfig.isEnabled
     @State private var directiveURLDraft = ""
     @State private var statusURLDraft = ""
+    @State private var shareRatings = FeedbackSettings.shareRatings()
+    @State private var shareActivity = FeedbackSettings.shareActivity()
+    @State private var showsFeedbackComposer = false
 
     private enum ProbeState: Equatable {
         case idle
@@ -33,6 +36,7 @@ struct AgentEditView: View {
             modeSection
             limitsSection
             remoteSupervisionSection
+            helpImproveSection
             promptSection
         }
         .navigationTitle(agent.name.isEmpty ? "Agent" : agent.name)
@@ -416,6 +420,45 @@ struct AgentEditView: View {
             .string(forKey: RemoteSupervisionConfig.lastPollStatusKey) ?? ""
         let time = at.formatted(date: .omitted, time: .standard)
         return status.isEmpty ? time : "\(time) — \(status)"
+    }
+
+    // MARK: - Help Improve Fin
+
+    /// Device-wide like Remote Supervision above it (one opt-in covers every agent
+    /// on this device, and it never syncs). Two independent consents, both default
+    /// OFF — the footer says exactly what each one sends, because the toggles ARE
+    /// the privacy policy here.
+    private var helpImproveSection: some View {
+        Section {
+            Toggle("Share Ratings & Comments", isOn: $shareRatings)
+                .onChange(of: shareRatings) { _, newValue in
+                    FeedbackSettings.setShareRatings(newValue)
+                }
+            Toggle("Share Redacted Activity Summaries", isOn: $shareActivity)
+                .onChange(of: shareActivity) { _, newValue in
+                    FeedbackSettings.setShareActivity(newValue)
+                }
+            Button("Send Feedback…") {
+                showsFeedbackComposer = true
+            }
+        } header: {
+            Text("Help Improve Fin")
+        } footer: {
+            Text("Both are off by default — nothing leaves this device until you turn "
+                + "one on, and these settings apply device-wide and never sync. "
+                + "Share Ratings & Comments sends only what you write in a feedback "
+                + "card: thumbs up or down, your comment, the app version, and the "
+                + "platform. Comments are scrubbed of secret-shaped text before "
+                + "they're stored. Share Redacted Activity Summaries sends counts "
+                + "about finished agent conversations — turns, tool calls per tool, "
+                + "duration, outcome, transcript length, model, and hosting mode. "
+                + "Your messages and terminal output never leave the device: terminal "
+                + "content is redacted before anything is stored, and summaries are "
+                + "built from counts alone, quoting none of it.")
+        }
+        .sheet(isPresented: $showsFeedbackComposer) {
+            FeedbackComposerView()
+        }
     }
 
     // MARK: - Prompt

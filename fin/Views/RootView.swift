@@ -76,6 +76,10 @@ struct RootView: View {
                 // rather than waiting out the watchdog's next 5s beat.
                 sessionManager.resetAgentRecoveryBackoff()
                 sessionManager.watchdogTickNow()
+                // Foregrounding is also when conversations that ended in the
+                // background cross the quiet gap into "finished" — sweep them, and
+                // nudge any queued feedback whose backoff has elapsed.
+                FeedbackService.shared.sweepTrajectories(context: modelContext)
             } else if newPhase == .background {
                 sessionManager.recordLifecycleEvent("[app] backgrounded")
             }
@@ -85,6 +89,12 @@ struct RootView: View {
             // would leave the watchdog stopped until the first background/foreground
             // round-trip.
             sessionManager.isAppActive = scenePhase == .active
+            // Feedback give-up/discard lines join the agent trail (and iCloud
+            // mirror) through the same audit channel other services use.
+            FeedbackService.shared.audit = { [weak sessionManager] line in
+                sessionManager?.recordLifecycleEvent(line)
+            }
+            FeedbackService.shared.sweepTrajectories(context: modelContext)
             #if DEBUG
             await autoOpenSessionIfNeeded()
             #endif
