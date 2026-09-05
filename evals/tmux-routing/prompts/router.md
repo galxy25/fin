@@ -75,6 +75,10 @@ separate / clean / blank / scratch / fresh* all say it. Two consequences:
 - A thin task description never downgrades an explicit new-session request to
   clarify. Start it, record whatever task words were given; the user can
   elaborate inside the new session.
+- The reverse holds too: **start is only for session lifecycle.** "Set up",
+  "create", "add", or "build" applied to a feature, rollout, or config is
+  ordinary work for whichever session owns that domain — **route** it; those
+  verbs are not a request for a new session.
 
 Worked examples:
 
@@ -88,17 +92,23 @@ Worked examples:
 
 ## A mention is not a target
 
-A session name — or a word from its task vocabulary — only counts when the
-*actionable part* of the request is about that work. Words appearing in
-comparisons and analogies ("like we did for X"), asides and subordinate
-scenery ("while X runs, ..."), content being quoted or described, or the
-physical world (a window opened for air, a demo given in a room, a dj hired
-for a party) are mentions, not targets. The same discipline cuts every way:
+**Find the imperative first.** The target is the thing you are asked to *do*
+— the main imperative of the request. Temporal, contrastive, or comparative
+clauses ("while X runs, ...", "once X finishes, ...", "unlike X, ...",
+"like we did for X") and asides are scenery: they may name other sessions,
+but they never set the target, and they never make a request "two targets".
+Likewise words for the physical world (a window opened for air, a demo given
+in a room, a dj hired for a party) are mentions, not session pointers. The
+same discipline cuts every way:
 
-- **Never route on a phantom match.** If no session's vocabulary genuinely
-  covers the actionable ask, **clarify** — one short question beats a
-  confident wrong guess. Do not stretch a generic word ("tests", "build",
-  "logs", "push") into a route.
+- **Vocabulary is evidence, not a whitelist — read it honestly, both ways.**
+  A request that plainly describes a session's domain routes there even with
+  zero literal word overlap: a paraphrase naming the platform, product, or
+  artifact that session owns counts fully. But never claim a match that
+  isn't real: generic engineering words every project shares ("tests",
+  "build", "logs", "push", "status") carry no signal by themselves — with no
+  domain word to anchor them, **clarify**. Do not imagine registry contents
+  the printed registry does not show.
 - **Never refuse on a word collision.** An ordinary English word that happens
   to equal a live unregistered session's name only trips the guardrail when
   the user points at that session *as a terminal* ("the X session", "the X
@@ -109,6 +119,11 @@ for a party) are mentions, not targets. The same discipline cuts every way:
 
 Worked examples:
 
+- "while the gamedev sim runs, see if the payments deploy went through" →
+  **route** to `payments` — the gamedev clause is a clock, not a target; one
+  imperative, one target, nothing to clarify.
+- "the chargeback saga continues" → **route** to `payments` — no vocabulary
+  word matches, but chargebacks are unmistakably that session's domain.
 - "do it the same way we handled the invoices last quarter" → **clarify** —
   invoices is only the template for *how*; the actual task ("it") and its
   target are unstated.
@@ -119,9 +134,10 @@ Worked examples:
 - "hire a caterer for the offsite" → **clarify** — no terminal work is being
   requested, whatever words collide.
 
-When work is genuinely wanted in **two** registered sessions at once, a
-single route is wrong either way — **clarify** which to do first (or whether
-to do both), naming them.
+When the user genuinely wants work in **two** registered sessions ("X and Y
+both need ..."), a single route is wrong either way — **clarify** which to do
+first (or whether to do both), naming them. A session merely mentioned in
+passing does not count toward "two".
 
 ## Driving and upkeep
 
