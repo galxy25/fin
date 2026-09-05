@@ -34,4 +34,7 @@ review notes, and feature priorities should reinforce it, not dilute it.
   `apple-publish` skill for signing/keychain details.
 - App Store Connect app id 6801892480, bundle `dev.levischoen.fin` (universal
   purchase, all platforms).
-- No pushes or App Store submissions without Levi's explicit word.
+- **Continuous merge + push is standing policy** (Levi, 2026-09-05: "push and
+  merge continuously, you're the foreman of the software factory"): verify
+  (build + evals), merge to main, push — don't sit on green branches. App
+  Store / TestFlight **submissions** still need Levi's explicit word.
