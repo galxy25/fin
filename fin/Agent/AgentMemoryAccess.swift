@@ -31,6 +31,11 @@ struct AgentMemoryAccess {
     /// Feeds the runtime's once-per-session vector-lane audit line; optional and
     /// defaulted so existing constructions (and `.noop`) stay unchanged.
     var vectorLaneDiagnostic: (() -> String?)? = nil
+    /// The session-routing registry, nil when none exists — nil (the default) keeps
+    /// the routing prompt section out of the system prompt entirely, so agents
+    /// without a registry see zero change. Optional and defaulted so existing
+    /// constructions (and `.noop`) stay registry-free.
+    var readRoutingRegistry: (() -> RegistryDocument?)? = nil
     /// The user profile, empty if none exists yet.
     var readCumulative: () -> String
     var writeCumulative: (_ content: String) -> Bool

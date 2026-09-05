@@ -300,7 +300,8 @@ final class AgentRuntime: ObservableObject {
         self.activeSystemPrompt = Self.composeSystemPrompt(
             base: agent.systemPrompt,
             profile: memory.readCumulative(),
-            provider: agent.provider
+            provider: agent.provider,
+            routing: memory.readRoutingRegistry?() ?? nil
         )
         transcript.reset(systemPrompt: activeSystemPrompt)
         // Restores the conversation from the durable audit trail, so quitting the app
@@ -681,7 +682,8 @@ final class AgentRuntime: ObservableObject {
         activeSystemPrompt = Self.composeSystemPrompt(
             base: agent.systemPrompt,
             profile: memory.readCumulative(),
-            provider: agent.provider
+            provider: agent.provider,
+            routing: memory.readRoutingRegistry?() ?? nil
         )
         transcript.reset(systemPrompt: activeSystemPrompt)
         state = .idle
@@ -1947,17 +1949,31 @@ final class AgentRuntime: ObservableObject {
         }
     }
 
-    private static func composeSystemPrompt(base: String, profile: String, provider: AgentProvider) -> String {
+    private static func composeSystemPrompt(
+        base: String,
+        profile: String,
+        provider: AgentProvider,
+        routing: RegistryDocument? = nil
+    ) -> String {
+        var prompt = base
         var trimmed = profile.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return base }
-        // The profile syncs from devices with roomier models, so it must be capped at
-        // injection: the on-device window is fixed at ~4096 tokens and an oversized
-        // synced profile once blew it outright. Suffix keeps the newest content.
-        let cap = provider == .appleOnDevice ? 600 : 1200
-        if trimmed.count > cap {
-            trimmed = "…" + String(trimmed.suffix(cap))
+        if !trimmed.isEmpty {
+            // The profile syncs from devices with roomier models, so it must be capped at
+            // injection: the on-device window is fixed at ~4096 tokens and an oversized
+            // synced profile once blew it outright. Suffix keeps the newest content.
+            let cap = provider == .appleOnDevice ? 600 : 1200
+            if trimmed.count > cap {
+                trimmed = "…" + String(trimmed.suffix(cap))
+            }
+            prompt += "\n\nUser profile (from accumulated memory):\n\(trimmed)\nUse remember to save important new facts; use recall to look up past context."
         }
-        return base + "\n\nUser profile (from accumulated memory):\n\(trimmed)\nUse remember to save important new facts; use recall to look up past context."
+        // `promptSection` is nil for a nil/empty registry, so agents without any
+        // registered sessions keep a byte-identical system prompt — routing is
+        // strictly additive until someone registers a session.
+        if let routing, let section = SessionRouter.promptSection(registry: routing) {
+            prompt += "\n\n" + section
+        }
+        return prompt
     }
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {
