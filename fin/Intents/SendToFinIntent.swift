@@ -85,11 +85,18 @@ struct FinAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
             intent: SendToFinIntent(),
+            // "Tell X"/"Message X" collide with the built-in Messages domain —
+            // Siri hunts for a CONTACT named Fin and the shortcut loses. Keep
+            // them (they work when Siri disambiguates) but lead with phrasings
+            // the texting domain doesn't claim.
             phrases: [
+                "Ask \(.applicationName)",
+                "Talk to \(.applicationName)",
+                "Hey \(.applicationName)",
+                "\(.applicationName) agent",
                 "Message \(.applicationName)",
                 "Tell \(.applicationName)",
                 "Send a message to \(.applicationName)",
-                "Talk to \(.applicationName)",
             ],
             shortTitle: "Message Fin",
             systemImageName: "waveform.badge.mic"
