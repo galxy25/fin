@@ -114,6 +114,13 @@ public final class AgentTurnEngine {
     public var onMonitorStart: ((Int) -> Int)?
     /// Fired on `monitor` stop; the runner disables its heartbeat loop.
     public var onMonitorStop: (() -> Void)?
+    /// Fired when the MODEL calls `notify` — the proactively-social push. The engine
+    /// never calls this on its own (no heartbeat, no completion, no forced path routes
+    /// here); it fires only from `executeNotify`, so a notification is always a choice
+    /// the model made. Returns whether the runner has a live channel to carry it, so the
+    /// tool can tell the model the truth. Nil hook → the tool reports it's unavailable in
+    /// this runtime, the same honesty as the headless memory tools.
+    public var onNotify: ((_ title: String, _ body: String) -> Bool)?
 
     public init(
         configuration: AgentEngineConfiguration,
@@ -367,6 +374,13 @@ public final class AgentTurnEngine {
                 rawArguments: call.arguments
             )
 
+        case AgentToolSpec.notify.name:
+            return executeNotify(
+                title: call.argument("title") ?? "",
+                body: call.argument("body") ?? "",
+                rawArguments: call.arguments
+            )
+
         default:
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
                 + AgentToolSpec.all.map(\.name).joined(separator: ", ") + "."
@@ -443,6 +457,41 @@ public final class AgentTurnEngine {
                    toolArguments: rawArguments, isFailure: true)
             return message
         }
+    }
+
+    /// The model's `notify` tool: record the note, hand it to the runner's push channel,
+    /// and report back honestly. Deliberately synchronous and cheap — a proactively-social
+    /// push must never become a reason the mission stalls, so the runner fires-and-forgets
+    /// the actual delivery; this returns the moment it's handed off. A missing hook or an
+    /// unconfigured channel is told plainly so the model can fall back to its reply text
+    /// rather than believing a phantom owner heard it.
+    private func executeNotify(title: String, body: String, rawArguments: String) -> String {
+        let toolName = AgentToolSpec.notify.name
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBody.isEmpty else {
+            let message = "Error: notify requires a non-empty \"body\" argument."
+            record("error", message, toolName: toolName,
+                   toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        record(
+            "toolCall",
+            trimmedTitle.isEmpty ? "notify: \(trimmedBody)" : "notify: \(trimmedTitle) — \(trimmedBody)",
+            toolName: toolName, toolArguments: rawArguments
+        )
+        guard let onNotify else {
+            let message = "Error: notify is not available in this runtime; the owner can't be "
+                + "pushed from here. Put anything important in your reply text instead."
+            record("error", message, toolName: toolName,
+                   toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        let delivered = onNotify(trimmedTitle, trimmedBody)
+        return delivered
+            ? "Sent to the owner."
+            : "No push channel is configured, so the owner was not reached — say anything "
+                + "important in your reply text instead, and keep going."
     }
 
     private func executeReadTerminal(lines requested: Int?, rawArguments: String) async -> String {

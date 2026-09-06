@@ -1464,9 +1464,17 @@ final class AgentRuntime: ObservableObject {
                 )
             }
         }
+        let notifyTool = NotifyTool { [weak self] title, body in
+            guard let self else { return "unavailable" }
+            let encoded = (try? JSONSerialization.data(withJSONObject: ["title": title, "body": body]))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            return await MainActor.run {
+                self.executeNotify(title: title, body: body, rawArguments: encoded)
+            }
+        }
 
         let modelSession = LanguageModelSession(
-            tools: [readTool, sendTool, rememberTool, recallTool, requestInputTool, monitorTool],
+            tools: [readTool, sendTool, rememberTool, recallTool, requestInputTool, monitorTool, notifyTool],
             instructions: activeSystemPrompt
         )
 
@@ -1724,6 +1732,13 @@ final class AgentRuntime: ObservableObject {
                 rawArguments: call.arguments
             )
 
+        case AgentToolSpec.notify.name:
+            return executeNotify(
+                title: call.argument("title") ?? "",
+                body: call.argument("body") ?? "",
+                rawArguments: call.arguments
+            )
+
         default:
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
                 + AgentToolSpec.all.map(\.name).joined(separator: ", ") + "."
@@ -1920,6 +1935,40 @@ final class AgentRuntime: ObservableObject {
         }
     }
 
+    /// The model's `notify` tool: Fin's proactively-social push, in the app-local runtime.
+    /// The delivery surface is always present here — a local notification, no server or
+    /// APNs — so unlike the headless engine this never reports "unavailable"; it hands the
+    /// model-authored title and body to `AgentNotificationService` and confirms. Internal
+    /// so the empty-body guard is testable directly. Note this is the model's CHOICE: no
+    /// heartbeat, turn-finish, or watchdog path routes here — those keep their own
+    /// notification calls — so the tool never double-fires with them.
+    func executeNotify(title: String, body: String, rawArguments: String) -> String {
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBody.isEmpty else {
+            let message = "Error: notify requires a non-empty \"body\" argument."
+            record(.error, message, toolName: AgentToolSpec.notify.name,
+                   toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let startedAt = Date()
+        record(
+            .toolCall,
+            trimmedTitle.isEmpty ? "notify: \(trimmedBody)" : "notify: \(trimmedTitle) — \(trimmedBody)",
+            toolName: AgentToolSpec.notify.name,
+            toolArguments: rawArguments,
+            disposition: .unguarded,
+            toolDurationMS: Self.elapsedMS(since: startedAt)
+        )
+        AgentNotificationService.shared.notifyAgentUpdate(
+            agentName: agent.name,
+            title: trimmedTitle,
+            body: trimmedBody,
+            agentID: agent.id
+        )
+        return "Sent to the owner."
+    }
+
     /// Auto-saves this conversation's episodic memory after each completed turn. The
     /// answer comes from the turn that just ran — nil means it failed, and recording
     /// that beats misattributing a stale earlier reply to the new question.
@@ -1996,6 +2045,12 @@ final class AgentRuntime: ObservableObject {
         if let goals, let section = GoalsTick.promptSection(ledger: goals) {
             prompt += "\n\n" + section
         }
+        // Fin's proactively-social persona. Unconditional in the app because the notify
+        // tool's delivery surface here — a local notification — is always present (no
+        // server, no APNs to be missing), so the gate the headless daemon needs is always
+        // satisfied on device. The guidance keeps the owner in the loop without letting
+        // that slow or spam the mission; see AgentToolSpec.notifyPersonaGuidance.
+        prompt += "\n\n" + AgentToolSpec.notifyPersonaGuidance
         return prompt
     }
 

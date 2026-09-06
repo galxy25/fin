@@ -56,6 +56,64 @@ final class DaemonNotifyClientTests: XCTestCase {
         XCTAssertEqual(object.count, 3, "the contract has exactly three keys")
     }
 
+    /// The model's `notify` tool authors its own title, so `sendDirect` must push that
+    /// headline verbatim — NOT the event→title table `send(event:)` uses — while keeping
+    /// the same three-key contract.
+    func testSendDirectPostsModelAuthoredTitleVerbatim() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        }
+
+        await client.sendDirect(title: "Deploy done", body: "main is live on prod.")
+
+        let request = try XCTUnwrap(captured)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(object["title"] as? String, "Deploy done")
+        XCTAssertEqual(object["body"] as? String, "main is live on prod.")
+        XCTAssertEqual(object["agent"] as? String, "Nimbus")
+        XCTAssertEqual(object.count, 3, "the contract still has exactly three keys")
+    }
+
+    /// An empty headline falls back to the agent name, so a lock screen always shows
+    /// something recognizable.
+    func testSendDirectFallsBackToAgentNameForEmptyTitle() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        }
+
+        await client.sendDirect(title: "   ", body: "quiet update")
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(captured?.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(object["title"] as? String, "Nimbus")
+    }
+
+    /// A model-authored title leaves the machine too, so it passes through the redactor
+    /// exactly as the body does.
+    func testSendDirectRedactsTheTitle() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        }
+
+        await client.sendDirect(title: "token api_key=sk-verysecretvalue", body: "done")
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(captured?.httpBody)) as? [String: Any]
+        )
+        let title = try XCTUnwrap(object["title"] as? String)
+        XCTAssertFalse(title.contains("sk-verysecretvalue"))
+        XCTAssertTrue(title.contains("[redacted]"))
+    }
+
     func testTitlesPerEvent() {
         XCTAssertEqual(
             DaemonNotifyClient.title(event: "request-input", agentName: "Nimbus"),

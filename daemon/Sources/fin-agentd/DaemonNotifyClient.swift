@@ -86,6 +86,31 @@ final class DaemonNotifyClient {
     /// POSTs one event. Failures audit (throttled) and are otherwise swallowed —
     /// a dead control plane must never take down the agent.
     func send(event: String, message: String) async {
+        await deliver(
+            title: Self.title(event: event, agentName: agentName),
+            body: Self.alertBody(message)
+        )
+    }
+
+    /// A model-authored push: the `notify` tool supplies its OWN title, so this bypasses
+    /// the `event`→title table `send(event:)` uses and pushes the given headline verbatim
+    /// (still redacted + capped, since it still leaves the machine). An empty title falls
+    /// back to the agent's name so a lock screen always has something to show. Same
+    /// swallow-and-throttle failure discipline as `send(event:)`.
+    func sendDirect(title: String, body: String) async {
+        let redactedTitle = MemoryRedactor.redact(title)
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        await deliver(
+            title: redactedTitle.isEmpty ? agentName : redactedTitle,
+            body: Self.alertBody(body)
+        )
+    }
+
+    /// Shared POST for both `send(event:)` and `sendDirect`: the title and body are
+    /// already resolved and redacted by the caller. (Named `deliver`, not `post`, so it
+    /// doesn't shadow the injected `post` transport this ultimately calls.)
+    private func deliver(title: String, body: String) async {
         var base = endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") { base.removeLast() }
         guard !base.isEmpty, let url = URL(string: base + "/notify") else {
@@ -98,8 +123,8 @@ final class DaemonNotifyClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = Self.requestBody(
-            title: Self.title(event: event, agentName: agentName),
-            body: Self.alertBody(message),
+            title: title,
+            body: body,
             agentName: agentName
         )
         do {

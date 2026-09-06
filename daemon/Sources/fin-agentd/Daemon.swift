@@ -244,7 +244,8 @@ final class Daemon {
     nonisolated static func composedSystemPrompt(
         base: String,
         registryFileURL: URL,
-        goalsLedgerFileURL: URL? = nil
+        goalsLedgerFileURL: URL? = nil,
+        notifyAvailable: Bool = false
     ) -> String {
         var prompt = base
         if let registry = RegistryDocument.loadIfPresent(at: registryFileURL),
@@ -255,6 +256,12 @@ final class Daemon {
            let ledger = LedgerDocument.loadIfPresent(at: goalsLedgerFileURL),
            let section = GoalsTick.promptSection(ledger: ledger) {
             prompt += "\n\n" + section
+        }
+        // Strictly additive, and ONLY when a push channel exists: a headless daemon with
+        // no control plane and no shell hook keeps a byte-identical prompt, so the model
+        // is never told to notify an owner it can't actually reach.
+        if notifyAvailable {
+            prompt += "\n\n" + AgentToolSpec.notifyPersonaGuidance
         }
         return prompt
     }
@@ -382,7 +389,10 @@ final class Daemon {
         let systemPrompt = Self.composedSystemPrompt(
             base: basePrompt,
             registryFileURL: URL(fileURLWithPath: routingRegistryPath),
-            goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath)
+            goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath),
+            // The notify tool has a live channel exactly when a control-plane block or a
+            // shell hook is configured; only then does the persona guidance appear.
+            notifyAvailable: config.controlPlane != nil || (config.notifyCommand.map { !$0.isEmpty } ?? false)
         )
         if systemPrompt.contains("Session routing:") {
             log("session routing enabled: registry at \(routingRegistryPath)")
@@ -420,6 +430,13 @@ final class Daemon {
         }
         engine.onMonitorStop = { [weak self] in
             self?.disarmMonitor()
+        }
+        // The model's notify tool: a proactively-social push the model composes itself,
+        // title and all — distinct from the event-driven pushes the harness fires on its
+        // own for request-input/task-complete. Returns whether a channel exists, so the
+        // tool tells the model the truth instead of promising a delivery that no-oped.
+        engine.onNotify = { [weak self] title, body in
+            self?.notifyFromTool(title: title, body: body) ?? false
         }
 
         if let block = config.supervision {
@@ -704,6 +721,36 @@ final class Daemon {
         if let client = notifyClient {
             lastNotifyTask = Task { await client.send(event: event, message: message) }
         }
+        runNotifyCommand(event: event, message: message)
+    }
+
+    /// True when SOME push channel is wired — the control plane, the shell hook, or both.
+    /// The notify tool's availability gate and the persona-prompt gate both read this: no
+    /// channel means the tool honestly reports "not reached" and the prompt never coaches
+    /// the model to lean on it.
+    private var hasNotifyChannel: Bool {
+        notifyClient != nil || (config.notifyCommand.map { !$0.isEmpty } ?? false)
+    }
+
+    /// The model's `notify` tool, wired to `engine.onNotify`. Unlike `notify(event:)`,
+    /// the model authored the title, so the control-plane push takes it verbatim
+    /// (`sendDirect`) rather than the event→title table. Returns whether any channel was
+    /// there to carry it — the tool relays that truth to the model. Fire-and-forget by
+    /// design: being social must never block the mission on a network round-trip.
+    private func notifyFromTool(title: String, body: String) -> Bool {
+        if let client = notifyClient {
+            lastNotifyTask = Task { await client.sendDirect(title: title, body: body) }
+        }
+        // The shell hook is title-less by contract (FIN_EVENT/FIN_MESSAGE only), so the
+        // model's title rides in as the event label and the body is the message.
+        runNotifyCommand(event: "notify", message: body)
+        return hasNotifyChannel
+    }
+
+    /// Fires the optional `notifyCommand` shell hook with $FIN_EVENT/$FIN_MESSAGE. Shared
+    /// by the harness's own events and the model's notify tool; a launch failure is logged
+    /// and swallowed — a broken notifier must never take down the agent.
+    private func runNotifyCommand(event: String, message: String) {
         guard let command = config.notifyCommand, !command.isEmpty else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")

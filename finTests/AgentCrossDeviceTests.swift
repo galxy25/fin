@@ -168,6 +168,56 @@ final class AgentCrossDeviceTests: XCTestCase {
         XCTAssertEqual(signals().first?.agentID, agent.id)
     }
 
+    /// The model's `notify` tool is a deliberate, model-chosen push, so it writes its
+    /// cross-device signal regardless of notifyOnResponse (that gate mutes only the
+    /// automatic turn-finished banner) and confirms delivery — the app-local channel is
+    /// always present.
+    @MainActor
+    func testNotifyToolWritesAttentionSignalAndConfirms() {
+        let signals = captureSignals()
+        let (runtime, agent, _) = makeRuntime(notifyOnResponse: false)
+
+        let result = runtime.executeNotify(
+            title: "Deploy done", body: "main is live on prod.", rawArguments: "{}"
+        )
+
+        XCTAssertEqual(result, "Sent to the owner.")
+        XCTAssertEqual(signals().map(\.kind), [.attention])
+        XCTAssertEqual(signals().first?.preview, "main is live on prod.")
+        XCTAssertEqual(signals().first?.agentID, agent.id)
+    }
+
+    /// An empty body is a correctable tool error, not a silent no-op push: no signal, no
+    /// banner, and the model is told to supply a body.
+    @MainActor
+    func testNotifyToolRequiresABody() {
+        let signals = captureSignals()
+        let (runtime, _, _) = makeRuntime()
+
+        let result = runtime.executeNotify(title: "hi", body: "   ", rawArguments: "{}")
+
+        XCTAssertTrue(result.contains("non-empty \"body\""), "got: \(result)")
+        XCTAssertTrue(signals().isEmpty, "an empty-body notify must not write a signal")
+    }
+
+    /// A model-authored notification records its `.attention` signal with a redacted,
+    /// capped preview — it leaves the device, exactly like every other signal here.
+    @MainActor
+    func testNotifyAgentUpdateSignalIsRedactedAndCapped() {
+        let signals = captureSignals()
+        let secret = "shipped with password=hunter2 and then " + String(repeating: "y", count: 300)
+
+        AgentNotificationService.shared.notifyAgentUpdate(
+            agentName: "Fin", title: "Shipped", body: secret, agentID: UUID()
+        )
+
+        let preview = signals().first?.preview ?? ""
+        XCTAssertEqual(signals().first?.kind, .attention)
+        XCTAssertFalse(preview.contains("hunter2"))
+        XCTAssertTrue(preview.contains("[redacted]"))
+        XCTAssertLessThanOrEqual(preview.count, 140)
+    }
+
     // MARK: - Subscription builder
 
     func testSubscriptionBuilderIsUserLevelAndCoversEveryKind() {

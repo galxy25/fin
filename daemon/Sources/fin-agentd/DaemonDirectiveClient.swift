@@ -126,7 +126,7 @@ final class DaemonDirectiveClient {
     static let userMessageKind = "user_message"
     /// Reported in the status document so a supervisor can tell which harness features
     /// (stayResident, cloud transcript, inbox, push notify) this agent has.
-    static let daemonVersion = "1.2.0"
+    static let daemonVersion = "1.3.0"
 
     #if !canImport(Darwin)
     /// Linux only: the default fetch's buffered read runs through this session, whose

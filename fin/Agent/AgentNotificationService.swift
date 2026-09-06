@@ -134,6 +134,32 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         UNUserNotificationCenter.current().add(request)
     }
 
+    /// Posts a proactively-social update the AGENT chose to send via its `notify` tool —
+    /// the app-local half of Fin's copilot job. Unlike the harness-fired banners above,
+    /// the model authored both the headline and the message, so the banner shows the
+    /// model's `title` verbatim (falling back to the agent's name when it's blank) rather
+    /// than always leading with the agent name. Records an `.attention` cross-device
+    /// signal so the owner's other devices hear it too, then — like every banner here —
+    /// only surfaces the local alert when the user isn't already looking at the app.
+    func notifyAgentUpdate(agentName: String, title: String, body: String, agentID: UUID) {
+        recordSignal(.attention, agentID: agentID, agentName: agentName, text: body)
+        guard !isAppActive else { return }
+
+        let headline = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = UNMutableNotificationContent()
+        content.title = headline.isEmpty ? (agentName.isEmpty ? "Agent" : agentName) : headline
+        content.body = Self.preview(of: body)
+        content.sound = .default
+        content.userInfo = ["fin": ["kind": "agentUpdate", "agentID": agentID.uuidString]]
+
+        let request = UNNotificationRequest(
+            identifier: "agent-update-\(agentID.uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
     nonisolated static func preview(of reply: String) -> String {
         let flattened = reply
             .replacingOccurrences(of: "\n", with: " ")

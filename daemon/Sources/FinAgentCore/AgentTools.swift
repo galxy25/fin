@@ -2,7 +2,9 @@
 // Keep this file free of UI, SwiftData, and app-only imports.
 import Foundation
 
-struct AgentToolSpec {
+// Public so the daemon target (a separate module) can read `notifyPersonaGuidance` for
+// its gated prompt; the app compiles these sources directly, where it's simply internal.
+public struct AgentToolSpec {
     let name: String
     let description: String
     /// JSON Schema for the arguments object.
@@ -149,9 +151,54 @@ struct AgentToolSpec {
         ]
     )
 
-    static let all: [AgentToolSpec] = [readTerminal, sendInput, remember, recall, requestInput, monitor]
+    static let notify = AgentToolSpec(
+        name: "notify",
+        // The proactively-social lever, put in the MODEL's hands on purpose: nothing here
+        // pushes on your behalf, so YOU decide when a moment is worth the owner's attention.
+        // The description sells the copilot job (a remote owner sees only what you push) and
+        // the discipline in the same breath — one clear note when there's news, never a
+        // ping per trivial step or heartbeat tick.
+        description: "Send a short push notification to the owner. You are their copilot and "
+            + "they often can't see this terminal — a remote owner sees only what you push. "
+            + "Call it to stay in the loop: your reply to what they asked, meaningful progress, "
+            + "a blocker, or a finished goal. Delivers to their device and tells you whether it "
+            + "was sent. Use judgment: one clear note when there is something worth telling them, "
+            + "never a notify on every trivial step or on a heartbeat tick that found nothing new.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "title": [
+                    "type": "string",
+                    "description": "Short headline for the notification, a few words.",
+                ],
+                "body": [
+                    "type": "string",
+                    "description": "The message to the owner, one or two sentences.",
+                ],
+            ],
+            "required": ["title", "body"],
+        ]
+    )
+
+    static let all: [AgentToolSpec] = [readTerminal, sendInput, remember, recall, requestInput, monitor, notify]
 
     static let knownToolNames: Set<String> = Set(all.map(\.name))
+
+    /// Fin's proactively-social persona, appended to the system prompt ONLY when the
+    /// `notify` tool has a live delivery channel in this runtime (see the runner's gate).
+    /// Gated on purpose: a prompt must never coach the model to lean on a capability the
+    /// runner will just answer "unavailable" to. The guidance's whole job is Levi's brief —
+    /// keep a remote owner in the loop, and never let that slow or spam the mission.
+    public static let notifyPersonaGuidance = """
+        You are Fin: proactively social while ruthlessly accomplishing the mission. You are the \
+        owner's copilot, and they often can't see this terminal — a remote owner sees only what \
+        you push to them. So use the notify tool with judgment: when you finish answering their \
+        prompt, hit a blocker, complete a goal, or reach progress a remote owner would want, send \
+        one clear notify. Be genuinely social and keep them in the loop. But never let notifying \
+        slow the work, and never spam — no notify on every trivial internal step, and none on a \
+        heartbeat or self-check tick that turned up nothing worth reporting. Keep driving the \
+        mission to completion; notify is how you bring the owner along, not a reason to pause.
+        """
 }
 
 /// Commands that get a confirmation prompt even in auto mode.

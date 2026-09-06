@@ -175,4 +175,104 @@ final class AgentEngineDispatchTests: XCTestCase {
             XCTAssertTrue(result.contains("not available"), "got: \(result)")
         }
     }
+
+    // MARK: - notify (proactively-social push)
+
+    /// The 7th tool must ride in the shared roster the engine advertises, with the
+    /// {title, body} schema and both fields required — a drift here changes what every
+    /// backend exposes to the model.
+    func testNotifyToolIsAdvertisedInTheSharedRoster() {
+        XCTAssertTrue(AgentToolSpec.all.contains { $0.name == "notify" },
+                      "notify must be part of the advertised roster")
+        XCTAssertTrue(AgentToolSpec.knownToolNames.contains("notify"))
+
+        let properties = AgentToolSpec.notify.parameters["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["title"], "notify schema must expose a title property")
+        XCTAssertNotNil(properties?["body"], "notify schema must expose a body property")
+        let required = AgentToolSpec.notify.parameters["required"] as? [String]
+        XCTAssertEqual(required.map(Set.init), Set(["title", "body"]),
+                       "both title and body are required")
+    }
+
+    /// The happy path: the model chose to notify, so the runner's hook fires with the
+    /// exact title and body, and the tool tells the model it was sent.
+    func testNotifyFiresHookWithTitleAndBodyAndReportsSent() async {
+        var pushes: [(title: String, body: String)] = []
+        var audited: [AgentAuditEvent] = []
+        let engine = makeEngine(audit: { audited.append($0) })
+        engine.onNotify = { title, body in
+            pushes.append((title, body))
+            return true // a channel is configured
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.notify.name,
+            #"{"title": "Deploy done", "body": "main is live on prod; smoke tests green."}"#
+        ))
+
+        XCTAssertEqual(pushes.count, 1)
+        XCTAssertEqual(pushes.first?.title, "Deploy done")
+        XCTAssertEqual(pushes.first?.body, "main is live on prod; smoke tests green.")
+        XCTAssertEqual(result, "Sent to the owner.")
+        XCTAssertTrue(audited.contains {
+            $0.kind == "toolCall" && $0.text.contains("Deploy done")
+        }, "the notification must be recorded in the audit trail")
+    }
+
+    /// A configured-but-unreachable channel (hook returns false) must be reported to the
+    /// model honestly, not dressed up as a delivered push.
+    func testNotifyReportsWhenNoChannelDelivered() async {
+        let engine = makeEngine()
+        engine.onNotify = { _, _ in false }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.notify.name,
+            #"{"title": "FYI", "body": "halfway through the migration."}"#
+        ))
+        XCTAssertTrue(result.contains("not reached"), "got: \(result)")
+        XCTAssertFalse(result.hasPrefix("Sent"), "an undelivered push must not claim success")
+    }
+
+    func testNotifyRequiresABody() async {
+        let engine = makeEngine()
+        engine.onNotify = { _, _ in XCTFail("hook must not fire for an empty body"); return true }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.notify.name, #"{"title": "hi"}"#
+        ))
+        XCTAssertTrue(result.contains("non-empty \"body\""), "got: \(result)")
+    }
+
+    /// Same honesty as the memory/monitor tools: an advertised tool with no runner wiring
+    /// says so plainly rather than lying that the owner heard it.
+    func testNotifyWithoutARunnerHookIsAnHonestError() async {
+        let engine = makeEngine()
+        let result = await engine.execute(call(
+            AgentToolSpec.notify.name,
+            #"{"title": "hi", "body": "anyone there?"}"#
+        ))
+        XCTAssertTrue(result.hasPrefix("Error:"), "got: \(result)")
+        XCTAssertTrue(result.contains("not available"), "got: \(result)")
+    }
+
+    /// The heart of the delegate-to-the-model design: notifying is the MODEL's choice, so
+    /// nothing the engine does on its own — reading the terminal, arming/stopping a
+    /// monitor, asking for input — may fire the notify hook. Only a `notify` tool call
+    /// does. If this ever regresses, a heartbeat tick could spam the owner.
+    func testOtherToolsNeverAutoFireNotify() async {
+        let engine = makeEngine()
+        engine.onNotify = { _, _ in
+            XCTFail("no tool other than notify itself may push to the owner")
+            return true
+        }
+        engine.onRequestInput = { _ in }
+        engine.onMonitorStart = { _ in 60 }
+        engine.onMonitorStop = { }
+
+        _ = await engine.execute(call(AgentToolSpec.readTerminal.name, "{}"))
+        _ = await engine.execute(call(AgentToolSpec.requestInput.name, #"{"question": "which branch?"}"#))
+        _ = await engine.execute(call(AgentToolSpec.monitor.name, #"{"action": "start"}"#))
+        _ = await engine.execute(call(AgentToolSpec.monitor.name, #"{"action": "stop"}"#))
+        // No XCTFail fired → nothing auto-notified.
+    }
 }

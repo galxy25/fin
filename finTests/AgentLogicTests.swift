@@ -349,6 +349,26 @@ final class AgentLogicTests: XCTestCase {
         )
     }
 
+    func testNotifyToolSpecIsRegistered() {
+        XCTAssertTrue(AgentToolSpec.all.contains { $0.name == AgentToolSpec.notify.name })
+        XCTAssertTrue(AgentToolSpec.knownToolNames.contains("notify"))
+        XCTAssertEqual(
+            (AgentToolSpec.notify.parameters["required"] as? [String]).map(Set.init),
+            Set(["title", "body"])
+        )
+    }
+
+    /// Fin's proactively-social persona rides in every composed system prompt (the app's
+    /// notify tool always has a local-notification channel), and the guidance carries both
+    /// halves of Levi's brief — social AND non-spammy.
+    func testPersonaGuidanceIsPresentAndBalanced() {
+        let guidance = AgentToolSpec.notifyPersonaGuidance
+        XCTAssertTrue(guidance.contains("proactively social"))
+        XCTAssertTrue(guidance.contains("notify tool"))
+        XCTAssertTrue(guidance.lowercased().contains("never spam"))
+        XCTAssertTrue(guidance.contains("heartbeat"), "must warn off firing on a heartbeat tick")
+    }
+
     // MARK: - Consolidation guard
 
     func testConsolidationGuardRejectsGarbageProfiles() {

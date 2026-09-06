@@ -236,4 +236,27 @@ struct RecallTool: Tool {
     }
 }
 
+@available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
+@Generable
+struct NotifyArguments {
+    @Guide(description: "Short headline for the notification, a few words.")
+    var title: String
+    @Guide(description: "The message to the owner, one or two sentences.")
+    var body: String
+}
+
+@available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
+struct NotifyTool: Tool {
+    typealias Arguments = NotifyArguments
+    typealias Output = String
+
+    let name = AgentToolSpec.notify.name
+    let description = AgentToolSpec.notify.description
+    let perform: @Sendable (String, String) async -> String
+
+    func call(arguments: NotifyArguments) async throws -> String {
+        await perform(arguments.title, arguments.body)
+    }
+}
+
 #endif
