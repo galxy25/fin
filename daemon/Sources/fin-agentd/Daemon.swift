@@ -58,8 +58,10 @@ struct DaemonConfig: Decodable {
         /// to tell the daemon apart its `FIN_READY_*` probes and keystrokes land in the
         /// user's live session (the 2026-09-05 iMac shakedown). Shell profiles gate their
         /// auto-attach on this name — it is a contract, don't rename it. `LC_`-prefixed
-        /// because sshd's default `AcceptEnv` is `LANG LC_*` (macOS and Amazon Linux
-        /// alike), so it crosses the wire with no server-side configuration.
+        /// because the sshd configs that forward anything by default forward `LC_*`
+        /// (macOS, Debian/Ubuntu: `AcceptEnv LANG LC_*`); the RHEL family — Amazon Linux
+        /// included — enumerates locale names and needs `AcceptEnv LC_FIN_AGENT` added.
+        /// README: "The session marker".
         static let agentMarkerName = "LC_FIN_AGENT"
         static let agentMarkerDefaultValue = "1"
 
@@ -404,6 +406,32 @@ final class Daemon {
             await fail("cannot read private key at \(config.server.privateKeyPath): \(error)")
         }
 
+        if let block = config.supervision {
+            let client = DaemonDirectiveClient(
+                directiveURL: block.directiveURL,
+                statusURL: block.statusURL,
+                inboxURL: block.inboxURL,
+                agentName: block.agentName,
+                pollSeconds: block.pollSeconds ?? 30,
+                deviceToken8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
+                stateFilePath: directiveStatePath,
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                }
+            )
+            supervision = client
+            let sources = client.inboxURL == nil ? "directives" : "directives + inbox"
+            log("supervision enabled: polling \(sources) every \(client.pollSeconds)s as \"\(block.agentName)\"")
+            // Launch is the conversation boundary. The control plane empties the
+            // per-agent inbox at launch; the daemon draws its first-run directive
+            // high-water at the same moment — before the SSH connect, the readiness
+            // probes and the first task turn, which together can run for minutes — so
+            // a directive an operator writes from here on is delivered, not stamped as
+            // history. No-op on a box the daemon has run on before.
+            await client.primeFirstRunSeed()
+        }
+
         let session = HeadlessTerminalSession(
             configuration: Self.sessionConfiguration(server: config.server, privateKeyPEM: keyPEM)
         )
@@ -485,24 +513,6 @@ final class Daemon {
             self?.notifyFromTool(title: title, body: body) ?? false
         }
 
-        if let block = config.supervision {
-            let client = DaemonDirectiveClient(
-                directiveURL: block.directiveURL,
-                statusURL: block.statusURL,
-                inboxURL: block.inboxURL,
-                agentName: block.agentName,
-                pollSeconds: block.pollSeconds ?? 30,
-                deviceToken8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
-                stateFilePath: directiveStatePath,
-                audit: { [weak self] line in
-                    self?.log(line)
-                    self?.record(AgentAuditEvent(kind: "notice", text: line))
-                }
-            )
-            supervision = client
-            let sources = client.inboxURL == nil ? "directives" : "directives + inbox"
-            log("supervision enabled: polling \(sources) every \(client.pollSeconds)s as \"\(block.agentName)\"")
-        }
         if let uplink = transcript {
             log("cloud transcript enabled: last \(uplink.maxLines) lines, "
                 + "flushed at most every \(uplink.flushSeconds)s")

@@ -7,8 +7,11 @@ import XCTest
 /// A login shell that execs remote logins into the human's real tmux session (the dev
 /// iMac's fish config) skips that exec when it sees the marker; without it the daemon's
 /// tmux attach, `FIN_READY_*` probes and keystrokes land in the user's live session —
-/// the 2026-09-05 shakedown bug. `LC_`-prefixed because sshd's default AcceptEnv is
-/// `LANG LC_*`.
+/// the 2026-09-05 shakedown bug. `LC_`-prefixed because the sshd configs that forward
+/// anything at all forward `LC_*` (macOS, Debian/Ubuntu: `AcceptEnv LANG LC_*`).
+///
+/// Pure: what the daemon REQUESTS. `DaemonSessionMarkerLiveTests` proves the request
+/// actually reaches a remote login shell.
 final class DaemonSessionEnvironmentTests: XCTestCase {
 
     private func config(server: String) throws -> DaemonConfig {
@@ -81,12 +84,22 @@ final class DaemonSessionEnvironmentTests: XCTestCase {
         )
     }
 
-    /// The name is a contract with the shell profiles that guard on it (and with sshd's
-    /// default AcceptEnv); a rename would silently re-open the hijack.
+    /// `null` is not a way around the marker either: the config fails to load (exit 64,
+    /// "bad config"), so no session is ever opened without it. Pinned because a tolerant
+    /// decode that silently dropped the key would be the quiet alternative.
+    func testNullMarkerValueIsABadConfigNotAMissingMarker() {
+        XCTAssertThrowsError(try config(server: """
+        {"host": "h", "username": "u", "privateKeyPath": "/k", "environment": {"LC_FIN_AGENT": null}}
+        """))
+    }
+
+    /// The name is a contract with the shell profiles that guard on it (and with the
+    /// `LC_*` AcceptEnv glob where sshd ships one); a rename would silently re-open the
+    /// hijack.
     func testMarkerNameIsTheOneShellProfilesGuardOn() {
         XCTAssertEqual(DaemonConfig.ServerConfig.agentMarkerName, "LC_FIN_AGENT")
         XCTAssertEqual(DaemonConfig.ServerConfig.agentMarkerDefaultValue, "1")
         XCTAssertTrue(DaemonConfig.ServerConfig.agentMarkerName.hasPrefix("LC_"),
-                      "sshd's default AcceptEnv forwards only LANG and LC_*")
+                      "an sshd that forwards anything by default forwards LANG and LC_*")
     }
 }

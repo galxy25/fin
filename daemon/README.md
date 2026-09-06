@@ -69,10 +69,18 @@ marker is how that shell profile tells the daemon apart. The daemon has no PTY+e
 mode (Citadel's `withPTY` is a shell channel), so the marker — not a remote command — is
 what keeps it out of your session.
 
-It is `LC_`-prefixed because sshd's default `AcceptEnv` is `LANG LC_*` (macOS and
-Amazon Linux both), so it crosses the wire with no sshd change. A hardened sshd needs
-`AcceptEnv LC_*` (or `LC_FIN_AGENT` by name) in `sshd_config` for the marker — and any
-other `server.environment` entry — to arrive.
+It is `LC_`-prefixed because the sshd configs that forward anything at all forward
+`LC_*`: macOS (`/etc/ssh/sshd_config.d/100-macos.conf`) and Debian/Ubuntu ship
+`AcceptEnv LANG LC_*`, so there it crosses the wire with no sshd change. The RHEL family
+— Fedora, RHEL, and Amazon Linux, which derives from Fedora — enumerates locale names
+instead (`AcceptEnv LANG LC_CTYPE LC_NUMERIC … LC_ALL LANGUAGE`, no glob), which drops
+`LC_FIN_AGENT` silently; a hardened sshd may forward nothing. Check the host you SSH
+into with `sshd -T | grep -i acceptenv`, and where `LC_*` isn't listed add
+`AcceptEnv LC_FIN_AGENT` to `sshd_config` (or to a drop-in under
+`/etc/ssh/sshd_config.d/` where the main file includes that directory) and reload sshd
+— that gates any other `server.environment` entry too. The cloud worker's bootstrap
+does not do this today: its `fin-agent` login shell is a stock bash with no
+auto-attach, so nothing there needs the marker yet.
 
 If your login shell auto-attaches tmux, gate it on the marker:
 
@@ -84,7 +92,9 @@ end
 ```
 
 ```sh
-# bash / zsh — ~/.bashrc or ~/.zshrc
+# bash / zsh — in the SAME file as your auto-attach. An SSH login shell reads
+# ~/.bash_profile (or ~/.profile) and ~/.zprofile; ~/.bashrc runs only if one of
+# those sources it (Fedora's skeleton does, macOS's default doesn't).
 if [ -n "$SSH_TTY" ] && [ -z "$TMUX" ] && [ -z "$LC_FIN_AGENT" ]; then
     exec tmux new-session -A -s main
 fi
@@ -92,9 +102,12 @@ fi
 
 `server.environment` is merged over the marker: an entry named `LC_FIN_AGENT` changes
 its value (any non-blank string), but nothing in the config can remove or blank it — a
-blank value would read as unset to the `[ -z … ]` guard above. Everything else in the
-block is passed through as-is, subject to the same `AcceptEnv` caveat.
-(`DaemonSessionEnvironmentTests` pins all of this.)
+blank value would read as unset to the `[ -z … ]` guard above, and a `null` value fails
+the config load (exit 64, `bad config`) rather than dropping the key. Everything else in
+the block is passed through as-is, subject to the same `AcceptEnv` caveat.
+(`DaemonSessionEnvironmentTests` pins what the daemon requests;
+`DaemonSessionMarkerLiveTests` proves the request reaches a real login shell — and that
+the shell which got it is not inside tmux — against the dev machine's own sshd.)
 
 ### stayResident
 
@@ -193,20 +206,35 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   messages via the engine **between turns only**. A directive with `"arm_monitor": true`
   (optionally `"interval_seconds"`) also takes the monitor-start path above; any fresh
   directive restarts a model-disarmed heartbeat. Applied ids are deduped in
-  `fin-agentd-directives.json` next to the audit log (capped at 500, oldest evicted) so
-  a restart never replays old instructions.
+  `fin-agentd-directives.json` next to the audit log — since 1.4.0 an object
+  `{"applied": […], "seeded": […], "seed_pending": false}` (the 1.3.0 bare array still
+  loads); `applied` is capped at 500, oldest evicted — so a restart never replays old
+  instructions.
 
   **First run (1.4.0).** A box with no ledger file at all — a fresh cloud worker, a new
   install — treats the first directive document it successfully reads as history, not
   instructions: every id in it (matching this agent or not, well-formed or not) is
-  marked applied without being injected, the ledger is written, and one line audits
+  recorded as seeded without being injected, the ledger is written, and one line audits
   `[s3] first run: N historical directive(s) in the supervision doc marked applied, not
-  replayed`. Only directives issued after that point are delivered. The document is
+  replayed`. That read happens **at launch** — before the SSH connect, the readiness
+  probes and the first task turn, which together can run for minutes — so the boundary
+  is the same one the control plane draws when it empties the per-agent inbox, and a
+  directive written after launch is delivered even if it lands mid-first-turn. (If the
+  launch fetch fails, `[s3] first run: directive document not read at launch — seed
+  deferred to the next poll` is audited and the poll loop seeds on the first document
+  it does read.) Seeded ids live in the ledger's own `seeded` list, uncapped: the
+  document may hold more than the 500-id applied cap, and a seeded id evicted from a
+  capped list would replay — so the audit count is what was kept. The document is
   shared by every agent, so the control plane can't empty it at launch the way it
   empties the per-agent inbox; before this a fresh worker replayed weeks of operator
   directives, one model turn each. An existing ledger — even an empty `[]` — or a
-  corrupt one is *not* a first run: the daemon has run here, and every unapplied
-  directive is delivered as before.
+  corrupt or unreadable one is *not* a first run: the daemon has run here, and every
+  unapplied directive is delivered as before. The one exception is a ledger the first
+  run itself wrote while its seed was still owed (an inbox message applied while the
+  directive URL was failing, then a restart — systemd's `Restart=always`): the file
+  says so (`"seed_pending": true`), the next launch audits `[s3] first run: resumed
+  with the directive seed still pending`, and the seed lands when the document finally
+  arrives instead of the document replaying.
 
   ```json
   {"version": 1, "directives": [
@@ -252,8 +280,12 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   at-most-once by design); a dedupe state file that exists but doesn't parse audits
   `[s3] state file unreadable — dedupe reset` once at startup; a first run with history
   in the directive document audits `[s3] first run: N historical directive(s) in the
-  supervision doc marked applied, not replayed` once, on the poll that read it (a
-  missing ledger with an empty document audits nothing).
+  supervision doc marked applied, not replayed` once, on the read that seeded it —
+  normally the launch fetch (a missing ledger with an empty document audits nothing).
+  The other first-run lines: `[s3] first run: directive document not read at launch —
+  seed deferred to the next poll` when the launch fetch failed, and `[s3] first run:
+  resumed with the directive seed still pending` when a restart finds a ledger the
+  previous life wrote before its seed landed.
 
 ## Cloud transcript
 
@@ -321,8 +353,9 @@ swift test
 ```
 
 Pure-logic tests always run (engine dispatch, directive and inbox polling with an
-injected transport including the first-run high-water, the `LC_FIN_AGENT` session
-marker, the transcript line format against the app reader's contract, the stayResident
-gates, classifier guards). The live integration tests (real sshd + tmux on
-127.0.0.1, LM Studio at `localhost:1234`) skip cleanly when the dev-machine
-prerequisites are missing.
+injected transport including the first-run high-water and its launch-time prime, the
+`LC_FIN_AGENT` session marker, the transcript line format against the app reader's
+contract, the stayResident gates, classifier guards). The live integration tests (real
+sshd + tmux on 127.0.0.1, LM Studio at `localhost:1234`, and
+`DaemonSessionMarkerLiveTests` asking a real login shell whether the marker arrived)
+skip cleanly when the dev-machine prerequisites are missing.

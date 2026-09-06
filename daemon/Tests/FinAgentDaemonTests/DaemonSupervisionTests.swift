@@ -231,8 +231,20 @@ final class DaemonDirectiveClientTests: XCTestCase {
         try? FileManager.default.removeItem(atPath: stateFile)
     }
 
-    private func persistedLedger() throws -> [String] {
-        try JSONDecoder().decode([String].self, from: Data(contentsOf: URL(fileURLWithPath: stateFile)))
+    /// The 1.4.0 object form the client writes.
+    private func persistedLedger() throws -> DaemonDirectiveClient.LedgerFile {
+        try JSONDecoder().decode(DaemonDirectiveClient.LedgerFile.self,
+                                 from: Data(contentsOf: URL(fileURLWithPath: stateFile)))
+    }
+
+    /// The file's bytes as written — for the legacy `[]` posture and the corrupt case,
+    /// where the point is that the client left them alone.
+    private func rawLedger() throws -> String {
+        try String(contentsOfFile: stateFile, encoding: .utf8)
+    }
+
+    private func seededLedger(_ ids: [String], applied: [String] = []) -> DaemonDirectiveClient.LedgerFile {
+        DaemonDirectiveClient.LedgerFile(applied: applied, seeded: ids, seedPending: false)
     }
 
     override func tearDown() {
@@ -566,8 +578,9 @@ final class DaemonDirectiveClientTests: XCTestCase {
         let first = await client.poll()
 
         XCTAssertTrue(first.isEmpty, "history must not replay: \(first.map(\.id))")
-        XCTAssertEqual(client.appliedIDs, ["d-1", "d-2", "d-3"])
-        XCTAssertEqual(try persistedLedger(), ["d-1", "d-2", "d-3"], "the seed is durable")
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
+        XCTAssertTrue(client.appliedIDs.isEmpty, "seeded ids live apart from the capped applied list")
+        XCTAssertEqual(try persistedLedger(), seededLedger(["d-1", "d-2", "d-3"]), "the seed is durable")
         XCTAssertEqual(
             lines.filter {
                 $0 == "[s3] first run: 3 historical directive(s) in the supervision doc marked applied, not replayed"
@@ -601,7 +614,7 @@ final class DaemonDirectiveClientTests: XCTestCase {
         let pending = await client.poll()
 
         XCTAssertTrue(pending.isEmpty)
-        XCTAssertEqual(client.appliedIDs, ["d-1", "d-2", "d-3", "d-4"])
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3", "d-4"])
         XCTAssertTrue(lines.contains(
             "[s3] first run: 4 historical directive(s) in the supervision doc marked applied, not replayed"
         ), "got: \(lines)")
@@ -611,7 +624,7 @@ final class DaemonDirectiveClientTests: XCTestCase {
     /// An existing ledger — even an empty one — means the daemon has run here before:
     /// today's behavior is unchanged and every unapplied directive is delivered.
     func testPresentEmptyLedgerIsNotAFirstRun() async throws {
-        XCTAssertEqual(try persistedLedger(), [], "setUp leaves an empty ledger on disk")
+        XCTAssertEqual(try rawLedger(), "[]", "setUp leaves the 1.3.0 empty ledger on disk")
         var lines: [String] = []
         let client = makeClient(audit: { lines.append($0) },
                                 fetch: { _ in (self.history(), self.response(200)) })
@@ -619,7 +632,22 @@ final class DaemonDirectiveClientTests: XCTestCase {
         let pending = await client.poll()
 
         XCTAssertEqual(pending.map(\.id), ["d-1", "d-2", "d-3"])
+        XCTAssertTrue(client.seededIDs.isEmpty)
         XCTAssertFalse(lines.contains { $0.hasPrefix(Self.firstRunAuditPrefix) }, "got: \(lines)")
+        XCTAssertEqual(try rawLedger(), "[]", "nothing applied, nothing seeded — the file is untouched")
+    }
+
+    /// A 1.3.0 ledger — the bare array — loads as applied ids and is rewritten in the
+    /// 1.4.0 object form on the next write, with nothing lost.
+    func testLegacyArrayLedgerLoadsAndUpgradesInPlace() async throws {
+        try Data(#"["d-1"]"#.utf8).write(to: URL(fileURLWithPath: stateFile))
+        let client = makeClient(fetch: { _ in (self.history(), self.response(200)) })
+
+        let pending = await client.poll()
+        XCTAssertEqual(pending.map(\.id), ["d-2", "d-3"], "d-1 was applied by the 1.3.0 daemon")
+
+        client.markApplied("d-2")
+        XCTAssertEqual(try persistedLedger(), seededLedger([], applied: ["d-1", "d-2"]))
     }
 
     /// The inbox is exempt: the control plane empties it at launch (the launch is the
@@ -645,8 +673,9 @@ final class DaemonDirectiveClientTests: XCTestCase {
         let pending = await client.poll()
 
         XCTAssertEqual(pending.map(\.id), ["m-1", "m-2"], "inbox delivers; directives are seeded")
-        XCTAssertEqual(client.appliedIDs, ["d-1", "d-2"], "directive ids seeded, inbox ids untouched")
-        XCTAssertEqual(try persistedLedger(), ["d-1", "d-2"])
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2"], "directive ids seeded, inbox ids untouched")
+        XCTAssertTrue(client.appliedIDs.isEmpty)
+        XCTAssertEqual(try persistedLedger(), seededLedger(["d-1", "d-2"]))
         XCTAssertTrue(lines.contains(
             "[s3] first run: 2 historical directive(s) in the supervision doc marked applied, not replayed"
         ), "got: \(lines)")
@@ -655,8 +684,8 @@ final class DaemonDirectiveClientTests: XCTestCase {
     /// A corrupt ledger is a reset, not a first run: the daemon HAS run here, so it
     /// keeps today's replay-what's-unapplied behavior with its own audit line, and the
     /// two cases stay distinguishable in the log.
-    func testCorruptLedgerIsNotSeeded() async {
-        try? Data("not json {{".utf8).write(to: URL(fileURLWithPath: stateFile))
+    func testCorruptLedgerIsNotSeeded() async throws {
+        try Data("not json {{".utf8).write(to: URL(fileURLWithPath: stateFile))
         var lines: [String] = []
         let client = makeClient(audit: { lines.append($0) },
                                 fetch: { _ in (self.history(), self.response(200)) })
@@ -664,7 +693,26 @@ final class DaemonDirectiveClientTests: XCTestCase {
         let pending = await client.poll()
 
         XCTAssertEqual(pending.map(\.id), ["d-1", "d-2", "d-3"])
+        XCTAssertTrue(client.seededIDs.isEmpty)
         XCTAssertEqual(lines.filter { $0 == "[s3] state file unreadable — dedupe reset" }.count, 1)
+        XCTAssertFalse(lines.contains { $0.hasPrefix(Self.firstRunAuditPrefix) }, "got: \(lines)")
+        XCTAssertEqual(try rawLedger(), "not json {{", "a reset never rewrites the file it couldn't read")
+    }
+
+    /// A ledger that exists but can't be read (permissions, a directory at the path) is
+    /// a reset like a corrupt one — the daemon has run here — never a first run that
+    /// would seed, fail to persist, and do it all again on every launch.
+    func testUnreadableLedgerIsAResetNotAFirstRun() async throws {
+        try FileManager.default.removeItem(atPath: stateFile)
+        try FileManager.default.createDirectory(atPath: stateFile, withIntermediateDirectories: false)
+        var lines: [String] = []
+        let client = makeClient(audit: { lines.append($0) },
+                                fetch: { _ in (self.history(), self.response(200)) })
+
+        XCTAssertEqual(lines.filter { $0 == "[s3] state file unreadable — dedupe reset" }.count, 1, "got: \(lines)")
+        let pending = await client.poll()
+        XCTAssertEqual(pending.map(\.id), ["d-1", "d-2", "d-3"], "delivered, as after any reset")
+        XCTAssertTrue(client.seededIDs.isEmpty)
         XCTAssertFalse(lines.contains { $0.hasPrefix(Self.firstRunAuditPrefix) }, "got: \(lines)")
     }
 
@@ -684,12 +732,12 @@ final class DaemonDirectiveClientTests: XCTestCase {
 
         let failed = await client.poll()
         XCTAssertTrue(failed.isEmpty)
-        XCTAssertTrue(client.appliedIDs.isEmpty, "nothing was read, so nothing is seeded")
+        XCTAssertTrue(client.seededIDs.isEmpty, "nothing was read, so nothing is seeded")
         XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile))
 
         let seeded = await client.poll()
         XCTAssertTrue(seeded.isEmpty)
-        XCTAssertEqual(client.appliedIDs, ["d-1", "d-2", "d-3"])
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
         XCTAssertEqual(lines.filter { $0.hasPrefix(Self.firstRunAuditPrefix) }.count, 1, "got: \(lines)")
     }
 
@@ -719,8 +767,213 @@ final class DaemonDirectiveClientTests: XCTestCase {
         let pending = await client.poll()
 
         XCTAssertTrue(pending.isEmpty)
-        XCTAssertEqual(try persistedLedger(), [])
+        XCTAssertEqual(try persistedLedger(), seededLedger([]))
         XCTAssertTrue(lines.isEmpty, "got: \(lines)")
+    }
+
+    /// The seed must outlive the applied-id cap: a shared document can hold more than
+    /// 500 entries, and a seeded id evicted from a capped list would replay — the bug
+    /// itself, in the large-document case. Seeded ids are therefore kept apart and
+    /// uncapped, the audit count is the retained count, and the cap keeps governing
+    /// only what the daemon applies itself.
+    func testFirstRunSeedSurvivesTheAppliedIDCap() async throws {
+        startWithNoLedger()
+        let count = DaemonDirectiveClient.appliedIDsCap + 100
+        let history = (1...count).map { #"{"id": "d-\#($0)", "kind": "user_message", "text": "old"}"# }
+        var body = document(history.joined(separator: ","))
+        var lines: [String] = []
+        let client = makeClient(audit: { lines.append($0) },
+                                fetch: { _ in (body, self.response(200)) })
+
+        let first = await client.poll()
+
+        XCTAssertTrue(first.isEmpty, "nothing in a \(count)-entry history may replay: \(first.map(\.id).prefix(5))")
+        XCTAssertEqual(client.seededIDs.count, count)
+        XCTAssertTrue(client.appliedIDs.isEmpty)
+        XCTAssertTrue(lines.contains(
+            "[s3] first run: \(count) historical directive(s) in the supervision doc marked applied, not replayed"
+        ), "got: \(lines)")
+        XCTAssertEqual(try persistedLedger().seeded.count, count, "all of it is durable, not a 500-id suffix")
+
+        // Churn the applied list past its cap; the seed is unaffected.
+        for index in 0..<(DaemonDirectiveClient.appliedIDsCap + 10) {
+            client.markApplied("m-\(index)")
+        }
+        XCTAssertEqual(client.appliedIDs.count, DaemonDirectiveClient.appliedIDsCap)
+        body = document((history + [#"{"id": "d-new", "kind": "user_message", "text": "fresh"}"#]).joined(separator: ","))
+        let afterChurn = await client.poll()
+        XCTAssertEqual(afterChurn.map(\.id), ["d-new"])
+
+        // And across a restart.
+        let reborn = makeClient(fetch: { _ in (body, self.response(200)) })
+        let afterRestart = await reborn.poll()
+        XCTAssertEqual(afterRestart.map(\.id), ["d-new"])
+    }
+
+    /// The status document's `last_applied_id` is the high-water mark after a seed —
+    /// the newest seeded id — until the daemon applies something itself.
+    func testStatusReportsTheSeedAsLastAppliedUntilARealApply() async throws {
+        startWithNoLedger()
+        let client = makeClient(fetch: { _ in (self.history(), self.response(200)) })
+        _ = await client.poll()
+
+        func lastApplied() throws -> String? {
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(client.statusBody(DaemonStatusSnapshot(state: "idle")).utf8)
+            ) as? [String: Any])
+            return object["last_applied_id"] as? String
+        }
+        XCTAssertEqual(try lastApplied(), "d-3")
+        client.markApplied("m-1")
+        XCTAssertEqual(try lastApplied(), "m-1")
+    }
+
+    /// The one path where a ledger exists yet seeding still happens: the directive fetch
+    /// keeps failing while an inbox message applies and persists. The seed must still
+    /// land on the next successful directive read in this process.
+    func testInboxApplyWhileTheSeedIsPendingKeepsTheFirstRun() async throws {
+        startWithNoLedger()
+        struct Boom: Error {}
+        var directivesReachable = false
+        var lines: [String] = []
+        let inbox = document(#"{"id": "m-1", "kind": "user_message", "text": "from the phone"}"#)
+        let client = makeInboxClient(
+            audit: { lines.append($0) },
+            directives: {
+                guard directivesReachable else { throw Boom() }
+                return (self.history(), self.response(200))
+            },
+            inbox: { (inbox, self.response(200)) }
+        )
+
+        let pending = await client.poll()
+        XCTAssertEqual(pending.map(\.id), ["m-1"], "the inbox is exempt, and a dead directive URL is not its problem")
+        client.markApplied("m-1")
+        XCTAssertEqual(try persistedLedger(),
+                       DaemonDirectiveClient.LedgerFile(applied: ["m-1"], seeded: [], seedPending: true),
+                       "the ledger exists, and says the seed is still owed")
+
+        directivesReachable = true
+        let afterRecovery = await client.poll()
+
+        XCTAssertTrue(afterRecovery.isEmpty, "history seeded, m-1 applied: \(afterRecovery.map(\.id))")
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
+        XCTAssertEqual(try persistedLedger(), seededLedger(["d-1", "d-2", "d-3"], applied: ["m-1"]))
+        XCTAssertEqual(lines.filter { $0.hasPrefix(Self.firstRunAuditPrefix) }.count, 1, "got: \(lines)")
+    }
+
+    /// Same window, plus a restart before the directive URL recovers — real on a cloud
+    /// worker (systemd `Restart=always`, and the daemon exits after five failed turns).
+    /// Because the file records the pending seed, the second life is still a first run:
+    /// the shared document is seeded when it finally arrives, never replayed, and the
+    /// inbox id applied by the first life stays applied.
+    func testRestartWhileTheSeedIsPendingIsStillAFirstRun() async throws {
+        startWithNoLedger()
+        struct Boom: Error {}
+        let inbox = document(#"{"id": "m-1", "kind": "user_message", "text": "from the phone"}"#)
+        let firstLife = makeInboxClient(
+            directives: { throw Boom() },
+            inbox: { (inbox, self.response(200)) }
+        )
+        _ = await firstLife.poll()
+        firstLife.markApplied("m-1")
+        XCTAssertTrue(try persistedLedger().seedPending)
+
+        var lines: [String] = []
+        let secondLife = makeInboxClient(
+            audit: { lines.append($0) },
+            directives: { (self.history(), self.response(200)) },
+            inbox: { (inbox, self.response(200)) }
+        )
+        XCTAssertTrue(lines.contains("[s3] first run: resumed with the directive seed still pending"), "got: \(lines)")
+
+        let pending = await secondLife.poll()
+
+        XCTAssertTrue(pending.isEmpty, "m-1 stays applied and history is seeded, not replayed: \(pending.map(\.id))")
+        XCTAssertEqual(secondLife.seededIDs, ["d-1", "d-2", "d-3"])
+        XCTAssertEqual(secondLife.appliedIDs, ["m-1"])
+        XCTAssertEqual(try persistedLedger(), seededLedger(["d-1", "d-2", "d-3"], applied: ["m-1"]))
+        XCTAssertTrue(lines.contains(
+            "[s3] first run: 3 historical directive(s) in the supervision doc marked applied, not replayed"
+        ), "got: \(lines)")
+    }
+
+    // MARK: First run — the launch-time prime
+
+    /// `primeFirstRunSeed` is the daemon's launch hook: it draws the high-water before
+    /// the SSH connect and the first task turn, so a directive written during that
+    /// (minutes-long) window is delivered rather than stamped history. It is not a
+    /// poll — the loop's first scheduled poll still happens, riding the ETag the prime
+    /// recorded.
+    func testPrimeFirstRunSeedDrawsTheHighWaterAtLaunch() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+        var requests: [URLRequest] = []
+        var body = history()
+        let client = makeClient(audit: { lines.append($0) }, fetch: { request in
+            requests.append(request)
+            return (body, self.response(200, etag: "\"v1\""))
+        })
+
+        await client.primeFirstRunSeed()
+
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
+        XCTAssertEqual(try persistedLedger(), seededLedger(["d-1", "d-2", "d-3"]))
+        XCTAssertTrue(client.pollIsDue, "priming is not a poll; the loop's first poll runs on schedule")
+        XCTAssertEqual(lines.filter { $0.hasPrefix(Self.firstRunAuditPrefix) }.count, 1, "got: \(lines)")
+
+        // Written while the daemon connected and ran its first turn: delivered.
+        body = historyPlusOne()
+        let pending = await client.poll()
+        XCTAssertEqual(pending.map(\.id), ["d-4"])
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[1].value(forHTTPHeaderField: "If-None-Match"), "\"v1\"",
+                       "the poll's conditional GET rides the ETag the prime recorded")
+    }
+
+    func testPrimeFirstRunSeedIsANoOpWhenTheDaemonHasRunBefore() async throws {
+        XCTAssertEqual(try rawLedger(), "[]")
+        var fetches = 0
+        let client = makeClient(fetch: { _ in
+            fetches += 1
+            return (self.history(), self.response(200))
+        })
+
+        await client.primeFirstRunSeed()
+
+        XCTAssertEqual(fetches, 0, "nothing to seed, nothing to fetch")
+        XCTAssertTrue(client.seededIDs.isEmpty)
+        let pending = await client.poll()
+        XCTAssertEqual(pending.map(\.id), ["d-1", "d-2", "d-3"], "today's behavior, untouched")
+    }
+
+    /// A launch-time fetch that fails must not stop the daemon or forfeit the seed: it
+    /// says so once and the poll loop seeds on the first document it does read.
+    func testPrimeFirstRunSeedDefersToThePollLoopWhenTheFetchFails() async throws {
+        startWithNoLedger()
+        struct Boom: Error {}
+        var lines: [String] = []
+        var reachable = false
+        let client = makeClient(audit: { lines.append($0) }, fetch: { _ in
+            guard reachable else { throw Boom() }
+            return (self.history(), self.response(200))
+        })
+
+        await client.primeFirstRunSeed()
+
+        XCTAssertTrue(client.seededIDs.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile),
+                       "nothing read, nothing written — still a first run")
+        XCTAssertTrue(lines.contains(
+            "[s3] first run: directive document not read at launch — seed deferred to the next poll"
+        ), "got: \(lines)")
+
+        reachable = true
+        let pending = await client.poll()
+        XCTAssertTrue(pending.isEmpty)
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
+        XCTAssertEqual(lines.filter { $0.hasPrefix(Self.firstRunAuditPrefix) && $0.contains("historical") }.count, 1,
+                       "got: \(lines)")
     }
 
     // MARK: ETag and caching

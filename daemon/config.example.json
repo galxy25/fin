@@ -5,7 +5,7 @@
     "username": "youruser",
     "privateKeyPath": "~/.ssh/id_ed25519",
     "connectCommand": "tmux new-session -A -s fin-agentd \\; set status off",
-    "_environment_note": "Optional extra SSH env requests for the PTY channel; sshd must AcceptEnv them (the macOS and Amazon Linux default is LANG LC_*). LC_FIN_AGENT=1 is ALWAYS sent whether or not it is listed here — an entry for it changes the value, never removes it. See README: The session marker.",
+    "_environment_note": "Optional extra SSH env requests for the PTY channel; sshd must AcceptEnv them (macOS and Debian/Ubuntu default: LANG LC_*; RHEL-family sshd, Amazon Linux included, enumerates locale names and needs AcceptEnv LC_FIN_AGENT added — check with sshd -T). LC_FIN_AGENT=1 is ALWAYS sent whether or not it is listed here — an entry for it changes the value, never removes it. See README: The session marker.",
     "environment": {}
   },
   "agent": {
