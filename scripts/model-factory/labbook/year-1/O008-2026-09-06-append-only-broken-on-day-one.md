@@ -123,6 +123,13 @@ Appended to the READMEs alongside this entry:
 - **It does not show any current number in the book is wrong.** The audit passes
   fixed real errors, and the corrected values are the ones that reproduce today.
   The defect is procedural, in how they were fixed and in the silence about it.
+
+  *(A fourth pass has since run — **O010**, correcting the grep citation the
+  third pass introduced and five timestamps. Same draft-phase regime, same two
+  conditions met: it is not silent, and every rewritten passage names the figure
+  it withdrew. It also found that three consecutive correction rounds each
+  shipped a new provenance error, which is a defect in the correction procedure
+  itself and not only in the entries. O010 carries that.)*
 - **It does not settle where the book lives.** Two independently-numbered books
   with 13 colliding ids sit on this branch; that reconciliation is Levi's call
   and is still open (README.md, "Provenance of this directory").

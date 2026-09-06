@@ -13,7 +13,7 @@ sources:
   - main:evals/tmux-routing/run_evals.py:195 · main:evals/goals-ledger/run_evals.py:131 (the exit rule; the tmux-routing line is 210 on branch imac-site, where that file is 217 lines rather than 202)
 related: [E001, O007, H004, P001]
 corrects: []
-superseded-by: null
+superseded-by: O010
 ---
 
 ## Question
@@ -42,8 +42,10 @@ python3 evals/tmux-routing/run_evals.py
 python3 evals/goals-ledger/run_evals.py
 ```
 
-Run 2026-09-06, roughly 20 hours and several commits after the numbers in
-`RESULTS.md` were written.
+Run 2026-09-06 at ~11:26, **22h17m** and several commits after the numbers in
+`RESULTS.md` were written (`d98a031`, 2026-09-05 13:08:33). An earlier version
+of this line said "roughly 20 hours", which was rounded from nothing — the two
+endpoints were never subtracted.
 
 ## Result
 

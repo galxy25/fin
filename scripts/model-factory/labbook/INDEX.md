@@ -43,12 +43,13 @@ is unambiguous.
 | [O007](year-1/O007-2026-09-06-labels-are-baseline-output.md) | 2026-09-06 | OBSERVATION | Every routing and ledger label is deterministic-baseline output, and the filter meant to validate them rejected nothing | standing |
 | [O008](year-1/O008-2026-09-06-append-only-broken-on-day-one.md) | 2026-09-06 | OBSERVATION | The append-only rule was broken on day one, by the audit passes that were fixing the book | standing |
 | [O009](year-1/O009-2026-09-06-two-books-one-factory.md) | 2026-09-06 | OBSERVATION | Two lab books existed for one factory — the consolidation, and the id map it needed | standing |
+| [O010](year-1/O010-2026-09-06-fixing-a-citation-is-a-citation.md) | 2026-09-06 | OBSERVATION | Three rounds of correcting provenance claims, three new provenance errors — a fix to a citation is itself a citation | standing |
 | [H001](year-1/H001-2026-09-06-bits-per-example.md) | 2026-09-06 | HYPOTHESIS | Bits per example is the right currency for a training curriculum | untested |
 | [H002](year-1/H002-2026-09-06-high-information-subset.md) | 2026-09-06 | HYPOTHESIS | A small high-information subset reaches the same gate score in materially fewer iterations | untested |
 | [H003](year-1/H003-2026-09-06-best-checkpoint-not-last.md) | 2026-09-06 | HYPOTHESIS | The best checkpoint is not the last one | untested |
 | [H004](year-1/H004-2026-09-06-baseline-labels-cap-hard-tier.md) | 2026-09-06 | HYPOTHESIS | Distilling the deterministic baseline will pull the hard tier down toward it | untested |
 
-**26 entries.** The row count of the table above equals the file count of
+**27 entries.** The row count of the table above equals the file count of
 `year-1/`; check it with
 `ls scripts/model-factory/labbook/year-1/*.md | wc -l`.
 
@@ -66,4 +67,4 @@ is unambiguous.
 
 ## Next free ids
 
-`E009` · `O010` · `H005` · `P006`
+`E009` · `O011` · `H005` · `P006`

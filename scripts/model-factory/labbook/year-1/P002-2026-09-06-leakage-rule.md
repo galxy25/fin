@@ -17,7 +17,7 @@ sources:
   - "merged from docs/labbook/entries/P002-2026-09-06-leakage-gate.md (the parallel book, 4705b67) — see the merge note below"
 related: [P001, P005, O003, O007, H004, E006, E007]
 corrects: []
-superseded-by: null
+superseded-by: O010
 ---
 
 **Merged from two drafts.** Both books wrote a leakage protocol on 2026-09-06
@@ -50,7 +50,7 @@ Reproducing it in training would teach the model the wrong answers.
 ## Why the rule exists — the approach that was abandoned
 
 The first dataset builder seeded training data **from the eval corpus itself**.
-`build_dataset.py` (`a823271`, 2026-09-05 13:03) emits one training example per
+`build_dataset.py` (`a823271`, 2026-09-05 **12:59:51**) emits one training example per
 eval scenario, building the system message from the eval adapter's own
 `_system_prompt` and the assistant message from the scenario's `expected` label.
 Its own docstring flags it in capitals (`build_dataset.py:29-33` at main

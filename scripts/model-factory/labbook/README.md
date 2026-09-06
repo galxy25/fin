@@ -134,6 +134,38 @@ same command at `0fe0883` returns **30**. The arithmetic was never the problem:
 the number measured the book, and updating it would only reset the clock. O009
 records the sweep that applied this rule to every entry.
 
+### And run it at every revision it names
+
+The rule above says *which* command to cite. This one says what you owe before
+citing it, and it exists because the fix for the "24 hits" claim broke this way
+within the same commit, and it was the **third** consecutive round in which a
+correction to a provenance claim shipped a new provenance error (O010 has the
+sequence).
+
+> **A command cited as evidence must be RUN AT EVERY REVISION IT CLAIMS, not
+> reasoned about.** "This exits 1 at `X` and at `Y`" is two measurements. Run it
+> twice. A single `<rev>`-parameterised command with a list of revisions beside
+> it is a claim about each of them separately, and it is not licensed by having
+> run any one.
+
+Two corollaries, both learned the hard way:
+
+- **The revisions a claim spans change when history changes underneath it.** The
+`0fe0883` grep needed *two* `:(exclude)` pathspecs because two lab books existed
+there; the consolidation deleted one book, made one pathspec sufficient *going
+forward*, and rewrote the old citation as though the repository had always had
+that shape. Do not retrofit today's repository onto yesterday's revision.
+- **A branch name is not a revision.** `main` is a moving pointer: it was
+`704ab09` while this book was written and is `587fb9a` now, and `git grep
+'datasets/mlx' main` changed answer between those two without anyone touching
+the factory. Cite the sha. If prose needs the name, give the sha beside it and
+say when it was read.
+
+The check that catches this is mechanical: for each command in an entry, run it
+at each revision named, paste the exit code and the output, and only then write
+the sentence. If a command is expensive to run at four revisions, that is a
+reason to cite fewer revisions, not a reason to reason about the fourth.
+
 **Honest negative results are first-class.** An abandoned approach, with the
 reason it was abandoned, is among the most valuable things in this book: it is
 the only record that stops the same road being walked twice. E001 (a prompt
@@ -329,8 +361,8 @@ records.**
 
 A parallel draft of the same book existed on this branch at `docs/labbook/`,
 committed the same morning (`4705b67`, 2026-09-06 11:21:40) by a sibling agent
-working from an overlapping set of facts — twelve minutes before this book's
-first commit, `a02cec3`. Its 13 entries were numbered in their own sequence and
+working from an overlapping set of facts — **sixteen minutes** before this
+book's first commit, `a02cec3` (11:37:55; the gap is 16m15s). Its 13 entries were numbered in their own sequence and
 **every one of its ids collided with an id here, with a different subject behind
 it.** The crossings were the dangerous part: the stale champion was `O004` there
 and `O002` here; bits per example was `E004` there and `H001` here; "the best
@@ -377,6 +409,15 @@ merge:
   taken from the deleted book's README, which stated it better.
 - **Reproduction commands are written against a revision** — also the deleted
   book's, and the reason E006 and P005 read the way they do.
+
+A fourth arrived one round later, from the round that was fixing the first
+three:
+
+- **And run it at every revision it names** — rule 2's other new subsection,
+  added by O010, because the consolidation's fix for the hit-count above
+  asserted an exit code at a revision nobody ran it at. Correcting a provenance
+  claim is itself making a provenance claim, and this book has now got that
+  wrong three rounds running.
 
 One thing did *not* change, and it is worth saying: ids are still never reused
 and never renumbered. The four entries that moved were renumbered exactly once,

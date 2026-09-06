@@ -8,25 +8,25 @@ status: standing
 tags: [meta, conventions, provenance, consolidation]
 sources:
   - 4705b67 — "Open the model factory lab book: year 1, day 1" (2026-09-06 11:21:40) — `docs/labbook/`, 13 entries
-  - a02cec3 — "Model factory lab book, year 1: the dated record the factory did not have" — `scripts/model-factory/labbook/`, 20 entries
+  - a02cec3 — "Model factory lab book, year 1: the dated record the factory did not have" (2026-09-06 11:37:55) — `scripts/model-factory/labbook/`, 20 entries
   - cdb895a — "Lab book audit pass: correct every number that did not trace to its artifact" — 26 files modified, 0 added
   - 0fe0883 — "Lab book, round 2: fix the anchors that moved and record the rule we broke" — the state both books were in when this entry was written (21 entries here, 13 there)
   - "local-artifact: memory note labbook-and-publishing (2026-09-06) — fixes the location as scripts/model-factory/labbook/ alongside a publishing pipeline under content/"
   - "git log --diff-filter=D --name-only -- docs/labbook — the deleted book, recoverable at 0fe0883"
-related: [O008, O001, O002, O003, O005, O007, H001, H003, H004, P002, E006, E007, E008, P005]
+related: [O008, O010, O001, O002, O003, O005, O007, H001, H003, H004, P002, E006, E007, E008, P005]
 corrects: []
-superseded-by: null
+superseded-by: O010
 ---
 
 ## What was observed
 
-Two lab books were opened for one factory on the morning of 2026-09-06, twelve
-minutes apart, by two agents working from an overlapping set of facts. Neither
-knew it was the second.
+Two lab books were opened for one factory on the morning of 2026-09-06,
+**sixteen minutes** apart, by two agents working from an overlapping set of
+facts. Neither knew it was the second.
 
 | | `docs/labbook/` | `scripts/model-factory/labbook/` |
 | --- | --- | --- |
-| opened | `4705b67`, 11:21:40 | `a02cec3`, 11:33 |
+| opened | `4705b67`, 11:21:40 | `a02cec3`, **11:37:55** |
 | entries at `0fe0883` | 13 | 21 |
 | entry format | bold-field header (`- **Kind:**`) | YAML front matter |
 | numbering | its own sequence | its own sequence |
@@ -59,7 +59,8 @@ of what that cost and what it moved.
 Not a merge conflict and not a mistake either agent could have seen. Both were
 told to open a lab book for the model factory; both did; nothing in the
 repository at 11:21 said one already existed, because the first one was still
-being written. The window between the two first commits was **twelve minutes**.
+being written. The window between the two first commits was **16m15s** —
+`4705b67` at 11:21:40 and `a02cec3` at 11:37:55, both `%ad` from `git log`.
 
 The deeper cause is that neither book was reachable from anywhere a second
 author would look first. `scripts/model-factory/README.md` gained its "Lab book"
@@ -172,6 +173,17 @@ show` heading counted a book that has since grown, so it is now pinned to
 `0fe0883` with the reproducer beside it. E003's and E004's log-report counts are
 already stated with the offset they were read at, which is the same discipline
 applied to a file rather than to a repository.
+
+**Amended by O010.** The replacement this section describes — swapping the "24
+hits" row for `git grep -n 'datasets/mlx' <rev> -- ':(exclude)scripts/model-factory/labbook'`,
+asserted to exit 1 "at `main` and at `0fe0883`" — was **not run at `0fe0883`**.
+It exits 0 there, with 11 hits, because `docs/labbook/` still existed at that
+revision and the new one-pathspec form excludes only this book. The pass applied
+a rule written for the repository it was creating to a citation about the
+repository as it had been, and deleted the "**Both qualifiers are load-bearing**"
+sentence that made the old form correct. Every site is fixed (O005's table is
+now a run matrix, E008 carries the command at each of three revisions), and
+O010 is the entry about *why* a correction pass keeps producing this shape.
 
 ## A second correction this pass made
 

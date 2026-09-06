@@ -16,7 +16,7 @@ sources:
   - "merged from docs/labbook/entries/E004-2026-09-06-bits-per-example.md (the parallel book, 4705b67) — see the merge note below"
 related: [H002, O001, O004, O007, E004, E006, E007]
 corrects: []
-superseded-by: null
+superseded-by: O010
 ---
 
 **Merged from two drafts.** Two lab books were opened on 2026-09-06 and both
@@ -321,8 +321,12 @@ opposite: that the four files were untracked, on no branch, and that "this entry
 cannot cite a sha for them". That was a recollection about a working tree, and it
 was already false when it was written. The commit is **`d4901d4`** on branch
 `bits-curriculum`, *"Bits per example: measure what each training example
-actually teaches"*, authored and committed **2026-09-06 11:25:38** — five minutes
-before the stated observation and twelve before this book's own first commit. Its
+actually teaches"*, authored and committed **2026-09-06 11:25:38** — 3m58s after
+`4705b67` (11:21:40) opened the other book and 12m17s before `a02cec3`
+(11:37:55) opened this one. An earlier version of this sentence also said "five
+minutes before the stated observation"; no observation time is stated anywhere in
+this entry, so that half named an interval with only one endpoint and has been
+cut (O010). Its
 `--stat` lists `score_bits.py`, `select_curriculum.py`, `run_bits_experiment.sh`,
 `tests/test_bits_curriculum.py` and a 150-line `README.md`, 2,640 insertions.
 
