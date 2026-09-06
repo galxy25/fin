@@ -19,6 +19,28 @@ decision trajectories flow in through the control plane, become datasets,
 train candidates, and only a candidate that beats the champion on the evals
 ships back to the app as the local model.
 
+## Lab book
+
+**[`labbook/`](labbook/) is the factory's dated, append-only record** —
+experiments, observations, hypotheses and protocols, every number citing an
+artifact. Start at [`labbook/INDEX.md`](labbook/INDEX.md); the conventions are
+in [`labbook/README.md`](labbook/README.md).
+
+This README describes how the factory is *meant* to work. The lab book records
+what actually happened, including the parts that did not work and the places
+the two disagree — the status checklist below has drifted from the running
+system more than once (see `labbook/year-1/O005-…`). When they conflict, the
+lab book cites its evidence; this file does not.
+
+Read first if you are new to the factory:
+
+| entry | why |
+| --- | --- |
+| `year-1/P001-…-promotion-protocol.md` | what actually promotes a model |
+| `year-1/P003-…-apple-silicon-training-contract.md` | the rules that keep the training box alive |
+| `year-1/E001-…-router-prompt-rounds.md` | how the current 49/51 prompt was arrived at, and the round that was reverted |
+| `year-1/O002-…-stale-champion.md` | the recorded champion is stale; do not promote against it |
+
 ## Status
 
 - [x] Architecture + frozen `POST /feedback` ingest contract (this doc)
