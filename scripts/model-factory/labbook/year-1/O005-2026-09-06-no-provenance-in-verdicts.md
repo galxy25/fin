@@ -60,7 +60,8 @@ Nothing emits it.
 
 ### There is no dataset manifest either
 
-`main:README.md:173-175` (branch `labbook`: 204-206) specifies one: *"Every build writes
+`704ab09:scripts/model-factory/README.md:173-175` (the same text is at 204-206
+of the 367-line copy at `59b0515`) specifies one: *"Every build writes
 `datasets/<dataset-id>/manifest.json`: source list, example counts per track,
 per-split sha256, corpus git commit, build date."* That README is the **only**
 place the manifest is promised. An earlier draft of this entry also cited
@@ -74,7 +75,7 @@ Neither `gen_training_data.py` nor whatever produced `datasets/mlx/` writes one.
 No `manifest.json` exists anywhere under `datasets/`.
 
 Consequence, concretely: establishing that the corpus now training was built
-from main's `router.md` and not `imac-site`'s took a full regeneration at two
+from `704ab09`'s `router.md` and not `cd64914`'s took a full regeneration at two
 commits and a byte-diff (O003). A manifest carrying the corpus sha256 next to
 the sha of `prompts/router.md` would have made that a one-line check instead
 of archaeology.
@@ -108,7 +109,8 @@ mentioned the path, while at `587fb9a` the sibling publishing pipeline does —
 `content/claims-ledger.md:416` quotes `launch-train.sh`'s `mlx_lm lora --data
 datasets/mlx` as evidence for a different claim. That single hit is a prose
 citation in a ledger, not a script that builds the directory, so the *finding*
-is unchanged; but "exits 1 with no output at `main`" is now simply false, and no
+is the same blob at `704ab09` and `077d970` (`git rev-parse <rev>:content/claims-ledger.md`
+run at both); but the sentence "exits 1 with no output at `main`" is now simply false, and no
 edit to this book made it false.
 
 `grep -rn 'datasets/mlx'` over the working tree returns, in addition, 2 hits
@@ -117,7 +119,8 @@ under gitignored `models/`.
 **How the four drafts failed, in order.** The first said "`grep -rn` returns
 nothing", ignoring the working tree's gitignored artifacts. The second said
 "`git grep 'datasets/mlx'` exits 1 with no output" — true at `704ab09`, false on
-the branch this entry lives on, and false at `main` today. The third caught that
+the branch this entry lives on, and false at `587fb9a` (and still false at
+`077d970`). The third caught that
 and wrote the bare-`labbook` row as **24 hits**, "every one of them inside
 `docs/labbook/` or `scripts/model-factory/labbook/` — including this sentence".
 That was true at `cdb895a` and for about half an hour after it: at `0fe0883` the
@@ -161,17 +164,17 @@ once.
 | --- | --- | --- |
 | `train/qlora_config.yaml:7` | `base_model: google/gemma-3-4b-it` | run 1 uses `mlx-community/gemma-4-E4B-it-qat-4bit` (E002) |
 | `train/qlora_config.yaml` | `output_dir: models/candidates/fin-foreman-4b` | never created |
-| `main:README.md:40` | "[ ] Synthetic expansion … unblocks the first real fine-tune" | done, `8aa690c` |
-| `main:README.md:42` | "[ ] First fine-tune run (**human go required**)" | **running since 2026-09-05 20:15:29** |
-| `main:README.md:44` | "[ ] goals-ledger eval joins the gate (that branch has not merged)" | the design merged `2026-09-05 12:45` (`e025413`); the *gate wiring* did not (O006) |
-| `main:README.md:29-33` | leakage caveat on the seed build | superseded by `8aa690c` (P002) |
+| `704ab09:scripts/model-factory/README.md:40` | "[ ] Synthetic expansion … unblocks the first real fine-tune" | done, `8aa690c` |
+| `704ab09:scripts/model-factory/README.md:42` | "[ ] First fine-tune run (**human go required**)" | **running since 2026-09-05 20:15:29** |
+| `704ab09:scripts/model-factory/README.md:44` | "[ ] goals-ledger eval joins the gate (that branch has not merged)" | the design merged `2026-09-05 12:45` (`e025413`); the *gate wiring* did not (O006) |
+| `704ab09:scripts/model-factory/README.md:29-33` | leakage caveat on the seed build | superseded by `8aa690c` (P002) |
 
 Two more rows, folded in from the merged draft:
 
 | file | says | reality |
 | --- | --- | --- |
 | `train/README-local.md` | names gemma-3 as the base | run 1 uses `mlx-community/gemma-4-E4B-it-qat-4bit` (`launch-train.sh:12`, E002). Already on the fix list — `fuse-and-gate.md` step 6 — and unfixed |
-| `main:README.md` "Eval gate" section | describes the gate as the routing corpus alone | **accurate**, and that is the point: `evals/goals-ledger` is merged but `eval_gate.py` never mentions it, so the *behaviour* is honest while the *checklist* is not (O006) |
+| `704ab09:scripts/model-factory/README.md` "Eval gate" section | describes the gate as the routing corpus alone | **accurate**, and that is the point: `evals/goals-ledger` is merged but `eval_gate.py` never mentions it, so the *behaviour* is honest while the *checklist* is not (O006) |
 
 **Why a docs bug belongs in a lab book at all**, which the merged draft argued
 and this entry had only implied: the Status block is load-bearing for the "human
@@ -194,7 +197,8 @@ future assertions into checks instead of archaeology. Neither has been done.
 - **It does not show any recorded number is wrong.** Every score in
   `RESULTS.md` reconstructs correctly from commit ordering (E001). The problem
   is that reconstruction was necessary at all.
-- **It does not show the run is illegitimate.** `main:README.md:231-238`
+- **It does not show the run is illegitimate.**
+`704ab09:scripts/model-factory/README.md:231-238`
   (branch `labbook`: 262-269) explicitly
   exempts local mlx runs from the GPU-spend approval rule; run 1 needed no
   purchase approval. The stale checkbox is a documentation failure, not a
@@ -210,7 +214,7 @@ at both: `git show 704ab09:scripts/model-factory/README.md | wc -l` → 336, and
 the same at `587fb9a`), but it disturbed the grep table above, so the anchors
 are pinned to the sha regardless. The lab-book work inserts a
 `## Lab book` section at line 22 of that file, so on branch `labbook` every
-anchor below line 22 shifts down. The table below is measured on `labbook` at
+anchor below line 22 shifts down. The table below is measured at `59b0515`, the
 the commit that contains this note; the reproducer beside it is the part that
 does not rot.
 

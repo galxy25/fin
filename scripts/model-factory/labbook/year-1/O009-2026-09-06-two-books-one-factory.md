@@ -205,8 +205,9 @@ rewrote nine entries of this book in place to receive that content, rewrote two
 more for the two findings above, and replaced this book's README section on the
 collision with the mapping table above.
 
-Under O008's regime table that is a **draft-phase** action — branch `labbook`
-has not merged to `main`, and no entry has been cited from outside the two books
+Under O008's regime table that is a **draft-phase** action —
+`git merge-base --is-ancestor 59b0515 077d970` exits non-zero, so this book is
+not yet published by O008's definition, and no entry has been cited from outside the two books
 — and it satisfies the two conditions the draft phase carries: it is not silent
 (this entry, plus a note in every entry that changed), and no entry asserts
 compliance it does not have. The wrong numbers it removed stay legible: 24 is

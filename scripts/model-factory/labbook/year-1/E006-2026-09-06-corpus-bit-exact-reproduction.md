@@ -8,7 +8,7 @@ status: closed
 tags: [corpus, reproducibility, provenance, prompt]
 sources:
   - "shasum -a 256 datasets/sft-train-2026-09-05.jsonl -> 9552ac13e49351a9d9869f089cc5bfe804d17864db047f7fcbec912188dd25b5 (2,363 lines, 16,142,664 B, mtime 2026-09-05 19:46)"
-  - "regenerated at main 704ab09 -> 9552ac13...; at imac-site cd64914 -> 4f25702b81c6b7e5232464ada428dec4f5e01a3f237373abdd3f11b72b45a9e2"
+  - "regenerated at 704ab09 -> sha256 9552ac13...; at cd64914 -> sha256 4f25702b81c6b7e5232464ada428dec4f5e01a3f237373abdd3f11b72b45a9e2"
   - 8aa690c — the generator commit (2026-09-05 19:26) · 99ed9d9 — the round-3 prompt (2026-09-05 13:07)
   - 7a591f4 — "Close the tmux guard's parser holes" (2026-09-06 09:52), NOT an ancestor of main
   - scripts/model-factory/gen_training_data.py:98-101 (the system message is built by router_llm._system_prompt)
@@ -83,7 +83,7 @@ shasum -a 256 "$SCRATCH"/regen*.jsonl \
 | regenerated at **main `704ab09`** | `9552ac13e49351a9d9869f089cc5bfe804d17864db047f7fcbec912188dd25b5` | **IDENTICAL** |
 | regenerated at **imac-site `cd64914`** | `4f25702b81c6b7e5232464ada428dec4f5e01a3f237373abdd3f11b72b45a9e2` | differs |
 
-So the corpus is fully reproducible, and it is pinned to main. The
+So the corpus is fully reproducible, and it is pinned to `704ab09`. The
 `cd64914` build differs in **exactly 890 lines** — precisely the routing
 track's example count (`gen_training_data.py` stdout: `routing 890`). The
 other 1,473 lines (ledger 769, elicit 320, tooluse 384) are byte-identical

@@ -19,9 +19,15 @@ superseded-by: null
 ## Status: proposed, never yet run
 
 `scripts/model-factory/gate_sweep.sh` exists (`d9100b6`, 2026-09-06 08:05) but
-lives on the `imac-site` branch and is **not on main** — verified:
-`git merge-base --is-ancestor d9100b6 main` exits non-zero. Its working
-directory `models/gate-sweep/` does not exist, so it has never been executed.
+lives on the `imac-site` line of history and is **not an ancestor of `704ab09`**
+— verified:
+`git merge-base --is-ancestor d9100b6 704ab09` exits non-zero, and so does the
+same test against `077d970`. Its working directory `models/gate-sweep/` does
+not exist, so it has never been executed. (A *different* 140-line
+`gate_sweep.sh`, blob `c0c2f72e…`, landed at the same path in `919cfcb` at
+13:31:14 on 2026-09-06 — see O002. The path is occupied on the `main` line of
+history; `d9100b6`'s 115-line script, blob `9a8b9fcc…`, is what this entry
+cites and it is still unmerged.)
 This entry records the protocol as designed. Its first run closes E004 and
 tests H003.
 

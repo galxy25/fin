@@ -10,7 +10,7 @@ sources:
   - "measured 2026-09-06 ~11:26 PDT in the labbook worktree on branch labbook, then at 4705b67 — commands and full output below"
   - evals/tmux-routing/RESULTS.md:25 (the recorded 29/51 row)
   - evals/goals-ledger/RESULTS.md (the recorded 24/35 block)
-  - main:evals/tmux-routing/run_evals.py:195 · main:evals/goals-ledger/run_evals.py:131 (the exit rule; the tmux-routing line is 210 on branch imac-site, where that file is 217 lines rather than 202)
+  - 704ab09:evals/tmux-routing/run_evals.py:195 (202 lines) · 704ab09:evals/goals-ledger/run_evals.py:131 (135 lines) — the exit rule; both blobs are unchanged at 077d970
 related: [E001, O007, H004, P001]
 corrects: []
 superseded-by: O010
@@ -85,12 +85,29 @@ start 13 / clarify 10 / refuse 4. goals-ledger **35 scenarios, 14 hard**.
 
 Both harnesses exit 0 because the exit rule is core-only —
 `return 0 if core_passed == core_total else 1`
-(`main:tmux-routing/run_evals.py:195`, `main:goals-ledger/run_evals.py:131`;
-both anchors also hold on `labbook`, where this entry lives). Hard-tier
-misses report but never fail a run. The tmux-routing anchor is branch-sensitive:
-on `imac-site` that file is 217 lines and the same statement is at line **210**,
-so quote the line rather than the number — `grep -n 'core_passed ==
-core_total' evals/tmux-routing/run_evals.py` resolves it on any branch.
+(`704ab09:evals/tmux-routing/run_evals.py:195` in a 202-line file,
+`704ab09:evals/goals-ledger/run_evals.py:131` in a 135-line file; both blobs
+are byte-identical at `59b0515`, the `labbook` commit this entry was last read
+at). Hard-tier misses report but never fail a run.
+
+The tmux-routing anchor is revision-sensitive, and this is the worked example of
+why a branch name cannot carry it. That file has three different shapes in this
+repository, each read with `git show <rev>:evals/tmux-routing/run_evals.py`:
+
+| revision | read at | lines | `core_passed == core_total` at |
+| --- | --- | --- | --- |
+| `704ab09` (merge base of this book) | — | 202 | 195 |
+| `077d970` (`main` tip at 13:38:50) | 2026-09-06 14:05 PDT | 202 | 195 |
+| `cd64914`, `f0ca4af` (`imac-site`, 10:29:25 / 12:22:52) | — | 217 | 210 |
+| `78e6c36` (`imac-site` tip at 13:22:14) | 2026-09-06 14:05 PDT | **219** | **212** |
+
+An earlier draft of this entry said "on `imac-site` that file is 217 lines and
+the same statement is at line 210". That was true of `cd64914` and `f0ca4af`
+and became false when `78e6c36` landed at 13:22:14, two lines further down —
+the branch moved 28 minutes before the round-3 commit that shipped the claim.
+The sentence is replaced by the table because a tip is a fact with a timestamp.
+Quote the line rather than trust any of these numbers: `grep -n 'core_passed ==
+core_total' evals/tmux-routing/run_evals.py` resolves it at any revision.
 
 ## What this shows
 

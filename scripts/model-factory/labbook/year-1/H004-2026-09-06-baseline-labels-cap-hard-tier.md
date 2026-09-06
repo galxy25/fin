@@ -13,7 +13,7 @@ sources:
   - "local-artifact: train.log — 2 epochs over those labels, loss to 0.000"
   - evals/tmux-routing/RESULTS.md:48 — the two 30 s endpoint timeouts (h21†, r01†) that each cost one scenario
   - scripts/model-factory/gen_training_data.py:31-34 — the docstring's defensive step
-  - "git branch --contains d9100b6 → imac-site only (gate_sweep.sh is not runnable from labbook or main); gate_sweep.sh:40-42 at d9100b6 — the pgrep -f 'mlx_lm lora' guard"
+  - "git merge-base --is-ancestor d9100b6 59b0515 and the same against 704ab09 and 077d970 → all non-zero, so d9100b6's gate_sweep.sh is runnable from none of them; d9100b6:scripts/model-factory/gate_sweep.sh:40-42 — the pgrep -f 'mlx_lm lora' guard, in a 115-line file"
   - "merged from docs/labbook/entries/H001-2026-09-06-hard-tier-regression.md (the parallel book, 4705b67) — see the merge note below"
 related: [O007, O002, E005, E001, P004, H003]
 corrects: []

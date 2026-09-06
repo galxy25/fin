@@ -10,7 +10,7 @@ sources:
   - a823271 — dataset scaffold; scripts/model-factory/build_dataset.py:29-33 (its own capitalised LEAKAGE WARNING)
   - 8aa690c — "Model factory: synthesize held-out SFT data for the foreman fine-tune" (2026-09-05 19:26)
   - scripts/model-factory/gen_training_data.py:86 (JACCARD_NEAR), :946-958 (_load_eval_inputs), :960-979 (_leak_verdict), :1068-1071 (the assertion)
-  - main:scripts/model-factory/README.md:167-171 (on branch labbook: 198-202; verify with `grep -n '^\*\*Leakage rule:\*\*' scripts/model-factory/README.md` — see the line-anchor note in O005)
+  - 704ab09:scripts/model-factory/README.md:167-171 (198-202 of the 367-line copy at 59b0515; verify with `grep -n '^\*\*Leakage rule:\*\*' scripts/model-factory/README.md` — see the line-anchor note in O005)
   - "local-artifact: datasets/sft-2026-09-05.jsonl (51 lines, 249,237 B) — the seed build that violates the rule"
   - scripts/model-factory/gen_training_data.py:941-980 (the detector), :1030-1096 (the build's leakage block)
   - "detector self-test reproduced at main 704ab09: 71 literal eval inputs → 71 exact, 0 missed; uppercased / punctuation-stripped / ' !!'-suffixed variants → 71 near, 0 missed"
@@ -39,7 +39,8 @@ Its literal scenarios are therefore **held out**: they never appear in
 `train.jsonl` or `valid.jsonl`. Train on generated variants and on telemetry;
 score on the untouched corpus.
 
-`main:scripts/model-factory/README.md:167-171` (branch `labbook`: 198-202) states it in one line worth keeping:
+`704ab09:scripts/model-factory/README.md:167-171` (198-202 of the 367-line copy
+at `59b0515`) states it in one line worth keeping:
 *"A gate that measures memorization measures nothing."*
 
 The adversarial hard tier is held out for a second reason on top of the first:
@@ -53,8 +54,8 @@ The first dataset builder seeded training data **from the eval corpus itself**.
 `build_dataset.py` (`a823271`, 2026-09-05 **12:59:51**) emits one training example per
 eval scenario, building the system message from the eval adapter's own
 `_system_prompt` and the assistant message from the scenario's `expected` label.
-Its own docstring flags it in capitals (`build_dataset.py:29-33` at main
-`704ab09`):
+Its own docstring flags it in capitals
+(`704ab09:scripts/model-factory/build_dataset.py:29-33`):
 
 > LEAKAGE WARNING […] the eval corpus is the promotion gate, so its literal
 > scenarios must be HELD OUT of any real training run. This builder emits them

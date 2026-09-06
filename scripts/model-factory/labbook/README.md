@@ -73,12 +73,26 @@ it launders recollection into fact. Every quantity in an entry cites one of:
 | an S3 key | full `s3://` URI | yes, if the object survives |
 | a **memory note** or a **session transcript** | filename + line, or transcript uuid + ISO timestamp, **and the text quoted verbatim** | **no** — see below |
 
-A file citation is only true of a revision. Prefix it (`main:…`,
-`cd64914:…`) whenever the file differs across branches, or when the citing
-entry lives on a branch that has edited it — O005's line-anchor note is the
-worked example, and it got this wrong twice before it got it right. The same
-applies to a **branch name**, which is a moving target and not a citation:
-O003's `imac-site:` references drifted within a single afternoon. Pin to a sha.
+A file citation is only true of a revision. **Prefix it with a sha**
+(`704ab09:…`, `cd64914:…`) — always, not only when you think the file differs.
+O005's line-anchor note is the worked example, and it got this wrong twice
+before it got it right.
+
+**Never prefix it with a branch name.** A branch is a moving pointer, so
+`main:README.md:44` is not a citation; it is a citation-shaped thing that
+resolves to whatever someone pushed most recently. This book broke that rule in
+four consecutive rounds (O010), including in the commit that wrote the rule, so
+it is no longer enforced by reading — `check_citations.py` fails the commit.
+If prose needs the branch name, give the sha beside it **and say when it was
+read**, because a tip is a fact with a timestamp:
+
+> ~~the `imac-site` tip is `f0ca4af`~~ → `imac-site` was `78e6c36` when read at
+> 2026-09-06 13:22:14
+
+And never write that a branch "has not moved" or that anchors "still resolve".
+That sentence is unverifiable from the text and was false the last two times
+this book said it. Publish the comparison you actually ran instead —
+`git rev-parse 704ab09:<path>` beside `git rev-parse 077d970:<path>`.
 
 **`datasets/` and `models/` are gitignored** — `/datasets/` by `a823271`
 ("Model factory scaffold", 2026-09-05 12:59) and `/models/` plus
@@ -156,15 +170,28 @@ there; the consolidation deleted one book, made one pathspec sufficient *going
 forward*, and rewrote the old citation as though the repository had always had
 that shape. Do not retrofit today's repository onto yesterday's revision.
 - **A branch name is not a revision.** `main` is a moving pointer: it was
-`704ab09` while this book was written and is `587fb9a` now, and `git grep
-'datasets/mlx' main` changed answer between those two without anyone touching
-the factory. Cite the sha. If prose needs the name, give the sha beside it and
-say when it was read.
+`704ab09` while this book was written, `587fb9a` when round 3 shipped,
+`077d970` when round 4 started pinning and `b9876c1` an hour later. That is
+**five distinct tips from this book's merge base onward, out of eight that
+`main` took on 2026-09-06**:
 
-The check that catches this is mechanical: for each command in an entry, run it
-at each revision named, paste the exit code and the output, and only then write
-the sentence. If a command is expensive to run at four revisions, that is a
-reason to cite fewer revisions, not a reason to reason about the fourth.
+```sh
+git reflog show main --date=format:'%Y-%m-%d %H:%M:%S' | grep -c 2026-09-06   # 8
+```
+
+and `git grep 'datasets/mlx' main` changed answer across them without anyone
+touching the factory. `imac-site` advanced three commits in the same window
+(`git rev-list --count cd64914..78e6c36` → 3). Cite the sha. If prose needs the
+name, give the sha beside it and say when it was read. This one is now checked
+by `check_citations.py` rather than trusted to the writer.
+
+The check that catches this is manual and still is: for each command in an
+entry, run it at each revision named, paste the exit code and the output, and
+only then write the sentence. If a command is expensive to run at four
+revisions, that is a reason to cite fewer revisions, not a reason to reason
+about the fourth. `check_citations.py` does **not** do this part — it checks
+that citations name revisions, not that the commands beside them were run
+(O010, open item 3).
 
 **Honest negative results are first-class.** An abandoned approach, with the
 reason it was abandoned, is among the most valuable things in this book: it is
@@ -232,9 +259,16 @@ so in its `status` and names the event that will close it.
 scripts/model-factory/labbook/
 ├── README.md      the conventions (this file)
 ├── INDEX.md       every entry, chronological, maintained by hand
+├── check_citations.py    the pre-commit citation checker (stdlib only)
+├── citation-waivers.txt  the places a branch name is legitimate, with reasons
 └── year-1/        entries opened between 2026-09-06 and 2027-09-05
     └── <ID>-<YYYY-MM-DD>-<slug>.md
 ```
+
+`check_citations.py` is the only executable in this directory and the only
+mechanical rule the book has. It exists because rule 2's branch-name clause was
+broken in four consecutive rounds, twice in the commit that restated it (O010).
+Run it before every commit; `--self-test` proves it still fires.
 
 `year-N/` is a filing convenience, not a semantic boundary: year 1 runs from
 the day the book opened (2026-09-06) to the day before its anniversary. When
@@ -328,7 +362,31 @@ entries that follow it most closely.
 3. Every number in it gets a citation or the word UNSOURCED.
 4. Add one row to `INDEX.md`. **The index is maintained by hand** — nothing
    generates it, so an entry that is not in it is effectively lost.
-5. Commit the entry and the index row together. One entry per commit where
+5. **Run the citation checker, and do not commit until it exits 0:**
+
+   ```
+   python3 scripts/model-factory/labbook/check_citations.py --verify-lines
+   ```
+
+   It fails on any citation that names a branch instead of a revision, on any
+   claim that a branch "has not moved", on a sha that does not resolve, and —
+   with `--verify-lines` — on a line anchor or line count that no longer
+   re-derives at the sha it names. `--fix-suggestions` prints the sha each cited
+   branch currently resolves to, so pinning is a copy rather than an
+   investigation. `--self-test` proves the checker still fires.
+
+   If a branch name is genuinely correct, it goes in `citation-waivers.txt`
+   with one of the five permitted reasons, keyed to its exact sentence so it
+   dies when that sentence is reworded. The checker prints how many are in
+   force on every run — do not restate the number here, since it is a count of
+   the book by the book. Adding a sixth *reason* is a change to the rules and
+   belongs in an entry, not in a waiver line.
+
+   **This step exists because the editorial version of it failed four times in
+   a row** (O010). Knowing the rule was never the control; running the command
+   is the control, and now the command runs itself.
+
+6. Commit the entry and the index row together. One entry per commit where
    practical, so `git log` over this directory reads as the lab notebook's own
    chronology.
 

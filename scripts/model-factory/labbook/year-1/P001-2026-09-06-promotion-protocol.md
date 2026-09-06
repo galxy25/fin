@@ -10,8 +10,8 @@ sources:
   - a823271 — "Model factory scaffold: dataset builder, QLoRA recipe, eval gate" (2026-09-05 12:59)
   - scripts/model-factory/eval_gate.py:44-45, :75-80, :110-112, :152
   - scripts/model-factory/evals-champions.json
-  - main:scripts/model-factory/README.md:240-262 (on branch labbook: 271-293; verify with `grep -n '^## Eval gate' scripts/model-factory/README.md` — see the line-anchor note in O005)
-  - main:evals/tmux-routing/run_evals.py:195 (the core-only exit rule; on branch `imac-site` the same line is 210 — the file gained 15 lines there)
+  - 704ab09:scripts/model-factory/README.md:240-262 (271-293 of the 367-line copy at 59b0515; verify with `grep -n '^## Eval gate' scripts/model-factory/README.md` — see the line-anchor note in O005)
+  - 704ab09:evals/tmux-routing/run_evals.py:195 (the core-only exit rule, in a 202-line file; the same statement is at 210 of 217 at cd64914 and f0ca4af, and at 212 of 219 at 78e6c36 — see the table in E005)
 related: [P002, P004, O002, O005, O006]
 corrects: []
 superseded-by: null
@@ -77,7 +77,7 @@ parse broke and the run tells you nothing.
 - **Core is a gate.** The 26 core scenarios are the behaviours a router must
   not get wrong; failing one is disqualifying regardless of the total. The
   eval harness encodes the same split independently — `run_evals.py:195` on
-  `main` (and on `labbook`, where this entry lives) is
+  `704ab09` (same blob at `59b0515`, where this entry lives) is
   `return 0 if core_passed == core_total else 1`, so hard-tier misses report
   but never fail a run. On `imac-site` that file is 217 lines rather than 202
   and the same statement is at line 210; `grep -n 'core_passed == core_total'

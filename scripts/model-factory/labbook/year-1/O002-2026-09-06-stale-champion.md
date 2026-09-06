@@ -40,8 +40,9 @@ beat as **36/51 (core 21/26, hard 15/25)** for `google/gemma-4-e4b`. That number
 was measured with the **round-0** router prompt — a 46-line, 423-word file that
 has not existed in the tree since 12:38 on 2026-09-05.
 
-The prompt that is actually shipped on `main` is the round-3 keeper, 166 lines,
-git blob `c511bab2bf99…`. **The same untuned model, on the same 51 scenarios,
+The prompt that is actually shipped at `704ab09` (same blob at `077d970`) is
+the round-3 keeper, 166 lines, git blob `c511bab2bf99…`. **The same untuned
+model, on the same 51 scenarios,
 scores 49/51 with it** (`RESULTS.md:27`).
 
 Ordering, which is what makes this certain rather than likely: the 36/51 run is
@@ -55,8 +56,29 @@ Worth stating plainly, because a reader who re-derives from `6b1c95f` will
 otherwise be stranded. `git show 6b1c95f:evals/tmux-routing/scenarios.json`
 parses to **51 scenarios, none of them flagged `hard`**. Tiering arrives one
 minute later in `2234284` ("Tier the routing corpus: core gates, hard
-benchmarks", 12:18), a child of `6b1c95f`, which rewrites `scenarios.json`
-(+509/−56) and `run_evals.py` (+16/−2). So the `core: 21/26` / `hard: 15/25`
+benchmarks", 12:18), which rewrites `scenarios.json` (+509/−56) and
+`run_evals.py` (+16/−2).
+
+`2234284` is **not** a child of `6b1c95f`, as an earlier draft of this entry
+said. It is a descendant two steps out, and the intervening step is a merge:
+
+```
+$ git cat-file -p 2234284 | head -2
+tree bee10af86564bbfbfa83cfa88f5823ade83164a9
+parent eda4e1bdb2ee498f289c6d149c8d28589d968a16
+$ git rev-list --ancestry-path --format='%h %p %s' 6b1c95f..2234284 | grep -v '^commit'
+2234284 eda4e1b Tier the routing corpus: core gates, hard benchmarks
+eda4e1b fbba538 6b1c95f Merge branch 'router-model'
+```
+
+So `2234284`'s only parent is `eda4e1b` ("Merge branch 'router-model'"), whose
+*second* parent is `6b1c95f`. The ordering argument is unaffected — `6b1c95f`
+is still an ancestor of `2234284`, which is all the claim needs — but "a child
+of" asserted a one-step relationship that the graph does not have, and the
+difference matters in a merge-heavy history where "the next commit" and "the
+next commit on this line" are different things.
+
+So the `core: 21/26` / `hard: 15/25`
 fields stored in `evals-champions.json` **cannot have been printed by the
 harness at the time of that run** — they are a post-hoc re-partition of the same
 51 results.
@@ -116,8 +138,15 @@ But:
 
 - `evals-champions.json` still reads 36/51 — one commit, `a823271`, never
   edited since 2026-09-05 12:59.
-- `gate_sweep.sh` is **not on main** (`git merge-base --is-ancestor d9100b6
-  main` fails) and has never been run: `models/gate-sweep/` does not exist.
+- `gate_sweep.sh` as `d9100b6` wrote it is **not an ancestor of `077d970`**
+  (`git merge-base --is-ancestor d9100b6 077d970` exits non-zero) and that
+  version has never been run: `models/gate-sweep/` does not exist. Note the
+  branch-shaped trap this sentence was in: an earlier draft said "not on main",
+  and at 13:31:14 on 2026-09-06 a *different* 140-line `gate_sweep.sh` (blob
+  `c0c2f72e…`, commit `919cfcb`) landed at that path on the `main` line of
+  history, so "not on main" is false at `077d970` while the claim it was
+  standing in for — that `d9100b6`'s 115-line script (blob `9a8b9fcc…`) never
+  merged and never ran — is still true. The path exists; this script does not.
 - The guard is runbook text, not code. `eval_gate.py` never reads `recordedAt`;
   nothing in the gate can notice that a champion is stale.
 - **The re-record has demonstrably not happened.** `gate_sweep.sh` step 1 scores

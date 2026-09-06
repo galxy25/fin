@@ -10,7 +10,7 @@ sources:
   - "memory note training-bits-per-example — Levi's directive 2026-09-06, quoted verbatim below"
   - "local-artifact: train.log:9 — 'Iter 1: Val loss 2.463' measured before any gradient step (trainer.py:284-286)"
   - "d4901d4 on branch bits-curriculum (2026-09-06 11:25:38) — 'Bits per example: measure what each training example actually teaches': score_bits.py, select_curriculum.py, run_bits_experiment.sh, tests/test_bits_curriculum.py, README.md, 2,640 insertions"
-  - "corpus measurements re-derived here on sha256 9552ac13… (2,363 lines, 16,142,664 B): xz -9e | wc -c → 58020; per-role character sums and label entropies by parsing the jsonl; generating-program size by git cat-file -s at main"
+  - "corpus measurements re-derived here on sha256 9552ac13… (2,363 lines, 16,142,664 B): xz -9e | wc -c → 58020; per-role character sums and label entropies by parsing the jsonl; generating-program size by git cat-file -s at 704ab09"
   - "local-artifact: train.log — 'Trained Tokens 121200' at iteration 3500; assistant-string length statistics parsed from the corpus"
   - scripts/model-factory/.venv/lib/python3.11/site-packages/mlx_lm/tuner/trainer.py:273-282 (one iteration is one example)
   - "merged from docs/labbook/entries/E004-2026-09-06-bits-per-example.md (the parallel book, 4705b67) — see the merge note below"
@@ -125,7 +125,7 @@ the thing rule 2 exists to stop.
 the program that writes the corpus. It loads `router_baseline.decide` and
 `policy_baseline.decide` to label every routing and ledger row (O007) and
 `router_llm._system_prompt`, which reads `prompts/router.md` at generation time.
-Sizes at `main`: `router_baseline.py` 5,693 + `policy_baseline.py` 9,139 +
+Sizes at `704ab09` (`git cat-file -s 704ab09:<path>`): `router_baseline.py` 5,693 + `policy_baseline.py` 9,139 +
 `router_llm.py` 7,008 + `prompts/router.md` 9,272 + `prompts/tick.md` 3,681 =
 34,793 bytes beyond the generator itself. The real program is **85,536 bytes**,
 which is **47% above** `xz -9e`, not 14% below it.

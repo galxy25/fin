@@ -11,7 +11,7 @@ sources:
   - "local-artifact: models/candidates/fin-foreman-e4b-mlx/ — 15 checkpoints at 250-iteration granularity, 27,683,964 B each"
   - "local-artifact: train.log — val loss flat 0.005-0.028 from iteration 1000; first Train loss 0.000 at iteration 2675"
   - evals/tmux-routing/scenarios.json — 25 hard scenarios (parsed today)
-  - "git branch --contains d9100b6 → imac-site only; git cat-file -e labbook:scripts/model-factory/gate_sweep.sh → fails ('does not exist in labbook')"
+  - "git merge-base --is-ancestor d9100b6 59b0515 → non-zero, and git cat-file -e 59b0515:scripts/model-factory/gate_sweep.sh → fails; d9100b6 is likewise not an ancestor of 704ab09 or 077d970"
   - "merged from docs/labbook/entries/H002-2026-09-06-best-checkpoint-is-not-last.md (the parallel book, 4705b67) — see the merge note below"
 related: [O001, O004, P004, E004, H001, H002]
 corrects: []
@@ -36,7 +36,8 @@ hard tier than the final one, because later checkpoints trade generalization
 for template memorization.**
 
 Stated in the repo first, in `gate_sweep.sh:7-10` (`d9100b6`; that script is
-on the `imac-site` line of history and not on `main` or `labbook` — P004:21-24):
+on the `imac-site` line of history and is not an ancestor of `704ab09` or
+`59b0515` — P004:21-24):
 
 > *"the 2026-09-06 run reached train loss 0.000 by iteration ~2900 on
 > programmatically synthesized data, so later checkpoints memorize templates
@@ -129,11 +130,13 @@ scripts/model-factory/gate_sweep.sh 1000 2250 3500 final
 ```
 
 **The script cannot be run from this branch, and that is two problems, not
-one.** `git branch --contains d9100b6` returns `imac-site` only, and
-`git cat-file -e labbook:scripts/model-factory/gate_sweep.sh` fails with "does
-not exist in 'labbook'" — so every `gate_sweep.sh` line number in this entry and
-in P004 is against `d9100b6` on `imac-site`, and the command above needs that
-checkout. Separately, `models/gate-sweep/` does not exist on disk: **the sweep
+one.** `git merge-base --is-ancestor d9100b6 59b0515` exits non-zero and
+`git cat-file -e 59b0515:scripts/model-factory/gate_sweep.sh` fails — so every
+`gate_sweep.sh` line number in this entry and in P004 is against the 115-line
+blob `9a8b9fcc…` at `d9100b6`, and the command above needs a checkout that has
+it. (`077d970` does have a `scripts/model-factory/gate_sweep.sh`, but it is a
+different 140-line script, blob `c0c2f72e…` from `919cfcb`; these line numbers
+do not address it — see O002.) Separately, `models/gate-sweep/` does not exist on disk: **the sweep
 has never been run.** Landing the script somewhere it can run from is a
 precondition of testing this hypothesis at all.
 

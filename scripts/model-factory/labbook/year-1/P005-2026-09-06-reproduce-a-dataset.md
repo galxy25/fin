@@ -8,7 +8,7 @@ status: active
 tags: [data, reproducibility, provenance, manifest]
 sources:
   - a823271 — "Model factory scaffold" (2026-09-05 12:59), the commit that gitignores /datasets/
-  - "main:scripts/model-factory/README.md:173-175 (the dataset manifest that is specified but never written; branch labbook: 204-206 — see the line-anchor note in O005)"
+  - "704ab09:scripts/model-factory/README.md:173-175 (the dataset manifest that is specified but never written; 204-206 of the 367-line copy at 59b0515 — see the line-anchor note in O005)"
   - "grep -in manifest scripts/model-factory/build_dataset.py -> zero matches"
   - E006 — the worked example this protocol generalizes
 related: [E006, E007, E008, O003, O005]
@@ -93,7 +93,8 @@ the output of.
 ## The standing gap this protocol works around
 
 Steps 5 and 6 are manual because the generator writes no manifest. The factory
-README specifies one (`main`, lines 173-175) — and *only* the README does;
+README specifies one (`704ab09:scripts/model-factory/README.md:173-175`) — and
+*only* the README does;
 `grep -in manifest scripts/model-factory/build_dataset.py` returns zero matches,
 so an earlier draft of this entry crediting that file's docstring with the same
 promise was wrong. Neither `gen_training_data.py` nor `datasets/mlx/` produces

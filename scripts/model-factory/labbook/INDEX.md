@@ -6,6 +6,14 @@ the entry.
 
 Conventions, entry template and the correction procedure: [README.md](README.md).
 
+Before committing an entry, run the citation checker — it fails on any citation
+that names a branch instead of a revision, which is the defect this book shipped
+in four consecutive rounds (O010):
+
+```sh
+python3 scripts/model-factory/labbook/check_citations.py --verify-lines
+```
+
 Every entry so far was written on 2026-09-06, so "oldest first" does not order
 them; the table is grouped by kind and runs in id order within each kind. When
 dates start to differ, sort by date and keep the id column monotonic per kind.

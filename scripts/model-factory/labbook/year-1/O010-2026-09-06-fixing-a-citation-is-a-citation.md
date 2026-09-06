@@ -104,11 +104,35 @@ The **finding** is unaffected — a ledger row quoting a launch script is not a
 script that builds `datasets/mlx/`, and no committed thing in the factory
 produces it. But the sentence "exits 1 with no output at `main`" became false
 between `0fe0883` and now, without anybody touching the factory or the book.
-Every `main:scripts/model-factory/README.md:N` anchor in this book was exposed
-to the same risk and survived it only by luck: the file is byte-identical at
-`704ab09` and `587fb9a` (`diff <(git show 704ab09:…) <(git show 587fb9a:…)` is
-empty), so all of them still resolve. O005's line-anchor note is now pinned to
-the sha rather than the name.
+Every `main:` anchor in this book was exposed to the same risk. Round 3's sweep
+of that exposure was itself under-counted: it swept only the
+`main:scripts/model-factory/README.md:N` anchors and silently omitted the seven
+`main:` anchors naming other files. The full census, taken at `59b0515` — the
+round-3 tip, the state the sweep was describing — with the pathspec written out
+so it reproduces:
+
+```
+$ git grep -hoE 'main:[A-Za-z0-9_./-]+\.[a-z]+(:[0-9]+(-[0-9]+)?)?' 59b0515 \
+    -- scripts/model-factory/labbook | wc -l
+24
+$ git grep -hoE 'main:[A-Za-z0-9_./-]+\.[a-z]+(:[0-9]+(-[0-9]+)?)?' 59b0515 \
+    -- scripts/model-factory/labbook | grep -v 'README.md' | sort | uniq -c
+   1 main:daemon/Sources/FinAgentCore/SessionRouting.swift
+   1 main:daemon/Sources/FinAgentCore/SessionRouting.swift:352
+   1 main:evals/goals-ledger/run_evals.py:131
+   2 main:evals/tmux-routing/run_evals.py:195
+   1 main:goals-ledger/run_evals.py:131
+   1 main:tmux-routing/run_evals.py:195
+```
+
+**24 `main:` anchors, of which 17 name a README and 7 name something else.** The
+seven omitted ones were the dangerous half: `scripts/model-factory/README.md` is
+the same blob `c2e35895…` at `704ab09`, `587fb9a` and `077d970`, so the README
+anchors survived by luck, while `evals/tmux-routing/run_evals.py` genuinely
+differs across the branches this book cites — 202 lines on the `main` line of
+history, 217 at `cd64914`/`f0ca4af`, 219 at `78e6c36` — and E005 shipped the
+wrong line count for it because of exactly this omission. A sweep that excludes
+part of its own subject is not a sweep. All 24 are pinned to shas in round 4.
 
 ## The rule this adds
 
@@ -178,6 +202,113 @@ s/iter and 58,289 s ÷ 4,000 = 14.57, and its 65.6-minute span (11:21:20 →
 rounds to "18 hours"; E005's branch-creation time 11:07, which the reflog
 confirms to the second (`labbook@{2026-09-06 11:07:25}`).
 
+## Round 4: the control stopped being editorial
+
+Round 4 audited round 3 and found the same defect again, in four places at once
+— including `O003` asserting that the book's `main:` anchors resolved "because
+`main` has not moved", in a commit made **12m50s after `main` moved**, while two
+other entries in that same commit correctly recorded the move. The book
+contradicted itself inside one commit.
+
+That is four rounds. Every round had read the rule; round 3 *wrote* the rule and
+broke it in the same commit as writing it. The conclusion is not that the writers
+were careless. It is that **"a branch name is not a revision" is not enforceable
+by reading**, because a branch citation looks correct at the instant it is
+written and is falsified later by someone else's commit, in a file nobody reopens.
+
+So the control is now a program: **`scripts/model-factory/labbook/check_citations.py`**.
+It scans every entry plus `README.md` and `INDEX.md` and fails, with `file:line`,
+on five rules:
+
+| rule | fires on |
+| --- | --- |
+| `BRANCH-ANCHOR` | `<ref>:<path>` where `<ref>` is not a 7-40 char hex sha |
+| `BRANCH-LOCUS` | "at/on/against `<branch>`" with no sha pinned on the same line |
+| `BRANCH-LINE` | a line number stated against a branch name — `` (`main`, line 154) `` |
+| `STASIS` | any assertion that a branch "has not moved" / "is unchanged" / "still resolves" |
+| `SHA-EXISTS` | a cited sha that `git cat-file -e` cannot resolve |
+
+`--verify-lines` additionally re-derives every `<sha>:<path>:N` against the blob
+and re-derives stated line counts; `--fix-suggestions` prints the sha each cited
+branch currently resolves to, so pinning is mechanical rather than a research
+task; `--self-test` builds a fixture with one planted defect per rule and
+asserts each rule fires and that a clean fixture stays clean, so the checker is
+itself checked.
+
+Three things it caught that four rounds of human audit had not:
+
+1. **`E005`'s `imac-site` line count.** The book said `run_evals.py` is 217
+lines with the exit rule at 210. True at `cd64914` and `f0ca4af`; the tip
+`78e6c36` (13:22:14) made it **219 and 212**, 29 minutes before round 3 shipped
+the sentence.
+2. **`O002`/`P004`/`H003`'s "`gate_sweep.sh` is not on main".** True when
+written. At 13:31:14 `919cfcb` put a *different* 140-line `gate_sweep.sh` (blob
+`c0c2f72e…`) at that path on the `main` line of history, so the sentence is now
+false while the claim it stood for — `d9100b6`'s 115-line script never merged,
+never ran — is still true. Three entries said the false version.
+3. **Its own miss.** The first version of `BRANCH-LOCUS` did not match
+`on **main**`, because markdown emphasis broke the pattern — and `O003`, the
+entry the rule exists for, wrote it that way. The self-test now carries a
+bolded fixture. A checker is a provenance claim too.
+
+**The waivers are part of the control, not an escape from it.**
+`citation-waivers.txt` holds the 14 places a branch name is legitimate, each
+keyed by the exact sentence and each carrying one of five permitted reasons
+(`quoted-defect`, `asserted-absence`, `shorthand-subject`, `future-state`,
+`not-a-git-object`). Keying on text rather than line number means a waiver dies
+the moment its sentence is reworded — you cannot inherit an excuse.
+
+What this does **not** do: it does not run the commands in `sources:` blocks
+(open item 3 below), and it does not know whether a pinned sha is the *right*
+sha. It closes exactly one failure mode, which is the one that recurred four
+times.
+
+### The branch moved again while round 4 was pinning it
+
+Not a hypothetical. `main` moved twice more during this pass:
+
+| `main` was | at | what happened |
+| --- | --- | --- |
+| `704ab09` | 2026-09-06 08:02:48 | the revision this book was written against |
+| `587fb9a` | 13:38:26 | moved 12m50s before round 3 committed the claim that it hadn't |
+| `077d970` | 13:38:50 | the tip when round 4 began pinning, read 14:05 PDT |
+| `b9876c1` | **14:09:09** | `Merge bits-curriculum`, landed mid-pass |
+
+`b9876c1` is the interesting one, because it touched a file this book cites
+17 times. `scripts/model-factory/README.md` went from **336 lines to 1,102** —
+`git diff --numstat 704ab09 b9876c1 -- scripts/model-factory/README.md` returns
+`766 0`, and the first 336 lines are byte-identical, so it is a pure append from
+the `bits-curriculum` line of work (`d4901d4` … `a8951f8`).
+
+Two things follow, and they point in opposite directions:
+
+- **Every round-4 citation still resolves exactly**, because they name
+`704ab09` and a sha is immutable. Had this pass merely re-checked the `main:`
+anchors and left them named `main`, all 17 would now be anchors into a
+different, three-times-longer file.
+- **They would have survived anyway, by luck, for the third time** — the append
+lands past line 336, so every cited line number is unmoved. That is worth
+stating plainly rather than claiming a save the evidence does not support. The
+argument for pinning has never been that the anchors break often. It is that
+whether they broke is not knowable from the citation, and "we got away with it"
+is not a property you can check in a diff.
+
+The blob comparison is the whole method, and it takes one command:
+
+```
+$ git rev-parse 704ab09:scripts/model-factory/README.md \
+                077d970:scripts/model-factory/README.md \
+                b9876c1:scripts/model-factory/README.md
+c2e35895badcd08e4270ab04f4ac866a76c66554
+c2e35895badcd08e4270ab04f4ac866a76c66554
+9bb81ef97d62…
+```
+
+Same blob at the first two, different at the third. Round 3 asserted this
+relationship instead of running it, and got it wrong. Round 4 ran it — and then
+made the running of it a `git`-less precondition of committing, because round 4
+has no reason to believe it is more careful than rounds 1 through 3.
+
 ## What this does not show
 
 - **It does not show the findings moved.** Nothing in the factory produces
@@ -185,11 +316,12 @@ confirms to the second (`labbook@{2026-09-06 11:07:25}`).
 provenance. Three rounds of correction have changed the *citations* and not one
 *conclusion*. That is worth saying plainly, because an entry this long about
 being wrong can read as though the subject matter were in doubt. It is not.
-- **It does not show the rule will hold.** The previous two rules were also
-written by people who had just been burned, and both were broken by the next
-round. The only reason to expect better of this one is that it names an action
-(run it) rather than a property (be careful), and an action can be checked in a
-diff.
+- **It does not show the rule will hold.** The previous three rules were also
+written by people who had just been burned, and each was broken by the next
+round — including this entry's own, broken in the commit that wrote it. That is
+the whole reason round 4 stopped writing rules and wrote a program instead. The
+checker will hold for the cases it matches and for nothing else; the honest
+claim is that one failure mode is now mechanical, not that the book is correct.
 - **It does not show three is the total.** Three is the number of rounds that
 have been audited. Rounds 1 and 2 each looked clean when they shipped.
 
@@ -198,26 +330,42 @@ have been audited. Rounds 1 and 2 each looked clean when they shipped.
 Known and deliberately not fixed in this round, recorded here instead of opening
 another one:
 
-1. **`main:…README.md:N` shorthand, 16 sites across `O003` (2), `O005` (8),
-`O006` (2), `P001` (1), `P002` (2), `P005` (1).** Every one of them resolves —
-the file is byte-identical at `704ab09` and `587fb9a`, verified — and O005's
-line-anchor note now declares the pin as a sha. The prefix itself is still a
-moving name, and rewriting it in eight files is a mechanical change worth doing
-in the next pass that touches those entries, not in this one.
+1. ~~**`main:…README.md:N` shorthand, 16 sites…**~~ **Closed in round 4, and the
+count was wrong.** The item deferred the rewrite and, in doing so, stated a
+count of the book by the book without pinning it — the exact thing the section
+above this one forbids. Re-derived at `59b0515`, the tip it was describing:
+
+```
+$ git grep -hoE 'main:(scripts/model-factory/)?README\.md:[0-9]+(-[0-9]+)?' \
+    59b0515 -- scripts/model-factory/labbook | wc -l
+14
+$ git grep -coE 'main:(scripts/model-factory/)?README\.md:[0-9]+(-[0-9]+)?' \
+    59b0515 -- scripts/model-factory/labbook
+…/O003-…:2   …/O005-…:6   …/O006-…:2   …/P001-…:1   …/P002-…:2   …/P005-…:1
+```
+
+**14, not 16, and `O005` had 6, not 8.** The two extra came from counting
+`O005`'s two README mentions that carry *no* line number — the "Eval gate"
+section reference and the sentence naming the `main:README.md:N` shorthand as a
+topic — as though they were `:N` anchors. Round 3 wrote "16" by reading its own
+prose rather than running a command, in the entry whose thesis is that you must
+run the command. Every one of the 14 is pinned to `704ab09` in round 4.
 2. **The sibling ledger's own version of this bug, still live.**
 `587fb9a:content/claims-ledger.md` §8 says `git log -S CARVE_OUT_RE --
 content/check-claims.py` "returns exactly two commits". Run at `17c7db1` it does.
 Run at `9e6ceaa` — **the commit that wrote that sentence** — it returns three,
 because the same commit reintroduced the token `CARVE_OUT_RE` into
 `check-claims.py`'s docstring while narrating the story. Verified here; that file
-is on `main` and not this book's to edit, and it is flagged for whoever next
+is at `077d970` and not this book's to edit, and it is flagged for whoever next
 works on `content/`. It is round 2's failure recurring inside round 2's own fix,
 which is the strongest evidence available that this shape is structural and not
 carelessness.
-3. **Nothing compares an entry's `sources:` block against its prose.** Round 3's
-error survived because `E008` asserted one thing in front matter and its
-contradiction eight lines below. A checker that extracted every command from
-every `sources:` list and ran it would have caught rounds 1 and 3 both. There is
-no such checker; `content/check-claims.py` is the sibling pipeline's equivalent
-and stops at the repository boundary. Cheapest real defence available and
-unbuilt.
+3. **Nothing runs the commands in an entry's `sources:` block.** Round 3's error
+survived because `E008` asserted one thing in front matter and its contradiction
+eight lines below. `check_citations.py` now checks that `sources:` entries *cite*
+revisions rather than branches, and `--verify-lines` re-derives their line
+anchors — which is why round 4 caught `E005` — but it does not execute the
+`git grep …` and `shasum …` commands the blocks quote, so a command whose output
+has changed still passes. That is the remaining half of this defence and it is
+still unbuilt. `content/check-claims.py` is the sibling pipeline's equivalent
+and stops at the repository boundary.
