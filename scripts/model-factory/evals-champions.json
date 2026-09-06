@@ -1,13 +1,39 @@
 {
   "tmux-routing": {
     "modelId": "google/gemma-4-e4b",
-    "note": "untuned local model via LM Studio; the score to beat until a fine-tuned candidate promotes",
-    "recordedAt": "2026-09-05",
-    "source": "evals/tmux-routing/RESULTS.md",
+    "note": "untuned local model via LM Studio, RE-RECORDED 2026-09-06 against the shipped round-3 router prompt (blob c511bab2bf99495603e199fbfe82a6b9f5c9dab5). The previous 36/51 was measured with the ROUND-0 prompt and flattered every candidate compared against it. Residual misses c01 (core) and h08 (hard) reproduce exactly as RESULTS.md records. NOTE the champion does NOT itself pass the core gate (25/26): promotion demands 26/26 AND beating this score, so the gate is strictly harder than the incumbent.",
+    "recordedAt": "2026-09-06",
+    "source": "re-run of evals/tmux-routing/run_evals.py --router router_llm.py at prompt blob c511bab",
     "scores": {
-      "core": {"passed": 21, "total": 26},
-      "hard": {"passed": 15, "total": 25},
-      "overall": {"passed": 36, "total": 51}
+      "core": {
+        "passed": 25,
+        "total": 26
+      },
+      "hard": {
+        "passed": 24,
+        "total": 25
+      },
+      "overall": {
+        "passed": 49,
+        "total": 51
+      }
+    },
+    "supersedes": {
+      "scores": {
+        "core": {
+          "passed": 21,
+          "total": 26
+        },
+        "hard": {
+          "passed": 15,
+          "total": 25
+        },
+        "overall": {
+          "passed": 36,
+          "total": 51
+        }
+      },
+      "note": "round-0 prompt, recorded 2026-09-05"
     }
   }
 }

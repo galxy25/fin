@@ -70,6 +70,23 @@ if [ "$PROMPT_SHA" != "$TRAINING_PROMPT_SHA" ]; then
   exit 78
 fi
 
+# Prove the served endpoint actually answers for the id we will send, BEFORE
+# spending 51 scenarios on it. mlx_lm.server reports its model id as the PATH
+# passed to --model; sending anything else 404s per request, run_evals degrades
+# every scenario to `clarify`, and the 5 clarify scenarios pass — 10/51 that
+# looks like a catastrophic fine-tune and is really an empty measurement.
+probe() {  # probe <base-url> <model-id>
+  local body
+  body=$(curl -s -m 90 "$1/chat/completions" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$2\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK\"}],\"max_tokens\":8,\"temperature\":0}")
+  case "$body" in
+    *'"choices"'*) return 0 ;;
+    *) say "PROBE FAILED for model id '$2' — the endpoint did not answer a trivial request:"
+       say "  ${body:-<empty response>}"
+       return 1 ;;
+  esac
+}
+
 serve() {  # serve <model-path> <label>; sets SERVE_PID
   "$VENV" -m mlx_lm server --model "$1" --port "$PORT" >"$WORK/server-$2.log" 2>&1 &
   SERVE_PID=$!
@@ -123,12 +140,12 @@ for IT in $ITERS; do
   fi
 
   say "serving + scoring checkpoint $IT"
-  if serve "$FUSED" "$IT"; then
-    OUT=$(score "http://127.0.0.1:$PORT/v1" "fin-foreman-$IT" "$IT")
+  if serve "$FUSED" "$IT" && probe "http://127.0.0.1:$PORT/v1" "$FUSED"; then
+    OUT=$(score "http://127.0.0.1:$PORT/v1" "$FUSED" "$IT")
     printf '%s\t%s\n' "$IT" "$(echo "$OUT" | tr '\n' ' ')" >>"$RESULTS"
     say "checkpoint $IT: $(echo "$OUT" | tr '\n' ' ')"
   else
-    printf '%s\tSERVE-FAILED\n' "$IT" >>"$RESULTS"
+    printf '%s\tSERVE-OR-PROBE-FAILED\n' "$IT" >>"$RESULTS"
   fi
   unserve
   rm -rf "$STAGE" "$FUSED"   # each fused model is ~4-6 GB
