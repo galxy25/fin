@@ -196,6 +196,18 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   `fin-agentd-directives.json` next to the audit log (capped at 500, oldest evicted) so
   a restart never replays old instructions.
 
+  **First run (1.4.0).** A box with no ledger file at all — a fresh cloud worker, a new
+  install — treats the first directive document it successfully reads as history, not
+  instructions: every id in it (matching this agent or not, well-formed or not) is
+  marked applied without being injected, the ledger is written, and one line audits
+  `[s3] first run: N historical directive(s) in the supervision doc marked applied, not
+  replayed`. Only directives issued after that point are delivered. The document is
+  shared by every agent, so the control plane can't empty it at launch the way it
+  empties the per-agent inbox; before this a fresh worker replayed weeks of operator
+  directives, one model turn each. An existing ledger — even an empty `[]` — or a
+  corrupt one is *not* a first run: the daemon has run here, and every unapplied
+  directive is delivered as before.
+
   ```json
   {"version": 1, "directives": [
     {"id": "d-1", "agent": "fin-agentd-1", "kind": "user_message",
@@ -212,27 +224,36 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   inbox message resumes a `request_input`-paused or `stayResident`-suspended agent
   exactly as a directive does. The two sources fail independently: a dead directive URL
   audits `[s3] poll failed: …` and still delivers inbox messages, a dead inbox audits
-  `[s3] inbox poll failed: …` and still delivers directives.
+  `[s3] inbox poll failed: …` and still delivers directives. The inbox is exempt from
+  the first-run seed: the control plane empties it at launch (the launch is the
+  conversation boundary), so a message that arrives while the worker boots still
+  applies.
 
 - **Status** — after every poll and every finished turn the daemon PUTs:
 
   ```json
   {"schema": 1, "device": "fin-agentd", "device_id8": "cloud001",
-   "daemon_version": "1.2.0", "agent": "fin-agentd-1", "state": "idle",
+   "daemon_version": "1.4.0", "agent": "fin-agentd-1", "state": "idle",
    "last_applied_id": "d-1", "last_turn_at": "…", "last_assistant_preview": "…",
    "last_error": null, "updated_at": "…"}
   ```
 
   (`last_assistant_preview` is capped at 200 characters; `last_error` carries the most
   recent turn failure, including a directive-injected turn that failed after its id was
-  consumed. `daemon_version` tells a supervisor which harness features exist.)
+  consumed. After a first-run seed, `last_applied_id` is the newest seeded id — the
+  high-water mark — until the daemon applies something itself. `daemon_version` tells a
+  supervisor which harness features exist; 1.4.0 = the always-on `LC_FIN_AGENT` session
+  marker and the first-run directive high-water.)
 
 - **Audit** — `[s3] applied directive <id>` on application, `[s3] poll failed: <reason>`
   / `[s3] put failed: <reason>` on failure, throttled to one line per 5 minutes per
   distinct error string so a dead bucket can't flood the log. A directive whose injected
   turn fails audits `[s3] directive <id> turn failed — not retried` (application is
   at-most-once by design); a dedupe state file that exists but doesn't parse audits
-  `[s3] state file unreadable — dedupe reset` once at startup.
+  `[s3] state file unreadable — dedupe reset` once at startup; a first run with history
+  in the directive document audits `[s3] first run: N historical directive(s) in the
+  supervision doc marked applied, not replayed` once, on the poll that read it (a
+  missing ledger with an empty document audits nothing).
 
 ## Cloud transcript
 
@@ -300,7 +321,8 @@ swift test
 ```
 
 Pure-logic tests always run (engine dispatch, directive and inbox polling with an
-injected transport, the transcript line format against the app reader's contract, the
-stayResident gates, classifier guards). The live integration tests (real sshd + tmux on
+injected transport including the first-run high-water, the `LC_FIN_AGENT` session
+marker, the transcript line format against the app reader's contract, the stayResident
+gates, classifier guards). The live integration tests (real sshd + tmux on
 127.0.0.1, LM Studio at `localhost:1234`) skip cleanly when the dev-machine
 prerequisites are missing.

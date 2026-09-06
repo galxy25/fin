@@ -126,7 +126,7 @@ final class DaemonDirectiveClient {
     static let userMessageKind = "user_message"
     /// Reported in the status document so a supervisor can tell which harness features
     /// (stayResident, cloud transcript, inbox, push notify) this agent has.
-    static let daemonVersion = "1.3.0"
+    static let daemonVersion = "1.4.0"
 
     #if !canImport(Darwin)
     /// Linux only: the default fetch's buffered read runs through this session, whose
@@ -158,6 +158,10 @@ final class DaemonDirectiveClient {
     private var directiveDocument: PolledDocument
     private var inboxDocument: PolledDocument?
     private(set) var appliedIDs: [String]
+    /// True from a first run (no ledger file at init) until the first successfully
+    /// fetched directive document has been seeded into the ledger — see
+    /// `seedLedgerIfFirstRun`. Never true again in this process afterwards.
+    private var awaitingFirstRunSeed: Bool
     /// Skip audits are once per directive id, so a permanently bad entry writes one
     /// line, not one per poll.
     private var auditedSkips: Set<String> = []
@@ -225,11 +229,21 @@ final class DaemonDirectiveClient {
         self.audit = audit
         self.fetch = fetch
         self.put = put
-        let loaded = Self.loadAppliedIDs(from: stateFilePath)
-        self.appliedIDs = loaded.ids
-        if loaded.corrupt {
+        switch Self.loadAppliedIDs(from: stateFilePath) {
+        case .loaded(let ids):
+            self.appliedIDs = ids
+            self.awaitingFirstRunSeed = false
+        case .missing:
+            // A box this daemon has never run on: the shared supervision document is
+            // history to it, not instructions. Seeded on the first fresh fetch.
+            self.appliedIDs = []
+            self.awaitingFirstRunSeed = true
+        case .corrupt:
             // Starting with an empty dedupe set means already-applied directives may
-            // replay; the supervisor must be able to see why.
+            // replay; the supervisor must be able to see why. Not a first run — the
+            // daemon HAS run here — so nothing is seeded and the replay is visible.
+            self.appliedIDs = []
+            self.awaitingFirstRunSeed = false
             audit("[s3] state file unreadable — dedupe reset")
         }
     }
@@ -250,8 +264,38 @@ final class DaemonDirectiveClient {
     func poll() async -> [DaemonRemoteDirective] {
         lastPollAt = Date()
         directiveDocument = await refreshed(directiveDocument)
+        seedLedgerIfFirstRun()
         if let inbox = inboxDocument { inboxDocument = await refreshed(inbox) }
         return pendingDirectives()
+    }
+
+    /// First run only: the first directive document actually read becomes the ledger's
+    /// high-water mark. Every id in it — matching this agent or not, well-formed or
+    /// not — is marked applied without being injected, because on a fresh box (a new
+    /// cloud worker, a new install) that document is the supervisor's whole history,
+    /// and replaying it burns a model turn re-answering every week-old prompt. The
+    /// control plane empties the per-agent INBOX at launch for the same reason but
+    /// cannot empty the directive document, which every agent shares — so the daemon
+    /// draws the line itself. The inbox is deliberately NOT seeded: launch reset it, so
+    /// anything in it by the first poll arrived while the worker booted and must apply.
+    ///
+    /// Keyed on the directive slot alone (not `refreshed`, which serves both slots): a
+    /// failed or unparseable first fetch leaves the seed pending for the next poll, and
+    /// in that window `matching(in:)` returns nothing for the slot anyway. Persisting
+    /// even an empty seed creates the ledger file, so an in-place restart is no longer
+    /// a first run.
+    private func seedLedgerIfFirstRun() {
+        guard awaitingFirstRunSeed, directiveDocument.isFresh,
+              let cached = directiveDocument.cached else { return }
+        awaitingFirstRunSeed = false
+        var seen = Set(appliedIDs)
+        let seeded = cached.directives.map(\.id).filter { seen.insert($0).inserted }
+        appliedIDs.append(contentsOf: seeded)
+        capAppliedIDs()
+        persistAppliedIDs()
+        if !seeded.isEmpty {
+            audit("[s3] first run: \(seeded.count) historical directive(s) in the supervision doc marked applied, not replayed")
+        }
     }
 
     /// One conditional GET, returning the slot with its ETag and cached parse updated.
@@ -339,18 +383,14 @@ final class DaemonDirectiveClient {
     /// Called by the daemon the moment it injects a directive's text into the engine.
     func markApplied(_ id: String) {
         appliedIDs.append(id)
-        if appliedIDs.count > Self.appliedIDsCap {
-            appliedIDs.removeFirst(appliedIDs.count - Self.appliedIDsCap)
-        }
+        capAppliedIDs()
         persistAppliedIDs()
         audit("[s3] applied directive \(id)")
     }
 
     private func skip(_ id: String, _ reason: String) {
         appliedIDs.append(id)
-        if appliedIDs.count > Self.appliedIDsCap {
-            appliedIDs.removeFirst(appliedIDs.count - Self.appliedIDsCap)
-        }
+        capAppliedIDs()
         persistAppliedIDs()
         guard !auditedSkips.contains(id) else { return }
         auditedSkips.insert(id)
@@ -419,17 +459,31 @@ final class DaemonDirectiveClient {
 
     // MARK: - Applied-id persistence
 
-    /// A missing file is the normal first run; a present-but-unparseable file is a
-    /// corrupt dedupe state worth one audit line (the init writes it), because the
-    /// reset can replay directives the previous run already applied.
-    private static func loadAppliedIDs(from path: String) -> (ids: [String], corrupt: Bool) {
+    /// The three ways the ledger file can come back at init, kept distinct on purpose:
+    /// `missing` is a first run and seeds (`seedLedgerIfFirstRun`); `loaded` — even an
+    /// empty `[]` — means the daemon has run here before and every unapplied directive
+    /// is delivered; `corrupt` is a reset worth one audit line (the init writes it),
+    /// because it can replay directives the previous run already applied.
+    private enum LedgerLoad {
+        case missing
+        case corrupt
+        case loaded([String])
+    }
+
+    private static func loadAppliedIDs(from path: String) -> LedgerLoad {
         guard let data = FileManager.default.contents(atPath: path) else {
-            return ([], false)
+            return .missing
         }
         guard let ids = try? JSONDecoder().decode([String].self, from: data) else {
-            return ([], true)
+            return .corrupt
         }
-        return (Array(ids.suffix(appliedIDsCap)), false)
+        return .loaded(Array(ids.suffix(appliedIDsCap)))
+    }
+
+    private func capAppliedIDs() {
+        if appliedIDs.count > Self.appliedIDsCap {
+            appliedIDs.removeFirst(appliedIDs.count - Self.appliedIDsCap)
+        }
     }
 
     private func persistAppliedIDs() {
