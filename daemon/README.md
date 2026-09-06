@@ -53,6 +53,49 @@ Beyond `server`, `agent`, and `task`, every field is optional:
 | `transcript` | — | The cloud transcript (below) |
 | `controlPlane` | — | Endpoint + bearer token of the serverless control plane; turns notify events into APNs pushes (below) |
 
+Inside `server`, `connectCommand` (typed into the shell once the PTY is up — normally a
+`tmux new-session -A …` attach) and `environment` (extra SSH env requests) are optional
+too. Since 1.4.0 the environment always carries one entry the config can't remove:
+
+### The session marker (`LC_FIN_AGENT`)
+
+Every SSH session the daemon opens carries the environment request `LC_FIN_AGENT=1` on
+its PTY channel — **always**, not only when `server.environment` lists it. It exists
+because a login shell that auto-attaches every interactive remote login to the human's
+real tmux session (`exec tmux new-session -A -s main`) does so *before* the daemon types
+its `connectCommand`, so the daemon's `FIN_READY_*` readiness probes and every keystroke
+after them land in the human's live session (the 2026-09-05 iMac shakedown bug). The
+marker is how that shell profile tells the daemon apart. The daemon has no PTY+exec
+mode (Citadel's `withPTY` is a shell channel), so the marker — not a remote command — is
+what keeps it out of your session.
+
+It is `LC_`-prefixed because sshd's default `AcceptEnv` is `LANG LC_*` (macOS and
+Amazon Linux both), so it crosses the wire with no sshd change. A hardened sshd needs
+`AcceptEnv LC_*` (or `LC_FIN_AGENT` by name) in `sshd_config` for the marker — and any
+other `server.environment` entry — to arrive.
+
+If your login shell auto-attaches tmux, gate it on the marker:
+
+```fish
+# fish — ~/.config/fish/config.fish
+if status is-interactive; and set -q SSH_TTY; and not set -q TMUX; and not set -q LC_FIN_AGENT
+    exec tmux new-session -A -s main
+end
+```
+
+```sh
+# bash / zsh — ~/.bashrc or ~/.zshrc
+if [ -n "$SSH_TTY" ] && [ -z "$TMUX" ] && [ -z "$LC_FIN_AGENT" ]; then
+    exec tmux new-session -A -s main
+fi
+```
+
+`server.environment` is merged over the marker: an entry named `LC_FIN_AGENT` changes
+its value (any non-blank string), but nothing in the config can remove or blank it — a
+blank value would read as unset to the `[ -z … ]` guard above. Everything else in the
+block is passed through as-is, subject to the same `AcceptEnv` caveat.
+(`DaemonSessionEnvironmentTests` pins all of this.)
+
 ### stayResident
 
 The cloud posture: one isolated EC2 instance per agent outlives any one task. With
