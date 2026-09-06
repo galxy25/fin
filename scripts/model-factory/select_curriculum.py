@@ -223,9 +223,12 @@ class Row:
 
 # The fingerprint keys a --base file and a --tuned file must agree on for
 # `learned_bits = bits_base - bits_tuned` to be a difference of commensurable
-# quantities. Mirrors score_bits.PAIR_FINGERPRINT_KEYS; `adapter` is deliberately
-# absent, being the one field that MUST differ between the two runs.
+# quantities. Mirrors score_bits.PAIR_FINGERPRINT_KEYS; `adapter` and
+# `adapter_digest` are deliberately absent, being the fields that MUST differ
+# between the two runs. "Must differ" is not "unchecked": `check_pair_adapters`
+# asserts they differ in the ONE direction that is valid.
 PAIR_FINGERPRINT_KEYS = ("model", "max_seq_length", "match_trainer", "full_forward", "chunk")
+ADAPTER_FINGERPRINT_KEYS = ("adapter", "adapter_digest")
 
 
 def load_scores(
@@ -253,6 +256,7 @@ def load_scores(
     out: dict[str, dict] = {}
     skipped: set[str] = set()
     adapters: set[str | None] = set()
+    digests: set[str | None] = set()
     fingerprint: dict = {}
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
@@ -261,8 +265,14 @@ def load_scores(
             rec = json.loads(line)
             if "adapter" in rec:
                 adapters.add(rec["adapter"])
+            if "adapter_digest" in rec:
+                digests.add(rec["adapter_digest"])
             if not fingerprint:
-                fingerprint = {k: rec[k] for k in PAIR_FINGERPRINT_KEYS if k in rec}
+                fingerprint = {
+                    k: rec[k]
+                    for k in PAIR_FINGERPRINT_KEYS + ADAPTER_FINGERPRINT_KEYS
+                    if k in rec
+                }
             if rec.get("skipped"):
                 skipped.add(rec["hash"])
                 continue
@@ -271,6 +281,17 @@ def load_scores(
         raise SystemExit(
             f"{path} mixes rows from {len(adapters)} different adapters {sorted(map(str, adapters))}. "
             "That file is two runs spliced together; re-score with --restart."
+        )
+    if len(digests) > 1:
+        # The case a PATH cannot see: one --adapter directory, two checkpoints.
+        # `models/candidates/fin-foreman-e4b-mlx` gets a new adapters.safetensors
+        # every 250 iterations and the staging recipe copies checkpoints over one
+        # reused directory, so "same path" is not "same weights".
+        raise SystemExit(
+            f"{path} mixes rows from {len(digests)} different adapter CONTENTS "
+            f"{sorted(map(str, digests))} under the path(s) {sorted(map(str, adapters))}. "
+            "The weights under that path changed while the file was being written -- it "
+            "holds two models under one name. Re-score with --restart."
         )
     if expect_adapter is not None and adapters:
         has_adapter = next(iter(adapters)) is not None
@@ -313,6 +334,85 @@ def check_pair_fingerprints(
         "learned_bits = bits_base - bits_tuned would be a difference of two "
         "incommensurable quantities, and it is the default ranking key. Re-score one "
         "side to match, or pass --allow-fingerprint-mismatch if you know why they differ."
+    )
+    if not allow:
+        raise SystemExit("[select_curriculum] " + msg)
+    print(f"[select_curriculum] WARNING: {msg}", file=sys.stderr)
+
+
+def check_pair_adapters(
+    base_fp: dict, tuned_fp: dict, base_path: Path, tuned_path: Path, allow: bool
+) -> None:
+    """The other half of the pair rule: what must DIFFER, and in which direction.
+
+    ``check_pair_fingerprints`` asserts the two runs agree on model, window and
+    forward path. It deliberately says nothing about the adapter, because that is
+    the one thing a valid pair differs in -- but "allowed to differ" quietly
+    became "never looked at", and a pair that does not differ is exactly as broken
+    as one that differs in the wrong field:
+
+    * both sides UNTUNED -> ``learned_bits = base - base = 0`` for every example.
+      The default ranking key becomes noise around zero and the selection is a
+      coin flip nothing downstream would report.
+    * both sides the SAME adapter -> the same, with an extra GPU run's worth of
+      confidence behind it.
+    * neither side RECORDS the fields -> written by a scorer that had no content
+      digest, so nothing can be verified. Refused rather than assumed.
+
+    So the direction is asserted, not just the difference: the --base file must
+    carry no adapter and no digest, the --tuned file must carry both.
+
+    ``adapter_digest`` is the field that makes this real. A path is not an
+    identity -- two runs against one reused staging directory hold different
+    weights and identical ``adapter`` strings -- so the digest is what says a
+    tuned run is tuned on something, and says WHICH something in the report.
+    """
+    fields = ("adapter", "adapter_digest")
+    recorded = any(k in base_fp for k in fields) or any(k in tuned_fp for k in fields)
+    if not recorded:
+        problem = (
+            f"neither {base_path} nor {tuned_path} records an adapter or an "
+            "adapter_digest. They predate the content fingerprint, so there is no "
+            "evidence that one of them is the base run and the other the tuned one -- "
+            "and if they are the same run, learned_bits is identically zero"
+        )
+    elif (
+        base_fp.get("adapter_digest") is not None
+        and base_fp.get("adapter_digest") == tuned_fp.get("adapter_digest")
+    ):
+        # Checked before the base-side rule so the sharpest case gets the
+        # sharpest message: one checkpoint staged twice, under two paths, and
+        # subtracted from itself. Nothing keyed on the PATH could see this.
+        problem = (
+            f"{base_path} and {tuned_path} were scored under the SAME adapter content "
+            f"({base_fp['adapter_digest']}, at {base_fp.get('adapter')!r} and "
+            f"{tuned_fp.get('adapter')!r}). learned_bits would be identically zero"
+        )
+    elif base_fp.get("adapter") is not None or base_fp.get("adapter_digest") is not None:
+        problem = (
+            f"{base_path} is used as --base but was scored WITH an adapter "
+            f"(adapter={base_fp.get('adapter')!r}, digest={base_fp.get('adapter_digest')!r}). "
+            "bits_base must be the UNTUNED model's surprise"
+        )
+    elif tuned_fp.get("adapter") is None and tuned_fp.get("adapter_digest") is None:
+        problem = (
+            f"{tuned_path} is used as --tuned but was scored with NO adapter. "
+            "learned_bits = bits_base - bits_tuned would be a model minus itself: "
+            "identically zero, and it is the default ranking key"
+        )
+    elif tuned_fp.get("adapter_digest") is None:
+        problem = (
+            f"{tuned_path} names an adapter ({tuned_fp.get('adapter')!r}) but records no "
+            "adapter_digest, so which checkpoint produced it cannot be established. "
+            "That path takes a new adapters.safetensors every 250 iterations"
+        )
+    else:
+        return
+
+    msg = (
+        f"{problem}. The pair must differ in one direction only: --base with no adapter, "
+        "--tuned with one. Re-score the side that is wrong, or pass "
+        "--allow-fingerprint-mismatch if you know why they are like this."
     )
     if not allow:
         raise SystemExit("[select_curriculum] " + msg)
@@ -1195,8 +1295,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-fingerprint-mismatch",
         action="store_true",
         help="proceed when --base and --tuned were scored under different model/window/"
-        "forward-path settings. learned_bits is then a difference of two incommensurable "
-        "quantities; you are asserting you know why.",
+        "forward-path settings, or when they do not differ in the one way they must "
+        "(--base untuned, --tuned with a content-fingerprinted adapter). learned_bits is "
+        "then a difference of two incommensurable quantities, or of a model with itself; "
+        "you are asserting you know why.",
     )
     p.add_argument("--residual-percentile", type=float, default=99.0)
     p.add_argument(
@@ -1280,6 +1382,11 @@ def load_rows(args: argparse.Namespace) -> tuple[list[Row], bool, list[tuple[int
     if args.tuned:
         tuned, _, tuned_fp = load_scores(Path(args.tuned), expect_adapter=True)
         check_pair_fingerprints(
+            base_fp, tuned_fp, Path(args.base), Path(args.tuned),
+            args.allow_fingerprint_mismatch,
+        )
+        # What must AGREE is checked above; what must DIFFER is checked here.
+        check_pair_adapters(
             base_fp, tuned_fp, Path(args.base), Path(args.tuned),
             args.allow_fingerprint_mismatch,
         )

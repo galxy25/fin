@@ -460,6 +460,12 @@ $V scripts/model-factory/select_curriculum.py \
     --report reports/curriculum-0.25.txt
 ```
 
+Step 2 prints the adapter it hashed (`--adapter … -> sha256:…`) before it loads
+anything. Note that `models/candidates/fin-foreman-e4b-mlx` takes a new
+`adapters.safetensors` every 250 iterations: **one `--out` per checkpoint**. A
+re-run against that path after the weights changed is refused (exit 2) rather
+than resumed — see the adapter digest below.
+
 `scripts/model-factory/run_bits_experiment.sh` wires all of that together plus
 the retrain and the gate. It derives its own location from `$0`, so it runs the
 code it shipped with; `FIN_DATA_ROOT` (corpora/models) and `FIN_OUT_ROOT`
@@ -490,13 +496,18 @@ is what it used to do, for `--jaccard` alone — let any other flag regain a sec
 confound silently; `--target-fraction 0.5` in one arm and `0.25` in the other
 passed the whole suite.
 
-`scripts/model-factory/tests/test_bits_curriculum.py` (stdlib `unittest`, **172
+`scripts/model-factory/tests/test_bits_curriculum.py` (stdlib `unittest`, **205
 tests, no model, no GPU, no network**, ~0.1s) covers the bits formula, the
 masking indices, truncation and exact-fit flagging, the per-track decision mask
 and its coverage preflight, the machine guard's actual refusals, both parity
-modes (internal and the external anchor), the run fingerprint within a file and
-across the base/tuned pair, the mislabel screen at scales two orders of magnitude
-apart, every selector property, and the experiment script's own configuration.
+modes (internal and the external anchor) and the relative tolerance with its
+absolute floor, the run fingerprint within a file and across the base/tuned pair,
+the adapter content digest and the pair's direction rule, the mislabel screen at
+scales two orders of magnitude apart, every selector property, and the experiment
+script's own configuration. The adapter tests build fixture adapter directories
+by hand — plausible bytes in `adapters.safetensors` and a real-shaped
+`adapter_config.json` — so the whole content-identity path is exercised with no
+`safetensors` library and no weights.
 
 It is mutation-checked. The earlier round broke 24 guards one at a time — wrong
 pad id, guard that checks nothing, guard that fails open, pad step at the
@@ -518,6 +529,15 @@ dropped, the decision column never preferred, the drop list re-sorted by
 `bits_base`, the shell guard returned to failing open) — **all 21 fail a test**.
 Three of them survived on the first attempt and the tests were rewritten until
 they did not; a test that cannot fail is not evidence.
+
+A third round broke **6** more, one per component of the two fixes above
+(`run_fingerprint` reverted to path-only adapter identity, the
+`check_pair_adapters` call site deleted, the two-digests-in-one-file refusal
+deleted, the parity tolerance reverted to an absolute `1e-2`, the `NOT
+CALIBRATED` banner deleted, the absolute floor removed) — **all 6 fail a test**,
+and the path-only mutation fails it in exactly the shape the review described:
+`resuming: 3 already scored / nothing to do`, exit 0, under weights that had
+changed underneath.
 
 ### Fidelity to training — the part that is easy to get wrong
 
@@ -592,8 +612,8 @@ read as "nothing is running".) It is resumable (skips hashes already in `--out`,
 `fsync` per row) and deterministic.
 
 **The run fingerprint, and the two places it is enforced.** Every row carries
-`model`, `adapter`, `max_seq_length`, `match_trainer`, `full_forward` and
-`chunk`.
+`model`, `adapter`, `adapter_digest`, `max_seq_length`, `match_trainer`,
+`full_forward` and `chunk`.
 
 * *Within* one file, on resume: a resume **refuses** when the existing rows were
   scored under different settings, so one forgotten `--out` cannot splice two
@@ -609,9 +629,98 @@ read as "nothing is running".) It is resumable (skips hashes already in `--out`,
   model, window and forward path; score the base at `--max-seq-length 3072` and
   the tuned adapter at 2048 and every example truncated under one but not the
   other contributes a fabricated `learned_bits`, to the **default** ranking key,
-  silently. `select_curriculum.py` now compares the two files' fingerprints and
-  refuses on a mismatch (`--allow-fingerprint-mismatch` to override). `adapter`
-  is deliberately excluded: it is the one field that must differ.
+  silently. `select_curriculum.py` compares the two files' fingerprints and
+  refuses on a mismatch (`--allow-fingerprint-mismatch` to override). The two
+  adapter fields are excluded from that comparison: they are the ones that must
+  **differ**, and they get their own rule, below.
+
+**The adapter is identified by its CONTENT (`adapter_digest`), not by its path.**
+A path is not an identity. `models/candidates/fin-foreman-e4b-mlx/adapters.safetensors`
+is rewritten every 250 iterations, and the checkpoint-staging recipe in
+`run_bits_experiment.sh` deliberately copies checkpoints over one reused
+directory. Identifying the adapter as `str(Path(args.adapter).resolve())` — which
+is all it used to be — therefore says nothing about which weights produced a row:
+score under checkpoint 3000, take a kill at row 1200, let checkpoint 3500 land on
+the same path, re-run the same command, and every recorded key still matched. The
+resume passed, the rest of the corpus was appended under different weights, and
+one score file held two models under one name.
+
+* **What it is.** A streaming SHA-256 over the two files `mlx_lm` actually loads
+  out of an adapter directory — `adapters.safetensors` and `adapter_config.json`
+  (rank, scale and which layers change the forward pass as surely as the weights
+  do) — mixed with each file's name and size in a fixed order, and recorded as
+  `sha256:…`. Deterministic and path-independent by construction: one checkpoint
+  staged at two paths digests the same, two checkpoints staged at one path do
+  not. **Cost: ~14 ms** on this repo's real 27,683,964-byte adapter, once per
+  run, before the guard and before any weights load — so a malformed `--adapter`
+  directory is refused there rather than three GPU-minutes later. (Full hashing,
+  not a `size+mtime` shortcut: `touch` changes mtime without changing weights,
+  `cp -p` changes weights without changing mtime, and consecutive LoRA
+  checkpoints are byte-identical in size — size+mtime is precisely the
+  discriminator this hazard defeats.)
+* **Operator-visible consequences.** Re-running with the same command against a
+  path whose weights have changed is now **refused** (exit 2) instead of resumed;
+  point `--out` at a new file per checkpoint, which is what the staging recipe
+  already tells you to do. A **tuned** score file written before this existed has
+  no digest and cannot be resumed — re-score it. A **base** file has no adapter,
+  so "recorded no digest" and "has no digest" are the same state and old base
+  files still resume; the expensive half is not invalidated.
+* **The pair's direction rule** (`check_pair_adapters`). "Allowed to differ" had
+  quietly become "never looked at", and a pair that does *not* differ is exactly
+  as broken as one that differs in the wrong field: two untuned runs make
+  `learned_bits` identically zero and the default ranking a coin flip. So the
+  **direction** is asserted, not just the difference — the `--base` file must
+  carry no adapter and no digest, the `--tuned` file must carry both — and these
+  are refused: both sides carrying the same digest (one checkpoint subtracted
+  from itself, under two paths, which nothing keyed on the path could see), a
+  base file that carries an adapter, a tuned file that carries none, a tuned file
+  that names an adapter but records no digest, and a pair where neither file
+  records the fields at all. `--allow-fingerprint-mismatch` waives it, loudly.
+  `select_curriculum.py` also refuses a single file holding two different
+  digests, however it came to (a hand-concatenation, a restored backup).
+
+**The parity tolerance is RELATIVE, and its default is not yet a gate.** The
+internal check (`parity_check.py CHUNKED.jsonl FULLFWD.jsonl`, stages 1c and 2b)
+compares an un-cached single forward against a chunked prefill through a rotating
+KV cache on a 4-bit-quantised model — two different sequences of floating-point
+operations over the same mathematics, which `score_bits.py`'s own comments concede
+disagree numerically. Some divergence is *expected*; the check's job is to
+separate it from a chunked path assembling the wrong rows.
+
+It used to enforce `TOLERANCE = 1e-2` as an **absolute** bound on a per-example
+**sum** of bits, and hard-gate the pipeline on it. At this corpus's scale that is
+~8e-5 relative:
+
+    Iter 1: Val loss 2.463 nats/token   ×   127129/3675 = 34.6 unmasked tokens/step
+      = 85.2 nats = ~123 bits per example        (from the live train.log)
+
+A per-token disagreement of 1e-3 nats — unremarkable for this arithmetic — sums to
+0.05 bits, **five times** the old bound. The check was likelier to fail on float
+noise than on a bug, and a check that cries wolf on its first honest run gets
+loosened by whoever is holding the pipeline at 2am. The rule now:
+
+    error(h) = |chunked[h] − full[h]| / max(|full[h]|, --abs-floor)
+
+Relative, because the quantity spans orders of magnitude (a base example is ~10²
+bits; a memorized tuned example is ~10⁻²) and one absolute bound cannot be right
+for both. Floored at 1 bit, because below that the model is essentially certain
+and a ratio stops carrying information.
+
+**Calibration status: AWAITING CALIBRATION — no GPU parity run has ever been made
+against this code**, so nobody knows what these two paths actually agree to, and
+no number here is a measured bound. Rather than invent one, `--tolerance` now
+defaults to *unset*: the check enforces only a deliberately coarse `5e-2` relative
+ceiling — an order-of-magnitude argument that resolves a chunked path wrong in
+**kind** (rows off by one, the wrong cache, the prompt scored as the answer), not
+one off by a little — reports the observed **max relative divergence**
+prominently, and prints a `NOT CALIBRATED` banner *on a pass*, because an
+uncalibrated pass is the one that gets mistaken for a validated one.
+
+**What an operator must do:** run stage 1c or 2b once, read the reported "max
+relative divergence", and add `--tolerance <a small multiple of it>` to **both**
+`parity_check.py` invocations in `run_bits_experiment.sh`. Until that is done, a
+pass from those stages means "not wrong in kind", not "validated to a stated
+precision", and the script's comments say so at both call sites.
 
 ### Honest caveats
 
@@ -790,7 +899,14 @@ refuses to start until that is clear. What that leaves unvalidated, precisely:
   resolution is limited — the log's figure is a `--val-batches 25` sample of the
   118-example split, so it catches a mask wrong in **kind** (prompt scored as
   answer), not one off by a single token, and it says so in its own output.
-* **The chunked-vs-full-forward parity check has never run** (stages 1c / 2b).
+* **The chunked-vs-full-forward parity check has never run** (stages 1c / 2b),
+  **and its tolerance is therefore uncalibrated.** It is now a *relative* bound
+  with an absolute floor rather than the old absolute `1e-2` bits (which was
+  ~8e-5 relative at this corpus's scale, tighter than the arithmetic can
+  support), but no number in it is measured. Until a real run reports its "max
+  relative divergence" and an operator sets `--tolerance` from it, these stages
+  resolve a forward path wrong in **kind**, not one off by a little — the check
+  prints `NOT CALIBRATED` on its own passes so this cannot be forgotten.
 * **The decision-field mask has been verified only against a character-level
   stub tokenizer**, never a real one.
 * **The mislabel screen's power is unknown.** The cut is now scale-free, so

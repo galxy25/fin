@@ -16,7 +16,13 @@
    number validated. So this refuses when the intersection is empty or
    incomplete, and prints the count it actually compared.
 
-     parity_check.py CHUNKED.jsonl FULLFWD.jsonl [--tolerance 0.01] [--column bits]
+     parity_check.py CHUNKED.jsonl FULLFWD.jsonl [--tolerance REL] [--column bits]
+
+   The tolerance is RELATIVE (with an absolute floor) and its default is
+   deliberately not a gate: no GPU parity run has ever been made against this
+   code, so the observed divergence is reported prominently and only a coarse
+   wrong-in-KIND ceiling is enforced until an operator sets --tolerance from a
+   real number. The long argument is in the constants block below.
 
 2. EXTERNAL anchor (--anchor META.json --log train.log). Internal parity says
    the two forward paths agree with each other; it cannot say the MASK is the
@@ -58,10 +64,74 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-# The tolerance the chunked path must meet. One number, used everywhere: a
-# comment promising 1e-3 over code enforcing 1e-2 is a 10x gap on the check that
-# decides whether the bits column is trustworthy at all.
-TOLERANCE = 1e-2
+# --------------------------------------------------------------------------
+# The tolerance, and why it is RELATIVE and why its default is not a gate.
+#
+# What is being compared: an un-cached single forward, and a chunked prefill
+# through a rotating KV cache, on a 4-bit-quantised model with bf16 activations.
+# Those are two different sequences of floating-point operations over the same
+# mathematics. score_bits.py's own comments concede the point -- different chunk
+# boundaries mean different matmul shapes and different cache eviction points,
+# and therefore numerically different nats. Some disagreement is EXPECTED. The
+# check's job is to separate that from a chunked path that is assembling the
+# wrong rows.
+#
+# The previous rule was TOLERANCE = 1e-2, an ABSOLUTE bound on a per-example SUM
+# of bits, and it hard-gated the pipeline. The scale it was applied at, derived
+# from the live training log (models/candidates/fin-foreman-e4b-mlx/train.log):
+#
+#     Iter 1: Val loss 2.463                      nats per unmasked token
+#     Iter 3675: ... Trained Tokens 127129        => 127129/3675 = 34.6 unmasked
+#                                                   tokens per optimizer step
+#     2.463 x 34.6 = 85.2 nats = 123 bits per example
+#
+# (Those are the trainer's numbers for its own batches, not a parity run's; with
+# --grad-accumulation-steps 2 a step may cover two examples, which halves the
+# per-example figure. Either way the example is of order 10^2 bits.) Against
+# ~123 bits, 1e-2 bits is ~8e-5 RELATIVE -- about 2.4e-6 nats per token. But a
+# per-token disagreement of 1e-3 nats, unremarkable for this arithmetic, sums to
+# 34.6 x 1e-3 = 0.035 nats = 0.05 bits: FIVE TIMES the old bound, and ~4e-4 in
+# relative terms. So the old rule was likelier to fail on float noise than on a
+# bug -- and a check that cries wolf on its first honest run gets loosened by
+# whoever is holding the pipeline at 2am, which is worse than no check at all.
+#
+# The rule now: relative error, with an absolute floor.
+#
+#     error(h) = |chunked[h] - full[h]| / max(|full[h]|, ABS_FLOOR_BITS)
+#
+# Relative, because the quantity being compared spans orders of magnitude: a
+# base-model example is ~10^2 bits and a memorized tuned example is ~10^-2, and
+# one absolute bound cannot be right for both. Floored, because below ~1 bit the
+# model is essentially certain and the ratio stops carrying information -- a
+# 0.001-bit wobble on a 0.05-bit example is not a 2% error in any meaningful
+# sense, it is the last digit of a number that is zero.
+#
+# AWAITING CALIBRATION. No GPU parity run has ever been made against this code
+# (see the README's "never run" list), so nobody knows what these two paths
+# actually agree to. Rather than invent a number and call it a bound, the default
+# refuses to pretend: it enforces only UNCALIBRATED_CEILING, deliberately coarse,
+# and reports the observed maximum prominently so the first real run produces the
+# number that a real gate can be set from. Pass --tolerance once you have it.
+#
+# What would make this meaningful: one run of stage 1c/2b on the GPU, the
+# reported "max relative divergence" written down, and --tolerance set a small
+# multiple above it (in run_bits_experiment.sh, so the gate travels with the
+# pipeline). Until then this check resolves a chunked path that is wrong in KIND
+# -- off-by-one rows, the wrong cache, the prompt scored as the answer -- and
+# says so in its own output rather than implying a precision it does not have.
+# --------------------------------------------------------------------------
+
+# Below this many bits an example is judged by absolute difference against the
+# floor instead of by ratio. See above.
+ABS_FLOOR_BITS = 1.0
+
+# The default, uncalibrated bound: relative. Coarse ON PURPOSE. Two orders of
+# magnitude above the ~4e-4 relative that a 1e-3 nats/token disagreement implies
+# at this corpus's scale, and far below anything a mis-assembled row could
+# produce (a wrong row is a different token's logprob, which moves an example's
+# bits by tens of percent). It is an order-of-magnitude argument, not a
+# measurement, and it is not a substitute for --tolerance.
+UNCALIBRATED_CEILING = 5e-2
 
 # Relative tolerance for the external anchor. Wide on purpose: the log's number
 # is a 25-batch sample of a 118-example split, so anything tighter would be
@@ -85,9 +155,18 @@ def load(path: Path, column: str) -> dict[str, float]:
 
 
 def compare(
-    chunked: dict[str, float], full: dict[str, float], tolerance: float
+    chunked: dict[str, float],
+    full: dict[str, float],
+    tolerance: float | None = None,
+    abs_floor: float = ABS_FLOOR_BITS,
 ) -> tuple[bool, str]:
-    """(ok, message). Empty or partial overlap is a FAILURE, not a pass."""
+    """(ok, message). Empty or partial overlap is a FAILURE, not a pass.
+
+    ``tolerance`` is a RELATIVE bound, applied as
+    ``|chunked - full| / max(|full|, abs_floor)``; see the block at the top of
+    this file for why it is relative and why the default is not a real gate.
+    ``None`` means the uncalibrated default, ``UNCALIBRATED_CEILING``.
+    """
     if not full:
         return False, "the full-forward file has no scored rows to compare against"
     missing = [h for h in full if h not in chunked]
@@ -97,15 +176,27 @@ def compare(
             "chunked file: the two files are not describing the same run, so a match "
             "would mean nothing"
         )
-    worst_hash, worst = "", 0.0
+    bound = UNCALIBRATED_CEILING if tolerance is None else tolerance
+    worst_hash, worst_rel, worst_abs, worst_scale = "", -1.0, 0.0, 0.0
+    biggest_abs = 0.0
     for h, v in full.items():
         delta = abs(chunked[h] - v)
-        if delta >= worst:
-            worst_hash, worst = h, delta
-    ok = worst < tolerance
+        biggest_abs = max(biggest_abs, delta)
+        scale = max(abs(v), abs_floor)
+        rel = delta / scale
+        # Rank on the RELATIVE error, because that is what the bound is on. The
+        # largest absolute gap is reported too, but it is the biggest EXAMPLE
+        # about as often as it is the biggest error.
+        if rel >= worst_rel:
+            worst_hash, worst_rel, worst_abs, worst_scale = h, rel, delta, scale
+    ok = worst_rel < bound
     msg = (
-        f"max |chunked - full| = {worst:.6f} bits over {len(full)} examples "
-        f"(worst: {worst_hash}); tolerance {tolerance:g}"
+        f"max relative divergence {worst_rel:.3e} over {len(full)} examples "
+        f"(worst: {worst_hash}, |chunked - full| = {worst_abs:.6f} bits against a "
+        f"{worst_scale:.4f}-bit example); largest absolute gap anywhere "
+        f"{biggest_abs:.6f} bits; bound {bound:g} relative"
+        + (" (UNCALIBRATED default)" if tolerance is None else " (--tolerance)")
+        + f", absolute floor {abs_floor:g} bits"
     )
     return ok, msg
 
@@ -165,7 +256,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("chunked", nargs="?")
     p.add_argument("full_forward", nargs="?")
-    p.add_argument("--tolerance", type=float, default=TOLERANCE)
+    p.add_argument(
+        "--tolerance",
+        type=float,
+        default=None,
+        help="max RELATIVE divergence |chunked-full|/max(|full|,--abs-floor) to accept. "
+        f"Omitted = uncalibrated: enforce only the coarse {UNCALIBRATED_CEILING:g} ceiling, "
+        "report the observed maximum, and say plainly that it is not a calibrated gate. "
+        "Set this from a real run's reported number; see the block at the top of this file.",
+    )
+    p.add_argument(
+        "--abs-floor",
+        type=float,
+        default=ABS_FLOOR_BITS,
+        help="bits below which an example is judged against this floor instead of by "
+        "ratio (a memorized tuned example is ~0.05 bits; a ratio there is meaningless)",
+    )
     p.add_argument("--column", default="bits")
     p.add_argument("--anchor", help="a score run's .meta.json (external-anchor mode)")
     p.add_argument("--log", help="the trainer's train.log (external-anchor mode)")
@@ -200,11 +306,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         load(Path(args.chunked), args.column),
         load(Path(args.full_forward), args.column),
         args.tolerance,
+        args.abs_floor,
     )
     print(f"[parity_check] {msg}", file=sys.stderr)
     if not ok:
         print("[parity_check] FAILED -- the chunked path is not reproducing the "
               "trainer's forward; every bits number from it is suspect.", file=sys.stderr)
+    elif args.tolerance is None:
+        # Loud on a PASS, because an uncalibrated pass is the one that gets
+        # mistaken for a validated one.
+        print(
+            "[parity_check] NOT CALIBRATED. No GPU parity run has ever been made "
+            f"against this code, so {UNCALIBRATED_CEILING:g} is an order-of-magnitude "
+            "ceiling, not a measured bound: it resolves a chunked path that is wrong in "
+            "KIND (rows off by one, the wrong cache, the prompt scored as the answer), "
+            "not one that is off by a little. This run did NOT validate the bits column "
+            "to any stated precision. Write the 'max relative divergence' above into "
+            "run_bits_experiment.sh as --tolerance (a small multiple of it) to turn this "
+            "into a gate that means something.",
+            file=sys.stderr,
+        )
     return 0 if ok else 1
 
 

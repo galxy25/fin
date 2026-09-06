@@ -10,6 +10,7 @@ property Levi asked for is asserted directly.
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import math
@@ -44,6 +45,23 @@ def example(system: str, user: str, answer: dict) -> list[dict]:
         {"role": "user", "content": user},
         {"role": "assistant", "content": json.dumps(answer)},
     ]
+
+
+def fake_adapter(path: Path, weights: bytes = b"lora-weights-v1", rank: int = 8) -> Path:
+    """An --adapter directory with the two files mlx_lm actually loads.
+
+    Hand-built bytes, no safetensors library and no model: the digest is a
+    stream hash over whatever is in the files, so a plausible-shaped directory
+    is enough to exercise every path that identifies an adapter.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    (path / sb.ADAPTER_WEIGHTS_NAME).write_bytes(weights)
+    (path / sb.ADAPTER_CONFIG_NAME).write_text(
+        json.dumps({"fine_tune_type": "lora", "num_layers": 16,
+                    "lora_parameters": {"rank": rank, "scale": 20.0}}, sort_keys=True),
+        encoding="utf-8",
+    )
+    return path
 
 
 def uniform_scorer(vocab: int) -> sb.StubScorer:
@@ -564,7 +582,8 @@ class TestClassification(unittest.TestCase):
             stderr, sys.stderr = sys.stderr, err
             try:
                 rc = sb.main(["--model", "m", "--data", str(corpus), "--out", str(out),
-                              "--adapter", str(d)])  # a DIFFERENT condition
+                              # a DIFFERENT condition
+                              "--adapter", str(fake_adapter(d / "adapter"))])
             finally:
                 sys.stderr = stderr
             self.assertEqual(rc, 2)
@@ -1038,6 +1057,8 @@ class TestEndToEndCLI(unittest.TestCase):
                     "decision_class": decision, "answer_tokens": 20,
                     "bits": (i + 1) * scale, "decision_bits": (i + 1) * scale * 0.1,
                     "truncated": False, "skipped": False, "adapter": adapter,
+                    # what score_bits stamps now: the adapter's CONTENT, not its path
+                    "adapter_digest": None if adapter is None else "sha256:" + "ab" * 32,
                 }, sort_keys=True) + "\n")
                 i += 1
         return p
@@ -1752,7 +1773,11 @@ class TestPairFingerprint(unittest.TestCase):
         def write(path, adapter, scale, over):
             with path.open("w", encoding="utf-8") as fh:
                 for i, m in enumerate(msgs):
-                    rec = dict(self.BASE, adapter=adapter)
+                    rec = dict(
+                        self.BASE,
+                        adapter=adapter,
+                        adapter_digest=None if adapter is None else "sha256:" + "cd" * 32,
+                    )
                     rec.update(over)
                     rec.update({
                         "hash": sb.content_hash(m), "index": i, "target": "routing",
@@ -2276,6 +2301,455 @@ class TestPreviouslyUntestedGuards(unittest.TestCase):
             sys.stderr = stderr
         self.assertIn("memory not checked", err.getvalue())
 
+
+
+# ---------------------------------------------------------------------------
+# 18. the adapter is identified by its CONTENT, not by its path
+# ---------------------------------------------------------------------------
+
+
+class TestAdapterContentDigest(unittest.TestCase):
+    """A path is not an identity.
+
+    ``models/candidates/fin-foreman-e4b-mlx/adapters.safetensors`` is rewritten
+    every 250 iterations, and the staging recipe copies checkpoints over one
+    reused directory on purpose. Identifying the adapter by
+    ``str(Path(args.adapter).resolve())`` therefore says nothing about which
+    weights produced a row.
+    """
+
+    def test_the_same_bytes_at_two_paths_digest_the_same(self):
+        """Deterministic and path-independent: staging one checkpoint twice is
+        the same measurement, and must join."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            a = fake_adapter(d / "stage-a", b"identical-weights")
+            b = fake_adapter(d / "stage-b", b"identical-weights")
+            self.assertEqual(sb.adapter_content_digest(a), sb.adapter_content_digest(b))
+
+    def test_different_weights_digest_differently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            a = fake_adapter(d / "a", b"checkpoint-3000")
+            b = fake_adapter(d / "b", b"checkpoint-3500")
+            self.assertNotEqual(sb.adapter_content_digest(a), sb.adapter_content_digest(b))
+
+    def test_the_CONFIG_is_in_the_digest_too(self):
+        """adapter_config.json decides rank, scale and which layers the LoRA is
+        applied to. The same weights under a different config is a different
+        forward pass, so it must be a different fingerprint."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            a = fake_adapter(d / "a", b"w", rank=8)
+            b = fake_adapter(d / "b", b"w", rank=16)
+            self.assertNotEqual(sb.adapter_content_digest(a), sb.adapter_content_digest(b))
+
+    def test_a_checkpoint_copied_over_one_path_changes_the_digest(self):
+        """THE hazard, in three lines: one directory, two models."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = fake_adapter(Path(tmp) / "adapter", b"checkpoint-3000")
+            before = sb.adapter_content_digest(p)
+            (p / sb.ADAPTER_WEIGHTS_NAME).write_bytes(b"checkpoint-3500")
+            self.assertNotEqual(before, sb.adapter_content_digest(p))
+
+    def test_a_base_run_has_no_digest(self):
+        self.assertIsNone(sb.adapter_content_digest(None))
+        self.assertIsNone(
+            sb.run_fingerprint("m", None, 3072, True, False, 512)["adapter_digest"]
+        )
+
+    def test_an_adapter_directory_missing_a_loaded_file_is_refused(self):
+        """Fingerprinting a directory mlx_lm could not load would record an
+        adapter that was never applied. Refused before the GPU is touched."""
+        for missing in (sb.ADAPTER_WEIGHTS_NAME, sb.ADAPTER_CONFIG_NAME):
+            with self.subTest(missing=missing):
+                with tempfile.TemporaryDirectory() as tmp:
+                    p = fake_adapter(Path(tmp) / "a")
+                    (p / missing).unlink()
+                    with self.assertRaises(SystemExit) as cm:
+                        sb.adapter_content_digest(p)
+                    self.assertIn(missing, str(cm.exception))
+
+    def test_a_nonexistent_adapter_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                sb.adapter_content_digest(Path(tmp) / "nope")
+
+    def test_the_digest_is_in_the_row_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = fake_adapter(Path(tmp) / "a")
+            digest = sb.adapter_content_digest(p)
+            fp = sb.run_fingerprint("m", str(p), 3072, True, False, 512, digest)
+            self.assertEqual(fp["adapter_digest"], digest)
+            self.assertTrue(digest.startswith("sha256:"))
+
+    # -- the resume, end to end, with no model ------------------------------
+
+    def _resumable(self, d: Path, adapter, digest):
+        """A corpus and a COMPLETE score file for it, so that a resume which
+        wrongly succeeds ends at 'nothing to do' -- never at a model load."""
+        msgs = [example(ROUTING_SYS, f"route job {i}",
+                        {"action": "route", "session": f"s{i}"})
+                for i in range(3)]
+        corpus = d / "corpus.jsonl"
+        corpus.write_text("".join(json.dumps({"messages": m}) + "\n" for m in msgs),
+                          encoding="utf-8")
+        out = d / "scores.jsonl"
+        with out.open("w", encoding="utf-8") as fh:
+            for m in msgs:
+                row = sb.run_fingerprint(
+                    "m", str(Path(adapter).resolve()) if adapter else None,
+                    3072, True, False, 512, digest,
+                )
+                row.update({"hash": sb.content_hash(m), "bits": 1.0, "skipped": False,
+                            "answer_tokens": 4, "trainer_tokens": 5, "trainer_nats": 1.0,
+                            "truncated": False})
+                fh.write(json.dumps(row, sort_keys=True) + "\n")
+        return corpus, out
+
+    def _resume(self, corpus: Path, out: Path, adapter: Path):
+        buf, err = io.StringIO(), io.StringIO()
+        stderr, sys.stderr = sys.stderr, err
+        try:
+            with redirect_stdout(buf):
+                rc = sb.main(["--model", "m", "--data", str(corpus), "--out", str(out),
+                              "--adapter", str(adapter)])
+        finally:
+            sys.stderr = stderr
+        return rc, err.getvalue()
+
+    def test_a_resume_after_the_weights_changed_under_one_path_is_REFUSED(self):
+        """The finding, reproduced: score under checkpoint 3000, get killed, let
+        checkpoint 3500 land on the same path, re-run the SAME command. Every
+        recorded key still matched -- model, adapter path, window, forward path
+        -- so the resume passed and appended the rest of the corpus under
+        different weights. One score file, two models, one name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            adapter = fake_adapter(d / "adapter", b"checkpoint-3000")
+            corpus, out = self._resumable(d, adapter, sb.adapter_content_digest(adapter))
+            # ... 250 iterations later, the trainer overwrites the same file.
+            (adapter / sb.ADAPTER_WEIGHTS_NAME).write_bytes(b"checkpoint-3500")
+            rc, err = self._resume(corpus, out, adapter)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("adapter_digest", err)
+            self.assertIn("ADAPTER'S CONTENT changed", err)
+
+    def test_a_resume_against_the_same_weights_still_resumes(self):
+        """The check has to be capable of passing, or it is just a stop sign."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            adapter = fake_adapter(d / "adapter", b"checkpoint-3000")
+            corpus, out = self._resumable(d, adapter, sb.adapter_content_digest(adapter))
+            rc, err = self._resume(corpus, out, adapter)
+            self.assertEqual(rc, 0, err)
+            self.assertIn("nothing to do", err)
+
+    def test_a_tuned_file_from_a_scorer_that_recorded_no_digest_is_not_resumed(self):
+        """What those rows were scored under cannot be established, so they
+        cannot be extended. Re-score; do not guess."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            adapter = fake_adapter(d / "adapter")
+            corpus, out = self._resumable(d, adapter, None)  # legacy rows
+            rc, err = self._resume(corpus, out, adapter)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("adapter_digest", err)
+
+    def test_a_BASE_file_from_an_older_scorer_still_resumes(self):
+        """A base run has no adapter, so 'recorded no digest' and 'has no
+        digest' are the same state and old base files stay joinable. Refusing
+        them would be a gratuitous re-score of the expensive half."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            msgs = example(ROUTING_SYS, "route it", {"action": "route", "session": "s"})
+            corpus = d / "c.jsonl"
+            corpus.write_text(json.dumps({"messages": msgs}) + "\n", encoding="utf-8")
+            out = d / "s.jsonl"
+            row = {"model": "m", "adapter": None, "max_seq_length": 3072,
+                   "match_trainer": True, "full_forward": False, "chunk": 512,
+                   "hash": sb.content_hash(msgs), "bits": 1.0, "skipped": False,
+                   "answer_tokens": 4, "trainer_tokens": 5, "trainer_nats": 1.0,
+                   "truncated": False}
+            out.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
+            buf, err = io.StringIO(), io.StringIO()
+            stderr, sys.stderr = sys.stderr, err
+            try:
+                with redirect_stdout(buf):
+                    rc = sb.main(["--model", "m", "--data", str(corpus), "--out", str(out)])
+            finally:
+                sys.stderr = stderr
+            self.assertEqual(rc, 0, err.getvalue())
+
+    # -- downstream ---------------------------------------------------------
+
+    def test_the_digest_is_deliberately_NOT_a_pair_key(self):
+        """base and tuned are SUPPOSED to differ here; a must-agree rule would
+        refuse every valid pair. The direction rule covers it instead."""
+        for keys in (sb.PAIR_FINGERPRINT_KEYS, sc.PAIR_FINGERPRINT_KEYS):
+            self.assertNotIn("adapter", keys)
+            self.assertNotIn("adapter_digest", keys)
+
+    def test_every_fingerprint_field_is_classified_agree_or_differ(self):
+        """The two modules mirror one split, and a field that is in neither
+        tuple is a field nothing checks across the pair -- which is how the
+        adapter came to be unchecked in the first place."""
+        self.assertEqual(sb.PAIR_FINGERPRINT_KEYS, sc.PAIR_FINGERPRINT_KEYS)
+        self.assertEqual(sb.ADAPTER_FINGERPRINT_KEYS, sc.ADAPTER_FINGERPRINT_KEYS)
+        self.assertEqual(
+            set(sb.PAIR_FINGERPRINT_KEYS) | set(sb.ADAPTER_FINGERPRINT_KEYS),
+            set(sb.run_fingerprint("m", None, 3072, True, False, 512)),
+        )
+
+    def test_a_file_mixing_two_adapter_CONTENTS_under_one_path_is_refused(self):
+        """The mixed-adapter refusal saw one path and said nothing. This is the
+        same splice the resume check now prevents, arriving from any other
+        direction -- a hand-concatenated file, a restored backup."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "spliced.jsonl"
+            p.write_text(
+                json.dumps({"hash": "a", "bits": 1.0, "adapter": "/one/path",
+                            "adapter_digest": "sha256:" + "11" * 32,
+                            "skipped": False}) + "\n"
+                + json.dumps({"hash": "b", "bits": 2.0, "adapter": "/one/path",
+                              "adapter_digest": "sha256:" + "22" * 32,
+                              "skipped": False}) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit) as cm:
+                sc.load_scores(p)
+            self.assertIn("two models under one name", str(cm.exception))
+
+
+class TestPairAdapterDirection(unittest.TestCase):
+    """What must AGREE across the pair is ``check_pair_fingerprints``. What must
+    DIFFER, and in which direction, is this. 'Allowed to differ' had quietly
+    become 'never looked at'."""
+
+    BASE = {"model": "m", "max_seq_length": 3072, "match_trainer": True,
+            "full_forward": False, "chunk": 512, "adapter": None, "adapter_digest": None}
+    TUNED = dict(BASE, adapter="/models/cand", adapter_digest="sha256:" + "ab" * 32)
+
+    def _check(self, base, tuned, allow=False):
+        sc.check_pair_adapters(base, tuned, Path("b"), Path("t"), allow)
+
+    def test_the_valid_direction_passes(self):
+        self._check(dict(self.BASE), dict(self.TUNED))
+
+    def test_both_sides_untuned_is_refused(self):
+        """learned_bits = base - base = 0 for every example, and it is the
+        DEFAULT ranking key: the selection becomes a coin flip."""
+        with self.assertRaises(SystemExit) as cm:
+            self._check(dict(self.BASE), dict(self.BASE))
+        self.assertIn("scored with NO adapter", str(cm.exception))
+
+    def test_a_base_file_that_carries_an_adapter_is_refused(self):
+        other = dict(self.TUNED, adapter="/other", adapter_digest="sha256:" + "ef" * 32)
+        with self.assertRaises(SystemExit) as cm:
+            self._check(dict(self.TUNED), other)
+        self.assertIn("--base but was scored WITH an adapter", str(cm.exception))
+
+    def test_the_same_CONTENT_under_two_paths_is_refused(self):
+        """One checkpoint staged twice and subtracted from itself. The paths
+        differ, so nothing keyed on the path could ever see it."""
+        same = dict(self.TUNED, adapter="/stage-a")
+        other = dict(self.TUNED, adapter="/stage-b")
+        with self.assertRaises(SystemExit) as cm:
+            sc.check_pair_adapters(same, other, Path("b"), Path("t"), False)
+        self.assertIn("SAME adapter content", str(cm.exception))
+        self.assertIn("identically zero", str(cm.exception))
+
+    def test_a_tuned_file_with_no_digest_is_refused(self):
+        with self.assertRaises(SystemExit) as cm:
+            self._check(dict(self.BASE), dict(self.TUNED, adapter_digest=None))
+        self.assertIn("records no adapter_digest", str(cm.exception))
+
+    def test_a_pair_recording_neither_field_is_refused(self):
+        """Both files predate the content fingerprint: there is no evidence that
+        one is the base run and the other the tuned one."""
+        bare = {"model": "m", "max_seq_length": 3072, "match_trainer": True,
+                "full_forward": False, "chunk": 512}
+        with self.assertRaises(SystemExit) as cm:
+            self._check(dict(bare), dict(bare))
+        self.assertIn("predate the content fingerprint", str(cm.exception))
+
+    def test_the_escape_hatch_warns_instead_of_refusing(self):
+        err = io.StringIO()
+        stderr, sys.stderr = sys.stderr, err
+        try:
+            self._check(dict(self.BASE), dict(self.BASE), allow=True)
+        finally:
+            sys.stderr = stderr
+        self.assertIn("WARNING", err.getvalue())
+
+    def test_the_SELECTOR_refuses_an_UNVERIFIABLE_tuned_file_end_to_end(self):
+        """Drive the CLI, so deleting the call site fails a test. The case is
+        the one only this check sees: a --tuned file that names an adapter (so
+        load_scores' expect_adapter is satisfied) but records no content digest,
+        which is exactly what a file scored under a path that has since taken
+        four more checkpoints looks like."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            msgs = [example(ROUTING_SYS, f"route job {i} to alpha now",
+                            {"action": "route", "session": f"s{i}", "reason": "named"})
+                    for i in range(8)]
+            corpus = d / "corpus.jsonl"
+            corpus.write_text("".join(json.dumps({"messages": m}) + "\n" for m in msgs),
+                              encoding="utf-8")
+
+            def write(path, adapter, digest, scale):
+                with path.open("w", encoding="utf-8") as fh:
+                    for i, m in enumerate(msgs):
+                        rec = dict(self.BASE, adapter=adapter, adapter_digest=digest)
+                        rec.update({"hash": sb.content_hash(m), "index": i,
+                                    "target": "routing", "decision_class": "route",
+                                    "answer_tokens": 20, "bits": (i + 1) * scale,
+                                    "decision_bits": (i + 1) * scale * 0.1,
+                                    "decision_tokens": 4, "truncated": False,
+                                    "skipped": False})
+                        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+
+            base, tuned = d / "base.jsonl", d / "tuned.jsonl"
+            write(base, None, None, 1.0)
+            write(tuned, "/models/cand", None, 0.5)  # named, but not identified
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()):
+                stderr, sys.stderr = sys.stderr, err
+                try:
+                    rc = sc.main(["--base", str(base), "--tuned", str(tuned),
+                                  "--corpus", str(corpus)])
+                except SystemExit as exc:
+                    rc = exc.code if isinstance(exc.code, int) else 1
+                    print(exc, file=err)
+                finally:
+                    sys.stderr = stderr
+            self.assertNotEqual(rc, 0)
+            self.assertIn("records no adapter_digest", err.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# 19. the parity tolerance is relative, and honest about being uncalibrated
+# ---------------------------------------------------------------------------
+
+
+class TestParityToleranceIsRelative(unittest.TestCase):
+    """The old rule was TOLERANCE = 1e-2 as an ABSOLUTE bound on a per-example
+    SUM of bits, hard-gating the pipeline. At this corpus's scale (~123 bits per
+    example: the live log's 2.463 nats/token x 34.6 unmasked tokens) that is
+    ~8e-5 relative, while the two paths compared -- one un-cached forward against
+    a chunked prefill through a rotating KV cache on a 4-bit-quantised model --
+    disagree by more than that as a matter of arithmetic. It was far likelier to
+    fail on float noise than to catch a bug."""
+
+    CORPUS_SCALE = 123.0  # bits/example, derived from train.log; see parity_check.py
+
+    def _cli(self, chunked, full, extra=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            for name, rows in (("chunked.jsonl", chunked), ("full.jsonl", full)):
+                (d / name).write_text(
+                    "".join(json.dumps({"hash": h, "bits": v}) + "\n"
+                            for h, v in rows.items()),
+                    encoding="utf-8")
+            err = io.StringIO()
+            stderr, sys.stderr = sys.stderr, err
+            try:
+                rc = pc.main([str(d / "chunked.jsonl"), str(d / "full.jsonl"), *extra])
+            finally:
+                sys.stderr = stderr
+            return rc, err.getvalue()
+
+    def test_float_noise_at_corpus_scale_no_longer_fails_the_pipeline(self):
+        """0.05 bits on a 123-bit example is 4e-4 relative -- what a 1e-3
+        nats/token disagreement over ~35 answer tokens comes to. The old
+        absolute 1e-2 bound failed it fivefold."""
+        ok, msg = pc.compare({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE})
+        self.assertTrue(ok, msg)
+        self.assertIn("4.065e-04", msg)
+
+    def test_the_same_absolute_gap_is_judged_differently_at_different_scales(self):
+        """The definition of relative. An absolute rule cannot tell these apart,
+        and one of the two answers it gives is wrong."""
+        big, _ = pc.compare({"a": 123.5}, {"a": 123.0})   # 0.4% -- noise
+        small, _ = pc.compare({"a": 10.5}, {"a": 10.0})   # 5%   -- not noise
+        self.assertTrue(big)
+        self.assertFalse(small)
+
+    def test_a_near_zero_example_is_judged_against_the_absolute_floor(self):
+        """A memorized tuned example is ~0.05 bits. A raw ratio there turns a
+        0.006-bit wobble into a 12% 'error' and fails the run on the last digits
+        of a number that is zero -- so below the floor the comparison is
+        absolute, against the floor."""
+        ok, msg = pc.compare({"a": 0.056}, {"a": 0.050})
+        self.assertTrue(ok, msg)
+        self.assertIn(f"absolute floor {pc.ABS_FLOOR_BITS:g}", msg)
+        self.assertAlmostEqual(0.006 / pc.ABS_FLOOR_BITS,
+                               float(msg.split("max relative divergence ")[1].split()[0]),
+                               places=9)
+
+    def test_a_divergence_that_cannot_be_float_noise_still_fails(self):
+        """The bound must not have been loosened into one that passes
+        everything: a mis-assembled row is a different token's logprob."""
+        ok, msg = pc.compare({"a": 200.0}, {"a": self.CORPUS_SCALE})
+        self.assertFalse(ok, msg)
+        rc, err = self._cli({"a": 200.0}, {"a": self.CORPUS_SCALE})
+        self.assertEqual(rc, 1)
+        self.assertIn("FAILED", err)
+
+    def test_an_explicit_tolerance_is_enforced_strictly(self):
+        """Once an operator has a real number, --tolerance is the gate and the
+        coarse ceiling is out of the way."""
+        ok, _ = pc.compare({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE}, 1e-5)
+        self.assertFalse(ok)
+        rc, err = self._cli({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE},
+                            ["--tolerance", "1e-5"])
+        self.assertEqual(rc, 1)
+        self.assertIn("(--tolerance)", err)
+
+    def test_the_uncalibrated_default_says_so_loudly_ON_A_PASS(self):
+        """An uncalibrated pass is the one that gets mistaken for a validated
+        one, so the banner prints when the check SUCCEEDS."""
+        rc, err = self._cli({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE})
+        self.assertEqual(rc, 0)
+        self.assertIn("NOT CALIBRATED", err)
+        self.assertIn("max relative divergence", err)
+        self.assertIn("--tolerance", err)
+
+    def test_an_explicit_tolerance_retires_the_uncalibrated_banner(self):
+        rc, err = self._cli({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE},
+                            ["--tolerance", "1e-2"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("NOT CALIBRATED", err)
+
+    def test_the_observed_maximum_is_reported_whatever_the_verdict(self):
+        """Reporting the number is the point: it is how the tolerance gets
+        calibrated at all."""
+        for extra in ((), ("--tolerance", "1e-9")):
+            with self.subTest(extra=extra):
+                _, err = self._cli({"a": 123.05, "b": 60.0}, {"a": 123.0, "b": 60.0}, extra)
+                self.assertIn("max relative divergence", err)
+                self.assertIn("over 2 examples", err)
+
+    def test_the_absolute_floor_is_configurable_and_load_bearing(self):
+        """Same two numbers, two floors, two verdicts: 0.006 bits against the
+        1-bit floor is 0.6%, and against a 0.001-bit floor it is judged on the
+        example's own 0.05 bits -- 12%, over the ceiling. The floor is not
+        decoration."""
+        rc, err = self._cli({"a": 0.056}, {"a": 0.050})
+        self.assertEqual(rc, 0, err)
+        rc, err = self._cli({"a": 0.056}, {"a": 0.050}, ["--abs-floor", "0.001"])
+        self.assertEqual(rc, 1)
+        self.assertIn("absolute floor 0.001", err)
+
+    def test_the_file_records_that_the_bound_is_awaiting_calibration(self):
+        """No GPU parity run has ever been made against this code. The default
+        must not pretend otherwise, and the old absolute hard gate must not come
+        back under the same name."""
+        src = Path(pc.__file__).read_text(encoding="utf-8")
+        self.assertIn("AWAITING CALIBRATION", src)
+        self.assertFalse(hasattr(pc, "TOLERANCE"),
+                         "the absolute, uncalibrated hard gate is back")
+        self.assertIsNone(inspect.signature(pc.compare).parameters["tolerance"].default)
 
 
 if __name__ == "__main__":

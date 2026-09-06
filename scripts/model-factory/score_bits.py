@@ -851,6 +851,77 @@ class MLXScorer:
 # ---------------------------------------------------------------------------
 
 
+# The files mlx_lm's `load_adapters` actually reads out of an --adapter dir:
+# the LoRA weights, and the config that decides how they are applied (rank,
+# scale, which layers). Both change what the forward pass computes, so both go
+# into the digest. A third file dropped in the directory does not.
+ADAPTER_WEIGHTS_NAME = "adapters.safetensors"
+ADAPTER_CONFIG_NAME = "adapter_config.json"
+ADAPTER_DIGEST_FILES = (ADAPTER_WEIGHTS_NAME, ADAPTER_CONFIG_NAME)
+_DIGEST_BLOCK = 1 << 20
+
+
+def file_sha256(path: Path) -> str:
+    """Streaming sha256 of one file. Constant memory, no model, no GPU."""
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(_DIGEST_BLOCK), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def adapter_content_digest(adapter_path: str | Path | None) -> str | None:
+    """A fingerprint of the adapter's CONTENT, not of where it happens to sit.
+
+    A path is not an identity. ``models/candidates/fin-foreman-e4b-mlx`` gets a
+    new ``adapters.safetensors`` every 250 iterations, and the staging recipe in
+    run_bits_experiment.sh deliberately copies checkpoints over one reused
+    directory. So a run keyed on the path alone can be killed at row 1200,
+    resumed after the file underneath changed, and append the rest of the corpus
+    under different weights -- one score file, two models, one name, and
+    ``learned_bits = bits_base - bits_tuned`` a difference of two incommensurable
+    quantities for half the rows, with nothing downstream able to see it.
+
+    FULL STREAMING SHA-256, not a size+mtime shortcut. Measured on this repo's
+    real adapter (27,683,964 bytes): ~14 ms. That is nothing against a scoring
+    run that spends minutes per stage on the GPU, and the shortcut would have
+    been actively wrong here -- mtime is not content (``touch`` changes it
+    without changing the weights; ``cp -p`` changes the weights without changing
+    it), and consecutive LoRA checkpoints are byte-identical in size, so
+    size+mtime is exactly the discriminator this hazard defeats.
+
+    Deterministic and path-independent by construction: only file NAMES, SIZES
+    and CONTENT are mixed in, in a fixed order. The same checkpoint staged at two
+    different paths digests the same (correct -- it is the same measurement);
+    two different checkpoints staged at one path digest differently (the whole
+    point). Returns None for a base run, which has no adapter.
+    """
+    if adapter_path is None:
+        return None
+    p = Path(adapter_path)
+    if p.is_dir():
+        parts = []
+        for name in ADAPTER_DIGEST_FILES:
+            f = p / name
+            if not f.is_file():
+                raise SystemExit(
+                    f"[score_bits] --adapter {p} has no {name}. mlx_lm loads exactly "
+                    f"{list(ADAPTER_DIGEST_FILES)} out of an adapter directory; a "
+                    "directory missing one of them would fail at load time anyway, and "
+                    "fingerprinting it would record an adapter that was never applied."
+                )
+            parts.append((name, f.stat().st_size, file_sha256(f)))
+    elif p.is_file():
+        # Tolerated because it is unambiguous: a single weights file, named.
+        parts = [(p.name, p.stat().st_size, file_sha256(p))]
+    else:
+        raise SystemExit(f"[score_bits] --adapter {p} does not exist")
+    h = hashlib.sha256()
+    for name, size, digest in parts:
+        h.update(f"{name}\0{size}\0{digest}\0".encode("utf-8"))
+    return "sha256:" + h.hexdigest()
+
+
 def run_fingerprint(
     model_label: str,
     adapter_label: str | None,
@@ -858,6 +929,7 @@ def run_fingerprint(
     match_trainer: bool,
     full_forward: bool,
     chunk: int | None = None,
+    adapter_digest: str | None = None,
 ) -> dict:
     """The settings a bits number is only comparable WITHIN.
 
@@ -873,10 +945,17 @@ def run_fingerprint(
     It is recorded as None under ``--full-forward``, where the prompt is never
     split and the value genuinely has no effect -- so the fingerprint names the
     forward path that was actually taken rather than a flag that was ignored.
+
+    ``adapter`` is the resolved path -- for humans, and for the base/tuned
+    direction check. ``adapter_digest`` is the one that identifies the WEIGHTS
+    (see ``adapter_content_digest``); the path is what the operator typed, the
+    digest is what the GPU actually loaded, and only the second survives a
+    checkpoint being copied over a reused directory mid-run.
     """
     return {
         "model": model_label,
         "adapter": adapter_label,
+        "adapter_digest": adapter_digest,
         "max_seq_length": max_seq_length,
         "match_trainer": match_trainer,
         "full_forward": full_forward,
@@ -886,9 +965,12 @@ def run_fingerprint(
 
 # The fingerprint keys that must agree between a --base file and a --tuned file
 # for `learned_bits = bits_base - bits_tuned` to be a difference of commensurable
-# quantities. `adapter` is excluded on purpose: it is the one thing that MUST
-# differ between the two runs.
+# quantities. `adapter` and `adapter_digest` are excluded on purpose: they are
+# the two things that MUST differ between the two runs. They are not unchecked,
+# though -- select_curriculum.check_pair_adapters asserts they differ in the one
+# direction that is valid (base has neither, tuned has both).
 PAIR_FINGERPRINT_KEYS = ("model", "max_seq_length", "match_trainer", "full_forward", "chunk")
+ADAPTER_FINGERPRINT_KEYS = ("adapter", "adapter_digest")
 
 
 def score_example(
@@ -903,6 +985,7 @@ def score_example(
     decision_fields: Sequence[str] | None = None,
     full_forward: bool = False,
     chunk: int | None = None,
+    adapter_digest: str | None = None,
 ) -> dict:
     """Score one example. ``decision_fields=None`` means AUTO: resolve the
     decision fields from the example's own track (DECISION_FIELDS_BY_TARGET).
@@ -924,7 +1007,8 @@ def score_example(
     }
     record.update(
         run_fingerprint(
-            model_label, adapter_label, max_seq_length, match_trainer, full_forward, chunk
+            model_label, adapter_label, max_seq_length, match_trainer, full_forward, chunk,
+            adapter_digest,
         )
     )
     record["decision_fields"] = list(fields)
@@ -1054,7 +1138,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="mlx-community/gemma-4-E4B-it-qat-4bit")
     p.add_argument("--data", required=True, help="JSONL corpus with a 'messages' key per line")
-    p.add_argument("--adapter", default=None, help="LoRA adapter dir; omit for bits_base")
+    p.add_argument(
+        "--adapter",
+        default=None,
+        help="LoRA adapter dir; omit for bits_base. Its CONTENT is hashed "
+        "(adapters.safetensors + adapter_config.json, streaming sha256, ~14 ms) and "
+        "stamped on every row as adapter_digest, so a resume cannot append rows scored "
+        "under a checkpoint that has since been copied over this same path.",
+    )
     p.add_argument("--out", required=True, help="JSONL output, one record per example (appended)")
     p.add_argument("--max-seq-length", type=int, default=3072)
     p.add_argument("--chunk", type=int, default=512, help="prompt prefill chunk size")
@@ -1124,9 +1215,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         decision_fields = tuple(f.strip() for f in args.decision_fields.split(",") if f.strip())
     adapter_label = str(Path(args.adapter).resolve()) if args.adapter else None
+    # Hashed BEFORE the guard and before any weights load: it costs ~14 ms on a
+    # 27.7 MB adapter, it is the thing the resume check is keyed on, and a
+    # malformed --adapter dir should be refused here rather than three GPU
+    # minutes later.
+    digest = adapter_content_digest(args.adapter)
     want = run_fingerprint(
-        args.model, adapter_label, args.max_seq_length, match_trainer, args.full_forward, args.chunk
+        args.model, adapter_label, args.max_seq_length, match_trainer, args.full_forward,
+        args.chunk, digest,
     )
+    if digest:
+        print(f"[score_bits] adapter {adapter_label} -> {digest}", file=sys.stderr)
 
     if args.check_decision_coverage is not None:
         # Pure text work: no tokenizer, no weights, no guard needed. Safe to run
@@ -1162,9 +1261,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             got = {k: r.get(k) for k in want}
             if any(k in r for k in want) and got != want:
                 differs = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
+                note = ""
+                if "adapter_digest" in differs:
+                    old, new = differs["adapter_digest"]
+                    if "adapter_digest" not in r:
+                        note = (
+                            " Those rows were written by a scorer that recorded no adapter "
+                            "digest, so which weights produced them cannot be established. "
+                            "Re-score; do not extend them."
+                        )
+                    else:
+                        note = (
+                            " The ADAPTER'S CONTENT changed under the same path "
+                            f"({want['adapter']}): those rows were scored under {old}, this "
+                            f"run loads {new}. Appending would put two models in one file "
+                            "under one name."
+                        )
                 print(
                     f"[score_bits] refusing to resume {out}: it holds rows scored under "
-                    f"different settings {differs}. Point --out at a new file, or pass "
+                    f"different settings {differs}.{note} Point --out at a new file, or pass "
                     "--restart to overwrite.",
                     file=sys.stderr,
                 )
@@ -1248,6 +1363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 decision_fields,
                 args.full_forward,
                 args.chunk,
+                digest,
             )
             fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             fh.flush()

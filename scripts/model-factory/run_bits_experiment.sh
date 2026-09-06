@@ -149,7 +149,9 @@ if [[ " $STAGES " == *" 1 "* ]]; then
       say "ANCHOR FAILED -- the mask is not the trainer's; every bits number is wrong"; exit 1; }
 
   # The base ranking IS the whole curriculum in base-only mode, so the chunked
-  # KV-cache path has to be validated here too, not only in stage 2.
+  # KV-cache path has to be validated here too, not only in stage 2. Same
+  # uncalibrated-tolerance caveat as stage 2b: this prints the divergence it
+  # observed and enforces only a coarse ceiling until someone sets --tolerance.
   say "stage 1c: parity spot-check on the BASE scores (chunked vs full forward)"
   "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$TRAIN" --limit 20 \
@@ -169,6 +171,11 @@ fi
 #      cp "$ADAPTERS/0003000_adapters.safetensors" \
 #         "$DATA/models/bits-stage-3000/adapters.safetensors"
 #      ... --adapter "$DATA/models/bits-stage-3000" --out reports/bits-train-3000.jsonl
+#    Give each checkpoint its OWN staging directory and its own --out, as above.
+#    score_bits.py hashes the adapter's contents into every row (adapter_digest),
+#    so re-using one staging directory for a second checkpoint no longer risks a
+#    silently spliced file -- a resume against changed weights is refused rather
+#    than appended. It is still refused, not merged: point --out somewhere new.
 #    Doing that for 250/1000/2250/3500/final gives a bits-vs-iteration curve:
 #    the iteration where learned_bits stops growing is the iteration where the
 #    corpus stopped teaching, which is the honest --iters ceiling.
@@ -182,9 +189,16 @@ if [[ " $STAGES " == *" 2 "* ]]; then
     --out "$REPORTS/bits-train-tuned.jsonl" || exit $?
 
   # Port validation, ~2 minutes: --full-forward reproduces the trainer's own
-  # un-cached single forward. parity_check.py holds the tolerance (1e-2 bits)
-  # and, crucially, FAILS on an empty or partial overlap -- a comparison over
-  # zero examples agrees perfectly and would validate nothing.
+  # un-cached single forward. parity_check.py FAILS on an empty or partial
+  # overlap -- a comparison over zero examples agrees perfectly and would
+  # validate nothing.
+  #
+  # TOLERANCE: NOT CALIBRATED YET. No parity run has been made on a GPU, so no
+  # --tolerance is passed here and the check enforces only its coarse
+  # wrong-in-KIND ceiling. It will PRINT "max relative divergence <x>". Write
+  # that number down, and add `--tolerance <a small multiple of x>` to BOTH
+  # parity_check invocations in this file (stage 1c and here). Until that is
+  # done, a pass from this stage means "not wrong in kind", not "validated".
   say "stage 2b: parity spot-check (chunked vs full forward, 20 examples)"
   "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$TRAIN" --adapter "$ADAPTERS" --limit 20 \
