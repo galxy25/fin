@@ -298,7 +298,11 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   empty, non-pending ledger, so from then on the verdict is read back from the file
   rather than re-derived from the audit log's existence at every start. A ledger that
   exists yet still owes a seed is a first run's own: every first run writes the file
-  with `"seed_pending": true` (and `"inbox_seed_pending"`, in the resident posture) the
+  with `"seed_pending": true` (and `"inbox_seed_pending"`, in the resident posture —
+  whether or not an `inboxURL` is configured yet: a launch with no inbox carries that
+  flag through every rewrite instead of recomputing it, so the launch that first
+  configures the inbox still owes, and draws, the inbox seed; *The inbox and the first
+  run* below) the
   moment it starts, before any document is read, and rewrites it as each seed lands —
   so a restart in that window (stale URLs, a dead bucket, an inbox message applied
   while the directive URL was failing, then systemd's `Restart=always`) finds the file,
@@ -365,6 +369,31 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   the app only ever appends — so a resident install's first run replayed the phone's
   whole backlog, one model turn each, before the first heartbeat.
 
+  *An inbox configured later.* `inboxURL` is its own optional field, so supervision
+  first and the inbox later is a normal rollout. A launch with no inbox cannot draw the
+  inbox seed, and `inbox_seeded: []` reads the same whether the inbox was seeded empty
+  or never seeded at all — so the flag is what is kept: a first run records
+  `"inbox_seed_pending": true` even with no inbox configured (the unsupervised record
+  does too), and every rewrite of the ledger by an inbox-less life (the directive seed,
+  each apply) carries it unchanged. The launch that first configures the inbox audits
+  `[s3] first run: resumed with the inbox seed still pending` and seeds the backlog
+  rather than delivering it. A ledger that predates the inbox keys (1.4.0 wrote no
+  `inbox_seed_pending`) decodes as owing no inbox seed — it cannot say whether a 1.4.0
+  inbox was already being read, and seeding one that was would drop whatever arrived
+  while the daemon was down — so an inbox first configured on such a box delivers its
+  backlog: a replay, never a drop, the same direction the audit-log rule errs in.
+
+  *The launcher's word outranks the ledger.* A ledger owing the inbox seed with no
+  launcher to ask (the unsupervised record; a resident first life whose inbox was never
+  read) can meet a launch that says `"inboxResetAtLaunch": true` — a box enrolled
+  through `POST /workers`, which emptied the inbox moments earlier. Anything in the
+  inbox by then arrived after the reset and is live; resuming the seed would stamp it
+  history and drop it, with the audit count as the only trace. So the flag on the
+  *current* launch wins: the seed is not resumed, `[s3] first run: inbox seed still
+  pending, but the launcher emptied the inbox at launch — not resumed` is audited, the
+  verdict is written to the ledger at once (so a later launch without the flag does not
+  resume a seed this one ruled out), and the message is delivered.
+
 - **Status** — after every poll and every finished turn the daemon PUTs:
 
   ```json
@@ -404,7 +433,10 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   backlog; `[s3] first run: could not persist the pending ledger — <reason>` when the
   launch write that records the seeds as owed failed, and `[s3] first run: could not
   persist the seed — <reason>` when the seed's own did (later writes: `[s3] ledger
-  write failed — <reason>`, throttled). And
+  write failed — <reason>`, throttled); `[s3] first run: inbox seed still pending, but
+  the launcher emptied the inbox at launch — not resumed` when a launch that says
+  `inboxResetAtLaunch` finds a ledger owing the inbox seed (the verdict is written
+  down, and the inbox delivers). And
   once, at startup, `[s3] no directive ledger, but the audit log predates this launch —
   not a first run, nothing seeded` on a 1.3.0 box that never applied a directive — the
   launch that also writes that box its empty ledger. A 403 on either URL is only ever

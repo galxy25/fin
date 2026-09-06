@@ -39,9 +39,12 @@ final class DaemonLaunchOrderTests: XCTestCase {
 
     /// The deployed cloud config's shape: no `environment`, no `connectCommand`.
     /// `privateKeyPath` overrides the readable key `setUp` wrote, for the launches that
-    /// must die on it.
-    private func makeDaemon(supervision: Bool = true, inbox: Bool = false, privateKeyPath: String? = nil) throws -> Daemon {
-        let inboxField = inbox ? #", "inboxURL": "https://bucket.example/inbox.json""# : ""
+    /// must die on it. `inboxResetAtLaunch` is what a config the control plane
+    /// provisions carries.
+    private func makeDaemon(supervision: Bool = true, inbox: Bool = false, inboxResetAtLaunch: Bool = false,
+                            privateKeyPath: String? = nil) throws -> Daemon {
+        let inboxField = (inbox ? #", "inboxURL": "https://bucket.example/inbox.json""# : "")
+            + (inboxResetAtLaunch ? #", "inboxResetAtLaunch": true"# : "")
         let supervisionBlock = supervision ? """
         ,
           "supervision": {"directiveURL": "https://bucket.example/directives.json", "agentName": "finbot"\(inboxField)}
@@ -70,11 +73,38 @@ final class DaemonLaunchOrderTests: XCTestCase {
         return (body, response)
     }
 
+    private func historyPlusOne() -> (Data, URLResponse) {
+        let body = Data("""
+        {"version": 1, "directives": [
+          {"id": "d-1", "kind": "user_message", "text": "last week"},
+          {"id": "d-2", "kind": "user_message", "text": "days ago"},
+          {"id": "d-3", "kind": "user_message", "text": "yesterday"},
+          {"id": "d-4", "kind": "user_message", "text": "fresh instruction"}
+        ]}
+        """.utf8)
+        let response = HTTPURLResponse(url: URL(string: "https://bucket.example/directives.json")!,
+                                       statusCode: 200, httpVersion: nil, headerFields: nil)!
+        return (body, response)
+    }
+
     private func inboxBacklog() -> (Data, URLResponse) {
         let body = Data("""
         {"version": 1, "directives": [
           {"id": "m-1", "kind": "user_message", "text": "three weeks ago"},
           {"id": "m-2", "kind": "user_message", "text": "last tuesday"}
+        ]}
+        """.utf8)
+        let response = HTTPURLResponse(url: URL(string: "https://bucket.example/inbox.json")!,
+                                       statusCode: 200, httpVersion: nil, headerFields: nil)!
+        return (body, response)
+    }
+
+    /// The inbox as the control plane's `POST /workers` leaves it: emptied at the launch
+    /// call, then written to by the user before the daemon's first read.
+    private func inboxAfterReset() -> (Data, URLResponse) {
+        let body = Data("""
+        {"version": 1, "directives": [
+          {"id": "m-1", "kind": "user_message", "text": "sent moments after the reset"}
         ]}
         """.utf8)
         let response = HTTPURLResponse(url: URL(string: "https://bucket.example/inbox.json")!,
@@ -119,8 +149,8 @@ final class DaemonLaunchOrderTests: XCTestCase {
         XCTAssertEqual(fetches, 1, "the prime read the document once, at launch")
         XCTAssertEqual(
             ledgerAtSessionConstruction,
-            #"{"applied":[],"inbox_seed_pending":false,"inbox_seeded":[],"seed_pending":false,"seeded":["d-1","d-2","d-3"]}"#,
-            "the seed was on disk BEFORE any session object existed"
+            #"{"applied":[],"inbox_seed_pending":true,"inbox_seeded":[],"seed_pending":false,"seeded":["d-1","d-2","d-3"]}"#,
+            "the seed was on disk BEFORE any session object existed (no inbox configured: its seed is carried as owed)"
         )
         XCTAssertEqual(configurationSeen?.environment, ["LC_FIN_AGENT": "1"],
                        "the session run() connects carries the marker, with no environment configured")
@@ -262,6 +292,109 @@ final class DaemonLaunchOrderTests: XCTestCase {
         XCTAssertTrue(audit.contains("3 historical directive(s) in the supervision doc marked applied, not replayed"), "got: \(audit)")
         XCTAssertTrue(audit.contains("2 message(s) already in the inbox marked applied, not replayed"), "got: \(audit)")
         XCTAssertFalse(audit.contains("not a first run, nothing seeded"), "the upgrade rule did not fire: \(audit)")
+    }
+
+    /// `inboxURL` is its own optional field, so supervision first and the inbox later is
+    /// a normal rollout. The first supervised life has no inbox to read, and every
+    /// ledger write it makes must carry the inbox seed as still owed: written as
+    /// `false` ("seeded, and it was empty" reads the same as "never seeded"), the life
+    /// that first configures the inbox would not be a first run for that slot and would
+    /// deliver the phone's whole backlog, one model turn each — the replay the inbox
+    /// seed exists to stop.
+    func testAnInboxConfiguredOnALaterLaunchIsSeededNotDelivered() async throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: auditPath), "a box the daemon has never run on")
+        let directivesOnly = try makeDaemon()
+        var directiveFetches = 0
+        directivesOnly.supervisionFetch = { _ in
+            directiveFetches += 1
+            return directiveFetches == 1 ? self.history() : self.historyPlusOne()
+        }
+        directivesOnly.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        directivesOnly.terminate = { _ in }
+
+        let firstSession = await directivesOnly.launch()
+        XCTAssertNotNil(firstSession)
+        XCTAssertEqual(try ledger(),
+                       DaemonDirectiveClient.LedgerFile(seeded: ["d-1", "d-2", "d-3"], inboxSeedPending: true),
+                       "the directive seed landed; the inbox seed is carried as owed, with no inbox to draw it from")
+        let firstDelivered = await directivesOnly.supervision?.poll()
+        XCTAssertEqual(firstDelivered?.map(\.id), ["d-4"], "written after the seed: delivered")
+        directivesOnly.supervision?.markApplied("d-4")
+        XCTAssertEqual(try ledger(),
+                       DaemonDirectiveClient.LedgerFile(applied: ["d-4"], seeded: ["d-1", "d-2", "d-3"], inboxSeedPending: true),
+                       "an apply rewrote the ledger and the inbox seed is still owed")
+        directivesOnly.shutdown(exitCode: 0)
+
+        // The operator adds `inboxURL`, same state directory.
+        let withInbox = try makeDaemon(inbox: true)
+        var primed: [String] = []
+        withInbox.supervisionFetch = { request in
+            primed.append(request.url!.lastPathComponent)
+            return request.url?.absoluteString.contains("inbox") == true ? self.inboxBacklog() : self.historyPlusOne()
+        }
+        withInbox.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        withInbox.terminate = { _ in }
+
+        let session = await withInbox.launch()
+
+        XCTAssertNotNil(session)
+        XCTAssertEqual(primed, ["inbox.json"], "only the inbox owes a seed: the prime read it, and nothing else")
+        XCTAssertEqual(try ledger(),
+                       DaemonDirectiveClient.LedgerFile(applied: ["d-4"], seeded: ["d-1", "d-2", "d-3"], inboxSeeded: ["m-1", "m-2"]),
+                       "M = 2 inbox ids seeded on the first inbox read; d-4 stays applied")
+        let delivered = await withInbox.supervision?.poll()
+        XCTAssertEqual(delivered?.map(\.id), [], "zero delivered: the backlog is history")
+        XCTAssertEqual(withInbox.supervision?.isFirstRun, false)
+        withInbox.shutdown(exitCode: 0)
+        let audit = try auditLog()
+        XCTAssertTrue(audit.contains("[s3] first run: resumed with the inbox seed still pending"), "got: \(audit)")
+        XCTAssertFalse(audit.contains("resumed with the directive seed still pending"), "that seed was drawn last life: \(audit)")
+        XCTAssertTrue(audit.contains("2 message(s) already in the inbox marked applied, not replayed"), "got: \(audit)")
+        XCTAssertFalse(audit.contains("not a first run, nothing seeded"), "the upgrade rule did not fire: \(audit)")
+    }
+
+    /// The other direction the unsupervised record could be wrong in: it says the inbox
+    /// seed is owed, because it had no launcher's word to go on — and the box is then
+    /// enrolled through the control plane's `POST /workers`, which empties the inbox
+    /// and launches with `inboxResetAtLaunch: true`. A message the user sends moments
+    /// after the reset is live; resuming the recorded inbox seed would stamp it history
+    /// and drop it silently. The launcher's word about THIS launch outranks the ledger.
+    func testAnUnsupervisedFirstLaunchThenEnrollmentThatResetTheInboxDeliversWhatArrivedAfterIt() async throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: auditPath), "a box the daemon has never run on")
+        let unsupervised = try makeDaemon(supervision: false)
+        unsupervised.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        unsupervised.terminate = { _ in }
+        let unsupervisedSession = await unsupervised.launch()
+        XCTAssertNotNil(unsupervisedSession)
+        unsupervised.shutdown(exitCode: 0)
+        XCTAssertEqual(try ledger(), DaemonDirectiveClient.LedgerFile(seedPending: true, inboxSeedPending: true),
+                       "the record owes both seeds — it had no launcher to ask about the inbox")
+
+        let enrolled = try makeDaemon(inbox: true, inboxResetAtLaunch: true)
+        var primed: [String] = []
+        enrolled.supervisionFetch = { request in
+            primed.append(request.url!.lastPathComponent)
+            return request.url?.absoluteString.contains("inbox") == true ? self.inboxAfterReset() : self.history()
+        }
+        enrolled.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        enrolled.terminate = { _ in }
+
+        let session = await enrolled.launch()
+
+        XCTAssertNotNil(session)
+        XCTAssertEqual(primed, ["directives.json"], "only the directive seed is owed; the exempt inbox is not primed")
+        XCTAssertEqual(try ledger(), DaemonDirectiveClient.LedgerFile(seeded: ["d-1", "d-2", "d-3"]),
+                       "the directive seed landed; the inbox seed was ruled out, not resumed")
+        let delivered = await enrolled.supervision?.poll()
+        XCTAssertEqual(delivered?.map(\.id), ["m-1"], "it arrived after the reset: delivered, not stamped history")
+        XCTAssertEqual(enrolled.supervision?.seededInboxIDs, [])
+        enrolled.shutdown(exitCode: 0)
+        let audit = try auditLog()
+        XCTAssertTrue(audit.contains("[s3] first run: resumed with the directive seed still pending"), "got: \(audit)")
+        XCTAssertTrue(audit.contains("[s3] first run: inbox seed still pending, but the launcher emptied the inbox at launch — not resumed"),
+                      "got: \(audit)")
+        XCTAssertFalse(audit.contains("resumed with the inbox seed still pending"), "got: \(audit)")
+        XCTAssertFalse(audit.contains("already in the inbox marked applied"), "nothing seeded from the inbox: \(audit)")
     }
 
     /// What the upgrade rule is still for, kept reachable on purpose: a 1.3.0 daemon ran

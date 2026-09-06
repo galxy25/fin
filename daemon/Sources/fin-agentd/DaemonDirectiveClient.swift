@@ -218,6 +218,17 @@ final class DaemonDirectiveClient {
     /// bucket writes one line per window, not one per poll.
     private var lastFailureAuditAt: [String: Date] = [:]
     private var lastPollAt: Date?
+    /// The inbox slot's share of the first-run seed while NO `inboxURL` is configured.
+    /// A first run owes the inbox its seed whether or not this launch can read one —
+    /// the phone's backlog is history to a daemon that has never read it, whenever it
+    /// first does — and `inbox_seeded: []` on disk reads the same for "seeded, and it
+    /// was empty" as for "never seeded", so the flag itself is what has to survive.
+    /// Held here, and carried through every `persistLedger` (the directive seed, each
+    /// apply), until a launch that configures the inbox moves it onto the slot. Without
+    /// it a supervised life with no inbox yet would rewrite `inbox_seed_pending: false`,
+    /// and the life that first turned the inbox on would not be a first run for that
+    /// slot: the app's whole backlog delivered, one model turn each.
+    private var inboxSeedPendingWithoutInbox = false
 
     /// - Parameters:
     ///   - inboxResetAtLaunch: Whether whatever launched this daemon emptied the inbox
@@ -332,7 +343,23 @@ final class DaemonDirectiveClient {
             if ledger.seedPending {
                 audit("[s3] first run: resumed with the directive seed still pending")
             }
-            if inboxDocument != nil, ledger.inboxSeedPending {
+            if inboxDocument == nil {
+                // No inbox to draw the seed from yet: carry the flag as it stands, so
+                // this life's ledger writes don't erase what the launch that first
+                // configures the inbox has to read back.
+                self.inboxSeedPendingWithoutInbox = ledger.inboxSeedPending
+            } else if ledger.inboxSeedPending, inboxResetAtLaunch {
+                // The launcher's word about THIS launch outranks a prior life's ledger.
+                // That ledger owes the inbox seed because it had no launcher to ask
+                // (the unsupervised record, a resident first life); this launch says
+                // the inbox was emptied first (the control plane's `POST /workers`,
+                // enrolling that box), so whatever is in it now arrived after the reset
+                // and must apply — resuming the seed would stamp it history and drop
+                // it. Written down, so a later launch without the flag doesn't resume
+                // a seed this one has ruled out.
+                audit("[s3] first run: inbox seed still pending, but the launcher emptied the inbox at launch — not resumed")
+                persistLedger()
+            } else if ledger.inboxSeedPending {
                 self.inboxDocument?.seedPending = true
                 audit("[s3] first run: resumed with the inbox seed still pending")
             }
@@ -374,7 +401,13 @@ final class DaemonDirectiveClient {
             self.seededInboxIDs = []
             self.seededLookup = []
             self.directiveDocument.seedPending = true
+            // The inbox's seed is owed too: on the slot when an inbox is configured
+            // (unless the launcher emptied it), carried on
+            // `inboxSeedPendingWithoutInbox` when none is yet — so the launch that
+            // first configures one seeds the backlog instead of delivering it. The
+            // unsupervised record writes the same.
             self.inboxDocument?.seedPending = !inboxResetAtLaunch
+            self.inboxSeedPendingWithoutInbox = inboxDocument == nil
             persistLedger(failurePrefix: "[s3] first run: could not persist the pending ledger")
         case .corrupt:
             // Starting with an empty dedupe set means already-applied directives may
@@ -401,6 +434,12 @@ final class DaemonDirectiveClient {
     /// True while any slot still owes its first-run seed.
     var isFirstRun: Bool {
         directiveDocument.seedPending || inboxDocument?.seedPending == true
+    }
+
+    /// What the ledger's `inbox_seed_pending` records: the slot's own flag when an inbox
+    /// is configured, the carried one when none is.
+    private var inboxSeedPending: Bool {
+        inboxDocument?.seedPending ?? inboxSeedPendingWithoutInbox
     }
 
     // MARK: - Polling
@@ -700,10 +739,15 @@ final class DaemonDirectiveClient {
     /// the whole document once the directive URL recovers. Since 1.4.1 the first run
     /// writes the file with that flag set the moment the daemon launches — before any
     /// document is read, before the private key is read, supervision block or not — so
-    /// the restart always finds it; 1.4.1 also adds the inbox's own pair. Every key is
+    /// the restart always finds it; 1.4.1 also adds the inbox's own pair, and
+    /// `inbox_seed_pending` is carried, not recomputed, by a launch with no `inboxURL`:
+    /// a first run owes the inbox its seed before there is an inbox to read, and the
+    /// launch that first configures one draws it. Every key is
     /// optional on read, each defaulting to "nothing": a file with
     /// only `applied` keeps its applied ids instead of counting as corrupt and
-    /// resetting dedupe — the same forward tolerance the directive document has.
+    /// resetting dedupe — the same forward tolerance the directive document has. That
+    /// default is why a 1.4.0 file (no inbox keys) owes no inbox seed: an inbox first
+    /// configured on such a box delivers its backlog — a replay, never a drop.
     struct LedgerFile: Codable, Equatable {
         var applied: [String]
         var seeded: [String]
@@ -784,7 +828,7 @@ final class DaemonDirectiveClient {
             seeded: seededIDs,
             seedPending: directiveDocument.seedPending,
             inboxSeeded: seededInboxIDs,
-            inboxSeedPending: inboxDocument?.seedPending ?? false
+            inboxSeedPending: inboxSeedPending
         )
         do {
             try Self.write(ledger, to: stateFilePath)
@@ -808,7 +852,9 @@ final class DaemonDirectiveClient {
     /// and replay the supervisor's whole history plus the inbox backlog. Written
     /// instead is the resident posture, both seeds owed (no block, so no
     /// `inboxResetAtLaunch` either): the shared document is history to a daemon that
-    /// has never read it, whenever it first does. Nothing is written when a ledger of
+    /// has never read it, whenever it first does. A later launch that does say
+    /// `inboxResetAtLaunch` rules the inbox seed out on load — the init's `.loaded`
+    /// branch — rather than seeding what arrived after its reset. Nothing is written when a ledger of
     /// any kind exists, or when the audit log predates this launch (a box a 1.3.0
     /// daemon ran on keeps its replay verdict for the supervised launch to draw). A
     /// failed write audits under the same line as the supervised one.
