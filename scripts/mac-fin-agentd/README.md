@@ -221,26 +221,40 @@ old `fin/sites/fin/<site8>/status.json` in S3 is left for the operator.
 - **`LC_FIN_AGENT` is checked at every launch**, not once at install: `launch-agentd.sh`
   refuses to start unless a marked loopback SSH lands in a plain shell (`TMUX=[]`). The
   guard itself lives in a file this package does not own and Fin can write.
-- **Routing registry — a prompt-level guardrail, not a construction-level gate.** `routing-registry.json`
-  registers only the daemon's own `fin` session, and the router renders that into the
-  system prompt as *"Live but not registered → OFF-LIMITS: never send keys to it"*
-  (`SessionRouting.promptSection`). **That paragraph is the entire guardrail.** The
-  `send_input` tool passes its string straight to the PTY (`AgentTools.swift` →
-  `HeadlessTerminalSession.sendAgentInput`); no byte is ever inspected for a tmux target
-  — `grep tmux AgentTools.swift` returns nothing. The only hard gate is
-  `DestructiveCommandHeuristic`, whose patterns cover `rm -rf`, `kill -9`, `mkfs`,
-  `git reset --hard` and friends and match **nothing** in `tmux send-keys -t main …`,
-  `tmux kill-session -t main`, `tmux kill-server` or `pkill -f mlx_lm`.
+- **Routing registry + the tmux send-keys guard — read anything, write only what is
+  registered.** `routing-registry.json` registers the daemon's own `fin` session, and the
+  router renders that into the system prompt as *"Live but not registered → OFF-LIMITS:
+  never send keys to it"* (`SessionRouting.promptSection`). That paragraph is no longer the
+  entire guardrail: `TmuxCommandGuard` (`daemon/Sources/FinAgentCore/TmuxCommandGuard.swift`)
+  parses every `send_input` string before it reaches the PTY and refuses a **mutating** tmux
+  command — `send-keys`, `paste-buffer`, `kill-session`/`-window`/`-pane`, `kill-server`,
+  `new-window`, `split-window`, `respawn-*`, `rename-*`, `set-option`, `attach`,
+  `switch-client`, `run-shell`, `if-shell`, `source-file`, `bind-key`, a `-L`/`-S` pointed
+  at another server — whose target is not the daemon's own session or a registered one. It
+  handles `;`/`&&`/`||`/newline chaining, `sudo`/`env`/full-path prefixes, quoting, tmux's
+  own `\;` form, abbreviations (`send`, `kill-ses`), `$(…)`/backticks, and one level of
+  `sh -c '…'` nesting. **Reading is deliberately unrestricted** — `capture-pane`,
+  `list-sessions`, `list-windows`, `has-session`, `display-message -p` work against `main`
+  and every other session, because seeing the iMac's real work is the whole point of a
+  resident site. Refusals are honest tool results (they name the session and hand back the
+  read commands) and land in the audit log as failures. Coverage:
+  `daemon/Tests/FinAgentCoreTests/TmuxCommandGuardTests.swift`.
 
-  So: the daemon's shell runs inside `tmux new-session -A -s fin` on the user's **default
-  tmux socket**, the same server that hosts Levi's live `main` session. One model turn
-  emitting `tmux send-keys -t main '…' Enter` reaches it. What stands between a local 12B
-  model and Levi's real work is one paragraph it is asked to obey — against an input
-  surface (terminal output) that arbitrary commands can influence. Treat `main` as
-  *conventionally* off-limits, not structurally. A real gate is either a `send_input`
-  refusal for tmux targets naming an unregistered session, or a dedicated tmux socket
-  (`tmux -L fin …`) for the daemon so `main` does not exist in its namespace at all;
-  `docs/SITES.md` records a forced-command variant as the Phase 2 option.
+  **This is defense in depth, not a sandbox — say so out loud.** The daemon's shell still
+  runs inside `tmux new-session -A -s fin` on the user's **default tmux socket**, the same
+  server that hosts Levi's live `main` session, and a byte-level guard over a
+  natural-language channel cannot close indirection: `T=tmux; $T send-keys …`, a
+  base64/`eval` reconstruction, a helper script or Makefile target that runs tmux, an alias
+  or shell function, writing `~/.tmux.conf` and having tmux read it later, `ssh <remote>
+  tmux …`, or plain non-tmux damage (`pkill -f mlx_lm`, `launchctl bootout`, an `rm` shape
+  `DestructiveCommandHeuristic` misses — its patterns still match **nothing** in a tmux
+  verb). The guard closes the direct path a model actually takes; treat `main` as protected
+  against the obvious, not isolated. The structural fix is a dedicated socket
+  (`connectCommand: "tmux -L fin new-session -A -s fin"`), which removes `main` from the
+  daemon's namespace entirely and costs exactly the read capability above —
+  `tmux capture-pane -t main -p` stops working, and Fin stops being able to see the iMac's
+  real work. That is Levi's call, not the code's; `docs/SITES.md` records a forced-command
+  variant as the Phase 2 option.
 - **`config.json` is 0600** from its first byte (`mkstemp` + atomic rename). It holds
   the four presigned URLs and the control-plane bearer. No script here prints a URL or
   the token; `provision-state.json` carries only key names and timestamps.
@@ -263,9 +277,13 @@ old `fin/sites/fin/<site8>/status.json` in S3 is left for the operator.
 Three things this package cannot fix from inside itself. All three are Phase 1/1.5.0 work;
 they are listed here so nobody discovers them as a surprise.
 
-1. **`main` is off-limits by instruction, not by construction.** See the routing-registry
-   bullet above. A prompt paragraph is the only thing keeping the model out of Levi's live
-   tmux session, on the same tmux socket, on the box where the fine-tune runs.
+1. **`main` is off-limits by policy, not by isolation.** See the routing-registry bullet
+   above. `TmuxCommandGuard` now refuses mutating tmux commands aimed at unregistered
+   sessions before they reach the PTY, so a prompt paragraph is no longer the only thing
+   standing there — but the daemon still shares a tmux socket with Levi's live session on
+   the box where the fine-tune runs, and a byte-level guard cannot stop indirection
+   (`$T send-keys`, `eval`, a helper script, an alias). Isolation is the dedicated-socket
+   change, and it trades away Fin's ability to read `main`.
 2. **The Mac stops idle-sleeping.** This site's inbox URL is signed `get_object` only, and
    `DaemonDirectiveClient` never writes the inbox back — it dedupes in its own ledger and
    leaves the object alone. The one writer that ever emptied `fin/inbox/fin.json` was the

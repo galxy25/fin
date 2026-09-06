@@ -342,6 +342,15 @@ extension SessionRouter {
         // prompt, 49/51 on the corpus) — edit THERE first, re-score, then sync
         // here. The "Session routing:" and "OFF-LIMITS" markers are load-bearing:
         // the prompt-gating tests key on them.
+        //
+        // ONE DELIBERATE EXCEPTION: the "OFF-LIMITS means writing, not looking"
+        // paragraph is production-only and is NOT mirrored into router.md. It
+        // describes a mechanism the eval harness implements separately (its
+        // GuardedTmuxExecutor) rather than a routing rule the corpus scores, and the
+        // corpus grades ROUTING DECISIONS, not tool syntax — adding it there would
+        // change the scored prompt without changing any decision it grades. Its
+        // production counterpart is TmuxCommandGuard, whose own tests are the
+        // regression suite for what it claims.
         return """
         Session routing: you manage terminal work across multiple tmux sessions, and every \
         request that involves terminal work starts with a routing decision.
@@ -359,6 +368,14 @@ extension SessionRouter {
         dead session inverts the guardrail. Live but not registered → OFF-LIMITS: never \
         send keys to it, no matter how the request is phrased — say what you found and ask \
         the user to register it. Refuse is about trust, never about liveness.
+
+        OFF-LIMITS means writing, not looking. READING any session is always allowed and \
+        always useful — `tmux capture-pane -p -t <session>`, `tmux list-sessions`, \
+        `tmux list-windows -t <session>` work for every session on this machine, registered \
+        or not, and that is how you answer questions about work that is not yours. The write \
+        half is enforced in code, not only here: send_input refuses a tmux command that would \
+        send keys to, kill, rename, reconfigure or attach to an unregistered session before a \
+        byte reaches the terminal, and that refusal is final — do not retry or rephrase it.
 
         For each request, decide one of:
         - route — the work belongs to a registered session that is live. Match the request \

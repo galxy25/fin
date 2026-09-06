@@ -122,6 +122,16 @@ public final class AgentTurnEngine {
     /// this runtime, the same honesty as the headless memory tools.
     public var onNotify: ((_ title: String, _ body: String) -> Bool)?
 
+    /// The tmux send-keys guard (see `TmuxCommandGuard`). NOT an optional hook, on
+    /// purpose: a nil hook reads as "allow", and a guard must never be disarmed by
+    /// omission. `.unenforced` is the explicit, named opt-out for a host with no tmux
+    /// namespace of its own — the app drives an arbitrary SSH session where tmux is
+    /// optional and the user's own session is often literally named `main`. The daemon
+    /// sets it from its `connectCommand` + routing registry (`TmuxSendGuard.forHost`),
+    /// where the fail-closed default lives: no registry → the allow-list is exactly the
+    /// agent's own session.
+    public var tmuxGuard: TmuxSendGuard = .unenforced
+
     public init(
         configuration: AgentEngineConfiguration,
         session: any AgentSessionDriving,
@@ -512,6 +522,17 @@ public final class AgentTurnEngine {
         rawArguments: String
     ) async -> String {
         let toolName = AgentToolSpec.sendInput.name
+
+        // THE TMUX GUARD, FIRST: read anything, write only what is registered. This runs
+        // before the destructive heuristic because it is the more specific violation and
+        // its refusal is the more actionable one — it names the session and tells the
+        // model to read it instead. Deliberately ahead of the connected-session check too,
+        // so a refusal is deterministic whether or not the PTY happens to be up.
+        if case .refuse(let message) = tmuxGuard.evaluate(input) {
+            record("error", message, toolName: toolName,
+                   toolArguments: rawArguments, isFailure: true)
+            return message
+        }
 
         // NO HUMAN IN THE LOOP: where the app's runtime would raise an approval sheet,
         // the daemon refuses destructive-looking commands outright. The refusal is fed

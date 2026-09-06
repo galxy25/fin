@@ -275,4 +275,78 @@ final class AgentEngineDispatchTests: XCTestCase {
         _ = await engine.execute(call(AgentToolSpec.monitor.name, #"{"action": "stop"}"#))
         // No XCTFail fired → nothing auto-notified.
     }
+
+    // MARK: - The tmux send-keys guard on the send_input path
+
+    /// The whole point of the port: a `send_input` aimed at an unregistered tmux session
+    /// never reaches the PTY, comes back as a tool result the model can act on, and lands
+    /// in the audit trail as a failure. The turn continues — a refusal is a decision, not
+    /// a crash.
+    func testGuardedSendInputRefusesUnregisteredTmuxTargets() async {
+        let session = RecordingStubSession()
+        var audited: [AgentAuditEvent] = []
+        let engine = makeEngine(session: session, audit: { audited.append($0) })
+        engine.tmuxGuard = TmuxSendGuard(
+            isEnforced: true,
+            ownSession: "fin",
+            registrySessions: ["fin"],
+            hasRegistry: true
+        )
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
+        ))
+
+        XCTAssertTrue(session.sentInputs.isEmpty, "a guarded target must never reach the session")
+        XCTAssertTrue(result.contains("REFUSED"), "got: \(result)")
+        XCTAssertTrue(result.contains("main"), "the refusal must name the session — got: \(result)")
+        XCTAssertTrue(result.contains("capture-pane"), "the refusal must offer the read path — got: \(result)")
+        XCTAssertTrue(
+            audited.contains { $0.kind == "error" && $0.isFailure },
+            "a refusal must land in the audit trail"
+        )
+    }
+
+    /// The other half: the guard is a target check, not a tmux ban. Reading any session
+    /// and writing a registered one both go through untouched, split-Return and all.
+    func testGuardedSendInputStillDeliversAllowedTmuxCommands() async {
+        let session = RecordingStubSession()
+        let engine = makeEngine(session: session)
+        engine.tmuxGuard = TmuxSendGuard(
+            isEnforced: true,
+            ownSession: "fin",
+            registrySessions: ["fin"],
+            hasRegistry: true
+        )
+
+        _ = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "tmux capture-pane -p -t main", "await_output_seconds": 1}"#
+        ))
+        _ = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "tmux send-keys -t fin 'git status' Enter", "await_output_seconds": 1}"#
+        ))
+
+        XCTAssertEqual(session.sentInputs.count, 4, "two sends, each body + Return")
+        XCTAssertTrue(session.sentInputs[0].contains("capture-pane"))
+        XCTAssertTrue(session.sentInputs[2].contains("send-keys -t fin"))
+    }
+
+    /// A host that never set the guard behaves exactly as it did before the guard
+    /// existed — the app's posture, where tmux is optional and the user's own session is
+    /// routinely named `main`.
+    func testUnguardedEngineSendsTmuxCommandsUnchanged() async {
+        let session = RecordingStubSession()
+        let engine = makeEngine(session: session)
+
+        _ = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "tmux send-keys -t main 'echo hi' Enter", "await_output_seconds": 1}"#
+        ))
+
+        XCTAssertEqual(session.sentInputs.count, 2)
+        XCTAssertTrue(session.sentInputs[0].contains("send-keys -t main"))
+    }
 }

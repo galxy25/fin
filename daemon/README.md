@@ -135,6 +135,86 @@ rides CloudKit or any synced channel. Nothing creates the file automatically; ab
 empty) it changes nothing, and the prompt stays byte-identical to a registry-less build.
 Read once at startup, so edits take effect on the next launch.
 
+### The tmux send-keys guard
+
+**Read anything, write only what is registered.** The daemon's shell usually lives inside
+a tmux session on the user's *default* tmux socket — the same server that hosts their own
+sessions. The routing prompt asks the model to leave those alone; `TmuxCommandGuard`
+(`Sources/FinAgentCore/TmuxCommandGuard.swift`) is the part that does not depend on the
+model agreeing. Every `send_input` string is parsed before a byte reaches the PTY
+(`AgentTurnEngine.executeSendInput`, ahead of the destructive heuristic and ahead of the
+connected-session check), and a violation comes back as a tool result the model can read
+and recover from — plus an `isFailure` line in the audit log. Nothing crashes; the turn
+continues.
+
+The allow-list is **the daemon's own tmux session** (parsed out of `connectCommand`, so it
+survives a missing registry) **∪ every session in `routing-registry.json`**. The registry
+file is re-read on every send, so a session registered mid-run becomes writable without a
+restart and a deleted registry shrinks the list back to the daemon's own session. **No
+registry means the allow-list is exactly the daemon's own session** — fail closed, and the
+refusal text says so, because a model that thinks the registry merely failed to load will
+keep trying.
+
+| Class | Commands | Rule |
+| --- | --- | --- |
+| Read | `capture-pane`, `list-sessions`/`ls`, `list-windows`, `list-panes`, `list-clients`, `list-buffers`, `list-keys`, `list-commands`, `display-message`, `show-options`, `show-window-options`, `show-environment`, `show-buffer`, `show-hooks`, `show-messages`, `show-prompt-history`, `has-session` | **Always allowed, against any session, registered or not** — including on another socket. Load-bearing: a resident agent that cannot SEE the machine's real work is useless, and "what is the status of the in-flight missions" *is* `tmux capture-pane -t main -p`. |
+| Never | `kill-server`, `run-shell`, `if-shell`, `source-file`, `bind-key`, `unbind-key`, `set-hook`, `command-prompt`, `confirm-before`, `display-menu`/`-popup`/`-panes`, `choose-*`, `customize-mode`, `attach-session`, `switch-client`, `detach-client`, `suspend-client`, `refresh-client`, `lock-*`, `server-access`, `wait-for`, `clear-prompt-history`, plus `tmux -c` and `tmux -f` | Refused whatever they target: they execute commands, reach the whole server, or move the human's client. |
+| Registered targets only | everything else that mutates — `send-keys`, `paste-buffer`, `kill-session`/`-window`/`-pane`, `new-window`, `split-window`, `respawn-*`, `swap`/`move`/`join`/`break`/`link`/`unlink`, `rename-*`, `select-*`, `resize-*`, `clear-history`, `pipe-pane`, `set-option`/`set-window-option`/`set-environment` | Allowed only when every session it names is on the allow-list. `set-*` with `-g`/`-s` is refused outright (global/server scope escapes the session). |
+| Creation | `new-session` | Creating a session stays legal — it is the router's `start` action. `-t <unregistered>` (grouping shares the target's windows) and `-A -s <unregistered>` (attach-or-create) are not. |
+
+Parsing details that matter, all covered by `TmuxCommandGuardTests`: multiple commands per
+line (`;`, `&&`, `||`, `|`, newline, `$( )`, backticks); leading env assignments and
+`sudo`/`env`/`command`/`exec`/`nohup` prefixes; a full path (`/opt/homebrew/bin/tmux`);
+quoting around the target; the target forms `main`, `main:0`, `main:0.1`, `=main`, `-tmain`;
+tmux's own `\;` chaining; **abbreviations** (tmux accepts any unambiguous prefix, so `send`,
+`send-key`, `kill-ses` all resolve, and an ambiguous prefix resolves to the *most
+restrictive* match); the `-L`/`-S` socket flags (a different server means the allow-list
+does not apply, so mutations there are refused and reads are not); and **no `-t` at all**,
+which means the daemon's own current session and is allowed only because that session is
+itself on the list. Anything the parser cannot confidently prove is read-only — an unknown
+verb, a `$0`/`%3`/`@2`/bare-index target — is refused. The command table was diffed against
+`tmux 3.6a`'s `list-commands`: all 90 real commands are present with matching aliases, and
+no prefix of a real command resolves to a read-only entry here that real tmux would resolve
+elsewhere.
+
+Quoted shell text is unwrapped one level (up to three), so `sh -c 'tmux send-keys -t main …'`
+and the two-hop `tmux send-keys -t fin 'tmux send-keys -t main …'` are both caught. As a
+bonus, `pkill`/`killall` aimed at tmux is refused — it ends the same way `kill-server` does.
+
+**Honest limits.** This is defense in depth over a natural-language channel, not a sandbox.
+It closes the direct path — the one a local model actually takes when it decides to be
+helpful — and it cannot close indirection. Known residual bypasses, none of which this
+guard can reach:
+
+- variable or alias indirection (`T=tmux; $T send-keys …`, `alias t=tmux` in a rc file);
+- encoding (`eval $(echo dG11eA== | base64 -d) …`), or any construction that assembles the
+  word `tmux` at runtime;
+- a helper script, Makefile target, or shell function that runs tmux on the model's behalf;
+- writing `~/.tmux.conf` (or any file) with one command and having tmux read it later;
+- `ssh <other host> tmux …` — the remote server is out of this guard's world (a *local*
+  `ssh localhost tmux …` is caught);
+- entirely non-tmux damage: `pkill -f mlx_lm`, `launchctl bootout`, `rm` shapes
+  `DestructiveCommandHeuristic` misses;
+- and everything downstream of a send to a session that IS registered — the guard checks
+  the target, not what the agent in that session then does.
+
+**The structural fix is a dedicated socket.** Set
+`"connectCommand": "tmux -L fin new-session -A -s fin"` and the human's sessions stop
+existing in the daemon's namespace at all — no parser, no allow-list, no bypass list. The
+price is exactly the capability the read half exists for: `tmux capture-pane -t main -p`
+stops working, so Fin can no longer see the machine's real work. That tradeoff is a product
+decision, not an engineering one; the guard above is what makes the shared-socket posture
+survivable until it is made.
+
+The guard is **off unless a host arms it**. `TmuxSendGuard.unenforced` is an explicit named
+value rather than a nil hook, so it can never be disarmed by omission, and
+`TmuxSendGuard.forHost` arms it whenever the host has a tmux `connectCommand` or a routing
+registry. The Fin app leaves it unenforced: it drives an arbitrary SSH session where tmux
+is optional and the user's own quick-fill session name is literally `main`, so enforcing
+there by default would refuse the user's own terminal. When the guard is armed the daemon
+also appends a prompt paragraph telling the model the gate exists and what it may do
+instead — a refusal the model understands beats a refusal it fights.
+
 ## Run
 
 ```sh
@@ -163,7 +243,9 @@ conditionally. Signal handling (`DispatchSourceSignal`) and the notify hook
 The engine advertises the same six tools as the app, with these headless behaviors:
 
 - **`read_terminal` / `send_input`** — identical to the app, except destructive-looking
-  commands are refused outright (no approval sheet exists here).
+  commands are refused outright (no approval sheet exists here), and a tmux command aimed
+  at a session outside the routing registry is refused before it reaches the PTY (see
+  "The tmux send-keys guard").
 - **`request_input`** — records the question in the audit log and fires the notify hook
   with `FIN_EVENT=request-input`, `FIN_MESSAGE=<question>`. The answer arrives as a
   supervision directive or an inbox message (below) — there is no local user to type

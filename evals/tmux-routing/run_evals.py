@@ -34,9 +34,16 @@ HERE = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
-# Guarded executor — the ONLY thing allowed to send keys, in evals and (as the
-# design to port) in production. The allow-list comes from the registry, never
-# from what happens to exist on the server.
+# Guarded executor — the ONLY thing allowed to send keys. The allow-list comes
+# from the registry, never from what happens to exist on the server.
+#
+# PORTED. Production's counterpart is TmuxCommandGuard in
+# daemon/Sources/FinAgentCore/TmuxCommandGuard.swift, wired into
+# AgentTurnEngine.executeSendInput. It differs in one way that mattered: this
+# executor is handed a session NAME, while production is handed a COMMAND STRING
+# the model wrote, so the port is mostly a pessimistic shell/tmux parser in front
+# of the same allow-list. Same policy on both sides — read anything, write only
+# what is registered — so the refuse-scenarios below stay the spec.
 # ---------------------------------------------------------------------------
 class GuardedTmuxExecutor:
     def __init__(self, socket_name: str, registry: dict):

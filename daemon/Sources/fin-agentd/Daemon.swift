@@ -322,11 +322,18 @@ final class Daemon {
         base: String,
         registryFileURL: URL,
         goalsLedgerFileURL: URL? = nil,
-        notifyAvailable: Bool = false
+        notifyAvailable: Bool = false,
+        tmuxGuard: TmuxSendGuard = .unenforced
     ) -> String {
         var prompt = base
         if let registry = RegistryDocument.loadIfPresent(at: registryFileURL),
            let section = SessionRouter.promptSection(registry: registry) {
+            prompt += "\n\n" + section
+        }
+        // Told, not just enforced: a refusal the model understands beats a refusal it
+        // fights. Gated on the guard actually being armed, so an unguarded host keeps a
+        // byte-identical prompt — the same discipline as the routing and notify sections.
+        if let section = tmuxGuard.promptSection {
             prompt += "\n\n" + section
         }
         if let goalsLedgerFileURL,
@@ -547,6 +554,14 @@ final class Daemon {
         // ledger itself, so goal CONTENT stays fresh; only the taxonomy section is
         // launch-pinned.) The marker checks are safe: both markers are load-bearing
         // strings the prompt-gating tests key on.
+        // The send-keys guard's allow-list: this daemon's own tmux session (parsed out of
+        // connectCommand, so a missing or corrupt registry still yields a working one)
+        // unioned with every registered session. Armed whenever this host has either —
+        // a host with neither has no tmux namespace to defend and is left untouched.
+        let tmuxGuard = TmuxSendGuard.forHost(
+            connectCommand: config.server.connectCommand,
+            registryFileURL: URL(fileURLWithPath: routingRegistryPath)
+        )
         let basePrompt = config.agent.systemPrompt ?? Self.defaultSystemPrompt
         let systemPrompt = Self.composedSystemPrompt(
             base: basePrompt,
@@ -554,10 +569,18 @@ final class Daemon {
             goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath),
             // The notify tool has a live channel exactly when a control-plane block or a
             // shell hook is configured; only then does the persona guidance appear.
-            notifyAvailable: config.controlPlane != nil || (config.notifyCommand.map { !$0.isEmpty } ?? false)
+            notifyAvailable: config.controlPlane != nil || (config.notifyCommand.map { !$0.isEmpty } ?? false),
+            tmuxGuard: tmuxGuard
         )
         if systemPrompt.contains("Session routing:") {
             log("session routing enabled: registry at \(routingRegistryPath)")
+        }
+        if tmuxGuard.isEnforced {
+            let allowed = tmuxGuard.resolved().allowed.sorted().joined(separator: ", ")
+            log("tmux guard armed: mutating tmux commands limited to [\(allowed)]; "
+                + "reads (capture-pane, list-*, has-session) are unrestricted")
+        } else {
+            log("tmux guard not armed: no tmux session in connectCommand and no routing registry")
         }
         if systemPrompt.contains("Mission ledger:") {
             log("goals ledger enabled: ledger at \(goalsLedgerPath)")
@@ -577,6 +600,10 @@ final class Daemon {
             session: session,
             audit: { [weak self] event in self?.record(event) }
         )
+        // Set, always — even when unarmed, so the assignment (not an omission) is what
+        // decides. The guard re-reads the registry per send, so a session the model
+        // registers mid-run becomes writable without a restart.
+        engine.tmuxGuard = tmuxGuard
 
         // The model's request_input tool: record + notify — the engine already wrote the
         // question into the audit trail as the tool call, this surfaces it to a human.
