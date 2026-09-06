@@ -1,5 +1,8 @@
 import Foundation
 import FinAgentCore
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 #if canImport(Glibc)
 import Glibc
 #endif
@@ -109,6 +112,14 @@ struct DaemonConfig: Decodable {
         /// GET target: the app-written message document, same schema as directives.
         /// Optional — the directive channel works without it.
         var inboxURL: String?
+        /// True when whatever launches this daemon empties the inbox document first —
+        /// the control plane's `POST /workers` does, right before the instance launch
+        /// (`launch.sh` does not). It exempts the inbox from the first-run seed: a
+        /// message in it by the daemon's first read arrived while the worker booted and
+        /// must apply. Absent or false — a resident install — a first run seeds the
+        /// inbox's backlog as history like the directive document's, instead of
+        /// replaying weeks of phone messages one model turn each.
+        var inboxResetAtLaunch: Bool?
         /// The name directives address; "*" directives always match.
         var agentName: String
         /// Poll cadence; defaults to 30 seconds (the app's).
@@ -202,6 +213,27 @@ final class Daemon {
     private var shuttingDown = false
     private let auditLog: AuditLogWriter
     private let auditLogPath: String
+    /// Whether the audit log was already on disk when this process started — evidence
+    /// that the daemon has run on this box, independent of the directive ledger. Read
+    /// BEFORE `AuditLogWriter` creates the file, or every launch would look like a
+    /// prior one. A 1.3.0 daemon wrote its ledger only on its first apply, so a box that
+    /// ran it for weeks without applying anything has no ledger; this is what keeps a
+    /// 1.3.0 → 1.4.x upgrade there from seeding the next directive as history. The
+    /// flip side: because this file exists from the init on, a 1.4.x launch must leave
+    /// a ledger behind whenever it leaves the audit log behind, or its own next launch
+    /// reads as that upgrade — so `launch()` records the first run before anything that
+    /// can fail, private key included, supervision block or not.
+    private let auditLogPredatesThisLaunch: Bool
+
+    /// Test seams for the launch phase, so `DaemonLaunchOrderTests` can drive the real
+    /// `launch()` without a network or an sshd: the supervision client's transport
+    /// (nil = the real one), the session constructor (records what `run()` would open),
+    /// and the process exit `shutdown` schedules.
+    var supervisionFetch: ((URLRequest) async throws -> (Data, URLResponse))?
+    var makeSession: @MainActor (HeadlessSessionConfiguration) -> HeadlessTerminalSession = {
+        HeadlessTerminalSession(configuration: $0)
+    }
+    var terminate: (Int32) -> Void = { exit($0) }
 
     /// The live heartbeat cadence. Config seeds it; the model's `monitor` tool (and a
     /// directive's `arm_monitor`) can retune it at runtime.
@@ -210,7 +242,8 @@ final class Daemon {
     /// keeps running, idle, and a later directive (or `monitor start`) re-arms it.
     private var heartbeatEnabled = true
     /// The S3 supervision consumer; nil when the config has no `supervision` block.
-    private var supervision: DaemonDirectiveClient?
+    /// Readable so the launch-order tests can poll it and see what a launch delivers.
+    private(set) var supervision: DaemonDirectiveClient?
     /// The cloud transcript uplink; nil when the config has no `transcript` block.
     private var transcript: DaemonTranscriptUplink?
     /// The push-notification client; nil when the config has no `controlPlane` block.
@@ -318,6 +351,8 @@ final class Daemon {
     init(config: DaemonConfig) {
         self.config = config
         let auditPath = ((config.auditLogPath ?? "fin-agentd-audit.jsonl") as NSString).expandingTildeInPath
+        // Before the writer creates the file — see `auditLogPredatesThisLaunch`.
+        self.auditLogPredatesThisLaunch = FileManager.default.fileExists(atPath: auditPath)
         let writer = AuditLogWriter(path: auditPath)
         self.auditLogPath = auditPath
         self.auditLog = writer
@@ -395,47 +430,91 @@ final class Daemon {
         )
     }
 
-    func run() async {
+    /// The pre-connect phase of `run()`, in the order that matters — and the seam the
+    /// launch-order tests drive with no network and no sshd: (1) the supervision client
+    /// and its first-run prime — or, with no `supervision` block, the first-run ledger
+    /// on its own — (2) a shutdown check, (3) the private key, (4) the session `run()`
+    /// will connect, built but not yet connected. The first-run record comes before the
+    /// key on purpose: the init already created the audit log, and a key that can't be
+    /// read (a path typo, wrong perms, cloud-init writing it after the unit started —
+    /// a crash loop under `Restart=always`) would otherwise leave "audit log, no
+    /// ledger" for the operator's fixed-key launch to read as a 1.3.0 upgrade and
+    /// replay the supervisor's whole history. Returns nil when a SIGINT/SIGTERM landed
+    /// during the prime's fetch — `shutdown` already closed the audit log and scheduled
+    /// the exit, so opening SSH, and failing into the audit log, would only race it —
+    /// and when the key can't be read, after `abort` has scheduled that exit.
+    func launch() async -> HeadlessTerminalSession? {
         log("fin-agentd starting: \(config.server.username)@\(config.server.host) → \(config.agent.modelIdentifier)")
-
-        let keyPEM: String
-        do {
-            let keyPath = (config.server.privateKeyPath as NSString).expandingTildeInPath
-            keyPEM = try String(contentsOfFile: keyPath, encoding: .utf8)
-        } catch {
-            await fail("cannot read private key at \(config.server.privateKeyPath): \(error)")
-        }
 
         if let block = config.supervision {
             let client = DaemonDirectiveClient(
                 directiveURL: block.directiveURL,
                 statusURL: block.statusURL,
                 inboxURL: block.inboxURL,
+                inboxResetAtLaunch: block.inboxResetAtLaunch ?? false,
                 agentName: block.agentName,
                 pollSeconds: block.pollSeconds ?? 30,
                 deviceToken8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
                 stateFilePath: directiveStatePath,
+                hasRunHereBefore: auditLogPredatesThisLaunch,
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                },
+                fetch: supervisionFetch
+            )
+            supervision = client
+            let sources = client.inboxURL == nil ? "directives" : "directives + inbox"
+            log("supervision enabled: polling \(sources) every \(client.pollSeconds)s as \"\(block.agentName)\"")
+            // The daemon's conversation boundary is its first directive read, and this
+            // is where it happens: before the SSH connect, the readiness probes and the
+            // first task turn, which together can run for minutes — so a directive an
+            // operator writes from here on is delivered, not stamped as history. It is
+            // NOT the boundary the control plane draws when it empties the per-agent
+            // inbox: that one falls at the POST /workers call, minutes before this on
+            // a cloud worker (cloud-init, downloads) — and further before it if this
+            // fetch fails and the poll loop has to draw the mark later. Anything
+            // written to the shared directive document between the launch call and
+            // this read is history to this daemon; the inbox has no such window.
+            // No-op on a box the daemon has run on before.
+            await client.primeFirstRunSeed()
+            if shuttingDown {
+                log("shutdown requested during launch — not connecting")
+                return nil
+            }
+        } else {
+            // Unsupervised, but the audit log is already on disk: leave the same
+            // first-run evidence the client would, so supervision added to this
+            // install later is still a first run — the shared document is history to
+            // a daemon that has never read it — rather than the 1.3.0-upgrade replay.
+            DaemonDirectiveClient.recordFirstRunWithoutSupervision(
+                stateFilePath: directiveStatePath,
+                hasRunHereBefore: auditLogPredatesThisLaunch,
                 audit: { [weak self] line in
                     self?.log(line)
                     self?.record(AgentAuditEvent(kind: "notice", text: line))
                 }
             )
-            supervision = client
-            let sources = client.inboxURL == nil ? "directives" : "directives + inbox"
-            log("supervision enabled: polling \(sources) every \(client.pollSeconds)s as \"\(block.agentName)\"")
-            // Launch is the conversation boundary. The control plane empties the
-            // per-agent inbox at launch; the daemon draws its first-run directive
-            // high-water at the same moment — before the SSH connect, the readiness
-            // probes and the first task turn, which together can run for minutes — so
-            // a directive an operator writes from here on is delivered, not stamped as
-            // history. No-op on a box the daemon has run on before.
-            await client.primeFirstRunSeed()
         }
 
-        let session = HeadlessTerminalSession(
-            configuration: Self.sessionConfiguration(server: config.server, privateKeyPEM: keyPEM)
+        let keyPEM: String
+        do {
+            let keyPath = (config.server.privateKeyPath as NSString).expandingTildeInPath
+            keyPEM = try String(contentsOfFile: keyPath, encoding: .utf8)
+        } catch {
+            await abort("cannot read private key at \(config.server.privateKeyPath): \(error)")
+            return nil
+        }
+
+        let session = makeSession(
+            Self.sessionConfiguration(server: config.server, privateKeyPEM: keyPEM)
         )
         self.session = session
+        return session
+    }
+
+    func run() async {
+        guard let session = await launch() else { return }
         session.connect()
         do {
             try await session.waitForConnection(timeout: 30)
@@ -752,13 +831,17 @@ final class Daemon {
             await transcript?.flush()
             await lastNotifyTask?.value
             try? await Task.sleep(for: .milliseconds(300))
-            exit(exitCode)
+            terminate(exitCode)
         }
     }
 
-    /// Async only so the fatal line can reach the cloud transcript before the process
-    /// dies — a remote supervisor's timeline would otherwise just stop.
-    private func fail(_ message: String) async -> Never {
+    /// The fatal exit, through the `terminate` seam so the launch-order tests can drive
+    /// a failing launch in-process: audit line, transcript flush, exit 1. Async only so
+    /// the fatal line can reach the cloud transcript before the process dies — a remote
+    /// supervisor's timeline would otherwise just stop. Callers that can return (the
+    /// private-key read in `launch()`) return after it; everything past the connect uses
+    /// `fail`, which cannot.
+    private func abort(_ message: String) async {
         log("fatal: \(message)")
         record(AgentAuditEvent(kind: "error", text: message, isFailure: true))
         await transcript?.flush()
@@ -766,6 +849,14 @@ final class Daemon {
         await lastNotifyTask?.value
         auditLog.close()
         session?.disconnect()
+        terminate(1)
+    }
+
+    /// `abort`, typed as the exit it is in production — `terminate` is `exit` there and
+    /// never returns; the trailing `exit(1)` is what the type system needs and what a
+    /// seam that did return would get.
+    private func fail(_ message: String) async -> Never {
+        await abort(message)
         exit(1)
     }
 
@@ -832,11 +923,15 @@ final class Daemon {
 // MARK: - Audit log
 
 /// Appends one JSON object per line. Deliberately synchronous and simple — audit lines
-/// are small and infrequent relative to model latency.
+/// are small and infrequent relative to model latency. Writes after `close()` are
+/// dropped, not attempted: `shutdown` closes the log while `run()` may still be
+/// suspended in a launch-time fetch, and the lines it records on resuming would
+/// otherwise hit a closed descriptor (an ObjC exception on Darwin, a trap in corelibs).
 final class AuditLogWriter: @unchecked Sendable {
     private let handle: FileHandle?
     private let encoder: JSONEncoder
     private let queue = DispatchQueue(label: "fin-agentd.audit")
+    private var isClosed = false
 
     init(path: String) {
         if !FileManager.default.fileExists(atPath: path) {
@@ -852,14 +947,18 @@ final class AuditLogWriter: @unchecked Sendable {
 
     func append(_ event: AgentAuditEvent) {
         queue.sync {
-            guard let handle, let data = try? encoder.encode(event) else { return }
+            guard !isClosed, let handle, let data = try? encoder.encode(event) else { return }
             handle.write(data)
             handle.write(Data("\n".utf8))
         }
     }
 
     func close() {
-        queue.sync { try? handle?.close() }
+        queue.sync {
+            guard !isClosed else { return }
+            isClosed = true
+            try? handle?.close()
+        }
     }
 }
 
