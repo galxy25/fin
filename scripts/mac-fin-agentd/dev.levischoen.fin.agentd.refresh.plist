@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Re-signs the 7-day presigned S3 URLs in fin-agentd's config and restarts the
+	     daemon so it reads them. Rendered by install.sh (see README.md,
+	     "Refresh"). Two slots a week: each run signs for a full 7 days,
+	     so one missed run (Mac asleep, AWS hiccup) still leaves ~3.5 days of slack. -->
+	<key>Label</key>
+	<string>dev.levischoen.fin.agentd.refresh</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__FIN_REFRESH_SCRIPT__</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Weekday</key>
+			<integer>0</integer>
+			<key>Hour</key>
+			<integer>4</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+		<dict>
+			<key>Weekday</key>
+			<integer>3</integer>
+			<key>Hour</key>
+			<integer>4</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>FIN_AGENTD_HOME</key>
+		<string>__FIN_AGENTD_HOME__</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>__FIN_AGENTD_LOG_DIR__/refresh.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>__FIN_AGENTD_LOG_DIR__/refresh.err.log</string>
+</dict>
+</plist>

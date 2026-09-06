@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- fin-agentd as a resident site on this Mac. Rendered by install.sh: every
+	     __PLACEHOLDER__ becomes an absolute path under the installing user's home.
+	     See README.md; design: docs/SITES.md section 9. -->
+	<key>Label</key>
+	<string>dev.levischoen.fin.agentd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__FIN_AGENTD_BIN__</string>
+		<string>__FIN_AGENTD_CONFIG__</string>
+	</array>
+	<!-- The daemon's state directory: the audit log, the applied-id ledger
+	     (fin-agentd-directives.json) and routing-registry.json all live here. -->
+	<key>WorkingDirectory</key>
+	<string>__FIN_AGENTD_HOME__</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Plain true, not SuccessfulExit:false — a clean exit 0 must respawn too. -->
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>15</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>__FIN_AGENTD_LOG_DIR__/agentd.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>__FIN_AGENTD_LOG_DIR__/agentd.err.log</string>
+</dict>
+</plist>
