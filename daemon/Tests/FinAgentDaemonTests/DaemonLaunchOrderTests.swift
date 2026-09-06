@@ -38,7 +38,9 @@ final class DaemonLaunchOrderTests: XCTestCase {
     }
 
     /// The deployed cloud config's shape: no `environment`, no `connectCommand`.
-    private func makeDaemon(supervision: Bool = true, inbox: Bool = false) throws -> Daemon {
+    /// `privateKeyPath` overrides the readable key `setUp` wrote, for the launches that
+    /// must die on it.
+    private func makeDaemon(supervision: Bool = true, inbox: Bool = false, privateKeyPath: String? = nil) throws -> Daemon {
         let inboxField = inbox ? #", "inboxURL": "https://bucket.example/inbox.json""# : ""
         let supervisionBlock = supervision ? """
         ,
@@ -46,7 +48,7 @@ final class DaemonLaunchOrderTests: XCTestCase {
         """ : ""
         let json = """
         {
-          "server": {"host": "h", "username": "u", "privateKeyPath": "\(keyPath)"},
+          "server": {"host": "h", "username": "u", "privateKeyPath": "\(privateKeyPath ?? keyPath)"},
           "agent": {"endpointURL": "http://localhost:1234/v1", "modelIdentifier": "m"},
           "task": "do the thing",
           "auditLogPath": "\(auditPath)"\(supervisionBlock)
@@ -132,6 +134,8 @@ final class DaemonLaunchOrderTests: XCTestCase {
     }
 
     /// No supervision block: nothing to prime, and the session still carries the marker.
+    /// The first-run record is still written — the audit log is, and a later supervised
+    /// launch must not find one without the other.
     func testLaunchWithoutSupervisionStillOpensTheSessionWithTheMarker() async throws {
         let daemon = try makeDaemon(supervision: false)
         var configurationSeen: HeadlessSessionConfiguration?
@@ -144,7 +148,157 @@ final class DaemonLaunchOrderTests: XCTestCase {
 
         XCTAssertNotNil(session)
         XCTAssertEqual(configurationSeen?.environment, ["LC_FIN_AGENT": "1"])
-        XCTAssertFalse(FileManager.default.fileExists(atPath: ledgerPath), "no supervision, no ledger")
+        XCTAssertEqual(try ledger(), DaemonDirectiveClient.LedgerFile(seedPending: true, inboxSeedPending: true),
+                       "no supervision, but the first run is on record: both seeds owed, the resident posture")
+        let audit = try auditLog()
+        XCTAssertFalse(audit.contains("[s3]"), "nothing to say about a write that landed: \(audit)")
+    }
+
+    /// The crash-loop route to "audit log, no ledger": the init creates the audit log,
+    /// and a private key the daemon can't read — a path typo, wrong perms, cloud-init
+    /// writing it after the unit started — kills every launch under `Restart=always`.
+    /// Were the first-run record written after the key read, no life would ever write
+    /// it, and the operator's fixed-key launch would read the audit log as a 1.3.0
+    /// upgrade and replay the supervisor's whole history. So the supervision client —
+    /// its ledger write and its prime — comes first, and the fixed-key launch resumes.
+    func testAnUnreadablePrivateKeyAtFirstLaunchStillRecordsTheFirstRunBeforeItDies() async throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: auditPath), "a box the daemon has never run on")
+        let crashing = try makeDaemon(inbox: true, privateKeyPath: stateDir + "/not-there.pem")
+        var exitCodes: [Int32] = []
+        crashing.terminate = { exitCodes.append($0) }
+        var fetches = 0
+        var ledgerExistedAtFetch: [Bool] = []
+        crashing.supervisionFetch = { request in
+            fetches += 1
+            ledgerExistedAtFetch.append(FileManager.default.fileExists(atPath: self.ledgerPath))
+            return self.denied(request)
+        }
+        var sessionsBuilt = 0
+        crashing.makeSession = { configuration in
+            sessionsBuilt += 1
+            return HeadlessTerminalSession(configuration: configuration)
+        }
+
+        let crashedSession = await crashing.launch()
+
+        XCTAssertNil(crashedSession, "the key read failed: nothing to connect")
+        XCTAssertEqual(exitCodes, [1], "the fatal exit, through the seam")
+        XCTAssertEqual(sessionsBuilt, 0)
+        XCTAssertEqual(fetches, 2, "the prime read both slots BEFORE the key was read")
+        XCTAssertEqual(ledgerExistedAtFetch, [true, true], "and the pending ledger was on disk before the prime's first fetch")
+        XCTAssertEqual(try ledger(), DaemonDirectiveClient.LedgerFile(seedPending: true, inboxSeedPending: true),
+                       "what the crash-looping life leaves: both seeds owed")
+        let crashAudit = try auditLog()
+        XCTAssertTrue(crashAudit.contains("cannot read private key at \(stateDir!)/not-there.pem"), "got: \(crashAudit)")
+        XCTAssertTrue(crashAudit.contains("[s3] poll failed: HTTP 403"), "got: \(crashAudit)")
+
+        // Key fixed, same state directory: the audit log predates THIS launch.
+        let fixed = try makeDaemon(inbox: true)
+        fixed.supervisionFetch = { request in
+            request.url?.absoluteString.contains("inbox") == true ? self.inboxBacklog() : self.history()
+        }
+        fixed.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        fixed.terminate = { _ in }
+
+        let session = await fixed.launch()
+
+        XCTAssertNotNil(session)
+        XCTAssertEqual(try ledger(),
+                       DaemonDirectiveClient.LedgerFile(seeded: ["d-1", "d-2", "d-3"], inboxSeeded: ["m-1", "m-2"]),
+                       "N = 3 + M = 2 seeded on the first documents actually read")
+        let delivered = await fixed.supervision?.poll()
+        XCTAssertEqual(delivered?.map(\.id), [], "zero delivered: the backlog is history")
+        fixed.shutdown(exitCode: 0)
+        let audit = try auditLog()
+        XCTAssertTrue(audit.contains("[s3] first run: resumed with the directive seed still pending"), "got: \(audit)")
+        XCTAssertTrue(audit.contains("[s3] first run: resumed with the inbox seed still pending"), "got: \(audit)")
+        XCTAssertFalse(audit.contains("not a first run, nothing seeded"), "the upgrade rule did not fire: \(audit)")
+    }
+
+    /// The other route, with no crash at all: the daemon runs unsupervised for a while
+    /// (the config has no `supervision` block), then the operator adds freshly minted
+    /// URLs to the same config. That first supervised launch finds the audit log every
+    /// unsupervised life wrote — and must find the first-run record next to it, or it
+    /// is the 1.3.0-upgrade verdict and the supervisor's whole history replays.
+    func testAnUnsupervisedFirstLaunchThenSupervisionAddedSeedsTheBacklogNotZero() async throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: auditPath), "a box the daemon has never run on")
+        let unsupervised = try makeDaemon(supervision: false)
+        unsupervised.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        unsupervised.terminate = { _ in }
+
+        let firstSession = await unsupervised.launch()
+        XCTAssertNotNil(firstSession)
+        XCTAssertNil(unsupervised.supervision)
+        unsupervised.shutdown(exitCode: 0)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: auditPath))
+        XCTAssertEqual(try ledger(), DaemonDirectiveClient.LedgerFile(seedPending: true, inboxSeedPending: true),
+                       "the unsupervised life left the first-run record: both seeds owed")
+
+        // Supervision added to the same install: audit log present, ledger present.
+        let supervised = try makeDaemon(inbox: true)
+        var fetches = 0
+        supervised.supervisionFetch = { request in
+            fetches += 1
+            return request.url?.absoluteString.contains("inbox") == true ? self.inboxBacklog() : self.history()
+        }
+        supervised.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        supervised.terminate = { _ in }
+
+        let session = await supervised.launch()
+
+        XCTAssertNotNil(session)
+        XCTAssertEqual(fetches, 2, "a first run: both slots primed at launch")
+        XCTAssertEqual(try ledger(),
+                       DaemonDirectiveClient.LedgerFile(seeded: ["d-1", "d-2", "d-3"], inboxSeeded: ["m-1", "m-2"]),
+                       "the supervisor's history and the inbox backlog are seeded, not delivered")
+        let delivered = await supervised.supervision?.poll()
+        XCTAssertEqual(delivered?.map(\.id), [], "zero delivered")
+        XCTAssertEqual(supervised.supervision?.isFirstRun, false)
+        supervised.shutdown(exitCode: 0)
+        let audit = try auditLog()
+        XCTAssertTrue(audit.contains("[s3] first run: resumed with the directive seed still pending"), "got: \(audit)")
+        XCTAssertTrue(audit.contains("[s3] first run: resumed with the inbox seed still pending"), "got: \(audit)")
+        XCTAssertTrue(audit.contains("3 historical directive(s) in the supervision doc marked applied, not replayed"), "got: \(audit)")
+        XCTAssertTrue(audit.contains("2 message(s) already in the inbox marked applied, not replayed"), "got: \(audit)")
+        XCTAssertFalse(audit.contains("not a first run, nothing seeded"), "the upgrade rule did not fire: \(audit)")
+    }
+
+    /// What the upgrade rule is still for, kept reachable on purpose: a 1.3.0 daemon ran
+    /// here (an audit log, no ledger), a 1.4.1 unsupervised life adds nothing — it has
+    /// no verdict of its own to write over a box with prior-run evidence — and the
+    /// first supervised launch draws the 1.3.0 verdict: not a first run, everything
+    /// delivered. A replay, never a drop.
+    func testAnUnsupervisedLaunchOnAPriorRunsBoxLeavesTheUpgradeVerdictToTheSupervisedLaunch() async throws {
+        try Data("{\"kind\":\"notice\",\"text\":\"a 1.3.0 run\"}\n".utf8)
+            .write(to: URL(fileURLWithPath: auditPath))
+        let unsupervised = try makeDaemon(supervision: false)
+        unsupervised.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        unsupervised.terminate = { _ in }
+
+        let unsupervisedSession = await unsupervised.launch()
+        XCTAssertNotNil(unsupervisedSession)
+        unsupervised.shutdown(exitCode: 0)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ledgerPath),
+                       "no first-run record on a box with prior-run evidence: the verdict is the supervised launch's to draw")
+
+        let supervised = try makeDaemon(inbox: true)
+        supervised.supervisionFetch = { request in
+            request.url?.absoluteString.contains("inbox") == true ? self.inboxBacklog() : self.history()
+        }
+        supervised.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        supervised.terminate = { _ in }
+
+        let supervisedSession = await supervised.launch()
+
+        XCTAssertNotNil(supervisedSession)
+        XCTAssertEqual(try ledger(), DaemonDirectiveClient.LedgerFile(), "the 1.3.0 verdict, on disk")
+        let delivered = await supervised.supervision?.poll()
+        XCTAssertEqual(delivered?.map(\.id), ["d-1", "d-2", "d-3", "m-1", "m-2"], "everything delivered, as 1.3.0 would have")
+        supervised.shutdown(exitCode: 0)
+        let audit = try auditLog()
+        XCTAssertTrue(audit.contains("not a first run, nothing seeded"), "got: \(audit)")
     }
 
     /// A 1.3.0 daemon ran here for weeks and never applied a directive: an audit log,

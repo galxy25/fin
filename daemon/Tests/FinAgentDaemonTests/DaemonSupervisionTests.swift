@@ -1375,6 +1375,76 @@ final class DaemonDirectiveClientTests: XCTestCase {
         XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
     }
 
+    // MARK: First run — recorded by a launch with no supervision block (1.4.1)
+
+    /// The unsupervised twin of the init's first-run write: a fresh box gets the
+    /// resident-posture pending ledger, so a later supervised launch on the same state
+    /// directory resumes a first run instead of reading "audit log, no ledger" as the
+    /// 1.3.0 upgrade. The client that then loads it is the tested resume path.
+    func testRecordFirstRunWithoutSupervisionWritesThePendingLedgerOnAFreshBox() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+
+        DaemonDirectiveClient.recordFirstRunWithoutSupervision(
+            stateFilePath: stateFile, hasRunHereBefore: false, audit: { lines.append($0) })
+
+        XCTAssertEqual(try persistedLedger(), DaemonDirectiveClient.LedgerFile(seedPending: true, inboxSeedPending: true),
+                       "both seeds owed — no block, so the resident posture")
+        XCTAssertTrue(lines.isEmpty, "a write that landed says nothing: \(lines)")
+
+        var supervisedLines: [String] = []
+        let supervised = makeInboxClient(
+            hasRunHereBefore: true,
+            audit: { supervisedLines.append($0) },
+            directives: { (self.history(), self.response(200)) },
+            inbox: { (self.document(#"{"id": "m-1", "kind": "user_message", "text": "backlog"}"#), self.response(200)) }
+        )
+        XCTAssertTrue(supervised.isFirstRun, "the record outranks the audit log")
+        XCTAssertTrue(supervisedLines.contains("[s3] first run: resumed with the directive seed still pending"), "got: \(supervisedLines)")
+        XCTAssertTrue(supervisedLines.contains("[s3] first run: resumed with the inbox seed still pending"), "got: \(supervisedLines)")
+        let pending = await supervised.poll()
+        XCTAssertTrue(pending.isEmpty, "seeded, not delivered: \(pending.map(\.id))")
+        XCTAssertEqual(supervised.seededIDs, ["d-1", "d-2", "d-3"])
+        XCTAssertEqual(supervised.seededInboxIDs, ["m-1"])
+    }
+
+    /// Nothing is written over a ledger of any kind, nor on a box with prior-run
+    /// evidence: a 1.3.0 box keeps its replay verdict for the supervised launch to draw.
+    func testRecordFirstRunWithoutSupervisionLeavesAnExistingLedgerAndAPriorRunsBoxAlone() throws {
+        var lines: [String] = []
+        DaemonDirectiveClient.recordFirstRunWithoutSupervision(
+            stateFilePath: stateFile, hasRunHereBefore: false, audit: { lines.append($0) })
+        XCTAssertEqual(try rawLedger(), "[]", "the legacy `[]` from setUp is untouched")
+
+        try Data(#"{"applied":["d-1"],"seeded":["d-9"],"seed_pending":false}"#.utf8)
+            .write(to: URL(fileURLWithPath: stateFile))
+        DaemonDirectiveClient.recordFirstRunWithoutSupervision(
+            stateFilePath: stateFile, hasRunHereBefore: false, audit: { lines.append($0) })
+        XCTAssertEqual(try persistedLedger(), DaemonDirectiveClient.LedgerFile(applied: ["d-1"], seeded: ["d-9"]),
+                       "a seeded ledger is untouched")
+
+        startWithNoLedger()
+        DaemonDirectiveClient.recordFirstRunWithoutSupervision(
+            stateFilePath: stateFile, hasRunHereBefore: true, audit: { lines.append($0) })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile),
+                       "an audit log from a prior run: no record, the supervised launch draws the 1.3.0 verdict")
+        XCTAssertTrue(lines.isEmpty, "got: \(lines)")
+    }
+
+    /// The same failure line as the supervised write, so the README's one paragraph
+    /// covers both.
+    func testRecordFirstRunWithoutSupervisionAuditsAWriteThatFails() {
+        let unwritable = NSTemporaryDirectory() + "fin-agentd-missing-dir-\(UUID().uuidString)/ledger.json"
+        var lines: [String] = []
+
+        DaemonDirectiveClient.recordFirstRunWithoutSupervision(
+            stateFilePath: unwritable, hasRunHereBefore: false, audit: { lines.append($0) })
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: unwritable))
+        XCTAssertEqual(lines.filter { $0.hasPrefix("[s3] first run: could not persist the pending ledger — ") }.count, 1,
+                       "got: \(lines)")
+    }
+
     // MARK: Ledger file shape
 
     /// The load side of the wire contract: a hand-written 1.4.0 object — the exact key

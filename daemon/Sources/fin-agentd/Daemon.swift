@@ -218,7 +218,11 @@ final class Daemon {
     /// BEFORE `AuditLogWriter` creates the file, or every launch would look like a
     /// prior one. A 1.3.0 daemon wrote its ledger only on its first apply, so a box that
     /// ran it for weeks without applying anything has no ledger; this is what keeps a
-    /// 1.3.0 → 1.4.x upgrade there from seeding the next directive as history.
+    /// 1.3.0 → 1.4.x upgrade there from seeding the next directive as history. The
+    /// flip side: because this file exists from the init on, a 1.4.x launch must leave
+    /// a ledger behind whenever it leaves the audit log behind, or its own next launch
+    /// reads as that upgrade — so `launch()` records the first run before anything that
+    /// can fail, private key included, supervision block or not.
     private let auditLogPredatesThisLaunch: Bool
 
     /// Test seams for the launch phase, so `DaemonLaunchOrderTests` can drive the real
@@ -427,22 +431,20 @@ final class Daemon {
     }
 
     /// The pre-connect phase of `run()`, in the order that matters — and the seam the
-    /// launch-order tests drive with no network and no sshd: (1) the private key, (2)
-    /// the supervision client and its first-run prime, (3) a shutdown check, (4) the
-    /// session `run()` will connect, built but not yet connected. Returns nil when a
-    /// SIGINT/SIGTERM landed during the prime's fetch: `shutdown` already closed the
-    /// audit log and scheduled the exit, so opening SSH — and failing into `fail()`,
-    /// which writes the audit log — would only race it.
+    /// launch-order tests drive with no network and no sshd: (1) the supervision client
+    /// and its first-run prime — or, with no `supervision` block, the first-run ledger
+    /// on its own — (2) a shutdown check, (3) the private key, (4) the session `run()`
+    /// will connect, built but not yet connected. The first-run record comes before the
+    /// key on purpose: the init already created the audit log, and a key that can't be
+    /// read (a path typo, wrong perms, cloud-init writing it after the unit started —
+    /// a crash loop under `Restart=always`) would otherwise leave "audit log, no
+    /// ledger" for the operator's fixed-key launch to read as a 1.3.0 upgrade and
+    /// replay the supervisor's whole history. Returns nil when a SIGINT/SIGTERM landed
+    /// during the prime's fetch — `shutdown` already closed the audit log and scheduled
+    /// the exit, so opening SSH, and failing into the audit log, would only race it —
+    /// and when the key can't be read, after `abort` has scheduled that exit.
     func launch() async -> HeadlessTerminalSession? {
         log("fin-agentd starting: \(config.server.username)@\(config.server.host) → \(config.agent.modelIdentifier)")
-
-        let keyPEM: String
-        do {
-            let keyPath = (config.server.privateKeyPath as NSString).expandingTildeInPath
-            keyPEM = try String(contentsOfFile: keyPath, encoding: .utf8)
-        } catch {
-            await fail("cannot read private key at \(config.server.privateKeyPath): \(error)")
-        }
 
         if let block = config.supervision {
             let client = DaemonDirectiveClient(
@@ -480,6 +482,28 @@ final class Daemon {
                 log("shutdown requested during launch — not connecting")
                 return nil
             }
+        } else {
+            // Unsupervised, but the audit log is already on disk: leave the same
+            // first-run evidence the client would, so supervision added to this
+            // install later is still a first run — the shared document is history to
+            // a daemon that has never read it — rather than the 1.3.0-upgrade replay.
+            DaemonDirectiveClient.recordFirstRunWithoutSupervision(
+                stateFilePath: directiveStatePath,
+                hasRunHereBefore: auditLogPredatesThisLaunch,
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                }
+            )
+        }
+
+        let keyPEM: String
+        do {
+            let keyPath = (config.server.privateKeyPath as NSString).expandingTildeInPath
+            keyPEM = try String(contentsOfFile: keyPath, encoding: .utf8)
+        } catch {
+            await abort("cannot read private key at \(config.server.privateKeyPath): \(error)")
+            return nil
         }
 
         let session = makeSession(
@@ -811,9 +835,13 @@ final class Daemon {
         }
     }
 
-    /// Async only so the fatal line can reach the cloud transcript before the process
-    /// dies — a remote supervisor's timeline would otherwise just stop.
-    private func fail(_ message: String) async -> Never {
+    /// The fatal exit, through the `terminate` seam so the launch-order tests can drive
+    /// a failing launch in-process: audit line, transcript flush, exit 1. Async only so
+    /// the fatal line can reach the cloud transcript before the process dies — a remote
+    /// supervisor's timeline would otherwise just stop. Callers that can return (the
+    /// private-key read in `launch()`) return after it; everything past the connect uses
+    /// `fail`, which cannot.
+    private func abort(_ message: String) async {
         log("fatal: \(message)")
         record(AgentAuditEvent(kind: "error", text: message, isFailure: true))
         await transcript?.flush()
@@ -821,6 +849,14 @@ final class Daemon {
         await lastNotifyTask?.value
         auditLog.close()
         session?.disconnect()
+        terminate(1)
+    }
+
+    /// `abort`, typed as the exit it is in production — `terminate` is `exit` there and
+    /// never returns; the trailing `exit(1)` is what the type system needs and what a
+    /// seam that did return would get.
+    private func fail(_ message: String) async -> Never {
+        await abort(message)
         exit(1)
     }
 

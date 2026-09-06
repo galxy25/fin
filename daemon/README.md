@@ -217,8 +217,10 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   **First run (1.4.0; refined in 1.4.1).** A box the daemon has never run on — a fresh
   cloud worker, a new install: no ledger file, and (1.4.1) no audit log from an earlier
   launch either — first writes its ledger with the seeds recorded as owed
-  (`"seed_pending": true`, before any document is read; *Not a first run* below says
-  why), then treats the first directive document it successfully reads as history,
+  (`"seed_pending": true`, the moment it launches: before any document is read, before
+  the private key is read, and whether or not the config has a `supervision` block yet;
+  *Not a first run* below says why), then treats the first directive document it
+  successfully reads as history,
   not instructions: every id in it (matching this agent or not, well-formed or not) is
   recorded as seeded without being injected, the ledger is rewritten, and one line audits
   `[s3] first run: N historical directive(s) in the supervision doc marked applied, not
@@ -234,6 +236,15 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   document not read at launch — seed deferred to the next poll` is audited and the poll
   loop seeds on the first document it does read; a 304 with nothing cached — a caching
   proxy can answer that even to the unconditional first GET — defers the same way.)
+  That window is minutes only while the reads succeed. A first run whose reads all
+  fail — stale URLs, a bucket that isn't there yet, a key the daemon can't read so
+  every launch dies — keeps the seed owed *across restarts* (it is on disk), so the
+  first document it ever reads, on whichever life that is, is history in full: the seed
+  covers everything written since the first life started, not just one launch's
+  launch-to-first-read gap. A directive written over that weekend *because* the agent
+  went quiet is in that set and is dropped with the rest; the audit count is the only
+  trace. That is the intended direction (a silent drop over a noisy replay), and it is
+  why the count is audited.
   Seeded ids live in the ledger's own `seeded` list, uncapped: the document may hold
   more than the 500-id applied cap, and a seeded id evicted from a capped list would
   replay — so the audit count is what was kept. The document is shared by every agent,
@@ -266,7 +277,9 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   at launch, before any document is read, so the restart after the re-mint finds that
   file and resumes the wait rather than being judged by the audit log the first launch
   created (the upgrade rule below), and the first documents actually read seed the
-  directive document's N ids and the inbox's M, delivering none. A missing key reads 404
+  directive document's N ids and the inbox's M, delivering none — N and M being
+  everything in those documents by then, including whatever was written during the
+  days the URLs were stale (see *First run* above). A missing key reads 404
   to the signers that matter — the control plane holds ListBucket on the bucket
   (`control-plane/deploy.sh`, `SeeMissingAgentObjects`), and so do the operator's own
   credentials. A signer without it sees the seed deferred until the document exists
@@ -290,15 +303,24 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   so a restart in that window (stale URLs, a dead bucket, an inbox message applied
   while the directive URL was failing, then systemd's `Restart=always`) finds the file,
   audits `[s3] first run: resumed with the directive seed still pending`, and the seed
-  lands when the document finally arrives instead of the document replaying. That is
-  also what keeps the audit-log rule to genuine 1.3.0 boxes: a 1.4.x first run leaves a
-  ledger behind even when every read failed, so "audit log, no ledger" can't be one.
+  lands when the document finally arrives instead of the document replaying. The
+  write sits at the top of the launch, ahead of everything that can fail — the private
+  key read in particular, so a key the daemon can't read (a path typo, wrong perms,
+  cloud-init writing it after the unit started: a crash loop under `Restart=always`)
+  still leaves the record for the fixed-key launch — and a launch with **no**
+  `supervision` block writes the same record (both seeds owed), so adding freshly
+  minted URLs to an install that ran unsupervised is a first run for the supervisor's
+  history, not a replay of it. What the audit-log rule is therefore left to judge is
+  exactly what it is for, plus the residue it can't tell apart: a 1.3.0 or 1.4.0
+  install that never seeded or applied (both wrote the ledger only then); a 1.4.1 first
+  run whose launch write failed (audited, below); and a ledger someone removed by hand.
+  Every one of those replays rather than drops, which is the safe way to be wrong.
 
   *If the ledger can't be written* (1.4.1) — a state directory owned by another uid, a
   read-only mount, a full disk — the first run's launch write audits `[s3] first run:
-  could not persist the pending ledger — <reason>`, the seed `[s3] first run: could not
-  persist the seed — <reason>`, and every later write `[s3] ledger write failed —
-  <reason>` (throttled like other failures). The process keeps working from memory, and
+  could not persist the pending ledger — <reason>` (supervised or not), the seed `[s3]
+  first run: could not persist the seed — <reason>`, and every later write `[s3] ledger
+  write failed — <reason>` (throttled like other failures). The process keeps working from memory, and
   the next launch is judged by the audit-log rule above: with the audit log there (a
   full disk that still let the empty log be created), it is not a first run — every
   unapplied directive is delivered, the 1.3.0 posture; with no audit log either (the

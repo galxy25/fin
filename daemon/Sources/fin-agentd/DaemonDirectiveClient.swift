@@ -232,10 +232,17 @@ final class DaemonDirectiveClient {
     ///     alone can't tell a fresh box from a 1.3.0 box that never applied anything;
     ///     seeding the latter would swallow the next directive as history. The verdict
     ///     is written as an empty, non-pending ledger, so the next launch reads it back
-    ///     instead of re-deriving it from the audit log's existence. And because a
-    ///     first run writes its own (pending) ledger at init, before any document is
-    ///     read, this rule can only fire on a genuine 1.3.0 box: a 1.4.x first run
-    ///     leaves a ledger behind even when every read failed.
+    ///     instead of re-deriving it from the audit log's existence. A 1.4.1 launch
+    ///     never leaves the state this rule judges: it records the pending ledger at
+    ///     the top of `Daemon.launch()` — before the private key is read, and whether
+    ///     or not a `supervision` block is configured (`recordFirstRunWithoutSupervision`
+    ///     is the unsupervised twin of the `.missing` branch below) — so every read
+    ///     failing, a crash-looping key read, or supervision being added to an
+    ///     existing install all still find that file next launch. What the rule still
+    ///     fires on: a 1.3.0 or 1.4.0 install that never seeded or applied (those wrote
+    ///     the ledger only then), a 1.4.1 first run whose pending write failed (audited
+    ///     as `could not persist the pending ledger`), or a ledger removed by hand.
+    ///     Each of those replays rather than drops — the 1.3.0 posture.
     ///   - fetch: The transport; nil (the default) is the real one — streaming and
     ///     body-capped on Darwin, buffered under a total-time timeout on Linux.
     init(
@@ -355,9 +362,13 @@ final class DaemonDirectiveClient {
             // "audit log, no ledger" — the 1.3.0-upgrade rule above — and deliver the
             // whole backlog, the exact replay the seed exists to prevent. With this
             // file on disk the next launch is `.loaded` with the seeds still pending
-            // and resumes the wait; the upgrade rule can then only fire on a genuine
-            // 1.3.0 box. A write that fails is audited (throttled, like every ledger
-            // write), and that next launch is judged by the audit log after all.
+            // and resumes the wait. The daemon constructs this client at the top of
+            // `launch()`, before it reads the private key, so a key that can't be read
+            // (a crash loop under Restart=always) leaves this file too; a launch with
+            // no supervision block writes the same file through
+            // `recordFirstRunWithoutSupervision`. A write that fails is audited
+            // (throttled, like every ledger write), and that next launch is judged by
+            // the audit log after all.
             self.appliedIDs = []
             self.seededIDs = []
             self.seededInboxIDs = []
@@ -687,8 +698,9 @@ final class DaemonDirectiveClient {
     /// that window — systemd's `Restart=always` after a failed-turn exit, stale
     /// presigned URLs re-minted by the operator — resumes the wait instead of replaying
     /// the whole document once the directive URL recovers. Since 1.4.1 the first run
-    /// writes the file with that flag set at init, before any document is read, so the
-    /// restart always finds it; 1.4.1 also adds the inbox's own pair. Every key is
+    /// writes the file with that flag set the moment the daemon launches — before any
+    /// document is read, before the private key is read, supervision block or not — so
+    /// the restart always finds it; 1.4.1 also adds the inbox's own pair. Every key is
     /// optional on read, each defaulting to "nothing": a file with
     /// only `applied` keeps its applied ids instead of counting as corrupt and
     /// resetting dedupe — the same forward tolerance the directive document has.
@@ -728,7 +740,8 @@ final class DaemonDirectiveClient {
     /// The three ways the ledger file can come back at init, kept distinct on purpose:
     /// `missing` is a first run: the init writes the ledger with its seeds pending, and
     /// `seedLedgerIfFirstRun` completes them — unless the daemon has other evidence it
-    /// ran here (`hasRunHereBefore`), in which case the init writes an empty ledger so
+    /// ran here (`hasRunHereBefore`: a 1.3.0/1.4.0 box, a lost pending write, a ledger
+    /// removed by hand), in which case the init writes an empty ledger so
     /// that verdict is on disk from then on; `loaded` — even
     /// an empty `[]` — means the daemon has run here before and every unapplied
     /// directive is delivered (unless the file itself says a seed is still pending);
@@ -773,12 +786,42 @@ final class DaemonDirectiveClient {
             inboxSeeded: seededInboxIDs,
             inboxSeedPending: inboxDocument?.seedPending ?? false
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
         do {
-            try encoder.encode(ledger).write(to: URL(fileURLWithPath: stateFilePath), options: .atomic)
+            try Self.write(ledger, to: stateFilePath)
         } catch {
             registerFailure("\(failurePrefix) — \(Self.shortError(error))")
+        }
+    }
+
+    /// The one encoding of the ledger file: sorted keys, written atomically.
+    private static func write(_ ledger: LedgerFile, to path: String) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(ledger).write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    /// The first-run evidence a launch with NO `supervision` block leaves behind — the
+    /// unsupervised twin of the init's `.missing` branch, called from the same place in
+    /// `Daemon.launch()`. Every launch creates the audit log, so without this a daemon
+    /// run unsupervised for a while and then given freshly minted URLs would start its
+    /// first supervised life on "audit log, no ledger" — the 1.3.0-upgrade verdict —
+    /// and replay the supervisor's whole history plus the inbox backlog. Written
+    /// instead is the resident posture, both seeds owed (no block, so no
+    /// `inboxResetAtLaunch` either): the shared document is history to a daemon that
+    /// has never read it, whenever it first does. Nothing is written when a ledger of
+    /// any kind exists, or when the audit log predates this launch (a box a 1.3.0
+    /// daemon ran on keeps its replay verdict for the supervised launch to draw). A
+    /// failed write audits under the same line as the supervised one.
+    static func recordFirstRunWithoutSupervision(
+        stateFilePath: String,
+        hasRunHereBefore: Bool,
+        audit: (String) -> Void
+    ) {
+        guard !hasRunHereBefore, !FileManager.default.fileExists(atPath: stateFilePath) else { return }
+        do {
+            try write(LedgerFile(seedPending: true, inboxSeedPending: true), to: stateFilePath)
+        } catch {
+            audit("[s3] first run: could not persist the pending ledger — \(shortError(error))")
         }
     }
 }
