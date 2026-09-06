@@ -3,9 +3,23 @@
 <plist version="1.0">
 <dict>
 	<!-- Re-signs the 7-day presigned S3 URLs in fin-agentd's config and restarts the
-	     daemon so it reads them. Rendered by install.sh (see README.md,
-	     "Refresh"). Two slots a week: each run signs for a full 7 days,
-	     so one missed run (Mac asleep, AWS hiccup) still leaves ~3.5 days of slack. -->
+	     daemon so it reads them. Rendered by install.sh (see README.md, "Refresh").
+
+	     Two slots a week because ONE slot against 7-day URLs has zero slack: sign
+	     Sunday 04:00 and the URLs die the following Sunday 04:00, the very minute of
+	     the next run. With Sunday+Wednesday every URL is renewed with ~3.5 days left
+	     on it. A MISSED run has no slack at all, in either arrangement: miss Sunday
+	     (Mac powered off — launchd does not replay slots missed while off) and the
+	     next attempt is Wednesday 04:00, which is exactly when Sunday's signature
+	     expires. Two slots halve the exposure; they do not survive a miss. That is why
+	     refresh.sh pushes a /notify when it fails and launch-agentd.sh warns when
+	     provision-state.json's expires_at is inside 48 hours.
+
+	     ProgramArguments points at the INSTALLED copy under
+	     ~/Library/Application Support/fin-agentd/bin/, never at the git checkout: this
+	     directory lives on an unmerged branch, and one `git checkout main` in that
+	     worktree would turn this job into a silent ENOENT and the site deaf a week
+	     later. -->
 	<key>Label</key>
 	<string>dev.levischoen.fin.agentd.refresh</string>
 	<key>ProgramArguments</key>

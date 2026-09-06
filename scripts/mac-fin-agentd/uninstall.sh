@@ -50,8 +50,9 @@ done
 
 if [ "$PURGE" -eq 0 ]; then
 	echo
-	echo "Kept: $FIN_AGENTD_HOME (key, config, site8, audit, ledger, registry) and $LOG_DIR."
+	echo "Kept: $FIN_AGENTD_HOME (key, config, site8, audit, ledger, registry, bin/) and $LOG_DIR."
 	echo "Kept: the fin-site-* line in $AUTHORIZED_KEYS."
+	echo "Kept: any launchctl-disabled override for these labels (install.sh --start re-enables)."
 	echo "Run with --purge to remove them too."
 	exit 0
 fi
@@ -71,9 +72,30 @@ if [ -f "$AUTHORIZED_KEYS" ]; then
 		pattern=" fin-site-[0-9a-f]{8}\$"
 	fi
 	before="$(grep -c . "$AUTHORIZED_KEYS" || true)"
+	matched="$(grep -Ec -- "$pattern" "$AUTHORIZED_KEYS" || true)"
 	tmp="$AUTHORIZED_KEYS.fin-uninstall.$$"
 	umask 077
-	grep -Ev -- "$pattern" "$AUTHORIZED_KEYS" > "$tmp" || true
+	# `|| true` alone was a foot-gun: it is needed for grep's legitimate exit 1 (the file
+	# held ONLY the fin-site line, so nothing is kept), but under `set -euo pipefail` it
+	# also swallowed exit >=2 — a read error, a full disk, an interrupted write — after
+	# which $tmp is empty or truncated and the unconditional `mv -f` installed THAT as
+	# ~/.ssh/authorized_keys. Every unrelated key would be gone at once (Fin's Key
+	# included, the one line the header comment promises never to touch), with no backup
+	# and a reassuring "N line(s) kept" printed afterwards. Accept 0 and 1 only, and
+	# verify the arithmetic before the rename.
+	status=0
+	grep -Ev -- "$pattern" "$AUTHORIZED_KEYS" > "$tmp" || status=$?
+	if [ "$status" -gt 1 ]; then
+		rm -f "$tmp"
+		echo "error: grep failed (exit $status) reading $AUTHORIZED_KEYS — NOTHING was changed" >&2
+		exit 1
+	fi
+	kept="$(grep -c . "$tmp" || true)"
+	if [ "$kept" -ne "$((before - matched))" ]; then
+		rm -f "$tmp"
+		echo "error: refusing to rewrite $AUTHORIZED_KEYS — expected $((before - matched)) line(s) to survive, the rewrite has $kept. NOTHING was changed." >&2
+		exit 1
+	fi
 	chmod 600 "$tmp"
 	mv -f "$tmp" "$AUTHORIZED_KEYS"
 	after="$(grep -c . "$AUTHORIZED_KEYS" || true)"

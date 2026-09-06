@@ -6,6 +6,8 @@
 #   provision-config.sh --refresh       re-sign the four presigned URLs IN PLACE; every other
 #                                       field of an existing config.json is kept verbatim
 #   provision-config.sh --print-site8   mint/persist SITE8 (no AWS, no token) and print it
+#   provision-config.sh --preflight     check the credentials a full write needs, then exit.
+#                                       Nothing is minted, generated, authorized or written.
 #   provision-config.sh --site8 HEX8    use this site identity (first run, or must match)
 #   provision-config.sh --no-verify     skip the GET check of the two read URLs
 #
@@ -38,14 +40,16 @@ SSH_USER="${FIN_SSH_USER:-$(id -un)}"
 TMUX_SESSION="${FIN_TMUX_SESSION:-fin}"
 
 SITE8_FILE="$FIN_AGENTD_HOME/site8"
-REFRESH=0; PRINT_ONLY=0; VERIFY=1; SITE8_ARG=""
+CONFIG_PATH="$FIN_AGENTD_HOME/config.json"
+REFRESH=0; PRINT_ONLY=0; PREFLIGHT=0; VERIFY=1; SITE8_ARG=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--refresh) REFRESH=1 ;;
 		--print-site8) PRINT_ONLY=1 ;;
+		--preflight) PREFLIGHT=1 ;;
 		--no-verify) VERIFY=0 ;;
 		--site8) [ $# -ge 2 ] || { echo "error: --site8 needs a value" >&2; exit 64; }; SITE8_ARG="$2"; shift ;;
-		-h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		-h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*) echo "error: unknown argument: $1" >&2; exit 64 ;;
 	esac
 	shift
@@ -53,6 +57,41 @@ done
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 valid_site8() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{8}$'; }
+
+# The python interpreter that has boto3. Resolved here so --preflight and the real run
+# apply exactly the same test.
+find_python() {
+	local candidate
+	for candidate in "${FIN_PYTHON:-}" /usr/bin/python3 /Applications/Xcode.app/Contents/Developer/usr/bin/python3; do
+		[ -n "$candidate" ] && [ -x "$candidate" ] || continue
+		if "$candidate" -c 'import boto3' >/dev/null 2>&1; then printf '%s' "$candidate"; return 0; fi
+	done
+	return 1
+}
+
+# --- --preflight: every credential a full write needs, checked BEFORE anything exists ---
+# Ordering matters: install.sh used to generate the site key and append its
+# authorized_keys line in steps 2 and 3, and only reach this script in step 4. A Mac
+# missing ~/.fin-control-plane-token therefore aborted with a LIVE authorized key on disk
+# next to its private half — and plain `uninstall.sh` deliberately keeps both. Nothing in
+# the failure message said so. install.sh now runs this before it generates anything.
+if [ "$PREFLIGHT" -eq 1 ]; then
+	[ -s "$TOKEN_FILE" ] || die "control-plane token file missing or empty: $TOKEN_FILE"
+	PYTHON="$(find_python)" || die "no python3 with boto3 importable (tried FIN_PYTHON, /usr/bin/python3, Xcode's)"
+	FIN_AWS_PROFILE="$PROFILE" FIN_AWS_REGION="$REGION" "$PYTHON" - <<'PY' || exit 1
+import os, sys
+import boto3
+profile, region = os.environ["FIN_AWS_PROFILE"], os.environ["FIN_AWS_REGION"]
+try:
+    session = boto3.session.Session(profile_name=profile, region_name=region)
+except Exception as error:                     # noqa: BLE001 — botocore raises several types here
+    sys.exit("error: AWS profile %r unusable: %s" % (profile, error.__class__.__name__))
+if session.get_credentials() is None:
+    sys.exit("error: AWS profile %r has no credentials" % profile)
+print("preflight:  token file, python3+boto3, AWS profile %r — ok" % profile)
+PY
+	exit 0
+fi
 
 # --- SITE8: minted once, persisted, never re-minted -------------------------------
 umask 077
@@ -79,13 +118,22 @@ if [ "$PRINT_ONLY" -eq 1 ]; then
 fi
 
 # --- prerequisites -------------------------------------------------------------------
-[ -s "$TOKEN_FILE" ] || die "control-plane token file missing or empty: $TOKEN_FILE"
-PYTHON=""
-for candidate in "${FIN_PYTHON:-}" /usr/bin/python3 /Applications/Xcode.app/Contents/Developer/usr/bin/python3; do
-	[ -n "$candidate" ] && [ -x "$candidate" ] || continue
-	if "$candidate" -c 'import boto3' >/dev/null 2>&1; then PYTHON="$candidate"; break; fi
-done
-[ -n "$PYTHON" ] || die "no python3 with boto3 importable (tried FIN_PYTHON, /usr/bin/python3, Xcode's)"
+# The token is only ever WRITTEN into config.json on a full write. --refresh keeps the
+# existing value verbatim and never reads the file, so requiring it there would turn an
+# ordinary secrets-hygiene step (rotate the token, move the file) into both weekly
+# refreshes dying at this line — with the site still perfectly able to re-sign, and the
+# only symptom a Fin that goes quiet up to seven days later.
+if [ "$REFRESH" -eq 1 ] && [ ! -s "$CONFIG_PATH" ]; then
+	# …unless there is no config to refresh, in which case this falls through to a full
+	# write below and does need the token.
+	REFRESH_NEEDS_TOKEN=1
+else
+	REFRESH_NEEDS_TOKEN=0
+fi
+if [ "$REFRESH" -eq 0 ] || [ "$REFRESH_NEEDS_TOKEN" -eq 1 ]; then
+	[ -s "$TOKEN_FILE" ] || die "control-plane token file missing or empty: $TOKEN_FILE"
+fi
+PYTHON="$(find_python)" || die "no python3 with boto3 importable (tried FIN_PYTHON, /usr/bin/python3, Xcode's)"
 
 # --- the work: presign + write, in python so the JSON is never string-assembled ------
 # Values cross as environment, never as arguments (argv is visible in `ps`). The token
@@ -106,6 +154,7 @@ FIN_AGENT_ID="$AGENT_ID" \
 FIN_AGENT_NAME="$AGENT_NAME" \
 FIN_SSH_USER="$SSH_USER" \
 FIN_TMUX_SESSION="$TMUX_SESSION" \
+FIN_DAEMON_VERSION="${FIN_DAEMON_VERSION:-}" \
 exec "$PYTHON" - <<'PY'
 import datetime
 import json
@@ -136,10 +185,15 @@ state_path = os.path.join(home, "provision-state.json")
 audit_path = os.path.join(home, "audit.jsonl")
 key_path = os.path.join(home, "site_ed25519")
 
-with open(env["FIN_CONTROL_PLANE_TOKEN_FILE"]) as fh:
-    token = fh.read().strip()
-if not token:
-    sys.exit("error: control-plane token file is empty")
+transcripts_dir = os.path.join(home, "transcripts")
+
+# --refresh keeps the existing token verbatim, so the file need not exist on that path
+# (see the shell-side prerequisite block). A full write below re-checks and dies.
+try:
+    with open(env["FIN_CONTROL_PLANE_TOKEN_FILE"]) as fh:
+        token = fh.read().strip()
+except OSError:
+    token = ""
 
 # --- presign ------------------------------------------------------------------------
 session = boto3.session.Session(profile_name=profile, region_name=region)
@@ -167,12 +221,15 @@ urls = {name: sign(method, key) for name, (method, key) in keys.items()}
 expires_at = signed_at + datetime.timedelta(seconds=expires)
 
 # --- verify the two GET URLs the way the daemon uses them (reads only; nothing is written)
+inbox_body = None
 if verify:
     for name in ("directiveURL", "inboxURL"):
         request = urllib.request.Request(urls[name], method="GET")
+        body = b""
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 status = response.status
+                body = response.read(1_048_576)
         except urllib.error.HTTPError as error:
             status = error.code
         except (urllib.error.URLError, OSError) as error:
@@ -182,9 +239,34 @@ if verify:
         if status in (200, 304, 404):
             # 404 = signature accepted, object simply not there yet.
             print("verify:     %-13s HTTP %d" % (name, status))
+            if name == "inboxURL" and status == 200:
+                inbox_body = body
         else:
             sys.exit("error: %s answered HTTP %d — the presigned URL would fail the daemon too "
                      "(wrong region/profile/bucket?)" % (name, status))
+
+# --- the fin-wake latch: report it, because nothing here can clear it -----------------
+# This site's inbox URL is signed get_object ONLY, and DaemonDirectiveClient never writes
+# the inbox back — it dedupes in its own ledger and leaves the object alone. In Phase 0
+# the one writer that ever emptied fin/inbox/<slug>.json was the control plane's
+# create_worker, and nobody may tap Start Worker until Phase 1 (README, "Do not Start
+# Worker for Fin"); the app only ever appends, trimming at 200. So after the first message
+# the `directives` array is non-empty forever, and fin-wake's `any_inbox_nonempty`
+# (scripts/mac-wake-for-fin/wake-for-fin.py) returns True on every 30 s poll and holds its
+# caffeinate assertion — its 10-minute idle release can never fire again, and this Mac
+# stops sleeping without anyone running the pmset line. docs/SITES.md section 6.5 records
+# the same fact ("today it is true forever after the first message") and fixes it in
+# Phase 1 by making the legacy inbox pending-only. Counts only; content is NEVER printed.
+if inbox_body:
+    try:
+        pending = (json.loads(inbox_body) or {}).get("directives")
+    except ValueError:
+        pending = None
+    if isinstance(pending, list) and pending:
+        print("note: fin/inbox/%s.json holds %d message(s). Nothing in Phase 0 empties it, so "
+              "fin-wake's any_inbox_nonempty stays true and its caffeinate assertion is held "
+              "indefinitely — this Mac will not idle-sleep until Phase 1 (docs/SITES.md 6.5) or "
+              "the object is emptied by hand." % (slug, len(pending)), file=sys.stderr)
 
 # --- config ---------------------------------------------------------------------------
 existing = None
@@ -213,6 +295,9 @@ if refresh and isinstance(existing, dict):
 else:
     if refresh:
         print("note: no existing config.json to refresh — writing a full one", file=sys.stderr)
+    if not token:
+        sys.exit("error: control-plane token file is missing or empty (%s); a full config write "
+                 "needs it" % env["FIN_CONTROL_PLANE_TOKEN_FILE"])
     config = {
         "server": {
             "host": "127.0.0.1",
@@ -307,11 +392,50 @@ if not os.path.exists(registry_path):
     os.chmod(registry_path, 0o600)
     registry_state = "written"
 
+# --- archive the app-visible transcript before whoever called us restarts the daemon ---
+# DaemonTranscriptUplink starts every run with an EMPTY ring and PUTs the whole document
+# (flush() never GETs the existing object first), so the next launch overwrites
+# fin/transcripts/<slug>.jsonl with only the new process's lines: twice a week, at 04:00,
+# Fin's timeline in the iOS app is truncated to nothing. docs/SITES.md section 7 names
+# this "the restart-overwrites-history bug" and fixes it structurally in 1.5.0 with
+# per-run keys. Until then the least this package can do is keep a local copy, taken with
+# the operator's own credentials (a read; nothing is written to S3) immediately before the
+# restart. Best-effort: a missing object or an offline Mac must never fail a provision.
+archive_state = "skipped"
+try:
+    transcript_key = keys["transcriptPutURL"][1]
+    body = s3.get_object(Bucket=bucket, Key=transcript_key)["Body"].read()
+    if body:
+        os.makedirs(transcripts_dir, exist_ok=True)
+        os.chmod(transcripts_dir, 0o700)
+        name = "%s-%s.jsonl" % (slug, signed_at.strftime("%Y%m%dT%H%M%SZ"))
+        write_private(os.path.join(transcripts_dir, name), body.decode("utf-8", "replace"))
+        keep = sorted(f for f in os.listdir(transcripts_dir) if f.endswith(".jsonl"))
+        for stale in keep[:-8]:
+            try:
+                os.unlink(os.path.join(transcripts_dir, stale))
+            except OSError:
+                pass
+        archive_state = "%s (%d bytes)" % (name, len(body))
+except Exception as error:                     # noqa: BLE001 — botocore raises several types
+    archive_state = "not archived (%s)" % error.__class__.__name__
+
 # --- provenance for humans and the refresh job: no URLs, no token -------------------
+prior_state = {}
+try:
+    with open(state_path) as fh:
+        prior_state = json.load(fh) or {}
+except (OSError, ValueError):
+    prior_state = {}
+
 state = {
     "site8": site8,
     "agent": agent_name,
     "agent_id": config.get("agentID"),
+    # Which daemon body this config was provisioned for. install.sh reads
+    # `fin-agentd --version` and passes it here, so a stale binary is visible on disk
+    # rather than only in a byte count nobody can interpret.
+    "daemon_version": env.get("FIN_DAEMON_VERSION") or prior_state.get("daemon_version") or None,
     "signed_at": signed_at.isoformat().replace("+00:00", "Z"),
     "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
     "presign_seconds": expires,
@@ -320,6 +444,7 @@ state = {
     "profile": profile,
     "keys": {name: key for name, (_, key) in keys.items()},
     "mode": mode,
+    "transcript_archive": archive_state,
 }
 write_private(state_path, json.dumps(state, indent=2) + "\n")
 
@@ -327,5 +452,6 @@ print("site8:      %s" % site8)
 print("config:     %s (0600, %s)" % (config_path, mode))
 print("urls:       4 presigned for %d s, expire %s" % (expires, state["expires_at"]))
 print("registry:   %s (%s)" % (registry_path, registry_state))
+print("transcript: %s" % archive_state)
 print("state:      %s" % state_path)
 PY

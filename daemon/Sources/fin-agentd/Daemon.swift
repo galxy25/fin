@@ -22,8 +22,17 @@ struct FinAgentDaemon {
     @MainActor
     static func main() async {
         let arguments = CommandLine.arguments
+        // `--version` before anything else: an installer must be able to ask a binary what
+        // it is WITHOUT a config, a brain, or a network. `daemonVersion` is a five-byte
+        // Swift string, so it lives in the instruction stream as a small-string immediate
+        // and never appears in `strings(1)` output — grepping the Mach-O for "1.4.1" finds
+        // nothing and would silently pass a stale body. This is the only reliable check.
+        if arguments.count >= 2, arguments[1] == "--version" || arguments[1] == "-v" {
+            print("fin-agentd \(DaemonDirectiveClient.daemonVersion)")
+            exit(0)
+        }
         guard arguments.count >= 2 else {
-            FileHandle.standardError.write(Data("usage: fin-agentd <config.json>\n".utf8))
+            FileHandle.standardError.write(Data("usage: fin-agentd <config.json>\n       fin-agentd --version\n".utf8))
             exit(64)
         }
 
