@@ -8,8 +8,10 @@
 #
 #   scripts/model-factory/run_bits_experiment.sh [stage...]
 #
-# Stages (default: all of 1-4; stage 5 is the retrain and needs an explicit go):
+# Stages (default: all of 0-4; stage 5 is the retrain and needs an explicit go):
+#   0  preflight, no GPU: can the chosen bits column be computed at all?
 #   1  score the corpus under the UNTUNED base       -> bits_base
+#      (1b also anchors the masking port against the trainer's own logged loss)
 #   2  score it under the FINAL adapter              -> bits_tuned
 #   3  select a subset from the two score files      -> the curriculum
 #   4  report                                        -> the numbers to argue about
@@ -63,9 +65,17 @@ done
 # score_bits._BUSY_PATTERNS -- a subset here is a guard with a hole in it.
 guard() {
   for pat in "mlx_lm lo""ra" "mlx_lm server" "mlx_lm fuse" "mlx_lm generate"; do
-    if pgrep -f "$pat" >/dev/null 2>&1; then
-      say "'$pat' is live -- refusing (it is holding the GPU)"; exit 75
-    fi
+    pgrep -f "$pat" >/dev/null 2>&1
+    rc=$?
+    # FAIL CLOSED, like score_bits._pgrep: 0 = matched, 1 = no match, and
+    # ANYTHING ELSE (2 usage, 3 fatal) means the process table could not be
+    # read. Treating "I could not check" as "nothing is running" fails in
+    # exactly the direction that wedges the machine.
+    case "$rc" in
+      0) say "'$pat' is live -- refusing (it is holding the GPU)"; exit 75;;
+      1) ;;
+      *) say "pgrep -f '$pat' exited $rc -- cannot verify the machine is idle; refusing"; exit 75;;
+    esac
   done
   FREE=$(vm_stat | awk '/page size of/ { gsub(/[^0-9]/, "", $8); ps = $8 }
     /Pages free/ { gsub(/\./, "", $3); f = $3 } /Pages inactive/ { gsub(/\./, "", $3); i = $3 }
@@ -78,7 +88,30 @@ guard() {
 
 cd "$DATA" || exit 1
 mkdir -p "$REPORTS"
-STAGES=${*:-"1 2 3 4"}
+STAGES=${*:-"0 1 2 3 4"}
+
+# ---------------------------------------------------------------------------
+# 0. PREFLIGHT, no GPU, seconds. Everything that can invalidate the run is
+#    checked here rather than discovered at stage 3 with the GPU hours spent.
+#
+#    This stage exists because that is exactly what happened: the runner
+#    defaulted to --bits-column decision while score_bits defaulted to a flat
+#    `action,session`, which is empty for the whole ledger and tooluse tracks
+#    (1093 of 2245 rows, 48.7%). select_curriculum refuses past 20% missing --
+#    correctly -- so stages 1 and 2 would both have run to completion and stage
+#    3 would then have aborted, producing no curriculum. A cheap check that
+#    cannot pass when the expensive stages would be wasted.
+# ---------------------------------------------------------------------------
+if [[ " $STAGES " == *" 0 "* ]]; then
+  if [ "$BITS_COLUMN" = "decision" ]; then
+    say "stage 0: can the decision column even be computed on this corpus?"
+    "$PY" "$SCRIPTS/score_bits.py" --data "$TRAIN" --out /dev/null \
+      --check-decision-coverage 0.95 || {
+        say "PREFLIGHT FAILED -- fix --decision-fields before spending the GPU"; exit 1; }
+  else
+    say "stage 0: bits column is '$BITS_COLUMN'; no decision-coverage preflight needed"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 1. bits_base -- what the untuned base does NOT already know.
@@ -92,11 +125,28 @@ if [[ " $STAGES " == *" 1 "* ]]; then
     --model "$BASE" --data "$TRAIN" \
     --max-seq-length 3072 --chunk 512 \
     --out "$REPORTS/bits-train-base.jsonl" || exit $?
-  say "stage 1b: same for the validation split (a sanity check, not a curriculum)"
+  say "stage 1b: same for the validation split -- THE EXTERNAL ANCHOR, not a curriculum"
   "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$VALID" \
     --max-seq-length 3072 --chunk 512 \
     --out "$REPORTS/bits-valid-base.jsonl" || exit $?
+
+  # THE ONE CHECK THIS REPO DID NOT PRODUCE THE ANSWER TO. Internal parity
+  # (1c/2b) proves the chunked path agrees with the full forward; it cannot
+  # prove the MASK is the trainer's, because both paths would be wrong the same
+  # way. trainer.py runs evaluate() BEFORE the first step, so the log's
+  #   Iter 1: Val loss 2.463
+  # is the UNTUNED base's token-weighted loss over valid.jsonl under the
+  # trainer's own mask -- the same quantity stage 1b just wrote to
+  # summary.trainer_parity_loss_nats. At 2.463 nats/token there is dynamic
+  # range: a prompt-masking error moves it by a large multiple. (Comparing the
+  # TAIL of the log instead, as an earlier version of this script did, compares
+  # two numbers that are both ~0.01 whether the mask is right or wrong.)
+  say "stage 1b-anchor: does the masking port reproduce the trainer's own Iter 1 val loss?"
+  "$PY" "$SCRIPTS/parity_check.py" \
+    --anchor "$REPORTS/bits-valid-base.jsonl.meta.json" \
+    --log "$ADAPTERS/train.log" --iter 1 || {
+      say "ANCHOR FAILED -- the mask is not the trainer's; every bits number is wrong"; exit 1; }
 
   # The base ranking IS the whole curriculum in base-only mode, so the chunked
   # KV-cache path has to be validated here too, not only in stage 2.
@@ -143,12 +193,19 @@ if [[ " $STAGES " == *" 2 "* ]]; then
     "$REPORTS/bits-train-tuned.jsonl" "$REPORTS/bits-train-tuned-fullfwd.jsonl" || {
       say "PARITY FAILED -- do not trust the bits numbers"; exit 1; }
 
-  # And against the live run's own log: the token-weighted trainer-parity loss
-  # over train.jsonl should sit near the last recorded VALIDATION loss (the train
-  # loss line is an unweighted mean of per-batch means -- not comparable).
-  say "stage 2c: compare summary.trainer_parity_loss_nats in \
-$REPORTS/bits-train-tuned.jsonl.meta.json against the tail of \
-$ADAPTERS/train.log"
+  # NOT a comparison against the tail of train.log. That check used to live here
+  # and it was vacuous: the log's late val losses are 0.005-0.028 and this
+  # adapter has memorized train.jsonl, so both sides are ~0.01 under a correct
+  # port AND under a broken one. An off-by-one in the gather index would add or
+  # drop one template-deterministic token the tuned model also predicts at ~0
+  # nats, and the comparison would not move. The discriminating check is the
+  # base model's Iter 1 anchor in stage 1b, where the quantity is 2.463 rather
+  # than ~0.01. What is worth PRINTING here is the residual itself, as the
+  # measurement it is:
+  say "stage 2c: residual after training (a measurement, not a check) --"
+  say "  summary.trainer_parity_loss_nats in $REPORTS/bits-train-tuned.jsonl.meta.json"
+  say "  is this adapter's loss on the TRAIN split it memorized; expect ~0.01-0.04."
+  say "  It validates nothing about the mask: see stage 1b-anchor for that."
 fi
 
 # ---------------------------------------------------------------------------
@@ -181,9 +238,15 @@ if [[ " $STAGES " == *" 3 "* ]]; then
   # score distribution -- so a gate win would have been attributable to dedup or
   # to bits with no way to tell them apart, which is the one inference the
   # control exists to support. Both arms cluster; only the criterion differs.
+  # --bits-column is passed here too, identically. A random ranking ignores the
+  # column, so this changes no pick -- but leaving it off made the two arms
+  # differ in a second flag, and "it happens not to matter" is exactly the
+  # reasoning that let --jaccard 1.01 sit here unnoticed. The arms are
+  # configured identically; only --rank-by differs.
   "$PY" "$SCRIPTS/select_curriculum.py" \
     --base "$REPORTS/bits-train-base.jsonl" \
-    --corpus "$TRAIN" --target-fraction "$FRACTION" --seed 999 \
+    --corpus "$TRAIN" --bits-column "$BITS_COLUMN" \
+    --target-fraction "$FRACTION" --seed 999 \
     --rank-by random --jaccard "$JACCARD" \
     --out "$RAND_DIR/train.jsonl" \
     --report "$REPORTS/curriculum-random-${FRACTION}.txt" >/dev/null || exit $?
@@ -219,7 +282,7 @@ fi
 #        --fine-tune-type lora --num-layers 16 --batch-size 1 \
 #        --grad-accumulation-steps 2 --grad-checkpoint --mask-prompt \
 #        --max-seq-length 3072 --iters "$ITERS" --learning-rate 1e-4 \
-#        --seed 17 --save-every 250 \
+#        --seed 17 --save-every 250 \          # and again at --seed 18, 19
 #        --adapter-path models/candidates/fin-foreman-e4b-bits25
 #
 #    FOUR ARMS, NOT THREE. The fourth is the one that can kill the claim:
@@ -253,11 +316,37 @@ fi
 #      C. random control        : <core>/<total> at  ITERS
 #      D. full corpus, ITERS    : <core>/<total> at  ITERS   <-- the honest floor
 #
+#    HOW BIG A DIFFERENCE COUNTS. The gate is 51 binary scenarios, so ONE
+#    scenario is 2.0 percentage points, and nothing in this branch has ever
+#    measured LoRA seed-to-seed variance on it. A one-scenario gap between two
+#    single runs is not a result; declaring "bits beat random" on 46/51 vs 45/51
+#    would be reading noise. So:
+#
+#      * Run each arm at >= 3 SEEDS (--seed 17, 18, 19). Four arms x three seeds
+#        is the price of a claim; one seed per arm buys an anecdote.
+#      * First establish the NOISE FLOOR: the spread of arm A across its three
+#        seeds. Call it S (in scenarios).
+#      * "B beats C" requires median(B) - median(C) > max(S, 2 scenarios).
+#        "B ties A" requires |median(B) - median(A)| <= max(S, 2 scenarios).
+#      * Report every individual score, not just the medians. If the arms
+#        overlap, the honest finding is "no measurable difference at this
+#        sample size", and that is a result worth writing down.
+#
+#    WHAT THE VERDICT COVERS. evals/tmux-routing is 51 scenarios and all of them
+#    are routing (route/start/clarify/refuse); run_evals.py:matches() compares
+#    'action' and 'session'. The ledger, elicit and tooluse tracks -- 1398 of
+#    2245 training examples, 62.3% of what the curriculum cuts -- are NOT
+#    exercised by it. A subset that destroys tooluse's argument formatting
+#    scores identically on all 51 scenarios. So a stage-5 verdict is a verdict
+#    ON ROUTING. Before promoting anything on it, either hold out a per-track
+#    check of your own, or say plainly that the other three tracks are unmeasured.
+#
 #    The claim is proved only if B ties or beats A at strictly fewer iterations
-#    AND beats C AND beats D. It is disproved if B gates worse than A; if C
-#    matches B (the redundancy was real but bits added nothing over counting); or
-#    if D matches B (the saving was early stopping, not curriculum). Write down
-#    whichever happens -- a negative result honestly reported is a good result.
+#    AND beats C AND beats D, all at the margin above. It is disproved if B
+#    gates worse than A; if C matches B (the redundancy was real but bits added
+#    nothing over counting); or if D matches B (the saving was early stopping,
+#    not curriculum). Write down whichever happens -- a negative result honestly
+#    reported is a good result.
 # ---------------------------------------------------------------------------
 if [[ " $STAGES " == *" 5 "* ]]; then
   say "stage 5 is documented, not automated: it is a multi-hour GPU job."

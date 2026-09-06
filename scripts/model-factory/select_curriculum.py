@@ -39,10 +39,17 @@ wearing a different path).
 
 WHICH BITS. ``--bits-column answer`` (default) ranks on bits over the whole
 assistant turn; ``--bits-column decision`` ranks on ``decision_bits``, the bits
-spent on the fields the eval gate actually compares (action/session). The gate
-is the arbiter, so a curriculum built to move it has a good claim on the second
--- but prose bits still shape the model, so neither is automatically right and
-the report prints both.
+spent on the fields that carry the LABEL -- per track, because the four tracks
+do not share a schema (routing action/session, elicit action, ledger
+decision/goal_id/message_id, tooluse tool/arguments). Prose bits still shape the
+model, so neither column is automatically right and the report prints both.
+
+WHAT THE ARBITER ACTUALLY COVERS. evals/tmux-routing is 51 scenarios, all of
+them routing (route/start/clarify/refuse). The ledger, elicit and tooluse tracks
+-- 1398 of the 2245 training examples -- are not exercised by it. So the gate
+can certify that a curriculum did not hurt ROUTING and can say nothing about the
+other three quarters of what the selection cut. The report prints the count per
+run under 'gate visibility'; do not read a gate win as a verdict on the corpus.
 
 Stdlib only. Deterministic: no sampling anywhere; --seed only salts tie-breaks.
 
@@ -74,6 +81,18 @@ PERCENTILES = (1, 5, 10, 25, 50, 75, 90, 95, 99)
 # ---------------------------------------------------------------------------
 # statistics helpers
 # ---------------------------------------------------------------------------
+
+
+def fmt(value: float | None, places: int = 2) -> str:
+    """Format a bits figure that may legitimately be absent.
+
+    ``score_bits`` writes ``decision_bits: null`` -- deliberately, so an
+    unlocatable column ranks as unknown rather than as a known-easy zero -- and
+    ``--bits-column decision`` puts that null straight into ``bits_base``.
+    Every report line that formatted one with ``:.2f`` raised TypeError and
+    aborted the run AFTER selection, on a traceback instead of a report.
+    """
+    return "n/a" if value is None else f"{value:.{places}f}"
 
 
 def percentile(values: Sequence[float], pct: float) -> float:
@@ -138,12 +157,26 @@ class Row:
     truncated: bool
     text: str = ""
     shingles: frozenset = field(default_factory=frozenset)
-    # The whole-answer figures, kept even when --bits-column decision puts the
-    # gate-scored slice into bits_base/bits_tuned, so the report can show both.
+    # BOTH columns are carried on every row, whichever one --bits-column put
+    # into bits_base/bits_tuned, so the report can show the contrast and the
+    # mislabel screen can run on the column where its signal actually lives.
     answer_bits_base: float | None = None
     answer_bits_tuned: float | None = None
+    decision_bits_base: float | None = None
+    # Token count matching the DECISION column, so --rank-normalize can divide
+    # by a denominator that belongs to its numerator. score_bits writes it; the
+    # selector used to ignore it and divide decision bits by whole-answer tokens.
+    decision_tokens: int = 0
     noise_suspect: bool = False  # bits so far above its class that a mislabel is likelier
     rank_cap: float | None = None  # ceiling applied to value() under --noise-policy cap
+    # Which column bits_base/bits_tuned hold ("answer" or "decision"). value()
+    # needs it to pick the right per-token denominator.
+    bits_column: str = "answer"
+
+    @property
+    def norm_tokens(self) -> int:
+        """The token count that matches whatever is in ``bits_base``."""
+        return self.decision_tokens if self.bits_column == "decision" else self.answer_tokens
 
     @property
     def learned_bits(self) -> float | None:
@@ -174,7 +207,13 @@ class Row:
             raise ValueError(f"unknown rank_by {rank_by!r}")
         if raw is None:
             return 0.0
-        v = raw / self.answer_tokens if (normalize and self.answer_tokens) else float(raw)
+        # Divide by the token count that BELONGS to the numerator. Under
+        # --bits-column decision the numerator is decision bits, so dividing by
+        # whole-answer tokens would rank two examples with identical decision
+        # bits by the length of their `reason` prose -- the exact length bias
+        # --rank-normalize exists to remove, reintroduced upside down.
+        denom = self.norm_tokens
+        v = raw / denom if (normalize and denom) else float(raw)
         if self.rank_cap is not None:
             # --noise-policy cap: a suspected mislabel keeps its place in the
             # corpus but stops out-ranking every honest example in its class.
@@ -182,14 +221,30 @@ class Row:
         return v
 
 
-def load_scores(path: Path, expect_adapter: bool | None = None) -> tuple[dict[str, dict], set[str]]:
-    """(scored rows by hash, hashes the scorer refused to score).
+# The fingerprint keys a --base file and a --tuned file must agree on for
+# `learned_bits = bits_base - bits_tuned` to be a difference of commensurable
+# quantities. Mirrors score_bits.PAIR_FINGERPRINT_KEYS; `adapter` is deliberately
+# absent, being the one field that MUST differ between the two runs.
+PAIR_FINGERPRINT_KEYS = ("model", "max_seq_length", "match_trainer", "full_forward", "chunk")
+
+
+def load_scores(
+    path: Path, expect_adapter: bool | None = None
+) -> tuple[dict[str, dict], set[str], dict]:
+    """(scored rows by hash, hashes the scorer refused to score, run fingerprint).
 
     ``expect_adapter`` asserts the file is the one it is being used as: a --base
     file's rows must carry ``adapter: null`` and a --tuned file's must not.
     Swapping them makes ``learned_bits = base - tuned`` a difference of two
     quantities measured under the same model, i.e. approximately zero, and
     nothing downstream would notice.
+
+    The FINGERPRINT is returned so the caller can compare the two files against
+    each other. score_bits stamps model / max_seq_length / match_trainer /
+    full_forward / chunk on every row precisely so incommensurable rows cannot be
+    spliced, and enforces it WITHIN one file on resume -- but the subtraction
+    happens ACROSS two files, which is the one place nothing was checking. See
+    ``check_pair_fingerprints``.
 
     Skipped hashes are RETURNED, not silently dropped: an example the scorer
     could not score is an unknown, and an unknown that vanishes from the corpus
@@ -198,6 +253,7 @@ def load_scores(path: Path, expect_adapter: bool | None = None) -> tuple[dict[st
     out: dict[str, dict] = {}
     skipped: set[str] = set()
     adapters: set[str | None] = set()
+    fingerprint: dict = {}
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
             if not line.strip():
@@ -205,6 +261,8 @@ def load_scores(path: Path, expect_adapter: bool | None = None) -> tuple[dict[st
             rec = json.loads(line)
             if "adapter" in rec:
                 adapters.add(rec["adapter"])
+            if not fingerprint:
+                fingerprint = {k: rec[k] for k in PAIR_FINGERPRINT_KEYS if k in rec}
             if rec.get("skipped"):
                 skipped.add(rec["hash"])
                 continue
@@ -223,7 +281,42 @@ def load_scores(path: Path, expect_adapter: bool | None = None) -> tuple[dict[st
                 "--base wants base scores and --tuned wants adapter scores; swapping them "
                 "makes learned_bits meaningless."
             )
-    return out, skipped
+    return out, skipped, fingerprint
+
+
+def check_pair_fingerprints(
+    base_fp: dict, tuned_fp: dict, base_path: Path, tuned_path: Path, allow: bool
+) -> None:
+    """Refuse to subtract two bits columns measured under different conditions.
+
+    ``learned_bits = bits_base - bits_tuned`` is only "information the run
+    acquired" if both sides saw the same model, the same window and the same
+    forward path. Score the base at --max-seq-length 3072 and the tuned adapter
+    at 2048 and every example truncated under one but not the other contributes
+    a fabricated learned_bits -- to the DEFAULT ranking key, silently.
+
+    A key absent from BOTH files is not a mismatch (an older score file simply
+    did not record it). A key present on one side only is: that is exactly the
+    "one file was written by a different version of the scorer" case.
+    """
+    if not base_fp and not tuned_fp:
+        return
+    differs = {
+        k: (base_fp.get(k, "<absent>"), tuned_fp.get(k, "<absent>"))
+        for k in PAIR_FINGERPRINT_KEYS
+        if (k in base_fp or k in tuned_fp) and base_fp.get(k) != tuned_fp.get(k)
+    }
+    if not differs:
+        return
+    msg = (
+        f"{base_path} and {tuned_path} were scored under different settings {differs}. "
+        "learned_bits = bits_base - bits_tuned would be a difference of two "
+        "incommensurable quantities, and it is the default ranking key. Re-score one "
+        "side to match, or pass --allow-fingerprint-mismatch if you know why they differ."
+    )
+    if not allow:
+        raise SystemExit("[select_curriculum] " + msg)
+    print(f"[select_curriculum] WARNING: {msg}", file=sys.stderr)
 
 
 def content_hash(messages: Sequence[dict]) -> str:
@@ -362,9 +455,41 @@ class Selection:
     cuts: dict[tuple[str, str], float]  # per-partition value cut
 
 
-def flag_noise_suspects(rows: Sequence[Row], factor: float, floor: float, min_n: int = 8) -> int:
+@dataclass
+class NoiseScreen:
+    """What the mislabel screen actually did, per partition. Reported, so that
+    "none flagged" can be read as "nothing reached cut X" rather than as an
+    all-clear -- the two are indistinguishable from a bare count."""
+
+    cuts: dict[tuple[str, str], float] = field(default_factory=dict)
+    medians: dict[tuple[str, str], float] = field(default_factory=dict)
+    spreads: dict[tuple[str, str], float] = field(default_factory=dict)
+    bound_by: dict[tuple[str, str], str] = field(default_factory=dict)
+    skipped: dict[tuple[str, str], str] = field(default_factory=dict)
+    column: str = "bits_base"
+    flagged: int = 0
+
+
+def mad(values: Sequence[float]) -> float:
+    """Median absolute deviation. Robust dispersion: a single huge outlier moves
+    it almost not at all, which is what a mislabel detector needs its baseline
+    to do."""
+    if not values:
+        return 0.0
+    med = percentile(values, 50)
+    return percentile([abs(v - med) for v in values], 50)
+
+
+def flag_noise_suspects(
+    rows: Sequence[Row],
+    factor: float,
+    floor: float,
+    min_n: int = 8,
+    z: float = 6.0,
+    use_decision: bool = True,
+) -> NoiseScreen:
     """Mark rows whose bits are so far above their own class that a MISLABEL is
-    the likelier explanation.
+    the likelier explanation. Returns a NoiseScreen describing every cut.
 
     This is the converse of the high-residual warning, and it is the one the
     SELECTOR needs: the ranking maximizes bits, and a label the generator got
@@ -373,24 +498,74 @@ def flag_noise_suspects(rows: Sequence[Row], factor: float, floor: float, min_n:
     ranking modes put a mislabel at the very top of its class and a 25% budget
     concentrates label noise several-fold.
 
-    The test is per-partition and relative -- ``bits >= max(floor, factor x the
-    class median)`` -- because absolute bits differ hugely between an
-    ``elicit/ask`` question string and a ``routing/refuse`` reason.
+    THE CUT IS SCALE-FREE, and it has to be. The previous rule was
+    ``max(8.0 bits, 4.0 x the class median)``, calibrated against a unit-test
+    fixture whose clean class sits at ~6.5 bits. On the real corpus the scale is
+    two orders of magnitude larger -- the log's ``Iter 1: Val loss 2.463`` at
+    ~34.6 trained tokens per example puts a typical whole-answer example near
+    ~123 bits under the base -- so that rule cuts at ~492 bits while a wrong
+    decision token adds only ~10. It could not fire, and the absolute 8.0 floor
+    was inert by three orders of magnitude. The rule now is
+
+        cut = median + z x 1.4826 x MAD          (robust; scales with the data)
+
+    falling back to ``factor x median`` where MAD is 0 (a degenerate class in
+    which every example costs the same, so any deviation at all is the signal).
+    ``floor`` remains available as an absolute override and defaults to 0.0:
+    an absolute bits floor is only meaningful once stage 1 has measured what a
+    bit is worth in the column in force, and until then a hardcoded one silently
+    binds every partition.
+
+    WHICH COLUMN. A mislabel shows up in the DECISION bits, where a wrong label
+    token is most of the signal, and drowns in whole-answer bits, where it is
+    ~10 bits against a class spread of tens. So the screen prefers
+    ``decision_bits_base`` when it is available for the whole partition, and
+    records which column it used. Even so: this test's POWER is unknown until
+    the real distribution exists. It can fire; whether it fires on the mislabels
+    that are actually there is a stage-1 question, and the report says so.
     """
     by_partition: dict[tuple[str, str], list[Row]] = defaultdict(list)
     for r in rows:
         by_partition[r.partition].append(r)
-    flagged = 0
-    for members in by_partition.values():
-        vals = [r.bits_base for r in members if r.bits_base is not None]
+
+    screen = NoiseScreen()
+    # Prefer the decision column, but only if every scored row has one: a screen
+    # run on a mix of two columns is not a screen.
+    scored = [r for r in rows if r.bits_base is not None]
+    use_dec = bool(
+        use_decision and scored and all(r.decision_bits_base is not None for r in scored)
+    )
+    screen.column = "decision_bits_base" if use_dec else "bits_base"
+
+    def val_of(r: Row) -> float | None:
+        return r.decision_bits_base if use_dec else r.bits_base
+
+    for partition, members in by_partition.items():
+        vals = [v for v in (val_of(m) for m in members) if v is not None]
         if len(vals) < min_n:
-            continue  # too few rows to say what "normal for this class" is
-        cut = max(floor, percentile(vals, 50) * factor)
-        for r in members:
-            if r.bits_base is not None and r.bits_base >= cut:
-                r.noise_suspect = True
-                flagged += 1
-    return flagged
+            # Not enough rows to say what "normal for this class" is. Recorded,
+            # never silent: an unscreened partition is where a mislabel hides.
+            screen.skipped[partition] = f"only {len(vals)} scored rows (need {min_n})"
+            continue
+        med = percentile(vals, 50)
+        spread = mad(vals)
+        if spread > 0:
+            robust, bound = med + z * 1.4826 * spread, f"median + {z:g}x1.4826xMAD"
+        else:
+            robust, bound = med * factor, f"{factor:g}x median (MAD=0)"
+        cut = robust
+        if floor > robust:
+            cut, bound = floor, f"absolute floor {floor:g}"
+        screen.cuts[partition] = cut
+        screen.medians[partition] = med
+        screen.spreads[partition] = spread
+        screen.bound_by[partition] = bound
+        for m in members:
+            v = val_of(m)
+            if v is not None and v >= cut:
+                m.noise_suspect = True
+                screen.flagged += 1
+    return screen
 
 
 def select(
@@ -480,7 +655,7 @@ def select(
         for m in excluded:
             dropped.append(m)
             reasons[m.index] = (
-                f"noise-suspect: {m.bits_base:.2f} bits under the base is far above the "
+                f"noise-suspect: {fmt(m.bits_base)} bits under the base is far above the "
                 f"{partition[0]}/{partition[1]} median; in a synthesized corpus that is a "
                 "likelier sign of a mislabel from gen_training_data.py than of a hard "
                 "example (--noise-policy exclude)"
@@ -533,9 +708,11 @@ def build_report(
     have_tuned: bool,
     curve: Sequence[tuple[float, int]] = (),
     unscored: Sequence[tuple[int, str]] = (),
+    screen: NoiseScreen | None = None,
 ) -> str:
     out: list[str] = []
     a = out.append
+    screen = screen or NoiseScreen()
     total = len(rows)
     corpus_lines = total + len(unscored)
     a("=" * 78)
@@ -547,16 +724,18 @@ def build_report(
     a(f"ranking           : {args.rank_by}{' (per-token)' if args.rank_normalize else ' (per-example)'}")
     a(f"bits column       : {args.bits_column}"
       + ("  (bits over the WHOLE assistant turn)" if args.bits_column == "answer"
-         else "  (bits over the gate-scored fields only)"))
+         else "  (bits over the DECISION fields only)"))
     a(f"budget            : {args.target_fraction:.3f} of {total} scored examples "
       f"({corpus_lines} lines in the corpus)")
     a(f"near-dup threshold: Jaccard >= {args.jaccard} on word {args.shingle}-grams of {args.cluster_on}")
-    a(f"noise policy      : {args.noise_policy} (>= max({args.noise_floor:.1f} bits, "
-      f"{args.noise_factor:.1f}x the class median))")
+    a(f"noise policy      : {args.noise_policy} on {screen.column} "
+      f"(cut = median + {args.noise_z:g}x1.4826xMAD per class; see section 5)")
     a("")
+    unscored_section = "7" if have_tuned else "6"
     if unscored:
         a(f"!! {len(unscored)} corpus lines are NOT in this selection at all: the scorer")
-        a("   could not score them, so they are neither kept nor dropped. Section 6 names")
+        a(f"   could not score them, so they are neither kept nor dropped. Section "
+          f"{unscored_section} names")
         a("   them. Every percentage below is over the {0} SCORED lines.".format(total))
         a("")
 
@@ -613,18 +792,32 @@ def build_report(
     all_clusters = [c for cs in sel.clusters.values() for c in cs]
     n_clusters = len(all_clusters)
     sizes = sorted((len(c.members) for c in all_clusters), reverse=True)
-    a(f"{total} examples collapse to {n_clusters} distinct information clusters "
-      f"({(1 - n_clusters / total) * 100:.1f}% surface redundancy)")
+    # DENOMINATOR: the rows that were actually clustered, not every row. Under
+    # --noise-policy exclude the suspects never enter a cluster, so dividing by
+    # len(rows) would count each excluded row as its own redundancy and invent
+    # surface redundancy that does not exist -- while the per-partition table
+    # below, which divides by the clustered count, disagreed in the same report.
+    clustered = sum(sizes)
+    excluded_from_clustering = total - clustered
+    a(f"{clustered} clustered examples collapse to {n_clusters} distinct information "
+      f"clusters ({(1 - n_clusters / clustered) * 100:.1f}% surface redundancy)"
+      if clustered else "no examples were clustered")
+    if excluded_from_clustering:
+        a(f"  ({excluded_from_clustering} of the {total} scored rows never entered a cluster: "
+          f"--noise-policy {args.noise_policy} held them out. They are NOT counted as")
+        a("   redundant -- they were not compared to anything.)")
     a(f"largest cluster   : {sizes[0] if sizes else 0} examples")
     a(f"singletons        : {sum(1 for s in sizes if s == 1)}")
-    a(f"cluster size      : mean={sum(sizes)/len(sizes):.2f} p50={percentile(sizes, 50):.1f} "
-      f"p90={percentile(sizes, 90):.1f}")
+    if sizes:
+        a(f"cluster size      : mean={sum(sizes)/len(sizes):.2f} p50={percentile(sizes, 50):.1f} "
+          f"p90={percentile(sizes, 90):.1f}")
     a("")
-    a(f"ONE REPRESENTATIVE PER CLUSTER would need {n_clusters}/{total} = "
-      f"{n_clusters/total*100:.1f}% of the corpus.")
-    a(f"The budget in force is {args.target_fraction*100:.1f}%, so this selection is "
-      f"{'ABOVE' if args.target_fraction * total >= n_clusters else 'BELOW'} full cluster")
-    a("coverage -- below it, the ranking (not the clustering) decides what survives.")
+    if clustered:
+        a(f"ONE REPRESENTATIVE PER CLUSTER would need {n_clusters}/{clustered} = "
+          f"{n_clusters/clustered*100:.1f}% of the clustered examples.")
+        a(f"The budget in force is {args.target_fraction*100:.1f}%, so this selection is "
+          f"{'ABOVE' if args.target_fraction * clustered >= n_clusters else 'BELOW'} full cluster")
+        a("coverage -- below it, the ranking (not the clustering) decides what survives.")
     a("")
     if curve:
         a("redundancy vs threshold (one threshold is one arbitrary choice):")
@@ -655,9 +848,34 @@ def build_report(
     all_bits = sum(r.bits_base or 0 for r in rows) or 1.0
     a(f"kept {len(sel.kept)}/{total} scored examples ({len(sel.kept)/total*100:.1f}%) "
       f"carrying {kept_bits/all_bits*100:.1f}% of the corpus's bits_base")
+    # The share of the RANKED quantity, which is the number that actually
+    # evidences the hypothesis. With --tuned the criterion is learned_bits, and
+    # reporting only the bits_base share describes a criterion the selector did
+    # not use. Values are clamped at 0 because learned_bits can be negative and
+    # a share of a signed total is not a share.
+    if args.rank_by not in ("bits_base", "random"):
+        ranked_kept = sum(max(0.0, r.value(args.rank_by, args.rank_normalize, args.seed))
+                          for r in sel.kept)
+        ranked_all = sum(max(0.0, r.value(args.rank_by, args.rank_normalize, args.seed))
+                         for r in rows) or 1.0
+        a(f"                  ... and {ranked_kept/ranked_all*100:.1f}% of the corpus's "
+          f"{args.rank_by} -- THE CRITERION ACTUALLY USED. The bits_base share above is")
+        a("                  context, not the selection's own objective.")
     a(f"accounting        : kept {len(sel.kept)} + dropped {len(sel.dropped)} = "
       f"{len(sel.kept) + len(sel.dropped)} of {total} scored "
-      f"({len(unscored)} unscored, see section 6)")
+      f"({len(unscored)} unscored, see section {unscored_section})")
+    # What the arbiter can and cannot see. evals/tmux-routing scores the ROUTING
+    # track only, so a cut into any other track is invisible to the gate that
+    # decides whether this curriculum worked -- a measured statement, not a
+    # caveat, because the fraction changes with every corpus.
+    gate_blind_kept = sum(1 for r in sel.kept if r.target != "routing")
+    gate_blind_drop = sum(1 for r in sel.dropped if r.target != "routing")
+    if gate_blind_kept or gate_blind_drop:
+        a(f"gate visibility   : evals/tmux-routing scores the ROUTING track only. "
+          f"{gate_blind_kept + gate_blind_drop}/{total} rows")
+        a(f"                    ({gate_blind_drop} of them dropped) are in tracks the "
+          "arbiter never exercises, so damage")
+        a("                    to them cannot appear in the gate score. See LIMITS.")
     covered = 0
     kept_ids = {r.index for r in sel.kept}
     for c in all_clusters:
@@ -690,10 +908,22 @@ def build_report(
       f"(mean {dropped_bits/max(1,len(sel.dropped)):.2f} bits vs "
       f"{kept_bits/max(1,len(sel.kept)):.2f} for kept)")
     a("")
-    a("examples (highest-bits drops first -- these are the ones to argue about):")
-    worst = sorted(sel.dropped, key=lambda r: -(r.bits_base or 0))[: args.explain]
+    # Sorted by the RANKED value, so the list names the drops the criterion
+    # itself considered most costly. Sorting by bits_base while ranking on
+    # learned_bits printed one number as the header and a different one as the
+    # reason, with nothing saying which was the criterion.
+    ranked_label = f"{args.rank_by}{' per token' if args.rank_normalize else ''}"
+    a(f"examples (highest-{ranked_label} drops first -- these are the ones to argue about):")
+    worst = sorted(
+        sel.dropped, key=lambda r: -r.value(args.rank_by, args.rank_normalize, args.seed)
+    )[: args.explain]
     for r in worst:
-        a(f"  idx {r.index:>5} {r.target}/{r.decision_class} bits={r.bits_base:.2f}")
+        # bits_base is None for any row whose --bits-column could not be
+        # computed; formatting None with :.2f raises TypeError and would abort
+        # the whole run, after selection, on a traceback instead of a report.
+        a(f"  idx {r.index:>5} {r.target}/{r.decision_class} "
+          f"{ranked_label}={r.value(args.rank_by, args.rank_normalize, args.seed):.2f} "
+          f"bits={fmt(r.bits_base)}")
         a(f"      {sel.reasons[r.index]}")
     a("")
 
@@ -706,11 +936,39 @@ def build_report(
     a("learned_bits too. Both ranking modes therefore put a mislabel FIRST in its")
     a("class, and a small budget concentrates label noise instead of diluting it.")
     a("This section exists so that concentration is visible rather than assumed away.")
+    a("")
+    a(f"screened on       : {screen.column}"
+      + ("  (a mislabel's signal is concentrated in the decision fields; in "
+         "whole-answer" if screen.column == "decision_bits_base" else ""))
+    if screen.column == "decision_bits_base":
+        a("                    bits it is ~10 bits against a class spread of tens)")
+    else:
+        a("                    -- no usable decision column, so the screen runs on the")
+        a("                    whole answer, where its power is LOW. See LIMITS.")
+    a(f"cut rule          : median + {args.noise_z:g} x 1.4826 x MAD, per (target, class)")
+    a(f"partitions        : {len(screen.cuts)} screened, {len(screen.skipped)} skipped "
+      f"(< --noise-min-n {args.noise_min_n} rows)")
+    if screen.cuts:
+        a("")
+        a(f"    {'target/class':<28} {'median':>10} {'MAD':>9} {'cut':>10}  bound by")
+        for partition in sorted(screen.cuts):
+            a(f"    {partition[0] + '/' + partition[1]:<28} "
+              f"{screen.medians[partition]:>10.3f} {screen.spreads[partition]:>9.3f} "
+              f"{screen.cuts[partition]:>10.3f}  {screen.bound_by[partition]}")
+    if screen.skipped:
+        a("")
+        a("NOT SCREENED (too few rows to say what normal is -- a mislabel here is exempt")
+        a("from the test entirely, which is the failure mode this line exists to expose):")
+        for partition in sorted(screen.skipped):
+            a(f"    {partition[0] + '/' + partition[1]:<28} {screen.skipped[partition]}")
+
     suspects = [r for r in rows if r.noise_suspect]
     if not suspects:
         a("")
-        a(f"none: no example reaches max({args.noise_floor:.1f} bits, "
-          f"{args.noise_factor:.1f}x its class median).")
+        a("none: no example in any SCREENED partition reached its cut above. Read that")
+        a("as 'nothing exceeded these thresholds', not as 'the corpus is clean' -- the")
+        a("test's power against the mislabels that are actually present is unknown until")
+        a("a real bits distribution exists.")
     else:
         kept_ids_all = {r.index for r in sel.kept}
         in_kept = [r for r in suspects if r.index in kept_ids_all]
@@ -729,7 +987,7 @@ def build_report(
         for r in sorted(suspects, key=lambda r: -(r.bits_base or 0))[: args.explain]:
             state = "KEPT   " if r.index in kept_ids_all else "dropped"
             a(f"  {state} idx {r.index:>5} {r.target}/{r.decision_class} "
-              f"bits={r.bits_base:.2f} tokens={r.answer_tokens}")
+              f"bits={fmt(r.bits_base)} tokens={r.answer_tokens}")
     a("")
 
     if have_tuned:
@@ -766,13 +1024,13 @@ def build_report(
             for r in flagged:
                 state = "KEPT   " if r.index in kept_ids_all else "dropped"
                 a(f"  {state} idx {r.index:>5} {r.target}/{r.decision_class} "
-                  f"residual={r.bits_tuned:.3f} base={r.bits_base:.2f} "
+                  f"residual={fmt(r.bits_tuned, 3)} base={fmt(r.bits_base)} "
                   f"learned={(r.learned_bits or 0):.2f}")
         a("")
 
     if unscored:
         a("-" * 78)
-        a(f"{'7' if have_tuned else '6'}. UNSCORED CORPUS LINES ({len(unscored)})")
+        a(f"{unscored_section}. UNSCORED CORPUS LINES ({len(unscored)})")
         a("-" * 78)
         a("score_bits.py refused to score these (usually: the prompt alone fills")
         a("--max-seq-length, so the answer is entirely truncated away). They are")
@@ -794,18 +1052,38 @@ def build_report(
     a("  mislabel maximizes. Section 5 measures the resulting concentration; it does")
     a("  not remove it unless --noise-policy says to. A bits number cannot tell a hard")
     a("  example from a wrong one -- only reading the flagged examples can.")
-    a("* THE GATE READS TWO FIELDS. run_evals.py:matches() compares 'action' and, when")
-    a("  present, 'session', and nothing else. Under --bits-column answer most of every")
-    a("  bits number is prose the arbiter never sees; --bits-column decision ranks on")
-    a("  the gate-scored tokens alone. Neither is obviously right -- prose still shapes")
-    a("  the model -- but they rank differently and only the gate can say which wins.")
+    a("* THE SCREEN'S POWER IS UNMEASURED. Section 5's cut is scale-free, so unlike the")
+    a("  absolute threshold it replaced it CAN fire at any bits scale. Whether it fires")
+    a("  on the mislabels actually present is a different question and is unanswered:")
+    a("  a wrong decision token costs perhaps ~10 bits, and in WHOLE-ANSWER bits that is")
+    a("  well inside the natural spread of a class whose examples differ by the length")
+    a("  of their prose. That is why the screen prefers the decision column, and why")
+    a("  'none flagged' is not evidence of a clean corpus. Calibrating it needs a real")
+    a("  bits distribution -- i.e. stage 1 -- and it has not been run.")
+    a("* THE GATE SCORES ONE TRACK OF FOUR. evals/tmux-routing is 51 scenarios whose")
+    a("  expected actions are all route/start/clarify/refuse, and run_evals.py:matches()")
+    a("  compares only 'action' and, when present, 'session'. The ledger, elicit and")
+    a("  tooluse tracks are NOT exercised by it at all -- see 'gate visibility' in")
+    a("  section 3 for this run's count. A subset that wrecks tool-argument formatting")
+    a("  scores identically on all 51 scenarios, so 'the gate is the arbiter' certifies")
+    a("  the routing track and asserts nothing about the rest. Hold that in mind before")
+    a("  reading a gate win as a verdict on the whole curriculum.")
+    a("* THE DECISION COLUMN IS PER TRACK. --bits-column decision ranks on the fields")
+    a("  that carry the label (routing action/session, elicit action, ledger decision/")
+    a("  goal_id/message_id, tooluse tool/arguments). Under --bits-column answer most")
+    a("  of every bits number is prose no arbiter reads. Neither is obviously right --")
+    a("  prose still shapes the model -- but they rank differently and only the gate")
+    a("  can say which wins, and only for routing.")
     a("* The redundancy curve is measured on --cluster-on both, which concatenates the")
     a("  ANSWER. Inside one (target, decision_class) the answer is near-constant label")
     a("  scaffold, so it inflates similarity the same way the system prompt would (the")
-    a("  system prompt is excluded for exactly that reason). On the 2026-09-05 corpus")
-    a("  the 0.80 headline is robust (1817 clusters vs 1840 user-only) but the loose")
-    a("  end is not: 0.70 gives 1335 with the answer vs 1733 without, and 0.50 gives")
-    a("  121 vs 834. Read the loose end of the curve as scaffold, not as shared input.")
+    a("  system prompt is excluded for exactly that reason). The curve in section 2 is")
+    a("  measured on THIS corpus with the answer included; to see how much of it is")
+    a("  scaffold, re-run with --cluster-on user and compare. (Measured on")
+    a("  datasets/mlx/train.jsonl, 2245 rows: 0.80 gives 1735 clusters with the answer")
+    a("  vs 1757 without -- robust; 0.70 gives 1283 vs 1661 and 0.50 gives 122 vs 805")
+    a("  -- not robust. Those are figures for that corpus, not for whatever --corpus")
+    a("  named above; read the loose end of ANY such curve as scaffold.)")
     a("* Redundancy here is SURFACE redundancy: word n-gram Jaccard cannot see two")
     a("  examples that teach the same rule in disjoint vocabulary, and it can over-")
     a("  merge two examples that differ only in the token that flips the label.")
@@ -857,7 +1135,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("answer", "decision"),
         default="answer",
         help="'answer' ranks on bits over the whole assistant turn; 'decision' ranks on "
-        "decision_bits -- the bits spent on the fields the eval gate compares.",
+        "decision_bits -- the bits spent on the per-track fields that carry the label. "
+        "'decision' needs the score files to have been produced with a --decision-fields "
+        "setting that covers this corpus; the selector refuses past 20% missing.",
     )
     p.add_argument("--chat-key", default="messages", help="must match score_bits.py --chat-key")
     p.add_argument("--jaccard", type=float, default=0.8)
@@ -874,8 +1154,50 @@ def build_parser() -> argparse.ArgumentParser:
         "flag = report only (default); cap = keep them but stop them out-ranking clean "
         "examples; exclude = leave them out of the curriculum, with a reason recorded.",
     )
-    p.add_argument("--noise-factor", type=float, default=4.0, help="x the class median")
-    p.add_argument("--noise-floor", type=float, default=8.0, help="absolute bits floor for a flag")
+    p.add_argument(
+        "--noise-z",
+        type=float,
+        default=6.0,
+        help="robust z: flag at median + z x 1.4826 x MAD of the class. Scale-free, so it "
+        "works at whole-answer bits (~100s) and decision bits (~units) alike.",
+    )
+    p.add_argument(
+        "--noise-factor",
+        type=float,
+        default=4.0,
+        help="x the class median; used only where MAD is 0 (a class in which every "
+        "example costs identical bits, so there is no spread to measure against)",
+    )
+    p.add_argument(
+        "--noise-floor",
+        type=float,
+        default=0.0,
+        help="absolute bits floor for a flag. DEFAULT 0 (off) on purpose: an absolute "
+        "floor is only meaningful once a run has measured what a bit is worth in the "
+        "column in force, and a hardcoded one silently binds every partition instead.",
+    )
+    p.add_argument(
+        "--noise-min-n",
+        type=int,
+        default=8,
+        help="a partition smaller than this is not screened at all (too few rows to say "
+        "what 'normal' is). Skipped partitions are named in the report, never silent.",
+    )
+    p.add_argument(
+        "--noise-column",
+        choices=("auto", "ranked"),
+        default="auto",
+        help="auto = screen on decision_bits when every scored row has one (a mislabel's "
+        "signal is concentrated there and drowns in whole-answer bits); ranked = screen on "
+        "whatever --bits-column selected.",
+    )
+    p.add_argument(
+        "--allow-fingerprint-mismatch",
+        action="store_true",
+        help="proceed when --base and --tuned were scored under different model/window/"
+        "forward-path settings. learned_bits is then a difference of two incommensurable "
+        "quantities; you are asserting you know why.",
+    )
     p.add_argument("--residual-percentile", type=float, default=99.0)
     p.add_argument(
         "--residual-floor",
@@ -954,9 +1276,13 @@ def load_rows(args: argparse.Namespace) -> tuple[list[Row], bool, list[tuple[int
     corpus = Path(args.corpus)
     check_leakage(corpus, args.chat_key, args.allow_valid_overlap)
 
-    base, base_skipped = load_scores(Path(args.base), expect_adapter=False)
+    base, base_skipped, base_fp = load_scores(Path(args.base), expect_adapter=False)
     if args.tuned:
-        tuned, _ = load_scores(Path(args.tuned), expect_adapter=True)
+        tuned, _, tuned_fp = load_scores(Path(args.tuned), expect_adapter=True)
+        check_pair_fingerprints(
+            base_fp, tuned_fp, Path(args.base), Path(args.tuned),
+            args.allow_fingerprint_mismatch,
+        )
     else:
         tuned = {}
     have_tuned = bool(tuned)
@@ -1000,6 +1326,9 @@ def load_rows(args: argparse.Namespace) -> tuple[list[Row], bool, list[tuple[int
                     shingles=shingles(text, args.shingle),
                     answer_bits_base=b.get("bits"),
                     answer_bits_tuned=(t or {}).get("bits") if have_tuned else None,
+                    decision_bits_base=b.get("decision_bits"),
+                    decision_tokens=int(b.get("decision_tokens") or 0),
+                    bits_column=args.bits_column,
                 )
             )
             idx += 1
@@ -1111,7 +1440,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     args.rank_by = rank_by
 
-    flag_noise_suspects(rows, args.noise_factor, args.noise_floor)
+    if args.rank_normalize:
+        # A zero denominator makes value() fall back to the un-normalized bits
+        # for that row alone, which silently ranks two different quantities
+        # against each other. Say so rather than degrade.
+        no_denom = sum(1 for r in rows if r.bits_base is not None and not r.norm_tokens)
+        if no_denom:
+            unit = "decision_tokens" if args.bits_column == "decision" else "answer_tokens"
+            print(
+                f"[select_curriculum] WARNING: --rank-normalize, but {no_denom}/{len(rows)} "
+                f"rows have {unit} = 0. Those rank on RAW bits while the rest rank on bits "
+                "per token -- two different quantities in one sort.",
+                file=sys.stderr,
+            )
+
+    screen = flag_noise_suspects(
+        rows,
+        args.noise_factor,
+        args.noise_floor,
+        min_n=args.noise_min_n,
+        z=args.noise_z,
+        use_decision=(args.noise_column == "auto"),
+    )
 
     sel = select(
         rows,
@@ -1144,7 +1494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         thresholds = sorted({round(t, 2) for t in (0.5, 0.6, 0.7, 0.8, 0.9, 0.95, args.jaccard)})
         curve = redundancy_curve(rows, thresholds, args.max_exact)
 
-    report = build_report(rows, sel, args, have_tuned, curve, unscored)
+    report = build_report(rows, sel, args, have_tuned, curve, unscored, screen)
     sys.stdout.write(report)
     if args.report:
         Path(args.report).parent.mkdir(parents=True, exist_ok=True)
@@ -1166,6 +1516,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "cluster_on": args.cluster_on,
             "min_per_class": args.min_per_class,
             "noise_policy": args.noise_policy,
+            "noise_column": screen.column,
+            "noise_partitions_screened": len(screen.cuts),
+            "noise_partitions_skipped": len(screen.skipped),
             "seed": args.seed,
             "kept": n,
             "of": len(rows),

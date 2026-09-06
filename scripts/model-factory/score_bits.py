@@ -16,18 +16,44 @@ bits that example costs the model. That number is the currency of a curriculum:
 This script emits ONE of those columns per run (the model you point it at).
 ``select_curriculum.py`` joins a base run and a tuned run into all four.
 
-WHAT THE GATE ACTUALLY READS. ``evals/tmux-routing/run_evals.py:matches()``
-compares ``expected["action"]`` and, when present, ``expected["session"]``. It
-never reads ``reason``, ``question`` or any other prose in the answer. Summed
-over the WHOLE assistant turn, most of an example's bits are therefore spent on
-text the arbiter ignores -- on this corpus the gate-scored fields are 9.6%-46.8%
-of each answer by characters (median 17.9%), and by tokens less still, because
-the decisive value is usually a single token while the prose is many. So the
-scorer emits a SECOND column, ``decision_bits``: the same cross-entropy summed
-only over the tokens that spell the gate-scored fields (--decision-fields).
-``select_curriculum.py --bits-column decision`` ranks on it. Neither column is
-"the" right one -- prose bits still shape the model -- but a curriculum meant to
-move the gate should be chosen on what the gate reads.
+THE DECISION COLUMN. Most of an example's bits are spent on prose that no
+arbiter reads. ``evals/tmux-routing/run_evals.py:matches()`` compares
+``expected["action"]`` and, when present, ``expected["session"]`` -- never
+``reason``, ``question`` or ``task``. So the scorer emits a SECOND column,
+``decision_bits``: the same cross-entropy summed only over the tokens that spell
+the fields carrying the LABEL. ``select_curriculum.py --bits-column decision``
+ranks on it.
+
+Those fields are PER TRACK, because the four tracks do not share a schema
+(``--decision-fields auto``, the default; see DECISION_FIELDS_BY_TARGET):
+
+    routing   action, session                    847 rows
+    elicit    action                             305 rows
+    ledger    decision, goal_id, message_id      728 rows
+    tooluse   tool, arguments                    365 rows
+
+A FLAT ``action,session`` -- what this script used to default to -- is empty for
+the whole ledger and tooluse tracks: 1093 of the 2245 rows in
+datasets/mlx/train.jsonl (48.7%) carry neither key, so their ``decision_bits``
+would be null and ``select_curriculum.py`` would refuse the column outright.
+Measured with ``field_spans`` over that corpus, the per-track share of each
+answer, by characters:
+
+    routing   min 11.7%  median 16.0%  max 42.6%
+    elicit    min  8.5%  median 10.7%  max 21.6%
+    ledger    min 23.7%  median 41.1%  max 51.2%
+    tooluse   min 92.5%  median 96.5%  max 97.4%   <- schema is {tool, arguments}
+    ALL 2245  min  8.5%  median 36.6%  max 97.4%   (0 rows missing the column)
+
+tooluse is ~97% because that track's answer has no prose field at all; there the
+decision column is very nearly the answer column, and honestly so. By TOKENS the
+share is smaller still for the tracks that do have prose, because the decisive
+value is usually a single token while a ``reason`` is many.
+
+Neither column is "the" right one -- prose bits still shape the model -- and
+note that the current gate scores ONLY the routing track (51 scenarios, all
+route/start/clarify/refuse), so for 1398 of 2245 rows the "decision" is the
+label the corpus teaches rather than a quantity any arbiter checks today.
 
 WHAT IT IS NOT. Bits never certify a model. `evals/tmux-routing` +
 `scripts/model-factory/eval_gate.py` remain the only arbiter of promotion. Bits
@@ -69,7 +95,10 @@ Usage:
       --out reports/bits-train-tuned.jsonl
 
   --dry-run tokenizes and reports lengths/offsets/truncation without loading the
-  model (still needs the tokenizer, still cheap, still respects the guard flag).
+  model. It still imports mlx_lm to reach the TokenizerWrapper, and that import
+  initialises the Metal device -- so it runs the PROCESS half of the guard (no
+  fine-tune may be live) while skipping the free-memory half, which it does not
+  need. It is a one-minute tokenizer pass, not a GPU job; it waits its turn.
 
 Stdlib at import time on purpose: mlx is imported lazily inside the scoring
 path so the unit tests can exercise every formula without a GPU.
@@ -99,8 +128,29 @@ BUSY_EXIT = 75  # EX_TEMPFAIL, the same code the gate sweep uses when it refuses
 MIN_FREE_GB_DEFAULT = 10
 
 # The fields evals/tmux-routing/run_evals.py:matches() actually compares.
-# Everything else in an answer is prose the arbiter never reads.
+# Everything else in a ROUTING answer is prose the arbiter never reads.
 GATE_FIELDS_DEFAULT = ("action", "session")
+
+# The DECISION fields, per track. The four tracks do not share an answer schema,
+# so one flat field list cannot address them: `action,session` is empty for every
+# ledger and tooluse row (1093 of 2245 = 48.7% of datasets/mlx/train.jsonl), and
+# a decision column that is null for half the corpus ranks on whether it could be
+# computed rather than on information. `--decision-fields auto` resolves through
+# this table; an explicit comma list overrides it for every track at once.
+#
+# What belongs here is the field whose VALUE is the label, plus the fields that
+# make that label specific (which session, which goal, which arguments) -- never
+# `reason`, `question` or `task`, which are prose.
+DECISION_FIELDS_BY_TARGET: dict[str, tuple[str, ...]] = {
+    "routing": ("action", "session"),
+    "elicit": ("action",),
+    "ledger": ("decision", "goal_id", "message_id"),
+    "tooluse": ("tool", "arguments"),
+}
+# A track we cannot classify falls back to the union, so an unrecognised schema
+# degrades to "look for any of the known label keys" instead of to nothing.
+DECISION_FIELDS_FALLBACK = ("action", "session", "decision", "goal_id", "message_id", "tool", "arguments")
+DECISION_FIELDS_AUTO = "auto"
 
 # The four fine-tune targets, recognised by the first line of the system prompt
 # that gen_training_data.py emits for each track.
@@ -392,6 +442,20 @@ def token_char_bounds(
     return bounds
 
 
+def decision_fields_for(target: str, override: Sequence[str] | None) -> tuple[str, ...]:
+    """Which answer fields carry the decision for ``target``.
+
+    ``override`` is an explicit ``--decision-fields`` list and wins for every
+    track. Under ``auto`` (the default) the per-track table decides, and an
+    unclassified row gets the union of every known label key rather than an
+    empty list -- "I do not recognise this schema" must not read as "this answer
+    has no decision", which is the difference between an unknown and a zero.
+    """
+    if override is not None:
+        return tuple(override)
+    return DECISION_FIELDS_BY_TARGET.get(target, DECISION_FIELDS_FALLBACK)
+
+
 def decision_indices(
     plan: MaskPlan,
     tokens: Sequence[int],
@@ -417,8 +481,16 @@ def decision_indices(
         return None
     spans = [(a + base, b + base) for a, b in spans]
     bounds = token_char_bounds(decode, tokens, plan.offset, plan.effective_length)
-    if bounds is None or len(bounds) != plan.answer_tokens:
+    if bounds is None:
         return None
+    # Invariant, not a branch a caller can reach: token_char_bounds returns
+    # exactly ``end - start`` bounds, and ``effective_length - offset`` IS
+    # ``answer_tokens`` by plan_mask's construction. Kept as an assertion so a
+    # future change to either function fails loudly here instead of silently
+    # mis-aligning the decision mask against the nats vector.
+    assert len(bounds) == plan.answer_tokens, (
+        f"token_char_bounds returned {len(bounds)} bounds for {plan.answer_tokens} answer tokens"
+    )
     keep = [
         i
         for i, (lo, hi) in enumerate(bounds)
@@ -486,8 +558,19 @@ def free_gb() -> float:
     return total * page_size / (1024**3)
 
 
-def guard(min_free: float, label: str = "score_bits", allow_unverified: bool = False) -> None:
-    """Refuse to compete for the GPU. Exits BUSY_EXIT; never raises past main."""
+def guard(
+    min_free: float,
+    label: str = "score_bits",
+    allow_unverified: bool = False,
+    check_memory: bool = True,
+) -> None:
+    """Refuse to compete for the GPU. Exits BUSY_EXIT; never raises past main.
+
+    ``check_memory=False`` runs only the process half: for a caller that touches
+    the Metal runtime but allocates nothing on it (``--dry-run`` imports mlx_lm
+    to reach the TokenizerWrapper), "no fine-tune is live" is the precondition
+    that matters and a free-memory threshold is not.
+    """
     try:
         for pattern in _BUSY_PATTERNS:
             pids = _pgrep(pattern)
@@ -498,6 +581,10 @@ def guard(min_free: float, label: str = "score_bits", allow_unverified: bool = F
                     file=sys.stderr,
                 )
                 sys.exit(BUSY_EXIT)
+        if not check_memory:
+            print(f"[{label}] no fine-tune is live (memory not checked: nothing will be allocated)",
+                  file=sys.stderr)
+            return
         have = free_gb()
     except MachineUnknown as exc:
         if not allow_unverified:
@@ -770,6 +857,7 @@ def run_fingerprint(
     max_seq_length: int,
     match_trainer: bool,
     full_forward: bool,
+    chunk: int | None = None,
 ) -> dict:
     """The settings a bits number is only comparable WITHIN.
 
@@ -777,6 +865,14 @@ def run_fingerprint(
     under a different model, adapter, window or forward path into one file --
     which would make ``learned_bits = base - tuned`` a difference of two
     incommensurable quantities for half the corpus.
+
+    ``chunk`` is part of the forward path, not a performance knob: different
+    prefill boundaries mean different matmul shapes and, on a sliding-window
+    architecture, different rotating-cache eviction points, so the same example
+    at ``--chunk 512`` and ``--chunk 2048`` yields numerically different nats.
+    It is recorded as None under ``--full-forward``, where the prompt is never
+    split and the value genuinely has no effect -- so the fingerprint names the
+    forward path that was actually taken rather than a flag that was ignored.
     """
     return {
         "model": model_label,
@@ -784,7 +880,15 @@ def run_fingerprint(
         "max_seq_length": max_seq_length,
         "match_trainer": match_trainer,
         "full_forward": full_forward,
+        "chunk": None if full_forward else chunk,
     }
+
+
+# The fingerprint keys that must agree between a --base file and a --tuned file
+# for `learned_bits = bits_base - bits_tuned` to be a difference of commensurable
+# quantities. `adapter` is excluded on purpose: it is the one thing that MUST
+# differ between the two runs.
+PAIR_FINGERPRINT_KEYS = ("model", "max_seq_length", "match_trainer", "full_forward", "chunk")
 
 
 def score_example(
@@ -796,9 +900,15 @@ def score_example(
     scorer: Any,
     model_label: str,
     adapter_label: str | None,
-    decision_fields: Sequence[str] = GATE_FIELDS_DEFAULT,
+    decision_fields: Sequence[str] | None = None,
     full_forward: bool = False,
+    chunk: int | None = None,
 ) -> dict:
+    """Score one example. ``decision_fields=None`` means AUTO: resolve the
+    decision fields from the example's own track (DECISION_FIELDS_BY_TARGET).
+    An explicit sequence overrides that for every track; an empty one disables
+    the column."""
+    fields = decision_fields_for(example.target, decision_fields)
     plan = plan_mask(tokens, offset, max_seq_length, match_trainer=match_trainer)
     record: dict[str, Any] = {
         "index": example.index,
@@ -813,8 +923,11 @@ def score_example(
         "tokens_lost": plan.tokens_lost,
     }
     record.update(
-        run_fingerprint(model_label, adapter_label, max_seq_length, match_trainer, full_forward)
+        run_fingerprint(
+            model_label, adapter_label, max_seq_length, match_trainer, full_forward, chunk
+        )
     )
+    record["decision_fields"] = list(fields)
     if not plan.usable:
         record.update(
             {
@@ -846,11 +959,11 @@ def score_example(
         }
     )
 
-    # The gate-scored subset of the answer. Null, never zero, when it cannot be
+    # The decision subset of the answer. Null, never zero, when it cannot be
     # located: a zero here would rank exactly like an example the model knows.
     keep = None
-    if decision_fields and hasattr(scorer, "decode"):
-        keep = decision_indices(plan, tokens, example.answer_text, decision_fields, scorer.decode)
+    if fields and hasattr(scorer, "decode"):
+        keep = decision_indices(plan, tokens, example.answer_text, fields, scorer.decode)
     if keep:
         record["decision_bits"] = bits_from_nats(float(sum(nats[i] for i in keep)))
         record["decision_tokens"] = len(keep)
@@ -863,6 +976,40 @@ def score_example(
     if plan.note:
         record["note"] = plan.note
     return record
+
+
+def decision_coverage(examples: Sequence[Example], override: Sequence[str] | None) -> dict:
+    """How much of a corpus the decision column CAN cover, without a GPU.
+
+    ``field_spans`` is pure text work, so the answer is knowable in seconds --
+    before two multi-hour scoring stages, not after. This exists because the
+    opposite happened: a flat ``action,session`` default was empty for 48.7% of
+    the corpus, ``select_curriculum.py`` correctly refused past 20% missing, and
+    the refusal landed at stage 3 with the entire GPU cost already spent.
+
+    It is an UPPER bound on what scoring will produce: tokenization can still
+    fail to locate a span (a truncated answer, a decode that does not round
+    trip). A corpus that fails here cannot possibly pass there.
+    """
+    per_target: dict[str, dict[str, int]] = {}
+    missing: list[int] = []
+    for e in examples:
+        fields = decision_fields_for(e.target, override)
+        bucket = per_target.setdefault(e.target, {"n": 0, "covered": 0})
+        bucket["n"] += 1
+        if fields and field_spans(e.answer_text, fields):
+            bucket["covered"] += 1
+        else:
+            missing.append(e.index)
+    n = len(examples)
+    return {
+        "examples": n,
+        "covered": n - len(missing),
+        "missing": len(missing),
+        "missing_share": len(missing) / n if n else 1.0,
+        "per_target": per_target,
+        "missing_indices": missing[:20],
+    }
 
 
 def summarize(rows: Iterable[dict]) -> dict:
@@ -927,14 +1074,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--restart", action="store_true", help="ignore and overwrite an existing --out")
     p.add_argument(
         "--decision-fields",
-        default=",".join(GATE_FIELDS_DEFAULT),
-        help="comma-separated answer fields the eval gate compares; their tokens get "
-        "their own bits column (decision_bits). Empty string disables the column.",
+        default=DECISION_FIELDS_AUTO,
+        help="answer fields whose tokens get their own bits column (decision_bits). "
+        "'auto' (default) resolves them PER TRACK from DECISION_FIELDS_BY_TARGET -- "
+        "routing action,session; elicit action; ledger decision,goal_id,message_id; "
+        "tooluse tool,arguments -- which is the only setting that covers all four "
+        "tracks (a flat 'action,session' is empty for 48.7% of the corpus). Pass a "
+        "comma-separated list to override every track at once; empty disables the column.",
     )
     p.add_argument(
         "--allow-unverified-machine",
         action="store_true",
         help="proceed when pgrep/vm_stat cannot be read. Only if you KNOW the box is idle.",
+    )
+    p.add_argument(
+        "--check-decision-coverage",
+        type=float,
+        default=None,
+        metavar="MIN_SHARE",
+        help="preflight, no GPU and no tokenizer: report what share of the corpus the "
+        "--decision-fields setting can cover and exit 3 if it is below MIN_SHARE. Run "
+        "this BEFORE the scoring stages -- the selector's own >20%%-missing refusal "
+        "otherwise fires at stage 3, with every GPU hour already spent.",
     )
     p.add_argument(
         "--dry-run",
@@ -957,11 +1118,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         examples = examples[: args.limit]
     print(f"[score_bits] {len(examples)} examples from {data}", file=sys.stderr)
 
-    decision_fields = tuple(f.strip() for f in args.decision_fields.split(",") if f.strip())
+    # None = auto (per-track); a list = an explicit override for every track.
+    if args.decision_fields.strip().lower() == DECISION_FIELDS_AUTO:
+        decision_fields: tuple[str, ...] | None = None
+    else:
+        decision_fields = tuple(f.strip() for f in args.decision_fields.split(",") if f.strip())
     adapter_label = str(Path(args.adapter).resolve()) if args.adapter else None
     want = run_fingerprint(
-        args.model, adapter_label, args.max_seq_length, match_trainer, args.full_forward
+        args.model, adapter_label, args.max_seq_length, match_trainer, args.full_forward, args.chunk
     )
+
+    if args.check_decision_coverage is not None:
+        # Pure text work: no tokenizer, no weights, no guard needed. Safe to run
+        # while a fine-tune holds the machine, which is the whole point.
+        cov = decision_coverage(examples, decision_fields)
+        print(json.dumps(cov, indent=2, sort_keys=True))
+        if cov["missing_share"] > 1.0 - args.check_decision_coverage:
+            print(
+                f"[score_bits] decision-field coverage is "
+                f"{(1 - cov['missing_share'])*100:.1f}%, below the required "
+                f"{args.check_decision_coverage*100:.1f}%. Scoring would produce a "
+                "decision_bits column that select_curriculum.py refuses. Fix "
+                "--decision-fields (or DECISION_FIELDS_BY_TARGET) first; do NOT spend "
+                "the GPU stages on it.",
+                file=sys.stderr,
+            )
+            return 3
+        print(
+            f"[score_bits] decision-field coverage {(1 - cov['missing_share'])*100:.1f}% "
+            "-- the decision column is viable on this corpus",
+            file=sys.stderr,
+        )
+        return 0
 
     done: set[str] = set()
     if args.restart and out.exists():
@@ -998,10 +1186,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.dry_run:
-        # NO GUARD HERE, deliberately: a dry run loads no weights and allocates
-        # nothing on the GPU, so it must stay runnable while a fine-tune holds
-        # the machine -- otherwise the token-count calibration in the README is
-        # a claim you cannot check rather than a command you can run.
+        # A dry run loads no weights and allocates nothing on the GPU -- but
+        # reaching the TokenizerWrapper means `import mlx_lm`, which pulls in
+        # mlx.core and initialises the Metal device. That is the one path in
+        # this file that touches the Metal runtime, so it takes the PROCESS half
+        # of the guard: no fine-tune may be live. The free-memory half is
+        # skipped, because nothing here will be allocated. This is a one-minute
+        # tokenizer pass; it waits its turn like everything else.
+        guard(args.min_free_gb, allow_unverified=args.allow_unverified_machine, check_memory=False)
+
         # load_tokenizer resolves a repo id through the HF cache and returns the
         # TokenizerWrapper. No weights, no Metal allocation beyond the import.
         from mlx_lm.utils import load_tokenizer
@@ -1054,6 +1247,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 adapter_label,
                 decision_fields,
                 args.full_forward,
+                args.chunk,
             )
             fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             fh.flush()
@@ -1068,7 +1262,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     meta.update(
         {
             "data": str(data.resolve()),
-            "decision_fields": list(decision_fields),
+            "decision_fields": (
+                {"mode": DECISION_FIELDS_AUTO, "by_target": {
+                    k: list(v) for k, v in DECISION_FIELDS_BY_TARGET.items()
+                }, "fallback": list(DECISION_FIELDS_FALLBACK)}
+                if decision_fields is None
+                else {"mode": "explicit", "fields": list(decision_fields)}
+            ),
             "summary": stats,
         }
     )

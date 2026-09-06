@@ -350,7 +350,7 @@ class TestDecisionMask(unittest.TestCase):
     def test_an_answer_without_the_fields_reports_unknown_not_zero(self):
         """Null, never 0.0: a zero would rank exactly like an example the model
         already knows, which is the opposite of 'we could not measure it'."""
-        answer = '{"decision": "drive", "reason": "top goal"}'
+        answer = '{"reason": "top goal", "note": "no label key in here"}'
         tokens = char_tokens("P>" + answer)
         ex = sb.Example(0, [{"role": "assistant", "content": answer}], "", "h", "ledger", "drive")
         rec = sb.score_example(ex, tokens, 2, 4096, True, uniform_scorer(256), "stub", None)
@@ -557,7 +557,7 @@ class TestClassification(unittest.TestCase):
             msgs = example(ROUTING_SYS, "route me", {"action": "route", "session": "s"})
             corpus.write_text(json.dumps({"messages": msgs}) + "\n", encoding="utf-8")
             out = d / "scores.jsonl"
-            prior = sb.run_fingerprint("m", None, 3072, True, False)
+            prior = sb.run_fingerprint("m", None, 3072, True, False, 512)
             prior.update({"hash": "deadbeef", "bits": 1.0, "skipped": False})
             out.write_text(json.dumps(prior, sort_keys=True) + "\n", encoding="utf-8")
             err = io.StringIO()
@@ -577,7 +577,7 @@ class TestClassification(unittest.TestCase):
             msgs = example(ROUTING_SYS, "route me", {"action": "route", "session": "s"})
             corpus.write_text(json.dumps({"messages": msgs}) + "\n", encoding="utf-8")
             out = d / "scores.jsonl"
-            row = sb.run_fingerprint("m", None, 3072, True, False)
+            row = sb.run_fingerprint("m", None, 3072, True, False, 512)
             row.update({"hash": sb.content_hash(msgs), "bits": 1.0, "skipped": False,
                         "answer_tokens": 4, "trainer_tokens": 5, "trainer_nats": 1.0,
                         "truncated": False})
@@ -908,8 +908,8 @@ class TestNoiseSuspects(unittest.TestCase):
 
     def test_a_mislabel_sized_outlier_is_flagged(self):
         rows = self._corpus_with_one_mislabel()
-        n = sc.flag_noise_suspects(rows, factor=4.0, floor=8.0)
-        self.assertEqual(n, 1)
+        screen = sc.flag_noise_suspects(rows, factor=4.0, floor=0.0)
+        self.assertEqual(screen.flagged, 1)
         self.assertEqual([r.hash for r in rows if r.noise_suspect], ["hBAD"])
 
     def test_bits_ranking_really_does_concentrate_the_suspect(self):
@@ -917,7 +917,7 @@ class TestNoiseSuspects(unittest.TestCase):
         larger share of a small curriculum, under BOTH information rankings."""
         for rank_by in ("bits_base", "learned_bits"):
             rows = self._corpus_with_one_mislabel()
-            sc.flag_noise_suspects(rows, 4.0, 8.0)
+            sc.flag_noise_suspects(rows, 4.0, 0.0)
             sel = sc.select(rows, 0.10, rank_by, False, 0.9, 3, 1, 17, 4000)
             kept = {r.hash for r in sel.kept}
             self.assertIn("hBAD", kept, f"{rank_by} did not rank the mislabel first")
@@ -928,7 +928,7 @@ class TestNoiseSuspects(unittest.TestCase):
 
     def test_cap_keeps_the_suspect_but_stops_it_out_ranking_everything(self):
         rows = self._corpus_with_one_mislabel()
-        sc.flag_noise_suspects(rows, 4.0, 8.0)
+        sc.flag_noise_suspects(rows, 4.0, 0.0)
         sel = sc.select(rows, 0.10, "bits_base", False, 0.9, 3, 1, 17, 4000, noise_policy="cap")
         self.assertEqual(len(sel.kept) + len(sel.dropped), len(rows))
         bad = [r for r in rows if r.hash == "hBAD"][0]
@@ -939,7 +939,7 @@ class TestNoiseSuspects(unittest.TestCase):
 
     def test_exclude_removes_it_and_records_why(self):
         rows = self._corpus_with_one_mislabel()
-        sc.flag_noise_suspects(rows, 4.0, 8.0)
+        sc.flag_noise_suspects(rows, 4.0, 0.0)
         sel = sc.select(rows, 0.10, "bits_base", False, 0.9, 3, 1, 17, 4000, noise_policy="exclude")
         self.assertNotIn("hBAD", {r.hash for r in sel.kept})
         bad = [r for r in sel.dropped if r.hash == "hBAD"][0]
@@ -950,7 +950,7 @@ class TestNoiseSuspects(unittest.TestCase):
         """Reporting must not quietly become dropping."""
         rows_a = self._corpus_with_one_mislabel()
         rows_b = self._corpus_with_one_mislabel()
-        sc.flag_noise_suspects(rows_b, 4.0, 8.0)
+        sc.flag_noise_suspects(rows_b, 4.0, 0.0)
         a = sc.select(rows_a, 0.25, "bits_base", False, 0.9, 3, 1, 17, 4000)
         b = sc.select(rows_b, 0.25, "bits_base", False, 0.9, 3, 1, 17, 4000, noise_policy="flag")
         self.assertEqual([r.hash for r in a.kept], [r.hash for r in b.kept])
@@ -966,7 +966,7 @@ class TestNoiseSuspects(unittest.TestCase):
     def test_a_uniform_class_flags_nobody(self):
         rows = make_rows([("routing", "route", f"unique sentence {i} about work", 6.0)
                           for i in range(20)])
-        self.assertEqual(sc.flag_noise_suspects(rows, 4.0, 8.0), 0)
+        self.assertEqual(sc.flag_noise_suspects(rows, 4.0, 0.0).flagged, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1407,11 +1407,60 @@ class TestExperimentConfiguration(unittest.TestCase):
     def test_both_arms_are_selected_and_found(self):
         self.assertEqual(len(self._select_invocations()), 2)
 
+    # Flags that are ALLOWED to differ between the arms, with the reason. Adding
+    # to this list is how you declare a second difference on purpose; anything
+    # not here that diverges fails the flag-for-flag test below.
+    ALLOWED_ARM_DIFFERENCES = {
+        "--rank-by",   # THE experimental variable
+        "--seed",      # the control needs its own draw
+        "--tuned",     # only the bits arm ranks on learned_bits
+        "--out",       # different destinations, obviously
+        "--report",
+    }
+
+    def _flags(self, inv: str) -> dict[str, str]:
+        parts = inv.split()
+        out: dict[str, str] = {}
+        i = 0
+        while i < len(parts):
+            if parts[i].startswith("--"):
+                nxt = parts[i + 1] if i + 1 < len(parts) else ""
+                if nxt and not nxt.startswith("--"):
+                    out[parts[i]] = nxt
+                    i += 2
+                    continue
+                out[parts[i]] = ""
+            i += 1
+        return out
+
+    def test_the_arms_differ_in_EXACTLY_the_ranking_and_nothing_else(self):
+        """The general form of the property the class exists for.
+
+        Pinning one flag at a time (this used to check only --jaccard) lets any
+        OTHER flag regain a second difference with every test still green: an
+        arm at --target-fraction 0.5 against an arm at 0.25 is a strictly larger
+        confound than the clustering threshold, and it passed. Compare the two
+        invocations flag for flag instead, and require every difference to be
+        declared in ALLOWED_ARM_DIFFERENCES.
+        """
+        a, b = (self._flags(i) for i in self._select_invocations())
+        differing = {
+            k for k in set(a) | set(b) if a.get(k) != b.get(k)
+        } - self.ALLOWED_ARM_DIFFERENCES
+        self.assertEqual(
+            differing,
+            set(),
+            "the arms differ in more than the ranking: "
+            + ", ".join(f"{k} ({a.get(k)!r} vs {b.get(k)!r})" for k in sorted(differing))
+            + ". A gate win would not be attributable to bits.",
+        )
+
     def test_the_two_arms_use_the_SAME_clustering_threshold(self):
         """--jaccard 1.01 in the control only would switch deduplication off in
-        one arm: measured on the real corpus that moves ~17% of the picks, so a
+        one arm: measured on the real corpus that moves ~10% of the picks, so a
         bits win could have been a dedup win and the experiment could not tell
-        them apart."""
+        them apart. (Subsumed by the flag-for-flag test above; kept because it
+        names the specific bug that was actually shipped once.)"""
         jaccards = []
         for inv in self._select_invocations():
             parts = inv.split()
@@ -1425,8 +1474,72 @@ class TestExperimentConfiguration(unittest.TestCase):
 
     def test_the_script_does_not_hardcode_another_checkouts_path(self):
         """It writes datasets and reports; a hardcoded absolute repo path means
-        running it from a worktree mutates a different checkout's trees."""
-        self.assertNotIn("/Users/", self.src.split("# ----")[0])
+        running it from a worktree mutates a different checkout's trees.
+
+        Over the WHOLE file: this used to read only the config header, up to the
+        first '# ----' separator, which left every stage body unchecked --
+        including the line that names the dataset output directory.
+        """
+        self.assertNotIn("/Users/", self.src)
+
+    def test_the_preflight_stage_runs_before_any_GPU_stage(self):
+        """Stage 0 is the guard against burning both scoring stages on a bits
+        column that stage 3 will refuse. It is worthless if it is not in the
+        default stage list, or if it runs after stage 1."""
+        self.assertIn("--check-decision-coverage", self.src)
+        default = [l for l in self.src.splitlines() if l.startswith("STAGES=")]
+        self.assertEqual(len(default), 1, "the default stage list moved")
+        self.assertIn("0", default[0], f"stage 0 is not in the default stages: {default[0]}")
+        self.assertLess(
+            self.src.index('" 0 "'), self.src.index('" 1 "'),
+            "the preflight stage must be dispatched before the first GPU stage",
+        )
+
+    def test_the_masking_port_is_anchored_against_the_trainers_own_log(self):
+        """Internal chunked-vs-full parity cannot catch a wrong MASK: both paths
+        would be wrong the same way. The only discriminating number is one this
+        repo did not produce -- the trainer's Iter 1 val loss."""
+        anchor = [
+            l for l in self.src.splitlines()
+            if "--anchor" in l and not l.strip().startswith("#")
+        ]
+        self.assertEqual(len(anchor), 1, "the anchor check is not invoked (or is only a comment)")
+        self.assertIn("train.log", self.src)
+        self.assertIn("--iter 1", self.src, "the anchor must name the UNTUNED base's val loss")
+        # The anchor must be taken against the BASE scores, not the tuned ones:
+        # a memorized adapter's residual is ~0.01 whether the mask is right or
+        # wrong, so anchoring there would pass under a broken port. Asserted on
+        # the executable line rather than on prose, which a comment explaining
+        # the history would otherwise trip.
+        self.assertIn("bits-valid-base", anchor[0])
+        self.assertNotIn("tuned", anchor[0])
+
+    def test_stage_5_requires_more_than_one_seed_per_arm(self):
+        """51 binary scenarios means one scenario is 2%; a single run per arm
+        cannot distinguish a curriculum effect from seed noise."""
+        self.assertIn("SEEDS", self.src)
+        self.assertIn("noise floor", self.src.lower())
+
+    def test_the_script_records_that_the_gate_covers_one_track_of_four(self):
+        """A stage-5 verdict is a verdict on routing. 62.3% of what the
+        curriculum cuts is invisible to the arbiter, and the script must say so
+        where the criterion is stated."""
+        self.assertIn("routing", self.src)
+        self.assertIn("1398", self.src)
+
+    def test_the_shell_guard_FAILS_CLOSED_like_the_python_one(self):
+        """`if pgrep -f "$pat"; then refuse; fi` sends every non-zero exit down
+        the same branch, so an unreadable process table (pgrep exits 2 or 3)
+        read as 'nothing is running' and the stage proceeded -- while
+        score_bits._pgrep raises MachineUnknown for exactly those codes. The
+        comment two lines up promises the two are kept in sync; the failure
+        DIRECTION has to be part of that."""
+        guard_block = self.src.split("guard() {")[1].split("\n}")[0]
+        self.assertIn("rc=$?", guard_block, "the guard does not inspect pgrep's exit code")
+        # 0 = matched, 1 = no match, anything else = cannot verify. All three
+        # must be handled distinctly; a two-way test cannot fail closed.
+        self.assertRegex(guard_block, r"case\s+\"\$rc\"")
+        self.assertIn("cannot verify", guard_block)
 
     def test_the_shell_guard_covers_every_pattern_score_bits_covers(self):
         guard_block = self.src.split("guard() {")[1].split("}")[0]
@@ -1440,6 +1553,729 @@ class TestExperimentConfiguration(unittest.TestCase):
         selection had no part in."""
         self.assertIn("D. the FULL corpus, trained for the SAME ITERS", self.src)
         self.assertIn("AND beats D", self.src)
+
+
+# ---------------------------------------------------------------------------
+# 12. the per-track decision column, and the preflight that keeps its failure
+#     cheap. A flat action,session was empty for 48.7% of the real corpus.
+# ---------------------------------------------------------------------------
+
+
+class TestPerTrackDecisionFields(unittest.TestCase):
+    def test_each_track_resolves_to_the_fields_its_schema_actually_uses(self):
+        self.assertEqual(sb.decision_fields_for("routing", None), ("action", "session"))
+        self.assertEqual(sb.decision_fields_for("elicit", None), ("action",))
+        self.assertEqual(
+            sb.decision_fields_for("ledger", None), ("decision", "goal_id", "message_id")
+        )
+        self.assertEqual(sb.decision_fields_for("tooluse", None), ("tool", "arguments"))
+
+    def test_an_unknown_track_gets_the_union_not_nothing(self):
+        """'I do not recognise this schema' must not read as 'this answer has no
+        decision' -- that is the unknown-vs-zero confusion the null column
+        exists to prevent, one level up."""
+        fields = sb.decision_fields_for("unknown", None)
+        for key in ("action", "decision", "tool"):
+            self.assertIn(key, fields)
+
+    def test_an_explicit_list_overrides_every_track(self):
+        self.assertEqual(sb.decision_fields_for("ledger", ["action"]), ("action",))
+
+    def test_a_ledger_answer_gets_a_decision_column_under_auto(self):
+        """The regression that made --bits-column decision unusable: a ledger
+        answer has no 'action' and no 'session', so under the old flat default
+        its decision_bits was null -- as it was for every ledger and tooluse row,
+        1093 of 2245, and the selector then refused the column outright."""
+        answer = '{"decision": "drive", "goal_id": "g7", "reason": "top goal"}'
+        tokens = char_tokens("P>" + answer)
+        ex = sb.Example(0, [{"role": "assistant", "content": answer}], "", "h", "ledger", "drive")
+        rec = sb.score_example(ex, tokens, 2, 4096, True, uniform_scorer(256), "stub", None)
+        self.assertTrue(rec["decision_ok"])
+        self.assertIsNotNone(rec["decision_bits"])
+        self.assertLess(rec["decision_bits"], rec["bits"])
+        # and the flat list that used to be the default still fails on it
+        flat = sb.score_example(
+            ex, tokens, 2, 4096, True, uniform_scorer(256), "stub", None,
+            decision_fields=("action", "session"),
+        )
+        self.assertIsNone(flat["decision_bits"])
+
+    def test_a_tooluse_answer_gets_a_decision_column_under_auto(self):
+        answer = '{"tool": "run", "arguments": {"cmd": "ls"}}'
+        tokens = char_tokens("P>" + answer)
+        ex = sb.Example(0, [{"role": "assistant", "content": answer}], "", "h", "tooluse", "run")
+        rec = sb.score_example(ex, tokens, 2, 4096, True, uniform_scorer(256), "stub", None)
+        self.assertTrue(rec["decision_ok"])
+
+    def test_the_row_records_which_fields_were_used(self):
+        answer = '{"decision": "drive", "reason": "x"}'
+        ex = sb.Example(0, [{"role": "assistant", "content": answer}], "", "h", "ledger", "drive")
+        rec = sb.score_example(
+            ex, char_tokens("P>" + answer), 2, 4096, True, uniform_scorer(256), "stub", None
+        )
+        self.assertEqual(rec["decision_fields"], ["decision", "goal_id", "message_id"])
+
+
+class TestDecisionCoveragePreflight(unittest.TestCase):
+    """The check that makes the above failure cost seconds instead of two
+    multi-hour GPU stages. Pure text work: no tokenizer, no weights."""
+
+    def _corpus(self, d: Path) -> Path:
+        lines = [
+            {"messages": example(ROUTING_SYS, "go", {"action": "route", "session": "s"})},
+            {"messages": example(LEDGER_SYS, "tick", {"decision": "drive", "goal_id": "g"})},
+            {"messages": example(TOOLUSE_SYS, "run", {"tool": "run", "arguments": {"c": "ls"}})},
+            {"messages": example(ELICIT_SYS, "ask", {"action": "ask", "question": "which?"})},
+        ]
+        p = d / "c.jsonl"
+        p.write_text("".join(json.dumps(l) + "\n" for l in lines), encoding="utf-8")
+        return p
+
+    def test_auto_covers_every_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            cov = sb.decision_coverage(sb.read_corpus(self._corpus(d)), None)
+            self.assertEqual(cov["missing"], 0)
+            self.assertEqual(cov["missing_share"], 0.0)
+
+    def test_the_flat_default_leaves_half_the_corpus_blind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            cov = sb.decision_coverage(sb.read_corpus(self._corpus(d)), ("action", "session"))
+            self.assertEqual(cov["missing"], 2)  # the ledger and tooluse rows
+            self.assertEqual(cov["per_target"]["ledger"]["covered"], 0)
+            self.assertEqual(cov["per_target"]["tooluse"]["covered"], 0)
+
+    def test_the_cli_exits_nonzero_BEFORE_any_gpu_stage_when_coverage_is_short(self):
+        """The whole point: a bad --decision-fields must be caught here, not by
+        select_curriculum.py after both scoring stages have run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            corpus = self._corpus(d)
+            buf, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf):
+                stderr, sys.stderr = sys.stderr, err
+                try:
+                    rc = sb.main([
+                        "--data", str(corpus), "--out", str(d / "o.jsonl"),
+                        "--decision-fields", "action,session",
+                        "--check-decision-coverage", "0.95",
+                    ])
+                finally:
+                    sys.stderr = stderr
+            self.assertEqual(rc, 3)
+            self.assertIn("below the required", err.getvalue())
+
+    def test_the_cli_passes_under_auto(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            buf, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf):
+                stderr, sys.stderr = sys.stderr, err
+                try:
+                    rc = sb.main([
+                        "--data", str(self._corpus(d)), "--out", str(d / "o.jsonl"),
+                        "--check-decision-coverage", "0.95",
+                    ])
+                finally:
+                    sys.stderr = stderr
+            self.assertEqual(rc, 0)
+
+
+# ---------------------------------------------------------------------------
+# 13. the fingerprint, across the PAIR of files where the subtraction happens
+# ---------------------------------------------------------------------------
+
+
+class TestPairFingerprint(unittest.TestCase):
+    BASE = {"model": "m", "max_seq_length": 3072, "match_trainer": True,
+            "full_forward": False, "chunk": 512}
+
+    def test_matching_runs_pass(self):
+        sc.check_pair_fingerprints(
+            dict(self.BASE), dict(self.BASE), Path("b"), Path("t"), False
+        )
+
+    def test_a_different_window_is_refused(self):
+        """Score the base at 3072 and the tuned adapter at 2048 and every
+        example truncated under one but not the other contributes a fabricated
+        learned_bits -- to the DEFAULT ranking key, silently."""
+        tuned = dict(self.BASE, max_seq_length=2048)
+        with self.assertRaises(SystemExit) as cm:
+            sc.check_pair_fingerprints(dict(self.BASE), tuned, Path("b"), Path("t"), False)
+        self.assertIn("max_seq_length", str(cm.exception))
+
+    def test_a_different_model_is_refused(self):
+        tuned = dict(self.BASE, model="some-other-model-entirely")
+        with self.assertRaises(SystemExit):
+            sc.check_pair_fingerprints(dict(self.BASE), tuned, Path("b"), Path("t"), False)
+
+    def test_a_different_forward_path_is_refused(self):
+        for key, value in (("full_forward", True), ("chunk", 2048), ("match_trainer", False)):
+            with self.subTest(key=key):
+                with self.assertRaises(SystemExit):
+                    sc.check_pair_fingerprints(
+                        dict(self.BASE), dict(self.BASE, **{key: value}),
+                        Path("b"), Path("t"), False,
+                    )
+
+    def test_the_ADAPTER_is_allowed_to_differ(self):
+        """It is the one field that MUST differ between a base run and a tuned
+        run; a check that refused it would refuse every valid pair."""
+        sc.check_pair_fingerprints(
+            dict(self.BASE, adapter=None), dict(self.BASE, adapter="/some/adapter"),
+            Path("b"), Path("t"), False,
+        )
+
+    def test_the_escape_hatch_warns_instead_of_refusing(self):
+        err = io.StringIO()
+        stderr, sys.stderr = sys.stderr, err
+        try:
+            sc.check_pair_fingerprints(
+                dict(self.BASE), dict(self.BASE, chunk=2048), Path("b"), Path("t"), True
+            )
+        finally:
+            sys.stderr = stderr
+        self.assertIn("WARNING", err.getvalue())
+
+    def test_two_files_that_record_no_fingerprint_at_all_are_not_a_mismatch(self):
+        sc.check_pair_fingerprints({}, {}, Path("b"), Path("t"), False)
+
+    def _pair(self, d: Path, tuned_over: dict) -> tuple[Path, Path, Path]:
+        msgs = [example(ROUTING_SYS, f"route job {i} to alpha now",
+                        {"action": "route", "session": f"s{i}", "reason": "named"})
+                for i in range(8)]
+        corpus = d / "corpus.jsonl"
+        corpus.write_text(
+            "".join(json.dumps({"messages": m}) + "\n" for m in msgs), encoding="utf-8"
+        )
+        def write(path, adapter, scale, over):
+            with path.open("w", encoding="utf-8") as fh:
+                for i, m in enumerate(msgs):
+                    rec = dict(self.BASE, adapter=adapter)
+                    rec.update(over)
+                    rec.update({
+                        "hash": sb.content_hash(m), "index": i, "target": "routing",
+                        "decision_class": "route", "answer_tokens": 20,
+                        "bits": (i + 1) * scale, "decision_bits": (i + 1) * scale * 0.1,
+                        "decision_tokens": 4, "truncated": False, "skipped": False,
+                    })
+                    fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        base, tuned = d / "base.jsonl", d / "tuned.jsonl"
+        write(base, None, 1.0, {})
+        write(tuned, "/some/adapter", 0.5, tuned_over)
+        return corpus, base, tuned
+
+    def _run(self, corpus, base, tuned, extra=()):
+        buf, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf):
+            stderr, sys.stderr = sys.stderr, err
+            try:
+                rc = sc.main(["--base", str(base), "--tuned", str(tuned),
+                              "--corpus", str(corpus), *extra])
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+                print(exc, file=err)
+            finally:
+                sys.stderr = stderr
+        return rc, err.getvalue()
+
+    def test_the_SELECTOR_refuses_a_mismatched_pair_end_to_end(self):
+        """The function existed and was correct; nothing called it across the
+        pair, which is the only place the subtraction happens. This drives the
+        CLI, so deleting the call site fails a test."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            corpus, base, tuned = self._pair(d, {"max_seq_length": 2048})
+            rc, err = self._run(corpus, base, tuned)
+            self.assertNotEqual(rc, 0)
+            self.assertIn("max_seq_length", err)
+
+    def test_the_SELECTOR_accepts_a_matching_pair_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            corpus, base, tuned = self._pair(d, {})
+            rc, err = self._run(corpus, base, tuned)
+            self.assertEqual(rc, 0, err)
+
+    def test_the_override_flag_lets_a_mismatched_pair_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            corpus, base, tuned = self._pair(d, {"chunk": 2048})
+            rc, err = self._run(corpus, base, tuned, ["--allow-fingerprint-mismatch"])
+            self.assertEqual(rc, 0, err)
+            self.assertIn("WARNING", err)
+
+    def test_chunk_is_part_of_the_resume_fingerprint(self):
+        """--chunk changes matmul shapes and, on a sliding-window model, cache
+        eviction points, so rows scored at 512 and at 2048 are not the same
+        measurement and must not land in one file."""
+        self.assertIn("chunk", sb.run_fingerprint("m", None, 3072, True, False, 512))
+        self.assertEqual(
+            sb.run_fingerprint("m", None, 3072, True, False, 512)["chunk"], 512
+        )
+
+    def test_chunk_is_null_under_full_forward_where_it_has_no_effect(self):
+        """The fingerprint names the forward path actually taken, not a flag
+        that was ignored -- otherwise two identical full-forward runs would
+        refuse to join over a value neither of them used."""
+        self.assertIsNone(sb.run_fingerprint("m", None, 3072, True, True, 512)["chunk"])
+
+
+# ---------------------------------------------------------------------------
+# 14. the mislabel screen, at scales two orders of magnitude apart
+# ---------------------------------------------------------------------------
+
+
+class TestNoiseScreenIsScaleFree(unittest.TestCase):
+    """The old rule was max(8.0 bits, 4.0 x class median). Calibrated against a
+    ~6.5-bit fixture, it cut at ~492 bits on a corpus whose examples cost ~123 --
+    it could not fire, and its absolute floor was inert by three orders of
+    magnitude. These pin the property that broke: the cut must track the data."""
+
+    def _class(self, centre: float, spread: float, outlier: float, n: int = 20):
+        spec = [
+            ("routing", "refuse", f"host number {i} is not registered with this factory",
+             centre + (i % 5) * spread)
+            for i in range(n)
+        ]
+        rows = make_rows(spec)
+        rows.append(sc.Row(
+            index=n, hash="hBAD", target="routing", decision_class="refuse",
+            answer_tokens=10, bits_base=outlier, bits_tuned=0.0, truncated=False,
+            text="host number ninety is not registered with this factory",
+            shingles=sc.shingles("host number ninety is not registered here", 3),
+        ))
+        return rows
+
+    def test_it_fires_at_DECISION_bits_scale(self):
+        rows = self._class(centre=3.0, spread=0.2, outlier=13.0)
+        screen = sc.flag_noise_suspects(rows, factor=4.0, floor=0.0)
+        self.assertEqual([r.hash for r in rows if r.noise_suspect], ["hBAD"])
+        self.assertEqual(screen.flagged, 1)
+
+    def test_it_fires_at_WHOLE_ANSWER_bits_scale(self):
+        """~123 bits per example is the scale the run log implies. The old
+        4x-median rule cut at ~492 here and flagged nothing."""
+        rows = self._class(centre=123.0, spread=3.0, outlier=400.0)
+        sc.flag_noise_suspects(rows, factor=4.0, floor=0.0)
+        self.assertEqual([r.hash for r in rows if r.noise_suspect], ["hBAD"])
+
+    def test_the_old_absolute_floor_would_have_disabled_it_entirely(self):
+        """A regression guard on the specific bug: an 8.0-bit absolute floor
+        dominates every relative cut in a small-scale column, so nothing is ever
+        flagged and section 5's 'none' is indistinguishable from an all-clear."""
+        rows = self._class(centre=1.5, spread=0.1, outlier=7.5)
+        self.assertEqual(sc.flag_noise_suspects(rows, 4.0, floor=8.0).flagged, 0)
+        self.assertEqual(sc.flag_noise_suspects(rows, 4.0, floor=0.0).flagged, 1)
+
+    def test_the_floor_defaults_to_off(self):
+        parser = sc.build_parser()
+        args = parser.parse_args(["--base", "b", "--corpus", "c"])
+        self.assertEqual(args.noise_floor, 0.0)
+
+    def test_the_screen_reports_the_cut_and_what_bound_it(self):
+        rows = self._class(centre=3.0, spread=0.2, outlier=13.0)
+        screen = sc.flag_noise_suspects(rows, 4.0, 0.0)
+        key = ("routing", "refuse")
+        self.assertIn(key, screen.cuts)
+        self.assertGreater(screen.cuts[key], screen.medians[key])
+        self.assertIn("MAD", screen.bound_by[key])
+
+    def test_an_absolute_floor_that_binds_says_so(self):
+        rows = self._class(centre=3.0, spread=0.2, outlier=13.0)
+        screen = sc.flag_noise_suspects(rows, 4.0, floor=999.0)
+        self.assertIn("floor", screen.bound_by[("routing", "refuse")])
+
+    def test_a_partition_too_small_to_screen_is_NAMED_not_skipped_silently(self):
+        """An unscreened partition is where a mislabel hides. The corpus is
+        designed to grow, and a new five-example decision class would be exempt
+        from the test entirely with nothing in the report saying so."""
+        rows = make_rows([("ledger", "rare", f"unusual case {i} here", 5.0) for i in range(3)])
+        screen = sc.flag_noise_suspects(rows, 4.0, 0.0, min_n=8)
+        self.assertIn(("ledger", "rare"), screen.skipped)
+        self.assertIn("3", screen.skipped[("ledger", "rare")])
+
+    def test_a_degenerate_class_with_no_spread_falls_back_to_the_factor(self):
+        rows = make_rows([("routing", "route", f"unique sentence {i} about work", 6.0)
+                          for i in range(20)])
+        screen = sc.flag_noise_suspects(rows, 4.0, 0.0)
+        self.assertEqual(screen.flagged, 0)
+        self.assertIn("MAD=0", screen.bound_by[("routing", "route")])
+
+    def test_it_screens_the_DECISION_column_when_every_row_has_one(self):
+        """A mislabel is ~10 bits against a whole-answer class spread of tens,
+        and most of that spread is prose length. In the decision column it is
+        most of the signal."""
+        rows = make_rows([("routing", "route", f"send job {i} to alpha", 100.0 + i)
+                          for i in range(12)])
+        for i, r in enumerate(rows):
+            r.decision_bits_base = 2.0 + (i % 3) * 0.1
+        rows[5].decision_bits_base = 40.0  # a wrong label token
+        screen = sc.flag_noise_suspects(rows, 4.0, 0.0)
+        self.assertEqual(screen.column, "decision_bits_base")
+        self.assertEqual([r.index for r in rows if r.noise_suspect], [5])
+
+    def test_it_falls_back_to_the_ranked_column_when_the_decision_one_is_partial(self):
+        rows = make_rows([("routing", "route", f"send job {i} to alpha", 10.0)
+                          for i in range(12)])
+        for r in rows[:6]:
+            r.decision_bits_base = 1.0
+        screen = sc.flag_noise_suspects(rows, 4.0, 0.0)
+        self.assertEqual(screen.column, "bits_base")
+
+    def test_noise_column_ranked_forces_the_ranked_column(self):
+        rows = make_rows([("routing", "route", f"send job {i} to alpha", 10.0)
+                          for i in range(12)])
+        for r in rows:
+            r.decision_bits_base = 1.0
+        self.assertEqual(
+            sc.flag_noise_suspects(rows, 4.0, 0.0, use_decision=False).column, "bits_base"
+        )
+
+    def test_exclude_keeps_the_class_quota_proportional_to_the_ORIGINAL_size(self):
+        """select_curriculum.py's own comment says the quota uses the ORIGINAL n
+        'so shares hold'. Nothing tested it: switching it to len(members) --
+        which lets --noise-policy exclude shrink a class below its corpus share
+        -- passed the whole suite."""
+        rows = make_rows([("routing", "route", f"unique sentence {i} about work {i}", 5.0)
+                          for i in range(20)])
+        for r in rows[:4]:
+            r.noise_suspect = True
+        sel = sc.select(rows, 0.5, "bits_base", False, 0.99, 3, 1, 17, 4000,
+                        noise_policy="exclude")
+        # 0.5 * the ORIGINAL 20 = 10. On the 16 that survived exclusion it would
+        # be 8, and the class would silently fall below its corpus share.
+        # (Four suspects, not one: round(0.5*19) is also 10, so a single
+        # exclusion cannot tell the two formulas apart.)
+        self.assertEqual(sel.quotas[("routing", "route")], 10)
+        self.assertEqual(len(sel.kept), 10)
+
+
+# ---------------------------------------------------------------------------
+# 15. report arithmetic that was wrong or crashed
+# ---------------------------------------------------------------------------
+
+
+class TestReportArithmetic(unittest.TestCase):
+    def _args(self, **over):
+        parser = sc.build_parser()
+        args = parser.parse_args(["--base", "b", "--corpus", "c"])
+        for k, v in over.items():
+            setattr(args, k, v)
+        return args
+
+    def test_a_dropped_row_with_no_bits_column_does_not_crash_the_report(self):
+        """--bits-column decision writes null, never 0.0, for a row whose fields
+        could not be located. Formatting that with :.2f raised TypeError and
+        killed the run AFTER selection -- a traceback instead of a report, and
+        no subset written."""
+        rows = make_rows([("routing", "route", f"unique sentence {i} here", float(i))
+                          for i in range(10)])
+        for r in rows[:2]:
+            r.bits_base = None
+        args = self._args(rank_by="bits_base", explain=10)
+        sel = sc.select(rows, 0.5, "bits_base", False, 0.9, 3, 1, 17, 4000)
+        report = sc.build_report(rows, sel, args, False)
+        self.assertIn("n/a", report)
+
+    def test_the_unscored_cross_reference_names_the_section_it_prints(self):
+        """The header said 'Section 6 names them' while the section was numbered
+        7 whenever --tuned was given -- i.e. in the main path."""
+        rows = make_rows([("routing", "route", f"unique sentence {i} here", float(i + 1))
+                          for i in range(10)])
+        for r in rows:
+            r.bits_tuned = 0.1
+        args = self._args(rank_by="learned_bits", explain=5)
+        sel = sc.select(rows, 0.5, "learned_bits", False, 0.9, 3, 1, 17, 4000)
+        report = sc.build_report(rows, sel, args, True, (), [(99, "unscorable")])
+        self.assertIn("Section 7 names", report)
+        self.assertIn("7. UNSCORED CORPUS LINES", report)
+        self.assertNotIn("Section 6 names", report)
+
+    def test_excluded_noise_suspects_are_not_counted_as_redundant(self):
+        """Under --noise-policy exclude the suspects never enter a cluster, so
+        dividing the cluster count by len(rows) invents surface redundancy that
+        does not exist -- and contradicts the per-partition table in the same
+        report."""
+        rows = make_rows([("routing", "route", f"wholly distinct sentence {i} xyz{i}", 5.0)
+                          for i in range(20)])
+        for r in rows[:4]:
+            r.noise_suspect = True
+            r.bits_base = 200.0
+        args = self._args(rank_by="bits_base", noise_policy="exclude", explain=5)
+        sel = sc.select(rows, 0.5, "bits_base", False, 0.9, 3, 1, 17, 4000,
+                        noise_policy="exclude")
+        report = sc.build_report(rows, sel, args, False)
+        # every row is textually distinct: 16 clustered rows, 16 clusters, 0%
+        self.assertIn("0.0% surface redundancy", report)
+        self.assertIn("never entered a cluster", report)
+
+    def test_the_report_names_the_share_of_the_RANKED_quantity(self):
+        """Sections 3 and 4 quantified the selection in bits_base while the
+        default ranking with --tuned is learned_bits, so the headline described
+        a criterion the selector did not use."""
+        rows = make_rows([("routing", "route", f"unique sentence {i} here", float(i + 1))
+                          for i in range(10)])
+        # bits_base ASCENDS with the index; learned_bits DESCENDS. So the two
+        # orderings are exact opposites and a report that sorts by the wrong one
+        # names the wrong example first.
+        for i, r in enumerate(rows):
+            r.bits_tuned = float(i + 1) - (10.0 - i)
+        args = self._args(rank_by="learned_bits", explain=10)
+        sel = sc.select(rows, 0.5, "learned_bits", False, 0.9, 3, 1, 17, 4000)
+        report = sc.build_report(rows, sel, args, True)
+        self.assertIn("of the corpus's learned_bits", report)
+        self.assertIn("THE CRITERION ACTUALLY USED", report)
+        self.assertIn("highest-learned_bits drops first", report)
+
+        # ...and the list is actually ORDERED by that criterion, not merely
+        # labelled with it. Sorting by bits_base while ranking on learned_bits
+        # printed one number as the header and a different one as the reason.
+        named = [int(l.split("idx")[1].split()[0])
+                 for l in report.splitlines() if l.strip().startswith("idx ")]
+        by_learned = sorted(sel.dropped, key=lambda r: -(r.learned_bits or 0))
+        self.assertEqual(named[: len(by_learned)], [r.index for r in by_learned])
+        self.assertNotEqual(
+            named[: len(by_learned)],
+            [r.index for r in sorted(sel.dropped, key=lambda r: -(r.bits_base or 0))],
+            "the fixture must make the two orderings differ, or this proves nothing",
+        )
+
+    def test_the_report_says_how_much_of_the_cut_the_gate_cannot_see(self):
+        """evals/tmux-routing scores the routing track only. A subset that
+        wrecks the tooluse track gates identically, so the count belongs in the
+        report as a measurement, not in a footnote as a caveat."""
+        rows = make_rows(
+            [("routing", "route", f"send job {i} to alpha", 5.0) for i in range(6)]
+            + [("tooluse", "run", f"run command number {i} now", 5.0) for i in range(6)]
+        )
+        args = self._args(rank_by="bits_base", explain=5)
+        sel = sc.select(rows, 0.5, "bits_base", False, 0.9, 3, 1, 17, 4000)
+        report = sc.build_report(rows, sel, args, False)
+        self.assertIn("gate visibility", report)
+        self.assertIn("ROUTING track only", report)
+
+    def test_the_limits_block_does_not_quote_another_corpus_as_if_it_were_this_one(self):
+        """The LIMITS text hardcoded cluster counts measured on the 2363-example
+        file into a report computed on the 2245-example one, contradicting
+        section 2 of the same report."""
+        rows = make_rows([("routing", "route", f"unique sentence {i} here", 5.0)
+                          for i in range(10)])
+        args = self._args(rank_by="bits_base")
+        sel = sc.select(rows, 0.5, "bits_base", False, 0.9, 3, 1, 17, 4000)
+        report = sc.build_report(rows, sel, args, False)
+        for stale in ("1817 clusters", "1335 with the answer", "121 vs 834"):
+            self.assertNotIn(stale, report)
+        # the figures that remain must name the corpus they were measured on
+        if "1283" in report:
+            self.assertIn("datasets/mlx/train.jsonl", report)
+
+
+class TestRankNormalizeUnits(unittest.TestCase):
+    def test_decision_bits_are_normalized_by_DECISION_tokens(self):
+        """--rank-normalize divided decision bits by whole-answer tokens, so two
+        examples with identical decision bits ranked by the length of their
+        reason prose -- the exact length bias the flag exists to remove, upside
+        down."""
+        a = sc.Row(index=0, hash="a", target="routing", decision_class="route",
+                   answer_tokens=100, bits_base=10.0, bits_tuned=None, truncated=False,
+                   decision_tokens=5, bits_column="decision")
+        b = sc.Row(index=1, hash="b", target="routing", decision_class="route",
+                   answer_tokens=20, bits_base=10.0, bits_tuned=None, truncated=False,
+                   decision_tokens=5, bits_column="decision")
+        # identical decision bits over identical decision tokens => identical rank
+        self.assertEqual(a.value("bits_base", True), b.value("bits_base", True))
+        self.assertEqual(a.value("bits_base", True), 2.0)
+
+    def test_answer_bits_still_normalize_by_answer_tokens(self):
+        r = sc.Row(index=0, hash="a", target="routing", decision_class="route",
+                   answer_tokens=10, bits_base=40.0, bits_tuned=None, truncated=False,
+                   decision_tokens=2, bits_column="answer")
+        self.assertEqual(r.value("bits_base", True), 4.0)
+
+
+# ---------------------------------------------------------------------------
+# 16. the external anchor: the one check this repo did not produce the answer to
+# ---------------------------------------------------------------------------
+
+
+class TestTrainerAnchor(unittest.TestCase):
+    LOG = (
+        "Iter 1: Val loss 2.463, Val took 12.0s\n"
+        "Iter 25: Train loss 1.2\n"
+        "Iter 500: Val loss 0.074\n"
+        "Iter 3500: Val loss 0.012\n"
+    )
+
+    def _meta(self, loss, adapter=None):
+        return {"adapter": adapter, "summary": {"trainer_parity_loss_nats": loss}}
+
+    def test_val_losses_are_read_off_the_log(self):
+        self.assertEqual(pc.val_losses(self.LOG)[1], 2.463)
+        self.assertEqual(pc.val_losses(self.LOG)[3500], 0.012)
+
+    def test_a_matching_port_passes(self):
+        ok, msg = pc.compare_anchor(self._meta(2.44), self.LOG, 1, 0.15)
+        self.assertTrue(ok, msg)
+
+    def test_a_prompt_masking_error_is_caught(self):
+        """Scoring the prompt as if it were the answer moves the loss by a large
+        multiple -- the failure that matters and the one internal parity cannot
+        see, because both forward paths would be wrong the same way."""
+        ok, _ = pc.compare_anchor(self._meta(0.31), self.LOG, 1, 0.15)
+        self.assertFalse(ok)
+
+    def test_anchoring_on_the_TAIL_of_the_log_is_refused_for_a_tuned_run(self):
+        """The vacuous check this replaced: a memorized adapter's residual is
+        ~0.01 and so is the late val loss, whether the mask is right or wrong."""
+        ok, msg = pc.compare_anchor(self._meta(0.01, adapter="/a"), self.LOG, 1, 0.15)
+        self.assertFalse(ok)
+        self.assertIn("UNTUNED", msg)
+
+    def test_a_log_with_no_val_losses_FAILS_rather_than_passing_vacuously(self):
+        ok, msg = pc.compare_anchor(self._meta(2.463), "Iter 25: Train loss 1.2\n", 1, 0.15)
+        self.assertFalse(ok)
+        self.assertIn("nothing to anchor", msg)
+
+    def test_a_missing_iteration_fails_rather_than_picking_another(self):
+        ok, msg = pc.compare_anchor(self._meta(2.463), self.LOG, 999, 0.15)
+        self.assertFalse(ok)
+        self.assertIn("999", msg)
+
+    def test_a_meta_file_without_the_summary_fails(self):
+        ok, msg = pc.compare_anchor({"summary": {}}, self.LOG, 1, 0.15)
+        self.assertFalse(ok)
+        self.assertIn("no summary", msg)
+
+    def test_the_cli_runs_in_anchor_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "m.json").write_text(json.dumps(self._meta(2.44)), encoding="utf-8")
+            (d / "train.log").write_text(self.LOG, encoding="utf-8")
+            err = io.StringIO()
+            stderr, sys.stderr = sys.stderr, err
+            try:
+                rc = pc.main(["--anchor", str(d / "m.json"), "--log", str(d / "train.log")])
+            finally:
+                sys.stderr = stderr
+            self.assertEqual(rc, 0)
+            self.assertIn("2.4630", err.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# 17. guards the review found untested by mutation
+# ---------------------------------------------------------------------------
+
+
+class TestPreviouslyUntestedGuards(unittest.TestCase):
+    def test_a_truncated_plan_is_refused_even_when_the_answer_IS_locatable(self):
+        """The old test reached its assertIsNone through a different branch --
+        the truncated region simply did not contain the answer text -- so
+        deleting 'or plan.truncated' from decision_indices kept every test
+        green. Drive the guard directly: a plan marked truncated whose region
+        DOES contain the whole answer."""
+        answer = '{"action": "route"}'
+        text = "P>" + answer
+        tokens = char_tokens(text)
+        stub = sb.StubScorer(256, lambda r, v: 0.0)
+        honest = sb.plan_mask(tokens, 2, 4096, match_trainer=True)
+        self.assertFalse(honest.truncated)
+        self.assertIsNotNone(
+            sb.decision_indices(honest, tokens, answer, ("action",), stub.decode)
+        )
+        # same tokens, same offset, same region -- only `truncated` differs
+        lying = sb.MaskPlan(
+            length=honest.length + 5, effective_length=honest.effective_length,
+            offset=honest.offset, rows=list(honest.rows), targets=list(honest.targets),
+            answer_tokens=honest.answer_tokens, trainer_tokens=honest.trainer_tokens,
+            truncated=True, tokens_lost=5, usable=True,
+        )
+        self.assertIsNone(
+            sb.decision_indices(lying, tokens, answer, ("action",), stub.decode),
+            "a truncated answer's decision span is not established, it is guessed",
+        )
+
+    def test_a_template_whose_prompt_is_not_a_prefix_is_REFUSED(self):
+        """chat_tokenize asserts tokens[:offset] == prompt tokens. The README
+        advertises that refusal; nothing exercised it, and replacing the
+        condition with `if False:` passed the suite."""
+
+        class NotPrefixStable:
+            def apply_chat_template(self, messages, tools=None, add_generation_prompt=False,
+                                    return_dict=False):
+                if len(messages) == 1:  # the prompt-only call
+                    return [9, 9, 9]
+                return [1, 2, 3, 4, 5]
+
+        with self.assertRaises(ValueError) as cm:
+            sb.chat_tokenize(NotPrefixStable(), [{"role": "user", "content": "u"},
+                                                 {"role": "assistant", "content": "a"}])
+        self.assertIn("prefix-stable", str(cm.exception))
+
+    def test_a_prefix_stable_template_is_accepted(self):
+        class PrefixStable:
+            def apply_chat_template(self, messages, tools=None, add_generation_prompt=False,
+                                    return_dict=False):
+                return [1, 2, 3] if len(messages) == 1 else [1, 2, 3, 4, 5]
+
+        tokens, offset = sb.chat_tokenize(
+            PrefixStable(), [{"role": "user", "content": "u"},
+                             {"role": "assistant", "content": "a"}]
+        )
+        self.assertEqual((tokens, offset), ([1, 2, 3, 4, 5], 3))
+
+    def test_a_score_file_mixing_two_adapters_is_refused(self):
+        """load_scores raises on it; no test drove that path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "mixed.jsonl"
+            p.write_text(
+                json.dumps({"hash": "a", "bits": 1.0, "adapter": None, "skipped": False}) + "\n"
+                + json.dumps({"hash": "b", "bits": 2.0, "adapter": "/x", "skipped": False}) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit) as cm:
+                sc.load_scores(p)
+            self.assertIn("two runs spliced together", str(cm.exception))
+
+    def test_dry_run_takes_the_process_half_of_the_guard(self):
+        """--dry-run imports mlx_lm to reach the TokenizerWrapper, and that
+        import initialises Metal. It used to skip the guard entirely -- the one
+        unguarded path to the Metal runtime, under exactly the condition the
+        standing rule was written for."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            corpus = d / "c.jsonl"
+            corpus.write_text(json.dumps({"messages": example(
+                ROUTING_SYS, "go", {"action": "route", "session": "s"})}) + "\n", encoding="utf-8")
+            real = sb._pgrep
+            sb._pgrep = lambda pattern: ["18405"] if "lo" + "ra" in pattern else []
+            err = io.StringIO()
+            stderr, sys.stderr = sys.stderr, err
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    sb.main(["--data", str(corpus), "--out", str(d / "o.jsonl"), "--dry-run"])
+            finally:
+                sb._pgrep = real
+                sys.stderr = stderr
+            self.assertEqual(cm.exception.code, sb.BUSY_EXIT)
+            self.assertIn("refusing to run", err.getvalue())
+
+    def test_the_process_only_guard_still_ignores_free_memory(self):
+        """It allocates nothing, so a memory threshold is not its precondition;
+        only 'no fine-tune is live' is."""
+        real_pgrep, real_free = sb._pgrep, sb.free_gb
+        sb._pgrep = lambda pattern: []
+        sb.free_gb = lambda: 0.5  # would fail the normal guard
+        err = io.StringIO()
+        stderr, sys.stderr = sys.stderr, err
+        try:
+            sb.guard(10.0, check_memory=False)  # must NOT raise
+        finally:
+            sb._pgrep, sb.free_gb = real_pgrep, real_free
+            sys.stderr = stderr
+        self.assertIn("memory not checked", err.getvalue())
+
 
 
 if __name__ == "__main__":

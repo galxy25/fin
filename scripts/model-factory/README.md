@@ -360,33 +360,78 @@ high-information answer is not buried under a long one — but note this is what
 ranks per-example. On this corpus the within-partition answer-length spread runs
 1.00×–1.55× (`tooluse/request_input` 1.55×, `ledger/report` 1.37×), so a 25% cut
 under the default partly selects on length. Pass `--rank-normalize` if that
-matters more to you than absolute information per example.
+matters more to you than absolute information per example. It divides by the
+token count **matching the column in force** — `decision_tokens` under
+`--bits-column decision`, `answer_tokens` under `answer`. (It used to divide by
+`answer_tokens` either way, so `decision --rank-normalize` ranked gate-field
+bits per *whole-answer* token: two examples with identical decision bits then
+sorted by the length of their `reason` prose — the exact length bias the flag
+exists to remove, upside down.)
 
-### What the gate actually reads — and why there are two bits columns
+### The decision column — and what the gate actually covers
 
-`evals/tmux-routing/run_evals.py:matches()` compares `expected["action"]` and,
-when present, `expected["session"]`. It never reads `reason`, `question`, or any
-other prose. Summed over the whole assistant turn, most of every bits number is
-therefore spent on text the arbiter ignores: measured on `datasets/mlx/train.jsonl`,
-the gate-scored fields are **9.6%–46.8% of each answer by characters (median
-17.9%)** — and less by tokens, because the decisive value is usually one token
-while the prose is many.
+Most of every bits number is spent on prose no arbiter reads. So `score_bits.py`
+emits a second column, **`decision_bits`**: the same cross-entropy summed only
+over the tokens that spell the fields carrying the **label**.
 
-So `score_bits.py` emits a second column, **`decision_bits`**: the same
-cross-entropy summed only over the tokens spelling `--decision-fields`
-(`action,session` by default). `select_curriculum.py --bits-column decision`
-ranks on it, and `run_bits_experiment.sh` uses it by default
-(`FIN_BITS_COLUMN=answer` switches back).
+Those fields are **per track**, because the four tracks do not share an answer
+schema. `--decision-fields auto` (the default) resolves them through
+`DECISION_FIELDS_BY_TARGET`:
 
-Neither column is automatically right — prose bits still shape the model — but a
-curriculum built to move the gate has the better claim on the second. The mapping
-from JSON field to token span is exact for spans and monotone-decode tokenizers,
-and is **verified only against a character-level stub so far**: no real
-tokenizer has run yet (see "Nothing above has been run yet"). `decision_bits` is
-`null`, never `0.0`, when the span cannot be located, `score_bits` reports how
-many rows that hit, and `select_curriculum` refuses `--bits-column decision`
-when more than 20% of rows lack it — otherwise the ranking would be on "could
-this be computed", not on information.
+| track | decision fields | rows | share of each answer, by characters |
+|---|---|---|---|
+| routing | `action`, `session` | 847 | min 11.7% · **median 16.0%** · max 42.6% |
+| elicit | `action` | 305 | min 8.5% · **median 10.7%** · max 21.6% |
+| ledger | `decision`, `goal_id`, `message_id` | 728 | min 23.7% · **median 41.1%** · max 51.2% |
+| tooluse | `tool`, `arguments` | 365 | min 92.5% · **median 96.5%** · max 97.4% |
+| **all** | | **2245** | min 8.5% · **median 36.6%** · max 97.4% |
+
+Measured with the shipped `field_spans` over `datasets/mlx/train.jsonl`, merging
+overlapping spans, denominator `len(answer)`. tooluse is ~97% because that
+track's answer schema is `{tool, arguments}` with no prose field at all — there
+the decision column is very nearly the answer column, and honestly so. By
+*tokens* the share is smaller for the tracks that do have prose.
+
+**A correction.** An earlier version of this document quoted "9.6%–46.8% of each
+answer by characters (median 17.9%)" for a flat `action,session`. That trio does
+not reproduce under any interpretation — the shipped code gives 8.5%/16.0%/42.6%
+— and, worse, it was a *conditional* distribution presented as a marginal: it
+described only the 1152 answers that contain one of those two keys. The other
+**1093 (48.7%) — the entire ledger and tooluse tracks — contain neither**, so
+their `decision_bits` was `null` and `select_curriculum.py` refused the column
+outright at its 20%-missing guard. The flat default could not produce a
+curriculum on the only corpus in the tree; the per-track table above covers
+**100%** of it.
+
+That failure is now cheap to catch. `--check-decision-coverage` is a pure-stdlib
+preflight (no tokenizer, no weights, no GPU, runs while a fine-tune holds the
+machine) and it is **stage 0** of the runner, before either scoring stage:
+
+```sh
+$V scripts/model-factory/score_bits.py --data datasets/mlx/train.jsonl \
+    --out /dev/null --check-decision-coverage 0.95     # exit 3 if short
+```
+
+**What the arbiter covers is narrower than either column.**
+`evals/tmux-routing` is 51 scenarios whose expected actions are all
+`route`/`start`/`clarify`/`refuse`, and `run_evals.py:matches()` compares only
+`action` and, when present, `session`. Nothing in it exercises ledger, elicit or
+tooluse. By `score_bits.classify` the corpus is routing 847, elicit 305, ledger
+728, tooluse 365 — so **1398 of 2245 rows (62.3%) of what the curriculum cuts is
+invisible to the gate**, while the selector applies its budget to every partition
+alike. A subset that destroys the tooluse track's argument formatting would score
+identically on all 51 scenarios. The gate remains the arbiter; it is an arbiter
+**of the routing track**, and a stage-5 verdict should be read that way. The
+report prints the per-run count under `gate visibility`.
+
+Neither column is automatically right — prose bits still shape the model. The
+mapping from JSON field to token span is exact for spans and monotone-decode
+tokenizers, and is **verified only against a character-level stub so far**: no
+real tokenizer has run yet (see "Nothing above has been run yet").
+`decision_bits` is `null`, never `0.0`, when the span cannot be located,
+`score_bits` reports how many rows that hit, and `select_curriculum` refuses
+`--bits-column decision` when more than 20% of rows lack it — otherwise the
+ranking would be on "could this be computed", not on information.
 
 ### Running it
 
@@ -421,17 +466,58 @@ code it shipped with; `FIN_DATA_ROOT` (corpora/models) and `FIN_OUT_ROOT`
 (reports/datasets it writes) both default to that same checkout, so running it
 from a worktree stays in the worktree.
 
-`scripts/model-factory/tests/test_bits_curriculum.py` (stdlib `unittest`, **110
+Its stages, default `0 1 2 3 4` (stage 5 needs an explicit go):
+
+| stage | GPU | what it does |
+| --- | --- | --- |
+| 0 | no | **preflight** — can the chosen bits column be computed at all? Seconds. |
+| 1 | yes | `bits_base`, plus **1b-anchor** (mask vs the trainer's own log) and **1c** (chunked-vs-full parity) |
+| 2 | yes | `bits_tuned`, plus **2b** parity |
+| 3 | no | select the curriculum + the random control arm |
+| 4 | no | print the report |
+| 5 | yes | retrain all four arms and gate them — the only proof that counts |
+
+Stage 0 exists because its absence was expensive by construction: the runner
+defaulted to `--bits-column decision` while the scorer defaulted to a flat
+`action,session`, so both multi-hour scoring stages would have completed and
+stage 3 would then have refused, producing nothing. `FIN_BITS_COLUMN=answer`
+skips the column (and the preflight) entirely.
+
+The two selector invocations in stage 3 are the experiment's honesty, and a test
+(`TestExperimentConfiguration`) compares them **flag for flag**, requiring every
+difference to be declared in an allow-list. Pinning one flag at a time — which
+is what it used to do, for `--jaccard` alone — let any other flag regain a second
+confound silently; `--target-fraction 0.5` in one arm and `0.25` in the other
+passed the whole suite.
+
+`scripts/model-factory/tests/test_bits_curriculum.py` (stdlib `unittest`, **172
 tests, no model, no GPU, no network**, ~0.1s) covers the bits formula, the
-masking indices, truncation and exact-fit flagging, the decision-field mask, the
-machine guard's actual refusals, the parity gate, every selector property, and
-the experiment script's own configuration. It is mutation-checked: 24 deliberate
-breaks — wrong pad id, guard that checks nothing, guard that fails open, pad
-step at the exact-fit boundary, decision-span off-by-one, dropped `tools`,
-missing resume check, chunked gather assertion removed, re-serializing emitter,
-`idx` not advanced past an unscored line, picks keyed by hash, leakage checks
-removed, residual floor removed, noise flag disabled, control arm un-clustered,
-stage-5 baseline removed, vacuous parity pass — and all 24 fail a test.
+masking indices, truncation and exact-fit flagging, the per-track decision mask
+and its coverage preflight, the machine guard's actual refusals, both parity
+modes (internal and the external anchor), the run fingerprint within a file and
+across the base/tuned pair, the mislabel screen at scales two orders of magnitude
+apart, every selector property, and the experiment script's own configuration.
+
+It is mutation-checked. The earlier round broke 24 guards one at a time — wrong
+pad id, guard that checks nothing, guard that fails open, pad step at the
+exact-fit boundary, decision-span off-by-one, dropped `tools`, missing resume
+check, chunked gather assertion removed, re-serializing emitter, `idx` not
+advanced past an unscored line, picks keyed by hash, leakage checks removed,
+residual floor removed, noise flag disabled, control arm un-clustered, stage-5
+baseline removed, vacuous parity pass — and all 24 failed a test. This round
+broke a further **21**, one per fix below (per-track fields reverted to the flat
+default, `chunk` dropped from the fingerprint, the pair check removed from its
+call site, the noise cut reverted to `max(8.0, 4× median)`, `norm_tokens`
+reverted to `answer_tokens`, `fmt()` reverted to a raw `:.2f`, the redundancy
+denominator reverted to `total`, the section cross-reference reverted to 6, the
+dry-run guard removed, the truncation guard removed, the prefix-stability
+assertion disabled, the quota switched to `len(members)`, the coverage preflight
+made unconditional, the ranked-share and gate-visibility blocks removed, the
+anchor's adapter and empty-log guards removed, the skipped-partition record
+dropped, the decision column never preferred, the drop list re-sorted by
+`bits_base`, the shell guard returned to failing open) — **all 21 fail a test**.
+Three of them survived on the first attempt and the tests were rewritten until
+they did not; a test that cannot fail is not evidence.
 
 ### Fidelity to training — the part that is easy to get wrong
 
@@ -463,8 +549,7 @@ a bits number that does not match the trainer's is not measuring the training:
   run reports `Trained Tokens 127129` at `Iter 3675`, i.e. **34.593 tokens/iter**.
   The corpus side — mean `L - offset + 1` over `train.jsonl` — has **not been
   run**, because it needs the real tokenizer and the machine has been held by
-  the fine-tune. `--dry-run` now prints it and deliberately skips the GPU guard
-  (it loads no weights), so the check is a command rather than a claim:
+  the fine-tune:
 
   ```sh
   $V scripts/model-factory/score_bits.py --model mlx-community/gemma-4-E4B-it-qat-4bit \
@@ -473,11 +558,25 @@ a bits number that does not match the trainer's is not measuring the training:
 
   The port is validated when that figure lands near 34.593. Until it does,
   treat the masking port as unconfirmed against the log.
+
+  **`--dry-run` is not GPU-free, and no longer pretends to be.** It loads no
+  weights, but reaching mlx-lm's `TokenizerWrapper` means `import mlx_lm`, and
+  that import initialises the Metal device. An earlier version skipped the guard
+  entirely on the grounds that it "allocates nothing" — making it the one path
+  in this branch that touched the Metal runtime unguarded, under exactly the
+  condition the standing machine rule was written for. It now takes the
+  **process half** of the guard (no `mlx_lm lora`/`server`/`fuse`/`generate` may
+  be live) and skips only the free-memory half, which it genuinely does not
+  need. So this command **waits for the fine-tune to finish** like everything
+  else; it is a one-minute tokenizer pass, not a GPU job.
 * **Truncation is flagged, never silent.** An example whose ANSWER is cut by
   `--max-seq-length` gets `truncated: true` and its bits are a lower bound; one
-  whose prompt alone fills the window is `skipped`, not scored as zero. (For the
-  2026-09-05 corpus max length is 2826, so nothing truncates at 3072 — the check
-  exists for the next corpus.)
+  whose prompt alone fills the window is `skipped`, not scored as zero. Whether
+  anything in today's corpus truncates at 3072 is **not known**: that is a token
+  count and the corpus has never been tokenized (same reason as above). The
+  longest example is 11012 *characters*, which at 3.5–4 chars/token **estimates**
+  ~2750–3150 tokens — i.e. near enough to 3072 that it could go either way. The
+  `--dry-run` above answers it; until then this is an estimate, not a measurement.
 * **Comparing to logged loss:** the TRAIN loss line is an unweighted mean of
   per-batch per-token means; VALIDATION is token-weighted. The summary's
   `trainer_parity_loss_nats` is token-weighted, so compare it to validation.
@@ -485,11 +584,34 @@ a bits number that does not match the trainer's is not measuring the training:
 The scorer **refuses to run** while `mlx_lm lora`/`server`/`fuse`/`generate` is
 alive or free memory is under 10 GB, and it **fails closed**: if `pgrep` or
 `vm_stat` cannot be read, the machine state is *unknown*, not *idle*, and the
-run is refused unless `--allow-unverified-machine`. It is resumable (skips
-hashes already in `--out`, `fsync` per row) and deterministic — and a resume
-**refuses** when the existing rows were scored under a different model, adapter,
-`--max-seq-length` or forward path, so one forgotten `--out` cannot splice two
-incommensurable runs into one file.
+run is refused unless `--allow-unverified-machine`. (The shell `guard()` in
+`run_bits_experiment.sh` now fails closed the same way: `pgrep` exits 1 for "no
+match" but 2 or 3 for a usage or fatal error, and the old `if pgrep …; then`
+sent every non-zero code down the same branch, so an unreadable process table
+read as "nothing is running".) It is resumable (skips hashes already in `--out`,
+`fsync` per row) and deterministic.
+
+**The run fingerprint, and the two places it is enforced.** Every row carries
+`model`, `adapter`, `max_seq_length`, `match_trainer`, `full_forward` and
+`chunk`.
+
+* *Within* one file, on resume: a resume **refuses** when the existing rows were
+  scored under different settings, so one forgotten `--out` cannot splice two
+  incommensurable runs into one file. `chunk` is part of that set — it is a
+  forward-path parameter, not a performance knob, because different prefill
+  boundaries mean different matmul shapes and, on a sliding-window architecture,
+  different rotating-cache eviction points. (It is recorded as `null` under
+  `--full-forward`, where the prompt is never split and the flag has no effect,
+  so the fingerprint names the path actually taken.)
+* *Across* the `--base`/`--tuned` pair — **which is where the subtraction
+  happens, and where nothing was checking.** `learned_bits = bits_base −
+  bits_tuned` is only "information the run acquired" if both sides saw the same
+  model, window and forward path; score the base at `--max-seq-length 3072` and
+  the tuned adapter at 2048 and every example truncated under one but not the
+  other contributes a fabricated `learned_bits`, to the **default** ranking key,
+  silently. `select_curriculum.py` now compares the two files' fingerprints and
+  refuses on a mismatch (`--allow-fingerprint-mismatch` to override). `adapter`
+  is deliberately excluded: it is the one field that must differ.
 
 ### Honest caveats
 
@@ -506,12 +628,40 @@ incommensurable runs into one file.
   `learned_bits ≈ bits_base` too, so **both** information rankings put a mislabel
   first in its class and a small budget concentrates label noise rather than
   diluting it. `select_curriculum.py` flags examples whose bits exceed
-  `max(--noise-floor, --noise-factor × their class median)`, reports how many of
-  them the subset kept and by what enrichment factor, and warns on stderr past
-  1.25×. Default policy is `flag` (report only); `--noise-policy cap` keeps them
-  but stops them out-ranking clean examples; `exclude` leaves them out with a
-  reason recorded. **No bits number can tell a hard example from a wrong one** —
-  only reading the flagged examples can.
+  **`median + --noise-z × 1.4826 × MAD` of their own `(target, decision_class)`**,
+  reports how many of them the subset kept and by what enrichment factor, and
+  warns on stderr past 1.25×.
+
+  That cut is **scale-free, and it had to become so.** The previous rule was
+  `max(--noise-floor 8.0 bits, --noise-factor 4.0 × the class median)`,
+  calibrated against a unit-test fixture whose clean class sits at ~6.5 bits. The
+  real scale is two orders of magnitude larger — the log's `Iter 1: Val loss
+  2.463` at 34.593 trained tokens per example puts a typical whole-answer example
+  near ~123 bits under the base — so that rule cut at ~492 bits while a wrong
+  decision token adds roughly 10. It could not fire on this corpus, and the
+  absolute 8.0 floor was inert by three orders of magnitude: section 5 would have
+  printed "none" on a corpus that does contain mislabels, and `--noise-policy
+  cap`/`exclude` were levers no one would ever be told to pull. `--noise-floor`
+  now defaults to **0.0 (off)**, because an absolute bits floor is only
+  meaningful once a run has measured what a bit is worth in the column in force.
+
+  Two further changes follow from the same arithmetic. The screen now runs on
+  **`decision_bits` when every scored row has one**, because a mislabel is ~10
+  bits against a whole-answer class spread of *tens* — mostly prose length — and
+  in the decision column it is most of the signal. And section 5 now prints the
+  **per-partition median, MAD, cut and which term bound it**, plus any partition
+  too small to screen at all (`--noise-min-n`, default 8), so that "none flagged"
+  reads as *"nothing reached these thresholds"* rather than as an all-clear.
+  **Its power is still unmeasured**: whether it fires on the mislabels actually
+  present needs a real bits distribution, i.e. stage 1, which has not run.
+
+  Default policy is `flag` (report only); `--noise-policy cap` keeps them but
+  stops them out-ranking clean examples; `exclude` leaves them out with a reason
+  recorded. Under `exclude` the excluded rows never enter a cluster, so the
+  redundancy headline divides by the **clustered** count, not by every scored row
+  — otherwise each excluded row counted as its own redundancy and the headline
+  contradicted the per-partition table in the same report. **No bits number can
+  tell a hard example from a wrong one** — only reading the flagged examples can.
 * **The redundancy estimate is SURFACE redundancy.** Word 3-gram Jaccard cannot
   see two examples that teach the same rule in disjoint vocabulary, and it could
   over-merge two examples that differ only in the token that flips the label —
@@ -523,10 +673,15 @@ incommensurable runs into one file.
 * **The loose end of that curve is mostly label scaffold.** `--cluster-on both`
   (the default) concatenates the assistant answer, which inside one
   `(target, decision_class)` is near-constant JSON — the same artifact the code
-  excludes the *system* prompt to avoid. The 0.80 headline is robust (1817
-  clusters with the answer, 1840 on user text alone), but the loose end is not:
-  at 0.70, 1335 vs 1733; at 0.50, 121 vs 834. Read a low threshold as shared
-  scaffold, not as shared input.
+  excludes the *system* prompt to avoid. Measured on the corpus the pipeline
+  actually selects from, `datasets/mlx/train.jsonl` (2245 rows): the 0.80
+  headline is robust (**1735** clusters with the answer, **1757** on user text
+  alone), but the loose end is not: at 0.70, **1283 vs 1661**; at 0.50, **122 vs
+  805**. Read a low threshold as shared scaffold, not as shared input.
+  (`select_curriculum.py`'s own LIMITS block used to hardcode the 2363-row
+  figures — 1817 / 1335 / 121 — into a report computed on the 2245-row file, so
+  every report contradicted its own section 2. It now names the corpus those
+  figures belong to.)
 * **High residual does not mean "drop it".** It is reported and never
   auto-dropped: deleting genuinely hard cases is how a curriculum quietly
   removes the thing the gate measures. The report's residual section also has an
@@ -552,8 +707,12 @@ of the iterations.
 
 What the training log actually supports, parsed from
 `models/candidates/fin-foreman-e4b-mlx/train.log` (152 reported train points):
-**validation loss has sat at 0.005–0.013 since iteration 1000** (0.013 / 0.028 /
-0.005 / 0.013 / 0.009 / 0.012 at iters 1000–3500) — that half is solid. The train
+**validation loss has sat at 0.005–0.013 since iteration 2000** (0.005 / 0.013 /
+0.009 / 0.012 at iters 2000–3500; from iteration 1000 the honest range is
+0.005–0.028, because iteration 1500 reads 0.028). An earlier draft of this
+paragraph said "0.005–0.013 since iteration 1000" while listing the 0.028 that
+contradicts it two clauses later — the enumeration was right and the summary was
+not. The train
 loss did **not** "hit 0.000 and stay there": it touched 0.000 exactly twice
 (iters 2675 and 2925) and kept bouncing, averaging 0.041 over iterations ≥ 2900
 with a maximum of 0.322. The direction of the claim survives — the corpus is easy
@@ -595,14 +754,52 @@ the truncated full-corpus run matches it (the saving was early stopping, not
 curriculum). Write down whichever happens; a negative result honestly reported is
 a good result.
 
+**How big a difference counts.** The gate is 51 binary scenarios, so **one
+scenario is 2.0 points**, and LoRA seed-to-seed variance on it has never been
+measured. Four single runs compared against each other can therefore produce a
+confident PROVED from noise: 46/51 vs 45/51 is one scenario. So each arm needs
+**≥ 3 seeds** (17, 18, 19); arm A's spread across its seeds is the noise floor
+*S*; and "B beats C" means `median(B) − median(C) > max(S, 2 scenarios)`, with
+"ties" defined the same way rather than left to the reader. Report every
+individual score. If the arms overlap, the honest finding is "no measurable
+difference at this sample size" — which is a result.
+
+**And the verdict is a verdict on routing.** `evals/tmux-routing` exercises the
+routing track only; 1398 of 2245 training examples (62.3%) are in tracks it never
+touches (see [the decision column](#the-decision-column--and-what-the-gate-actually-covers)).
+A subset that wrecks tooluse formatting gates identically. Either hold out a
+per-track check, or state plainly that three of the four tracks are unmeasured.
+
 **No bits number above has been produced yet.** All of this was written
 2026-09-06 while a fine-tune held ~15 GB of the machine, and every GPU stage
-refuses to start until that is clear. Consequently: the masking port is
-unvalidated against the training log (see the `--dry-run` check above), the
-chunked-vs-full-forward parity check has never run, and the decision-field mask
-has been verified only against a character-level stub tokenizer. Those are real
-limitations, not oversights — they are unfixable without the GPU, and nothing
-downstream should be trusted until stages 1–2 have run and stage 2b passes.
+refuses to start until that is clear. What that leaves unvalidated, precisely:
+
+* **The masking port is unconfirmed against the training log.** Two checks now
+  exist for it and neither has run. `--dry-run` gives the token-count
+  calibration (mean `trainer_tokens` vs the log's 34.593/iter) — and it is *not*
+  runnable right now, because it imports mlx_lm and therefore takes the process
+  guard; it waits for the fine-tune like everything else.
+* **The external anchor has never run.** `parity_check.py --anchor
+  reports/bits-valid-base.jsonl.meta.json --log …/train.log --iter 1` compares
+  the scorer's token-weighted loss on `valid.jsonl` against the trainer's own
+  `Iter 1: Val loss 2.463` — the untuned base's loss under the trainer's mask,
+  recorded before the first step. This replaces a check that was **vacuous**:
+  the old stage 2c compared the *tuned* run's residual on the memorized train
+  split against the *tail* of the log, two numbers that are both ~0.01 whether
+  the mask is right or wrong. At 2.463 nats/token there is dynamic range. Its
+  resolution is limited — the log's figure is a `--val-batches 25` sample of the
+  118-example split, so it catches a mask wrong in **kind** (prompt scored as
+  answer), not one off by a single token, and it says so in its own output.
+* **The chunked-vs-full-forward parity check has never run** (stages 1c / 2b).
+* **The decision-field mask has been verified only against a character-level
+  stub tokenizer**, never a real one.
+* **The mislabel screen's power is unknown.** The cut is now scale-free, so
+  unlike the threshold it replaced it *can* fire; whether it fires on the
+  mislabels actually present needs the real distribution.
+
+Those are real limitations, not oversights — they are unfixable without the GPU,
+and nothing downstream should be trusted until stages 1–2 have run and 1b-anchor,
+1c and 2b all pass.
 
 What HAS been measured is the redundancy estimate, which needs only text. On
 **`datasets/mlx/train.jsonl` (2245 — the corpus the experiment actually selects
