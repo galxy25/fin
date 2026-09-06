@@ -19,3 +19,7 @@ tester-added.png
 testflight-group.png
 scripts/cloud-agent/dist/
 /datasets/
+
+# Local model-factory artifacts: the training venv and candidate adapters/fused models
+scripts/model-factory/.venv/
+/models/
