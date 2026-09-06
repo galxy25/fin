@@ -150,10 +150,11 @@ if [[ " $STAGES " == *" 1 "* ]]; then
 
   # The base ranking IS the whole curriculum in base-only mode, so the chunked
   # KV-cache path has to be validated here too, not only in stage 2. Same
-  # uncalibrated-bound caveat as stage 2b: this prints the two divergences it
-  # observed and enforces only coarse ceilings until someone sets --tolerance
-  # AND --per-token-bits (the bound is the larger of the two halves, so setting
-  # one alone tightens nothing).
+  # uncalibrated-bound caveat as stage 2b: this prints the per-token divergence
+  # it observed and enforces only a coarse ceiling until someone sets
+  # --per-token-bits from a real run. (--tolerance is retired and REFUSED: it
+  # was a relative half ORed on top, and at the base scale its 6.15 bits of
+  # room passed a mis-assembled row.)
   say "stage 1c: parity spot-check on the BASE scores (chunked vs full forward)"
   "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$TRAIN" --limit 20 \
@@ -195,16 +196,19 @@ if [[ " $STAGES " == *" 2 "* ]]; then
   # overlap -- a comparison over zero examples agrees perfectly and would
   # validate nothing.
   #
-  # TOLERANCE: NOT CALIBRATED YET. No parity run has been made on a GPU, so no
-  # bound is passed here and the check enforces only its coarse wrong-in-KIND
-  # ceilings. It will PRINT "max relative divergence <x>" and "max per-token
-  # divergence <y> bits/token". Write BOTH down, and add
-  #   --tolerance <a small multiple of x> --per-token-bits <a small multiple of y>
-  # to BOTH parity_check invocations in this file (stage 1c and here). The bound
-  # is max(relative, per-token), so calibrating one half alone tightens nothing.
-  # Until that is done, a pass from this stage means "not wrong in kind", not
-  # "validated". The two score files must also come from runs that differ ONLY
-  # in the forward path -- parity_check refuses the pair (exit 2) otherwise,
+  # BOUND: NOT CALIBRATED YET. No parity run has been made on a GPU, so no bound
+  # is passed here and the check enforces only its coarse wrong-in-KIND ceiling.
+  # It will PRINT "max per-token divergence <y> bits/token". Write that down and
+  # add
+  #   --per-token-bits <a small multiple of y>
+  # to BOTH parity_check invocations in this file (stage 1c and here). That is
+  # the whole calibration: the bound is per TOKEN alone, at every length. The
+  # relative half is retired -- max() was an OR of two permissions, and at the
+  # base scale it granted 6.15 bits, more than a mis-assembled row costs -- so
+  # --tolerance is REFUSED (exit 2), not ignored. Until the bound is set, a pass
+  # from this stage means "not wrong in kind", not "validated". The two score
+  # files must also come from runs that differ ONLY in the forward path, and
+  # both must RECORD it -- parity_check refuses the pair (exit 2) otherwise,
   # which is why the --full-forward run below repeats the same --model/--adapter
   # and leaves --max-seq-length at its default 3072.
   say "stage 2b: parity spot-check (chunked vs full forward, 20 examples)"

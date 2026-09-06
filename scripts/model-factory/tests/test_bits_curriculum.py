@@ -1431,13 +1431,14 @@ class TestParityCheck(unittest.TestCase):
 
     def test_matching_files_pass_and_report_the_count(self):
         ok, msg = pc.compare(
-            {"a": 1.0, "b": 2.0, "c": 9.0}, {"a": 1.0, "b": 2.0005}, {"a": 1, "b": 1}, 1e-2
+            {"a": 1.0, "b": 2.0, "c": 9.0}, {"a": 1.0, "b": 2.0005}, {"a": 1, "b": 1},
+            per_token_bits=1e-2,
         )
         self.assertTrue(ok)
         self.assertIn("over 2 examples", msg)
 
     def test_a_real_divergence_fails(self):
-        ok, msg = pc.compare({"a": 1.0}, {"a": 1.5}, {"a": 1}, 1e-2)
+        ok, msg = pc.compare({"a": 1.0}, {"a": 1.5}, {"a": 1}, per_token_bits=1e-2)
         self.assertFalse(ok)
         self.assertIn("0.500000", msg)
 
@@ -1445,17 +1446,19 @@ class TestParityCheck(unittest.TestCase):
         """max(..., default=0.0) over an empty generator is 0.0, which reads as
         a perfect match. Every example being skipped, or the two files coming
         from different runs, would then 'validate' the whole pipeline."""
-        ok, msg = pc.compare({"aaa": 1.0}, {"zzz": 1.0}, {"zzz": 1}, 1e-2)
+        ok, msg = pc.compare({"aaa": 1.0}, {"zzz": 1.0}, {"zzz": 1}, per_token_bits=1e-2)
         self.assertFalse(ok)
         self.assertIn("absent from the chunked file", msg)
 
     def test_no_full_forward_rows_at_all_fails(self):
-        ok, msg = pc.compare({"a": 1.0}, {}, {}, 1e-2)
+        ok, msg = pc.compare({"a": 1.0}, {}, {}, per_token_bits=1e-2)
         self.assertFalse(ok)
         self.assertIn("no scored rows", msg)
 
     def test_a_partial_overlap_fails_rather_than_comparing_the_half_it_has(self):
-        ok, _ = pc.compare({"a": 1.0}, {"a": 1.0, "b": 1.0}, {"a": 1, "b": 1}, 1e-2)
+        ok, _ = pc.compare(
+            {"a": 1.0}, {"a": 1.0, "b": 1.0}, {"a": 1, "b": 1}, per_token_bits=1e-2
+        )
         self.assertFalse(ok)
 
     def test_the_cli_skips_null_bits_and_exits_nonzero_on_an_empty_comparison(self):
@@ -2797,21 +2800,33 @@ class TestPairAdapterDirection(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 19. the parity tolerance is relative, and honest about being uncalibrated
+# 19. the parity bound is ONE quantity, and honest about being uncalibrated
 # ---------------------------------------------------------------------------
 
 
-class TestParityToleranceIsRelative(unittest.TestCase):
-    """The old rule was TOLERANCE = 1e-2 as an ABSOLUTE bound on a per-example
-    SUM of bits, hard-gating the pipeline. At this corpus's scale (~123 bits per
-    example: the live log's 2.463 nats/token x 34.6 unmasked tokens) that is
-    ~8e-5 relative, while the two paths compared -- one un-cached forward against
-    a chunked prefill through a rotating KV cache on a 4-bit-quantised model --
-    disagree by more than that as a matter of arithmetic. It was far likelier to
-    fail on float noise than to catch a bug."""
+class TestParityBoundHasNoRelativeHalf(unittest.TestCase):
+    """Three rules have been retired here, and the third is the interesting one.
+
+      (1) TOLERANCE = 1e-2 as an ABSOLUTE bound on a per-example SUM of bits.
+          At this corpus's scale (~123 bits: 2.463 nats/token x 34.6 tokens)
+          that is ~8e-5 relative -- likelier to fail on float noise than on a
+          bug.
+      (2) |delta| / max(|full|, 1 bit) < 5e-2, whose 1-bit floor made the
+          allowance a FIXED 0.05 bits for every small example, whatever its
+          length.
+      (3) max(REL x |full|, PER_TOKEN x n) -- the fix for (2), which re-broke
+          the large end in the same move. max() is an OR of two PERMISSIONS, so
+          the wider half rules; at the base scale the relative half is 35x wider
+          and grants 6.15 bits of room, and a mis-assembled row costs ~3.55.
+
+    The rule now is the per-token half ALONE. This class asserts that the
+    relative half is gone in every form: not ORed, not ANDed, not defaulted, and
+    --tolerance refused rather than ignored."""
 
     CORPUS_SCALE = 123.0  # bits/example, derived from train.log; see parity_check.py
     TOKENS = 35           # 127129/3675 = 34.6 unmasked tokens per example, rounded
+    NOISE = 0.0505        # 1e-3 nats/token / ln2 x 35 tokens
+    MIS_ASSEMBLED = 3.553  # one wrong row = 2.463 nats of a different token's logprob
 
     def _cli(self, chunked, full, extra=(), tokens=TOKENS):
         return run_parity_cli(
@@ -2830,14 +2845,21 @@ class TestParityToleranceIsRelative(unittest.TestCase):
         self.assertTrue(ok, msg)
         self.assertIn("4.065e-04", msg)
 
-    def test_the_same_absolute_gap_is_judged_differently_at_different_scales(self):
-        """The definition of relative. An absolute rule cannot tell these apart,
-        and one of the two answers it gives is wrong."""
+    def test_the_same_absolute_gap_over_the_same_tokens_is_the_same_verdict(self):
+        """The magnitude of the sum is NOT the invariant; the disagreement per
+        token is. Under the retired max() rule these two got opposite answers,
+        because 0.5 bits is 0.4% of 123 and 5% of 10 -- but 0.5 bits over 35
+        tokens is one arithmetic disagreement, 10x the noise floor, at both."""
         n = {"a": self.TOKENS}
-        big, _ = pc.compare({"a": 123.5}, {"a": 123.0}, n)   # 0.4% -- noise
-        small, _ = pc.compare({"a": 10.5}, {"a": 10.0}, n)   # 5%   -- not noise
-        self.assertTrue(big)
+        big, big_msg = pc.compare({"a": 123.5}, {"a": 123.0}, n)
+        small, _ = pc.compare({"a": 10.5}, {"a": 10.0}, n)
+        self.assertFalse(big, big_msg)     # under max(): 0.5 < 6.15 -> passed
         self.assertFalse(small)
+        self.assertAlmostEqual(
+            float(big_msg.split("worst example uses ")[1].split()[0]),
+            0.5 / (pc.UNCALIBRATED_PER_TOKEN_BITS * self.TOKENS),
+            places=3,
+        )
 
     def test_a_divergence_that_cannot_be_float_noise_still_fails(self):
         """The bound must not have been loosened into one that passes
@@ -2850,34 +2872,123 @@ class TestParityToleranceIsRelative(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAILED", err)
 
-    def test_an_explicit_tolerance_is_enforced_strictly(self):
-        """Once an operator has real numbers, they are the gate and the coarse
-        ceilings are out of the way. BOTH halves have to be given: the bound is
-        the larger of the two, so a tight --tolerance alone changes nothing."""
+    # -- the four cases, which is the whole argument ------------------------
+
+    def test_THE_FOUR_CASES_base_and_tuned_x_noise_and_mis_assembled(self):
+        """base/tuned x float-noise/mis-assembled-row, with the allowance the
+        SAME 0.175 bits at both scales because it is 5e-3 bits/token x 35
+        tokens and depends on the length, not on the size of the number:
+
+            case  |full|      perturbation   |delta|   allow   ratio  verdict
+            B1    123   bits  float noise     0.0505b  0.175b   0.288  PASS
+            B2    123   bits  mis-assembled   3.553 b  0.175b  20.30   FAIL
+            T1      0.05 bits float noise     0.0505b  0.175b   0.288  PASS
+            T2      0.05 bits mis-assembled   3.553 b  0.175b  20.30   FAIL
+
+        Under the retired max() rule B2 PASSED (allowance max(6.15, 0.175) =
+        6.15, ratio 0.578); under min() T1 would FAIL (allowance min(0.0025,
+        0.175) = 0.0025, ratio 20.2). Only the per-token bound alone is right in
+        all four."""
+        allow = pc.UNCALIBRATED_PER_TOKEN_BITS * self.TOKENS
+        self.assertAlmostEqual(allow, 0.175, places=6)
+        cases = {
+            ("B1", self.CORPUS_SCALE, self.NOISE): (True, 0.288),
+            ("B2", self.CORPUS_SCALE, self.MIS_ASSEMBLED): (False, 20.30),
+            ("T1", 0.05, self.NOISE): (True, 0.288),
+            ("T2", 0.05, self.MIS_ASSEMBLED): (False, 20.30),
+        }
+        for (case, value, delta), (want_ok, want_ratio) in cases.items():
+            with self.subTest(case=case):
+                ok, msg = pc.compare(
+                    {"a": value + delta}, {"a": value}, {"a": self.TOKENS}
+                )
+                self.assertIs(ok, want_ok, msg)
+                ratio = float(msg.split("worst example uses ")[1].split()[0])
+                self.assertAlmostEqual(ratio, want_ratio, places=2, msg=msg)
+                self.assertIn(f"allowance {allow:.6f} bits", msg)
+
+    def test_a_mis_assembled_row_at_the_BASE_scale_fails(self):
+        """The hole the OR left, on its own so the failure names itself. Under
+        max(rel, per-token) the base-scale allowance was 5e-2 x 123 = 6.15 bits
+        and a 3.553-bit wrong row used 58% of it: a PASS, for the exact defect
+        this file exists to catch."""
+        ok, msg = pc.compare(
+            {"a": self.CORPUS_SCALE + self.MIS_ASSEMBLED},
+            {"a": self.CORPUS_SCALE},
+            {"a": self.TOKENS},
+        )
+        self.assertFalse(ok, msg)
+        self.assertGreater(float(msg.split("worst example uses ")[1].split()[0]), 20.0)
+        self.assertLess(self.MIS_ASSEMBLED, 5e-2 * self.CORPUS_SCALE,
+                        "this row is only catchable if the relative half is NOT ORed in")
+        rc, err = self._cli(
+            {"a": self.CORPUS_SCALE + self.MIS_ASSEMBLED}, {"a": self.CORPUS_SCALE}
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("FAILED", err)
+
+    def test_honest_float_noise_passes_at_BOTH_scales_with_the_same_margin(self):
+        """The other side of the same coin, and what an AND (min) would break:
+        at the tuned scale a relative demand is 5e-2 x 0.05 = 0.0025 bits, and
+        honest noise is 0.0505 -- a 20x false alarm on every clean run."""
+        ratios = []
+        for value in (self.CORPUS_SCALE, 0.05):
+            ok, msg = pc.compare(
+                {"a": value + self.NOISE}, {"a": value}, {"a": self.TOKENS}
+            )
+            self.assertTrue(ok, msg)
+            ratios.append(float(msg.split("worst example uses ")[1].split()[0]))
+        self.assertAlmostEqual(ratios[0], ratios[1], places=6,
+                               msg="the allowance must not depend on the magnitude")
+        self.assertLess(ratios[0], 0.3)
+        self.assertGreater(self.NOISE, 5e-2 * 0.05,
+                           "this noise passes only if the relative half is NOT ANDed in")
+
+    # -- --tolerance is refused, not ignored --------------------------------
+
+    def test_the_retired_tolerance_flag_is_REFUSED_not_ignored(self):
+        """Silently ignoring it would leave a stale invocation looking
+        calibrated while gating on nothing. Exit 2: this is a refusal to run,
+        not a numeric verdict."""
+        rc, err = self._cli(
+            {"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE},
+            ["--tolerance", "1e-9"],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("--tolerance is retired", err)
+        self.assertIn("REFUSED", err)
+        self.assertNotIn("NOT CALIBRATED", err)
+
+    def test_the_relative_permission_cannot_come_back_through_a_default(self):
+        """A constant to OR in is how the hole got there. There is no relative
+        default left to reach for, and compare() takes no relative argument."""
+        self.assertFalse(hasattr(pc, "UNCALIBRATED_REL_CEILING"),
+                         "the relative half of the OR is back")
+        self.assertNotIn("tolerance", inspect.signature(pc.compare).parameters)
+
+    def test_an_explicit_bound_is_enforced_strictly(self):
+        """Once an operator has a real number, it is the gate and the coarse
+        ceiling is out of the way."""
         ok, _ = pc.compare(
             {"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE}, {"a": self.TOKENS},
-            1e-5, 1e-6,
+            1e-6,
         )
         self.assertFalse(ok)
         rc, err = self._cli({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE},
-                            ["--tolerance", "1e-5", "--per-token-bits", "1e-6"])
+                            ["--per-token-bits", "1e-6"])
         self.assertEqual(rc, 1)
-        self.assertIn("(--tolerance)", err)
         self.assertIn("(--per-token-bits)", err)
 
-    def test_setting_only_one_half_cannot_tighten_past_the_other(self):
-        """The bound is max(relative, per-token), so the looser half rules. An
-        operator who calibrates one and forgets the other has NOT tightened the
-        gate -- which is why the banner names the half still at its default."""
+    def test_setting_the_bound_tightens_it_with_nothing_left_to_override(self):
+        """Under max() a tightened half changed nothing, because the other half
+        still ruled -- which is why the old banner had to name two flags. There
+        is one bound now, so setting it is the whole calibration."""
         args = ({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE}, {"a": self.TOKENS})
-        self.assertTrue(pc.compare(*args, 1e-9, None)[0])   # per-token half still 5e-3
-        self.assertTrue(pc.compare(*args, None, 1e-9)[0])   # relative half still 5e-2
-        self.assertFalse(pc.compare(*args, 1e-9, 1e-9)[0])
-        rc, err = self._cli(*args[:2], ["--tolerance", "1e-9"])
+        self.assertTrue(pc.compare(*args)[0])                      # 0.05 < 0.175
+        self.assertFalse(pc.compare(*args, 1e-9)[0])
+        rc, err = self._cli(*args[:2], ["--per-token-bits", "1e-2"])
         self.assertEqual(rc, 0)
-        self.assertIn("NOT CALIBRATED", err)
-        self.assertIn(f"--per-token-bits ({pc.UNCALIBRATED_PER_TOKEN_BITS:g}", err)
-        self.assertNotIn(f"--tolerance ({pc.UNCALIBRATED_REL_CEILING:g}", err)
+        self.assertNotIn("NOT CALIBRATED", err)
 
     def test_the_uncalibrated_default_says_so_loudly_ON_A_PASS(self):
         """An uncalibrated pass is the one that gets mistaken for a validated
@@ -2885,39 +2996,42 @@ class TestParityToleranceIsRelative(unittest.TestCase):
         rc, err = self._cli({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE})
         self.assertEqual(rc, 0)
         self.assertIn("NOT CALIBRATED", err)
-        self.assertIn("max relative divergence", err)
+        self.assertIn(f"--per-token-bits ({pc.UNCALIBRATED_PER_TOKEN_BITS:g}", err)
         self.assertIn("max per-token divergence", err)
-        self.assertIn("--tolerance", err)
 
-    def test_explicit_bounds_for_BOTH_halves_retire_the_uncalibrated_banner(self):
-        rc, err = self._cli({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE},
-                            ["--tolerance", "1e-2", "--per-token-bits", "1e-2"])
-        self.assertEqual(rc, 0)
-        self.assertNotIn("NOT CALIBRATED", err)
-
-    def test_the_observed_maxima_are_reported_whatever_the_verdict(self):
-        """Reporting the numbers is the point: it is how the two halves get
-        calibrated at all."""
-        for extra in ((), ("--tolerance", "1e-9", "--per-token-bits", "1e-12")):
+    def test_the_observed_maximum_is_reported_whatever_the_verdict(self):
+        """Reporting the number is the point: it is how the bound gets
+        calibrated at all. The relative divergence is still printed, marked as
+        context rather than as a second gate to set."""
+        for extra in ((), ("--per-token-bits", "1e-12")):
             with self.subTest(extra=extra):
                 _, err = self._cli({"a": 123.05, "b": 60.0}, {"a": 123.0, "b": 60.0}, extra)
-                self.assertIn("max relative divergence", err)
                 self.assertIn("max per-token divergence", err)
+                self.assertIn("max relative divergence", err)
+                self.assertIn("there is no relative gate", err)
                 self.assertIn("over 2 examples", err)
 
     def test_the_file_records_that_the_bound_is_awaiting_calibration(self):
         """No GPU parity run has ever been made against this code. The default
-        must not pretend otherwise; the old absolute hard gate must not come
-        back under the same name; and neither must the fixed per-example floor
-        that replaced it, whose allowance ignored an example's length."""
+        must not pretend otherwise; none of the three retired rules may come
+        back under its old name."""
         src = Path(pc.__file__).read_text(encoding="utf-8")
         self.assertIn("AWAITING CALIBRATION", src)
         self.assertFalse(hasattr(pc, "TOLERANCE"),
                          "the absolute, uncalibrated hard gate is back")
         self.assertFalse(hasattr(pc, "ABS_FLOOR_BITS"),
-                         "the fixed per-example floor is back; the small end is per TOKEN")
-        for half in ("tolerance", "per_token_bits"):
-            self.assertIsNone(inspect.signature(pc.compare).parameters[half].default)
+                         "the fixed per-example floor is back; the bound is per TOKEN")
+        self.assertIsNone(inspect.signature(pc.compare).parameters["per_token_bits"].default)
+
+    def test_the_four_case_arithmetic_is_written_down_in_the_file(self):
+        """The rule was decided by an argument, and the argument has to be
+        readable next to the code -- including what the two rejected rules do to
+        each of the four cases."""
+        src = Path(pc.__file__).read_text(encoding="utf-8")
+        for marker in ("THE FOUR CASES", "WHY NOT max(), AND WHY NOT min() EITHER",
+                       "B1", "B2", "T1", "T2", "max(rel, per-token)", "min(rel, per-token)",
+                       "per-token alone"):
+            self.assertIn(marker, src, marker)
 
 
 # ---------------------------------------------------------------------------
@@ -2983,7 +3097,7 @@ class TestParityBoundIsPerToken(unittest.TestCase):
         self.assertLess(delta, 0.05, "the old fixed floor passed exactly this")
         ok, msg = pc.compare({"a": 0.05 + delta}, {"a": 0.05}, {"a": 3})
         self.assertFalse(ok, msg)          # 0.04 > 5e-3 x 3 = 0.015
-        self.assertIn("set by the per-token half", msg)
+        self.assertIn("allowance 0.015000 bits = the per-token bound x 3 tokens", msg)
 
     def test_a_mis_assembled_row_at_the_TUNED_scale_still_fails(self):
         """What the check must keep resolving at the small end: one wrong row is
@@ -3015,17 +3129,22 @@ class TestParityBoundIsPerToken(unittest.TestCase):
             {"a": self.TUNED_BITS + 0.01}, {"a": self.TUNED_BITS}, {"a": self.TOKENS}
         )
         self.assertTrue(ok, msg)
-        self.assertIn("judged by the per-token half", msg)
+        self.assertIn("the allowance exceeds the example's own bits", msg)
         self.assertIn("wrong in KIND", msg)
 
-    def test_a_base_scale_example_is_judged_by_the_RELATIVE_half(self):
-        """Two-sided: the per-token half must not take over the large end, where
-        a proportional bound is the right one and is far tighter (6.15 bits of
-        room at 123 bits, against 0.175 per-token)."""
+    def test_a_base_scale_example_is_judged_by_the_SAME_per_token_bound(self):
+        """One-sided, and that is the fix. A base example used to be handed to a
+        relative half that was 35x wider (6.15 bits of room at 123 bits, against
+        0.175 per-token), which is how a mis-assembled row passed there. The
+        allowance is now the same 0.175 bits it is at the tuned scale, and only
+        the vacuity note distinguishes the two ends."""
         ok, msg = pc.compare({"a": 123.05}, {"a": 123.0}, {"a": 35})
         self.assertTrue(ok, msg)
-        self.assertIn("set by the relative half", msg)
-        self.assertNotIn("judged by the per-token half", msg)
+        self.assertIn("allowance 0.175000 bits", msg)
+        self.assertNotIn("the allowance exceeds the example's own bits", msg)
+        _, tuned = pc.compare({"a": 0.10}, {"a": 0.05}, {"a": 35})
+        self.assertIn("allowance 0.175000 bits", tuned)
+        self.assertIn("the allowance exceeds the example's own bits", tuned)
 
     def test_the_per_token_divergence_is_reported_for_calibration(self):
         """The number an operator needs to set --per-token-bits from, in the
@@ -3166,6 +3285,83 @@ class TestParityPairFingerprint(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("SAME forward path", msg)
 
+    # -- ABSENCE MUST NOT SATISFY A MUST-DIFFER RULE ------------------------
+
+    @staticmethod
+    def _stripped(values, *, drop=pc.PARITY_FORWARD_KEYS, **kw):
+        """Rows as score_bits writes them, minus the named fingerprint keys."""
+        rows = parity_rows(values, **kw)
+        for row in rows:
+            for k in drop:
+                row.pop(k, None)
+        return rows
+
+    def _loaded(self, rows, tmp, name):
+        return pc.load(write_rows(Path(tmp) / name, rows), "bits")
+
+    def test_a_file_that_does_not_RECORD_its_forward_path_is_refused(self):
+        """The rule is "the two files differ in the forward path", and a key
+        that is not there cannot differ from anything. Comparing `fp.get(k)` on
+        both sides let a missing key stand in as the value None, and None
+        differs from 512 -- so absence SATISFIED the must-differ rule."""
+        with tempfile.TemporaryDirectory() as tmp:
+            chunked = self._loaded(parity_rows({"a": 1.0}), tmp, "chunked.jsonl")
+            stripped = self._loaded(self._stripped({"a": 1.0}), tmp, "stripped.jsonl")
+            ok, msg = pc.check_parity_fingerprints(chunked, stripped)
+        self.assertFalse(ok, msg)
+        self.assertIn("does not RECORD its forward path", msg)
+        self.assertIn("full_forward", msg)
+        self.assertIn("chunk", msg)
+        self.assertNotIn("differ in the forward path (chunked", msg)
+
+    def test_a_copy_of_ITSELF_with_the_forward_keys_deleted_is_not_a_pair(self):
+        """The whole failure, end to end: one chunked file, and a byte-identical
+        copy with two keys deleted. It agrees with itself perfectly over every
+        row, which is the vacuous pass this function exists to refuse -- reached
+        by deleting two fields rather than by scoring twice. Exit 2."""
+        rows = parity_rows({"a": 1.0, "b": 2.0})
+        rc, err = run_parity_cli(rows, self._stripped({"a": 1.0, "b": 2.0}))
+        self.assertEqual(rc, 2, err)
+        self.assertIn("not a parity pair", err)
+        self.assertIn("does not RECORD its forward path", err)
+        self.assertNotIn("worst example uses", err)
+
+    def test_a_HALF_recorded_forward_path_is_refused_too(self):
+        """One key present, one deleted. The surviving key can still differ, so
+        the pair would otherwise be accepted on half a record."""
+        for drop in (("chunk",), ("full_forward",)):
+            with self.subTest(drop=drop), tempfile.TemporaryDirectory() as tmp:
+                chunked = self._loaded(parity_rows({"a": 1.0}), tmp, "c.jsonl")
+                half = self._loaded(
+                    self._stripped({"a": 1.0}, drop=drop, full_forward=True),
+                    tmp, "h.jsonl",
+                )
+                ok, msg = pc.check_parity_fingerprints(chunked, half)
+                self.assertFalse(ok, msg)
+                self.assertIn("does not RECORD its forward path", msg)
+                self.assertIn(drop[0], msg)
+
+    def test_NEITHER_file_recording_the_path_is_refused_by_name(self):
+        """Both sides stripped used to reach the same-path branch, which is the
+        right verdict for the wrong reason: they do not describe the same
+        forward path, they describe none. The refusal now says which."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._loaded(self._stripped({"a": 1.0}), tmp, "a.jsonl")
+            b = self._loaded(self._stripped({"a": 1.0}), tmp, "b.jsonl")
+            ok, msg = pc.check_parity_fingerprints(a, b)
+        self.assertFalse(ok, msg)
+        self.assertEqual(msg.count("does not RECORD its forward path"), 2)
+
+    def test_score_bits_always_stamps_both_forward_keys_so_the_demand_is_meetable(self):
+        """Requiring a record is only fair if the scorer writes one. chunk is
+        null under --full-forward -- but the KEY is there, which is exactly the
+        difference between "recorded as not applicable" and "absent"."""
+        for full_forward in (False, True):
+            fp = sb.run_fingerprint("m", None, 3072, True, full_forward, 512)
+            for k in pc.PARITY_FORWARD_KEYS:
+                self.assertIn(k, fp)
+        self.assertIsNone(sb.run_fingerprint("m", None, 3072, True, True, 512)["chunk"])
+
     def test_two_different_CHUNK_sizes_are_a_valid_pair(self):
         """The one thing they are SUPPOSED to differ in. Different prefill
         boundaries are different matmul shapes and different cache evictions --
@@ -3290,7 +3486,101 @@ class TestParityRefusesNonFinite(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 23. a zero allowance is a demand for exactness, not a crash
+# 23. the bound is bits/token, so a NATS column gets it converted
+# ---------------------------------------------------------------------------
+
+
+class TestParityColumnUnits(unittest.TestCase):
+    """--column nats and --column trainer_nats are the same per-example sums
+    expressed in nats. The per-token bound is an argument about BITS per token
+    (5e-3, ~3.5x an expected 1e-3 nats/token), and it was being applied to those
+    columns as a raw number: 5e-3 nats/token is 1.4427x LOOSER than the bound
+    that was argued, and the report printed "bits" beside values that were nats.
+    Both are one defect -- a quantity used without its unit."""
+
+    TOKENS = 35
+    NATS_BOUND = pc.UNCALIBRATED_PER_TOKEN_BITS * math.log(2)   # 3.466e-3 nats/token
+
+    def test_a_nats_column_is_judged_by_the_bound_CONVERTED_not_REUSED(self):
+        """The discriminating gap. 0.15 nats over 35 tokens is 4.29e-3
+        nats/token: inside the unconverted 5e-3 (which is what the bits number
+        looks like if you forget the unit) and outside the real bound of
+        3.466e-3 nats/token. Converted it fails; reused it passed."""
+        delta = 0.15
+        self.assertLess(delta, pc.UNCALIBRATED_PER_TOKEN_BITS * self.TOKENS)
+        self.assertGreater(delta, self.NATS_BOUND * self.TOKENS)
+        ok, msg = pc.compare(
+            {"a": 85.2 + delta}, {"a": 85.2}, {"a": self.TOKENS}, unit="nats"
+        )
+        self.assertFalse(ok, msg)
+        self.assertIn(f"allowance {self.NATS_BOUND * self.TOKENS:.6f} nats", msg)
+
+    def test_the_converted_bound_is_the_SAME_bound_not_a_different_one(self):
+        """0.175 bits and 0.121301 nats are one allowance in two units, so the
+        same physical divergence gets the same ratio through either column."""
+        bits_delta = 0.10
+        ok_bits, bits_msg = pc.compare(
+            {"a": 123.0 + bits_delta}, {"a": 123.0}, {"a": self.TOKENS}
+        )
+        ok_nats, nats_msg = pc.compare(
+            {"a": 85.2 + bits_delta * math.log(2)}, {"a": 85.2}, {"a": self.TOKENS},
+            unit="nats",
+        )
+        self.assertTrue(ok_bits and ok_nats)
+        ratio = lambda m: float(m.split("worst example uses ")[1].split()[0])  # noqa: E731
+        self.assertAlmostEqual(ratio(bits_msg), ratio(nats_msg), places=3)
+
+    def test_the_report_names_the_unit_it_is_actually_printing(self):
+        """Labelling nats "bits" is a mislabelled number whichever bound is
+        applied. Every magnitude in the message carries the column's own unit,
+        and the bits/token bound is quoted with its conversion."""
+        _, msg = pc.compare({"a": 85.3}, {"a": 85.2}, {"a": self.TOKENS}, unit="nats")
+        self.assertNotIn("bits/token;", msg)
+        self.assertNotIn(" bits ", msg.split("Bound:")[0])
+        self.assertIn("nats/token", msg)
+        self.assertIn("nats = the per-token bound", msg)
+        self.assertIn(f"{pc.UNCALIBRATED_PER_TOKEN_BITS:g} bits/token = ", msg)
+        self.assertIn("nats/token in this column's unit", msg)
+
+    def test_a_bits_column_is_unchanged_and_says_bits(self):
+        _, msg = pc.compare({"a": 123.1}, {"a": 123.0}, {"a": self.TOKENS})
+        self.assertIn("allowance 0.175000 bits", msg)
+        self.assertNotIn("nats", msg)
+        self.assertNotIn("in this column's unit", msg)
+
+    def test_every_selectable_column_declares_a_unit(self):
+        """--column's choices come from COLUMN_TOKEN_FIELD; a column that can be
+        selected but has no unit would be judged by an unconverted bound and
+        reported under whatever label happened to be hard-coded."""
+        self.assertEqual(set(pc.COLUMN_UNIT), set(pc.COLUMN_TOKEN_FIELD))
+        for column, unit in pc.COLUMN_UNIT.items():
+            with self.subTest(column=column):
+                self.assertIn(unit, pc.UNIT_PER_BIT)
+                self.assertEqual(unit, "nats" if column.endswith("nats") else "bits")
+        self.assertEqual(pc.UNIT_PER_BIT["bits"], 1.0)
+        self.assertAlmostEqual(pc.UNIT_PER_BIT["nats"], math.log(2))
+
+    def test_an_unknown_unit_is_refused_rather_than_silently_treated_as_bits(self):
+        ok, msg = pc.compare({"a": 1.0}, {"a": 1.0}, {"a": 35}, unit="dits")
+        self.assertFalse(ok)
+        self.assertIn("unknown column unit", msg)
+
+    def test_the_cli_carries_the_column_unit_through(self):
+        """End to end: the same 0.15-nat gap the bits number would have
+        forgiven, through --column nats on real files."""
+        rc, err = run_parity_cli(
+            parity_rows({"a": 85.35}, column="nats"),
+            parity_rows({"a": 85.2}, column="nats", full_forward=True),
+            ["--column", "nats"],
+        )
+        self.assertEqual(rc, 1, err)
+        self.assertIn("nats/token", err)
+        self.assertIn("every nats number from it is suspect", err)
+        self.assertNotIn("every bits number", err)
+
+
+# ---------------------------------------------------------------------------
+# 24. a zero allowance is a demand for exactness, not a crash
 # ---------------------------------------------------------------------------
 
 
@@ -3298,16 +3588,16 @@ class TestParityZeroAllowance(unittest.TestCase):
     """`--abs-floor 0` used to divide by max(|full|, 0) and raise an uncaught
     ZeroDivisionError the moment any full-forward example scored exactly 0.0
     bits -- which is what a memorized tuned example rounds to. The floor is gone,
-    but the hazard is the same shape: zero both halves of the bound and the
-    allowance is zero."""
+    but the hazard is the same shape: zero the bound and the allowance is
+    zero."""
 
-    def test_a_zero_per_token_half_against_a_zero_bit_example_does_not_crash(self):
+    def test_a_zero_bound_against_a_zero_bit_example_does_not_crash(self):
         ok, msg = pc.compare({"a": 0.0}, {"a": 0.0}, {"a": 35}, per_token_bits=0.0)
         self.assertTrue(ok, msg)
 
-    def test_both_halves_zero_demands_exactness_rather_than_raising(self):
-        self.assertTrue(pc.compare({"a": 5.0}, {"a": 5.0}, {"a": 35}, 0.0, 0.0)[0])
-        ok, msg = pc.compare({"a": 5.0 + 1e-12}, {"a": 5.0}, {"a": 35}, 0.0, 0.0)
+    def test_a_zero_bound_demands_exactness_rather_than_raising(self):
+        self.assertTrue(pc.compare({"a": 5.0}, {"a": 5.0}, {"a": 35}, 0.0)[0])
+        ok, msg = pc.compare({"a": 5.0 + 1e-12}, {"a": 5.0}, {"a": 35}, 0.0)
         self.assertFalse(ok)
         self.assertIn("inf", msg)
 
@@ -3317,11 +3607,9 @@ class TestParityZeroAllowance(unittest.TestCase):
         self.assertIn("relative n/a", msg)
 
     def test_a_negative_bound_is_refused_rather_than_inverted(self):
-        for tol, per_token in ((-1e-3, None), (None, -1e-3)):
-            with self.subTest(tol=tol, per_token=per_token):
-                ok, msg = pc.compare({"a": 1.0}, {"a": 1.0}, {"a": 35}, tol, per_token)
-                self.assertFalse(ok)
-                self.assertIn("negative bound", msg)
+        ok, msg = pc.compare({"a": 1.0}, {"a": 1.0}, {"a": 35}, -1e-3)
+        self.assertFalse(ok)
+        self.assertIn("negative bound", msg)
 
     def test_the_cli_survives_a_zero_bound_on_a_zero_bit_example(self):
         """The exact operator gesture that used to raise: bound the check at
@@ -3329,7 +3617,7 @@ class TestParityZeroAllowance(unittest.TestCase):
         rc, err = run_parity_cli(
             parity_rows({"a": 0.0, "b": 0.0}),
             parity_rows({"a": 0.0, "b": 0.0}, full_forward=True),
-            ["--tolerance", "0", "--per-token-bits", "0"],
+            ["--per-token-bits", "0"],
         )
         self.assertEqual(rc, 0, err)
         self.assertIn("over 2 examples", err)

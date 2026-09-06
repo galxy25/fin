@@ -16,20 +16,26 @@
 
      * empty or partial overlap -> refused (this file, ``compare``);
      * the two files not scored under the same model / adapter / window, or
-       scored under the SAME forward path -> refused (``check_parity_fingerprints``);
-     * a bound that stops discriminating as the numbers shrink -> the tolerance
-       rule is per TOKEN, and the report says how much resolving power was left
-       (the block below).
+       not RECORDING a forward path, or recording the SAME one -> refused
+       (``check_parity_fingerprints``);
+     * a bound that stops discriminating as the numbers shrink -> the bound is
+       per TOKEN at every length, with no second, magnitude-dependent half
+       able to widen it, and the report says how much resolving power was
+       left (the block below).
 
      parity_check.py CHUNKED.jsonl FULLFWD.jsonl
-         [--tolerance REL] [--per-token-bits B] [--column bits]
+         [--per-token-bits B] [--column bits]
 
-   The bound is two-sided -- relative for large examples, per-token for small --
-   and its default is deliberately not a gate: no GPU parity run has ever been
-   made against this code, so the observed divergence is reported prominently
-   and only a coarse wrong-in-KIND ceiling is enforced until an operator sets
-   both halves from a real number. The long argument is in the constants block
-   below.
+   The bound is ONE quantity, bits per token, because that is what the
+   arithmetic disagreement is proportional to. A relative half used to be ORed
+   on top of it; that half is retired and ``--tolerance`` is REFUSED rather than
+   quietly ignored, because the OR let a mis-assembled row pass at the base
+   scale. The four-case argument (base/tuned x float-noise/mis-assembled-row) is
+   spelled out in the constants block below. The default is deliberately not a
+   calibrated gate: no GPU parity run has ever been made against this code, so
+   the observed divergence is reported prominently and only a coarse
+   wrong-in-KIND ceiling is enforced until an operator sets it from a real
+   number.
 
    Exit codes: 0 agree, 1 diverged (or the comparison was vacuous), 2 the two
    files are not a parity pair at all.
@@ -113,67 +119,138 @@ from typing import NamedTuple, Sequence
 # per-example figure. Either way the base example is of order 10^2 bits and the
 # tuned one, after this adapter memorized the train split, of order 10^-2.)
 #
-# THE RULE THIS REPLACES, and why it stopped discriminating. It was
+# THE RULES THIS REPLACES, and why each stopped discriminating.
 #
-#     error(h) = |chunked - full| / max(|full|, ABS_FLOOR_BITS=1.0)  <  5e-2
+# (1) error(h) = |chunked - full| / max(|full|, ABS_FLOOR_BITS=1.0)  <  5e-2.
+#     For any example at or below the 1-bit floor that collapses to a FIXED
+#     allowance of 5e-2 x 1.0 = 0.05 bits -- whatever the example scored, and
+#     whatever its length. Two consequences, pointing in opposite directions:
 #
-# and for any example at or below the 1-bit floor that collapses to a FIXED
-# allowance of 5e-2 x 1.0 = 0.05 bits -- whatever the example scored, and
-# whatever its length. Two consequences, pointing in opposite directions:
+#       * VACUOUS exactly where the numbers get small, which is the tuned arm
+#         the curriculum subtracts. A memorized example is ~0.05 bits, so the
+#         allowance IS the whole example: the chunked path could report 0.0 bits
+#         or 0.10 bits for it and pass. Further down it exceeds the number.
+#       * SIMULTANEOUSLY TOO TIGHT at the typical length. 0.05 bits spread over
+#         this corpus's 34.6 answer tokens is 1.44e-3 bits/token = 1.00e-3
+#         nats/token -- precisely the per-token disagreement this file calls
+#         unremarkable for this arithmetic, with NO margin. On a 350-token
+#         example the same fixed 0.05 bits demands 10x BETTER per-token
+#         agreement; on a 3-token example it is 10x looser -- wide enough to
+#         swallow a whole mis-assembled row.
 #
-#   * VACUOUS exactly where the numbers get small, which is the tuned arm the
-#     curriculum subtracts. A memorized example is ~0.05 bits, so the allowance
-#     IS the whole example: the chunked path could report 0.0 bits or 0.10 bits
-#     for it and pass. Further down the allowance exceeds the number entirely.
-#   * SIMULTANEOUSLY TOO TIGHT at the typical length. 0.05 bits spread over this
-#     corpus's 34.6 answer tokens is 1.44e-3 bits/token = 1.00e-3 nats/token --
-#     precisely the per-token disagreement this file calls unremarkable for this
-#     arithmetic, with NO margin. On a 350-token example the same fixed 0.05
-#     bits demands 10x BETTER per-token agreement; on a 3-token example it is
-#     10x looser -- wide enough to swallow a whole mis-assembled row.
+# (2) allowance(h) = MAX( REL x |full[h]| , PER_TOKEN_BITS x n_tokens(h) ).
+#     The fix for (1) -- which fixed the small end and re-broke the large end in
+#     the same move. max() is an OR of two PERMISSIONS: an example passes if
+#     EITHER half forgives it, so the WIDER half always rules and the other is
+#     discarded. At the base scale the relative half is 35x wider, so the
+#     per-token half never applied there at all, and 5e-2 x 123 bits = 6.15 bits
+#     of room is nearly twice what a mis-assembled row costs (~3.55 bits). The
+#     exact failure this check exists to catch PASSED at the base scale. That is
+#     case B2 in the table below.
 #
-# Length generates the disagreement, and length is the one thing a per-example
-# floor cannot see.
+# THE RULE NOW: ONE bound, per token, at every length.
 #
-# THE RULE NOW. Two-sided; each example is judged by whichever half is more
-# permissive for it -- relative at the large end, per-token at the small end:
-#
-#     allowance(h) = max( REL x |full[h]| , PER_TOKEN_BITS x n_tokens(h) )
+#     allowance(h) = PER_TOKEN_BITS x n_tokens(h)
 #     pass  iff  |chunked[h] - full[h]| < allowance(h),  for EVERY h
 #
-#   * The RELATIVE half carries the large end. A base example is ~123 bits, so
-#     5e-2 relative is ~6 bits of room -- generous against float noise (~0.05
-#     bits) and still far inside what a mis-assembled row costs, since a wrong
-#     row is a different token's logprob and moves an example by tens of
-#     percent.
-#   * The PER-TOKEN half carries the small end, and unlike a picked floor its
-#     size is an argument rather than a number: the two paths are expected to
-#     disagree by ~1e-3 nats/token = 1.44e-3 bits/token, so the uncalibrated
-#     allowance is 5e-3 bits/token, ~3.5x the expected noise -- at EVERY length,
-#     which is the property the fixed floor lacked. For the 35-token tuned
-#     example that is 0.175 bits: an honest float wobble (~0.05 bits) passes
-#     with 3.5x of room, while one mis-assembled row costs about the base
-#     model's own per-token surprise, ~3.5 bits, and fails by 20x. Under the old
-#     fixed floor that same wobble sat exactly ON the bound -- a coin flip.
+# WHY NOT max(), AND WHY NOT min() EITHER. max() is an OR of two permissions;
+# min() is an AND of two demands. The question is which of the two this check
+# wants at each end, and the honest answer is NEITHER, because the relative half
+# is wrong in BOTH directions -- there is no end at which it is the right
+# quantity. The crossover is at 0.1 bits/token (5e-2 x V vs 5e-3 x n):
 #
-# WHAT THIS STILL CANNOT DO, said out loud rather than papered over. A memorized
-# tuned example carries ~0.05 bits over ~35 tokens = ~1.4e-3 bits/token, which
-# is the arithmetic noise floor itself. At that scale NO bound on a per-example
-# bits sum can separate signal from float noise: the honest statement is that
-# the check resolves a divergence wrong in KIND there and nothing finer. So the
-# report counts the examples whose allowance exceeded their own bits and says
-# so, per run, instead of implying a precision it does not have.
+#   * where the relative half is LOOSER -- above 0.1 bits/token, i.e. EVERY
+#     base-scale example, which runs at 3.55 bits/token -- ORing it in (max)
+#     grants 6.15 bits of permission and lets a mis-assembled row through. It is
+#     too loose exactly where it was claimed to "carry the large end".
+#   * where the relative half is TIGHTER -- below 0.1 bits/token, i.e. the
+#     memorized tuned arm at 1.4e-3 bits/token -- ANDing it in (min) demands
+#     agreement to 5e-2 x 0.05 = 0.0025 bits, while honest float noise over
+#     those same 35 tokens is 0.0505 bits. It rejects arithmetic that is 20x
+#     inside what the hardware can promise.
+#
+# So the relative half only ever bites where it is wrong: too loose to catch the
+# failure at the large end, too tight to admit the noise at the small one. It is
+# retired -- not ORed, not ANDed, not defaulted. ``--tolerance`` is REFUSED
+# rather than ignored, so a stale invocation cannot look like a calibrated one.
+#
+# THE FOUR CASES, in full, at this corpus's 35 tokens (127129/3675 = 34.6) and
+# PER_TOKEN_BITS = 5e-3 bits/token, so
+#
+#     allowance = 5e-3 bits/token x 35 tokens = 0.175 bits AT BOTH SCALES
+#
+# -- the allowance depends on the LENGTH, not on the size of the number, which
+# is this block's whole argument. The two perturbations:
+#
+#     honest float noise      1e-3 nats/token / ln2 x 35 tok = 0.0505 bits
+#     one mis-assembled row   a wrong row is a different token's logprob, about
+#                             the base model's own per-token surprise:
+#                             2.463 nats = 3.553 bits
+#
+#   case  scale  |full|      perturbation    |delta|      allowance  ratio  ->
+#   ----  -----  ----------  --------------  -----------  ---------  -----  ----
+#   B1    base    123   bits float noise     0.0505 bits  0.175 bits  0.288  PASS
+#   B2    base    123   bits mis-assembled   3.553  bits  0.175 bits  20.30  FAIL
+#   T1    tuned     0.05 bits float noise    0.0505 bits  0.175 bits  0.288  PASS
+#   T2    tuned     0.05 bits mis-assembled  3.553  bits  0.175 bits  20.30  FAIL
+#
+# 3.5x of headroom on both honest cases, 20x over the bound on both broken ones,
+# and the SAME margin at both scales -- which is what "the per-token argument
+# holds at every length" has to mean. The same four cases under the two rules
+# above, which is what deciding this deliberately amounts to:
+#
+#   rule                  B1     B2               T1               T2
+#   --------------------  -----  ---------------  ---------------  ----
+#   max(rel, per-token)   PASS   PASS  <-- HOLE   PASS             FAIL
+#   min(rel, per-token)   PASS   FAIL             FAIL  <-- HOLE   FAIL
+#   per-token alone       PASS   FAIL             PASS             FAIL
+#
+#   B2 under max(): allowance max(6.15, 0.175) = 6.15 bits, 3.553/6.15 = 0.578
+#     -> a mis-assembled row passes at the base scale.
+#   T1 under min(): allowance min(0.0025, 0.175) = 0.0025 bits, 0.0505/0.0025 =
+#     20.2 -> honest float noise fails at the tuned scale.
+#   Per-token alone is the only one of the three that is right in all four
+#   cases, and it is right for a reason rather than by tuning: the error being
+#   bounded is generated per token and the bound is per token.
+#
+# UNITS. PER_TOKEN_BITS is bits per token, and the compared column is not always
+# in bits: ``--column nats`` and ``--column trainer_nats`` are the same sums
+# expressed in nats. 1 bit = ln2 = 0.6931 nats, so the same bound applied to a
+# nats column is PER_TOKEN_BITS x ln2 = 3.466e-3 nats/token. Reusing the bits
+# NUMBER on a nats column (which this file used to do) is a different, 1.4427x
+# LOOSER bound than the one argued above, and the report then printed "bits"
+# next to values that were nats. The allowance is now converted per column and
+# every quantity in the report carries that column's own unit.
+#
+# WHAT THIS STILL CANNOT DO, said out loud rather than papered over.
+#
+#   * AT THE TUNED SCALE THE SIGNAL IS THE NOISE. A memorized example carries
+#     ~0.05 bits over ~35 tokens = ~1.4e-3 bits/token, which IS the arithmetic
+#     noise floor. A chunked path that returned twice such an example's value
+#     would diverge by 0.05 bits -- exactly what an honest float wobble does. No
+#     bound on a per-example sum separates those two, and a relative bound that
+#     "caught" it would be failing honest runs at the same rate (case T1 under
+#     min()). So the report counts the examples whose allowance exceeded their
+#     own value and says, per run, that there it resolved a divergence wrong in
+#     KIND and nothing finer.
+#   * A PER-TOKEN ALLOWANCE GROWS WITH LENGTH; ONE WRONG ROW DOES NOT. A single
+#     mis-assembled row costs a constant ~3.553 bits, so beyond 3.553 / 5e-3 =
+#     ~710 tokens it fits inside the allowance. This corpus's answers are ~35
+#     tokens, and the chunked path's realistic failures are systematic -- rows
+#     shifted by one, the wrong cache, a boundary error repeated at every chunk
+#     edge -- which scale WITH length and keep failing by the same 20x. One
+#     isolated wrong row on a 700+-token example is outside this check's
+#     resolution; it is not outside the external anchor's.
 #
 # AWAITING CALIBRATION. No GPU parity run has ever been made against this code
 # (see the README's "never run" list), so nobody knows what these two paths
-# actually agree to. Rather than invent numbers and call them bounds, both
-# halves default to deliberately coarse uncalibrated values, the observed
-# maxima for BOTH are reported prominently, and a pass says loudly that it is
-# not a calibrated one. What would make this meaningful: one run of stage 1c/2b
-# on the GPU, the reported "max relative divergence" and "max per-token
-# divergence" written down, and --tolerance / --per-token-bits set a small
-# multiple above them in run_bits_experiment.sh, so the gate travels with the
-# pipeline.
+# actually agree to. Rather than invent a number and call it a bound, the bound
+# defaults to a deliberately coarse uncalibrated value, the observed maximum is
+# reported prominently, and a pass says loudly that it is not a calibrated one.
+# What would make this meaningful: one run of stage 1c/2b on the GPU, the
+# reported "max per-token divergence" written down, and --per-token-bits set a
+# small multiple above it in run_bits_experiment.sh, so the gate travels with
+# the pipeline.
 # --------------------------------------------------------------------------
 
 # The expected per-token disagreement between the two forward paths, in nats.
@@ -182,22 +259,21 @@ from typing import NamedTuple, Sequence
 # below. 1e-3 nats = 1.4427e-3 bits.
 NOISE_NATS_PER_TOKEN = 1e-3
 
-# The uncalibrated PER-TOKEN half of the bound, in bits per token: ~3.5x the
-# noise estimate above. Coarse ON PURPOSE, and not a substitute for
-# --per-token-bits set from a real run.
+# The uncalibrated bound, in bits per token: ~3.5x the noise estimate above.
+# Coarse ON PURPOSE, and not a substitute for --per-token-bits set from a real
+# run. There is no second half; see "WHY NOT max(), AND WHY NOT min() EITHER".
 UNCALIBRATED_PER_TOKEN_BITS = 5e-3
 
-# The uncalibrated RELATIVE half. Two orders of magnitude above the ~4e-4
-# relative that a 1e-3 nats/token disagreement implies at this corpus's scale,
-# and far below anything a mis-assembled row could produce.
-UNCALIBRATED_REL_CEILING = 5e-2
+# 1 bit = ln2 nats. The bound is quoted in bits/token, so a column that sums
+# NATS is judged by that bound CONVERTED, never by the same number reused.
+NATS_PER_BIT = math.log(2)
 
 # Relative tolerance for the external anchor. Wide on purpose: the log's number
 # is a 25-batch sample of a 118-example split, so anything tighter would be
 # measuring the sampling, not the mask. See the docstring.
 ANCHOR_REL_TOLERANCE = 0.15
 
-# Which token count a column's sum is over. The per-token half of the rule is
+# Which token count a column's sum is over. The rule is per token, so it is
 # only meaningful against the tokens that column actually summed: `bits` is over
 # the answer, `trainer_bits` adds the trainer's trailing pad step, and
 # `decision_bits` covers only the decision fields' tokens. A column that is not
@@ -210,6 +286,23 @@ COLUMN_TOKEN_FIELD = {
     "trainer_nats": "trainer_tokens",
     "decision_bits": "decision_tokens",
 }
+
+# Which UNIT a column's sum is in. The bound is quoted in bits/token, and two
+# of these columns are nats: applying the bits NUMBER to a nats column is a
+# 1.4427x looser bound than the one argued above, and reporting it as "bits"
+# names a unit the values are not in. Both are fixed by converting the allowance
+# per column and printing this unit everywhere the report quotes a magnitude.
+COLUMN_UNIT = {
+    "bits": "bits",
+    "nats": "nats",
+    "trainer_bits": "bits",
+    "trainer_nats": "nats",
+    "decision_bits": "bits",
+}
+
+# How many of a unit are in one bit -- the factor the per-token bound is
+# multiplied by to reach the column's own scale.
+UNIT_PER_BIT = {"bits": 1.0, "nats": NATS_PER_BIT}
 
 # The run_fingerprint fields two files must AGREE on for a parity comparison to
 # mean anything: same model, same weights, same window, same mask. Mirrors
@@ -289,12 +382,23 @@ def check_parity_fingerprints(
         present on one side only counts as a mismatch: that is the "one file was
         written by a different version of the scorer" case.
       * ``PARITY_FORWARD_KEYS`` -- full_forward and chunk. These are what the
-        check exists to vary, so they must DIFFER. Two files describing the same
-        forward path agree perfectly and prove nothing: it is the empty
-        intersection again, wearing a full set of rows. (Different --chunk
-        values on both sides is a legitimate pair -- different prefill
-        boundaries are different arithmetic -- so the rule is "not identical",
-        not "one must be --full-forward".)
+        check exists to vary, so BOTH files must RECORD them and the two records
+        must DIFFER. Two files describing the same forward path agree perfectly
+        and prove nothing: it is the empty intersection again, wearing a full
+        set of rows. (Different --chunk values on both sides is a legitimate
+        pair -- different prefill boundaries are different arithmetic -- so the
+        rule is "not identical", not "one must be --full-forward".)
+
+        RECORDING comes first, because ABSENCE MUST NOT SATISFY A MUST-DIFFER
+        RULE. Comparing ``{k: fp.get(k)}`` on both sides made a missing key read
+        as the value None, and None differs from 512 -- so a chunked file
+        compared against a copy of ITSELF with those two keys deleted was
+        accepted as a valid pair, then agreed with itself perfectly. That is the
+        vacuous pass this whole function exists to refuse, reached by deleting
+        two fields instead of by scoring twice. ``score_bits.run_fingerprint``
+        stamps both keys on every row (``chunk`` is None under --full-forward,
+        but the KEY is there), so a file missing either is a file this check
+        cannot reason about, and it is refused by name.
 
     Files that record no fingerprint at all are refused, not assumed: rows
     written before the fingerprint existed carry no evidence of what produced
@@ -315,6 +419,18 @@ def check_parity_fingerprints(
                 f"fingerprints {f.fingerprints}: it is two runs spliced together, and a "
                 "comparison against it would be a comparison against both"
             )
+        elif absent := [k for k in PARITY_FORWARD_KEYS if k not in f.fingerprint]:
+            problems.append(
+                f"the {which} file {f.path} does not RECORD its forward path "
+                f"({', '.join(absent)} absent from its run fingerprint). This check is "
+                "defined by the two files DIFFERING in the forward path, and a key that "
+                "is not there cannot differ from anything: absence would otherwise read "
+                "as a difference, so a file compared against a copy of ITSELF with those "
+                "keys deleted would be accepted as a pair and then agree with itself "
+                "perfectly. score_bits.py stamps both keys on every row (chunk is null "
+                "under --full-forward, but the key is present), so re-score rather than "
+                "compare a file that cannot say which forward path produced it"
+            )
     if not problems:
         differs = {
             k: (chunked.fingerprint.get(k, "<absent>"), full.fingerprint.get(k, "<absent>"))
@@ -328,8 +444,11 @@ def check_parity_fingerprints(
                 f"{differs}. Those differences change the numbers on their own, so the "
                 "comparison would be measuring them and not the chunked path"
             )
-        same_path = {k: chunked.fingerprint.get(k) for k in PARITY_FORWARD_KEYS} == {
-            k: full.fingerprint.get(k) for k in PARITY_FORWARD_KEYS
+        # Both sides are known to RECORD every forward key by here (the loop
+        # above refuses otherwise), so this compares two present records rather
+        # than letting a `.get` default stand in for one of them.
+        same_path = {k: chunked.fingerprint[k] for k in PARITY_FORWARD_KEYS} == {
+            k: full.fingerprint[k] for k in PARITY_FORWARD_KEYS
         }
         if same_path:
             path_desc = ", ".join(
@@ -360,9 +479,9 @@ def check_parity_fingerprints(
 
 def check_token_counts(chunked: ScoreFile, full: ScoreFile, column: str) -> tuple[bool, str]:
     """(ok, message). The two files must agree on how many tokens each example's
-    sum is over -- otherwise the per-token half of the bound is dividing two
-    different quantities by two different denominators, and the examples are not
-    even the same measurement. A disagreement here IS a masking divergence: same
+    sum is over -- otherwise the per-token bound is dividing two different
+    quantities by two different denominators, and the examples are not even the
+    same measurement. A disagreement here IS a masking divergence: same
     example, same window, different token count."""
     field = COLUMN_TOKEN_FIELD.get(column, "?")
     differ = [
@@ -385,19 +504,26 @@ def compare(
     chunked: dict[str, float],
     full: dict[str, float],
     tokens: dict[str, int | None],
-    tolerance: float | None = None,
     per_token_bits: float | None = None,
+    unit: str = "bits",
 ) -> tuple[bool, str]:
     """(ok, message). Empty or partial overlap is a FAILURE, not a pass.
 
-    The bound is two-sided and per EXAMPLE:
+    The bound is ONE quantity, per EXAMPLE and per TOKEN:
 
-        allowance(h) = max(tolerance x |full[h]|, per_token_bits x tokens[h])
+        allowance(h) = per_token_bits x tokens[h]        [x ln2 for a nats column]
 
-    with the divergence required to be strictly inside it. ``None`` for either
-    half means that half's uncalibrated default. See the block at the top of
-    this file for why the small end is bounded per token rather than by a fixed
-    floor, and for what the check can and cannot resolve at each scale.
+    with the divergence required to be strictly inside it. ``None`` means the
+    uncalibrated default. There is deliberately NO second, magnitude-dependent
+    half: ORing a relative one in (max) let a mis-assembled row pass at the base
+    scale, and ANDing it in (min) failed honest float noise at the tuned scale.
+    The four-case table -- base/tuned x noise/mis-assembled, under all three
+    rules -- is at the top of this file, together with the unit conversion and
+    with what the check can and cannot resolve at each scale.
+
+    ``unit`` is the compared column's own unit (``COLUMN_UNIT``). The bound is
+    quoted in bits/token and CONVERTED into it; every magnitude in the returned
+    message is labelled with it.
     """
     if not full:
         return False, "the full-forward file has no scored rows to compare against"
@@ -408,19 +534,26 @@ def compare(
             "chunked file: the two files are not describing the same run, so a match "
             "would mean nothing"
         )
-    rel_bound = UNCALIBRATED_REL_CEILING if tolerance is None else tolerance
-    tok_bound = UNCALIBRATED_PER_TOKEN_BITS if per_token_bits is None else per_token_bits
-    if rel_bound < 0 or tok_bound < 0:
+    if unit not in UNIT_PER_BIT:
         return False, (
-            f"a negative bound is not a bound (--tolerance {rel_bound:g}, "
-            f"--per-token-bits {tok_bound:g})"
+            f"unknown column unit {unit!r}: the per-token bound is quoted in bits/token "
+            f"and this file knows no conversion into {unit!r}, so it cannot judge that "
+            "column without either mislabelling the report or loosening the bound"
         )
+    bound_bits = UNCALIBRATED_PER_TOKEN_BITS if per_token_bits is None else per_token_bits
+    if bound_bits < 0:
+        return False, f"a negative bound is not a bound (--per-token-bits {bound_bits:g})"
+    # The bound is an argument about bits per token; a nats column gets the same
+    # bound converted (5e-3 bits/token = 3.466e-3 nats/token), never the same
+    # number reused, which would be a 1.4427x looser bound wearing the same name.
+    per_bit = UNIT_PER_BIT[unit]
+    tok_bound = bound_bits * per_bit
 
     # A NaN or an inf passes every comparison written the obvious way, because
     # every comparison against NaN is False: the old rule's `-1.0` worst-so-far
     # sentinel was never displaced by one, and the check reported a divergence of
-    # -1.000e+00 and exited 0. A non-finite bits value is a broken forward pass,
-    # not a small one.
+    # -1.000e+00 and exited 0. A non-finite value is a broken forward pass, not a
+    # small one.
     nonfinite = [
         (h, chunked[h], full[h])
         for h in sorted(full)
@@ -432,8 +565,8 @@ def compare(
             f"{len(nonfinite)} of {len(full)} examples carry a NON-FINITE value ({shown}"
             + (", ..." if len(nonfinite) > 5 else "")
             + "). NaN/inf compares False against every bound, so this would otherwise "
-            "read as a pass; a non-finite bits value means the forward pass broke, not "
-            "that it agreed"
+            f"read as a pass; a non-finite {unit} value means the forward pass broke, "
+            "not that it agreed"
         )
 
     no_tokens = [h for h in sorted(full) if tokens.get(h) is None or tokens[h] <= 0]
@@ -442,71 +575,60 @@ def compare(
             f"{len(no_tokens)} of {len(full)} examples record no token count "
             f"({', '.join(no_tokens[:5])}"
             + (", ..." if len(no_tokens) > 5 else "")
-            + "). The bound's small end is per TOKEN, so a row that does not say how "
-            "many tokens its sum is over cannot be judged -- re-score with a scorer "
-            "that stamps the count rather than falling back to a bound that ignores it"
+            + "). The bound is per TOKEN, so a row that does not say how many tokens "
+            "its sum is over cannot be judged -- re-score with a scorer that stamps the "
+            "count rather than falling back to a bound that ignores it"
         )
 
     worst_hash, worst_ratio, worst = "", -1.0, {}
     max_rel, max_per_token, biggest_abs = 0.0, 0.0, 0.0
-    per_token_half, below_own_bits = 0, 0
+    below_own_value = 0
     for h, v in full.items():
         delta = abs(chunked[h] - v)
         n = tokens[h] or 0
-        rel_allow = rel_bound * abs(v)
-        tok_allow = tok_bound * n
-        allow = max(rel_allow, tok_allow)
-        # allow == 0 only if the operator zeroed both halves (or zeroed the
-        # per-token half against an exactly-0.0-bit example). That is a demand
-        # for exactness, not a division by zero.
+        allow = tok_bound * n
+        # allow == 0 only if the operator zeroed the bound. That is a demand for
+        # exactness, not a division by zero.
         ratio = (delta / allow) if allow > 0 else (0.0 if delta == 0 else math.inf)
         per_token = delta / n
         max_per_token = max(max_per_token, per_token)
         biggest_abs = max(biggest_abs, delta)
         if v:
             max_rel = max(max_rel, delta / abs(v))
-        if tok_allow >= rel_allow:
-            per_token_half += 1
-            if tok_allow > abs(v):
-                below_own_bits += 1
+        if allow > abs(v):
+            below_own_value += 1
         if ratio >= worst_ratio:
             worst_hash, worst_ratio = h, ratio
-            worst = {
-                "delta": delta, "n": n, "value": v, "allow": allow,
-                "per_token": per_token, "half": "per-token" if tok_allow >= rel_allow else "relative",
-            }
+            worst = {"delta": delta, "n": n, "value": v, "allow": allow, "per_token": per_token}
     ok = worst_ratio < 1.0
     rel_of_worst = (
         f"{worst['delta'] / abs(worst['value']):.3e} relative"
         if worst["value"]
-        else "relative n/a (that example is 0 bits)"
+        else f"relative n/a (that example is 0 {unit})"
     )
+    bound_desc = f"{bound_bits:g} bits/token"
+    if per_bit != 1.0:
+        bound_desc += f" = {tok_bound:.4g} {unit}/token in this column's unit"
     msg = (
         f"worst example uses {worst_ratio:.3f} of its allowance over {len(full)} examples "
-        f"(worst: {worst_hash}, |chunked - full| = {worst['delta']:.6f} bits over "
-        f"{worst['n']} tokens = {worst['per_token']:.3e} bits/token against a "
-        f"{worst['value']:.4f}-bit example, {rel_of_worst}; allowance "
-        f"{worst['allow']:.6f} bits, set by the {worst['half']} half). "
-        f"max relative divergence {max_rel:.3e}; max per-token divergence "
-        f"{max_per_token:.3e} bits/token; largest absolute gap {biggest_abs:.6f} bits. "
-        f"Bound: {rel_bound:g} relative"
-        + (" (UNCALIBRATED default)" if tolerance is None else " (--tolerance)")
-        + f" OR {tok_bound:g} bits/token"
+        f"(worst: {worst_hash}, |chunked - full| = {worst['delta']:.6f} {unit} over "
+        f"{worst['n']} tokens = {worst['per_token']:.3e} {unit}/token against "
+        f"an example of {worst['value']:.4f} {unit}, {rel_of_worst}; allowance "
+        f"{worst['allow']:.6f} {unit} = the per-token bound x {worst['n']} tokens). "
+        f"max per-token divergence {max_per_token:.3e} {unit}/token; largest absolute gap "
+        f"{biggest_abs:.6f} {unit}; max relative divergence {max_rel:.3e} (reported for "
+        "context only -- there is no relative gate, and the header says why). "
+        f"Bound: {bound_desc}"
         + (" (UNCALIBRATED default)" if per_token_bits is None else " (--per-token-bits)")
-        + ", whichever is larger for the example."
+        + ", at every length -- one bound, with no second half able to widen it."
     )
-    if per_token_half:
+    if below_own_value:
         msg += (
-            f" {per_token_half} of {len(full)} examples were judged by the per-token half"
+            f" For {below_own_value} of {len(full)} examples the allowance exceeds the "
+            f"example's own {unit} -- at that scale (a memorized tuned example is ~0.05 "
+            "bits over ~35 tokens, i.e. the arithmetic noise floor itself) this check "
+            "resolves a divergence that is wrong in KIND and nothing finer."
         )
-        if below_own_bits:
-            msg += (
-                f", and for {below_own_bits} of those the allowance exceeds the example's "
-                "own bits -- at that scale (a memorized tuned example is ~0.05 bits over "
-                "~35 tokens, i.e. the noise floor itself) this check resolves a divergence "
-                "that is wrong in KIND and nothing finer"
-            )
-        msg += "."
     return ok, msg
 
 
@@ -569,19 +691,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--tolerance",
         type=float,
         default=None,
-        help="the RELATIVE half of the bound: max |chunked-full|/|full| to accept. "
-        f"Omitted = uncalibrated: the coarse {UNCALIBRATED_REL_CEILING:g} ceiling, "
-        "reported as such. Set it from a real run's 'max relative divergence'.",
+        help="RETIRED -- refused, not ignored. It was a RELATIVE half ORed on top of "
+        "the per-token bound, and an OR is a permission: at the base scale it granted "
+        "6.15 bits of room and let a mis-assembled row (~3.55 bits) pass. Use "
+        "--per-token-bits; see the four-case table at the top of this file.",
     )
     p.add_argument(
         "--per-token-bits",
         type=float,
         default=None,
-        help="the PER-TOKEN half of the bound, in bits per token: an example may also "
-        "diverge by this much times its token count, whichever half is larger. Omitted "
-        f"= uncalibrated {UNCALIBRATED_PER_TOKEN_BITS:g} bits/token (~3.5x the "
-        f"{NOISE_NATS_PER_TOKEN:g} nats/token these two float paths are expected to "
-        "disagree by). Set it from a real run's 'max per-token divergence'.",
+        help="THE bound, in bits per token: an example may diverge by this much times "
+        "its token count, at every length. A nats column is judged by the same bound "
+        f"converted (x ln2). Omitted = uncalibrated {UNCALIBRATED_PER_TOKEN_BITS:g} "
+        f"bits/token (~3.5x the {NOISE_NATS_PER_TOKEN:g} nats/token these two float "
+        "paths are expected to disagree by). Set it from a real run's 'max per-token "
+        "divergence'.",
     )
     p.add_argument(
         "--allow-fingerprint-mismatch",
@@ -598,6 +722,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if bool(args.anchor) != bool(args.log):
         p.error("--anchor and --log go together")
+
+    if args.tolerance is not None:
+        # Refused rather than ignored: a stale invocation that still passes
+        # --tolerance would otherwise look calibrated while gating on nothing.
+        print(
+            "[parity_check] REFUSED -- --tolerance is retired. It was the RELATIVE half "
+            "of a max() bound, i.e. an OR of two permissions, so the wider half ruled: "
+            "at the base scale 5e-2 x 123 bits = 6.15 bits of room let a mis-assembled "
+            "row (~3.55 bits) through, which is the exact failure this check exists to "
+            "catch. ANDing it in instead (min) would have failed honest float noise at "
+            "the tuned scale -- 0.0505 bits against a 0.0025-bit demand -- so it is "
+            "wrong in both directions and is gone, not defaulted. The bound is per "
+            "TOKEN alone, at every length: use --per-token-bits. The four-case table is "
+            "at the top of parity_check.py.",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.anchor:
         ok, msg = compare_anchor(
@@ -642,38 +783,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         chunked.values,
         full.values,
         full.tokens,
-        args.tolerance,
         args.per_token_bits,
+        COLUMN_UNIT[args.column],
     )
     print(f"[parity_check] {msg}", file=sys.stderr)
     if not ok:
-        print("[parity_check] FAILED -- the chunked path is not reproducing the "
-              "trainer's forward; every bits number from it is suspect.", file=sys.stderr)
-    elif args.tolerance is None or args.per_token_bits is None:
-        # Loud on a PASS, because an uncalibrated pass is the one that gets
-        # mistaken for a validated one. Named per half: setting one of them
-        # leaves the other still guessing.
-        still = " and ".join(
-            name
-            for name, unset in (
-                (f"--tolerance ({UNCALIBRATED_REL_CEILING:g} relative)", args.tolerance is None),
-                (
-                    f"--per-token-bits ({UNCALIBRATED_PER_TOKEN_BITS:g} bits/token)",
-                    args.per_token_bits is None,
-                ),
-            )
-            if unset
-        )
         print(
-            f"[parity_check] NOT CALIBRATED: {still} still at the uncalibrated default. "
-            "No GPU parity run has ever been made against this code, so those are "
-            "order-of-magnitude ceilings, not measured bounds: they resolve a chunked "
+            "[parity_check] FAILED -- the chunked path is not reproducing the trainer's "
+            f"forward; every {args.column} number from it is suspect.",
+            file=sys.stderr,
+        )
+    elif args.per_token_bits is None:
+        # Loud on a PASS, because an uncalibrated pass is the one that gets
+        # mistaken for a validated one.
+        print(
+            f"[parity_check] NOT CALIBRATED: --per-token-bits "
+            f"({UNCALIBRATED_PER_TOKEN_BITS:g} bits/token) is still at the uncalibrated "
+            "default. No GPU parity run has ever been made against this code, so that is "
+            "an order-of-magnitude ceiling, not a measured bound: it resolves a chunked "
             "path that is wrong in KIND (rows off by one, the wrong cache, the prompt "
-            "scored as the answer), not one that is off by a little. This run did NOT "
-            "validate the bits column to any stated precision. Write the 'max relative "
-            "divergence' and 'max per-token divergence' above into "
-            "run_bits_experiment.sh as --tolerance / --per-token-bits (a small multiple "
-            "of each) to turn this into a gate that means something.",
+            f"scored as the answer), not one that is off by a little. This run did NOT "
+            f"validate the {args.column} column to any stated precision. Write the 'max "
+            "per-token divergence' above into run_bits_experiment.sh as --per-token-bits "
+            "(a small multiple of it) to turn this into a gate that means something.",
             file=sys.stderr,
         )
     return 0 if ok else 1
