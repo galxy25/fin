@@ -14,7 +14,8 @@ It walks BOTH directions:
                   ledger *rejected* appears in a piece, and no banned phrase or
                   infrastructure name does either
   row  -> itself  a rowed score carries its qualifiers IN the sentence, or the row
-                  declares the §4.3 carve-out and does not spend it on a headline
+                  declares the §4.3 carve-out AS A FIELD WITH A POLARITY
+                  (`Carve-out (§4.3): yes`) and does not spend it on a headline
 
 The second direction is the one that enforces THE CLAIM RULE. It was missing
 until 2026-09-06, and an injected `published/` piece asserting a fabricated
@@ -27,8 +28,22 @@ CAN be rowed and still be the sentence `EX-BAD-1` rejects. `RPI-12` shipped
 "36/51" appeared in a row's claim text and that was the whole test. Coverage is
 not qualification. See `claims-ledger.md` §8.
 
+The third check then spent a day granting its own exemption to any row whose
+re-check mentioned a carve-out *in any polarity*, `RPI-12`'s honest "No
+carve-out (§4.3), and none is available here" included. A substring search over
+prose is not a parser. The exemption is now a parsed field with a token
+polarity; `parse_declarations` below states exactly which shapes it accepts.
+
 What it still CANNOT do is open an artifact and read it — the part that matters
-most. This is a floor, not the audit. It exits non-zero on any defect.
+most. Two narrower holes, stated rather than papered over. A score in prose is
+checked for COVERAGE (the token appears in some row this piece declares) and not
+for QUALIFICATION: a sentence with no row of its own can therefore carry a bare
+number past this checker on the strength of a *different* sentence's row. That
+is how three bare `49/51`s accumulated in one draft — `git log -S` puts one in
+each of `09d828a`, `0be1f62` and `e84f4fd`, the three commits that hardened the
+claim rule, every run green. And it reads a ledger, not a repository, so a row
+whose evidence is a file still being written cannot be re-read here — see
+`RPI-25`. This is a floor, not the audit. It exits non-zero on any defect.
 
     python3 content/check-claims.py [--content-dir content] [--labbook-dir DIR]
 
@@ -106,17 +121,34 @@ EXCUSE_WORDS = ("never", "bad:", "do not", "don't", "forbid", "rejected", "avoid
 # the row's re-check column stand in for them, and both are decisions a reviewer
 # can audit rather than omissions a writer makes silently:
 #
-#   "carve-out"      §4.3's structurally-attached number. Checked further in
-#                    check_piece_to_rows: such a sentence may not be a heading or
-#                    the piece's title, which is what stops the phrase from being
-#                    typed into re-check to get past this check.
-#   "negated number" a figure present only in order to be refused (RPI-37). It
-#                    must NOT acquire qualifiers; that would make it an assertion.
+#   carve-out       §4.3's structurally-attached number. Checked further in
+#                   check_piece_to_rows: such a sentence may not be a heading or
+#                   the piece's title, which is what stops the declaration from
+#                   being typed in to buy an unqualified headline.
+#   negated number  a figure present only in order to be refused (RPI-37). It
+#                   must NOT acquire qualifiers; that would make it an assertion.
+#
+# A declaration is a FIELD WITH A POLARITY, and the polarity is a token. This
+# check spent 2026-09-06 as `re.search(r"carve[-\s]?out", recheck)` — a substring
+# test, blind to negation — so `RPI-12`'s re-check, rewritten that same morning
+# to say "No carve-out (§4.3), and none is available here", MATCHED, and the
+# round that corrected `RPI-12` permanently exempted it from the rule it had just
+# been corrected under. Nothing about that was visible in a green run. The
+# polarity is a token now, so a sentence cannot argue its way into an exemption.
 #
 # This is a shape test, not a reading. It cannot tell whether the model named is
 # the model that was run — that half is human work and always will be.
-CARVE_OUT_RE = re.compile(r"carve[-\s]?out", re.I)
-NEGATED_RE = re.compile(r"negated number", re.I)
+DECLARATION_RE = re.compile(
+    r"(?<![0-9A-Za-z])(?:\*\*\s*)?(?P<neg>no\s+)?"
+    r"(?P<field>carve-out|negated\s+number)\s*\(§4\.3\)"
+    # The polarity is a STANDALONE token: `yes`/`no` followed by the end of the
+    # cell or by punctuation, never by more words. Without that, "**Carve-out
+    # (§4.3):** no model qualifier, because this arm uses none" parses as the
+    # polarity `no` — a justification read as a refusal.
+    r"(?:\s*(?:\*\*\s*)?:\s*(?:\*\*\s*)?(?P<value>yes|no)(?:\*\*)?(?=\s*(?:$|[—–\-.,;:)])))?",
+    re.I,
+)
+DECLARATION_FIELDS = ("carve-out", "negated number")
 CORE_TIER_RE = re.compile(r"\bcore\b", re.I)
 OTHER_TIER_RE = re.compile(r"\b(hard|adversarial)\b", re.I)
 CORPUS_RE = re.compile(r"\bcorpus\b|\bscenarios?\b", re.I)
@@ -275,6 +307,76 @@ def names_a_model(claim: str) -> bool:
     return False
 
 
+def parse_declarations(rid: str, recheck: str, problems: list[str]) -> dict[str, bool]:
+    """Parse the §4.3 exemptions out of a row's re-check column as FIELDS.
+
+    A declaration is `<field> (§4.3)` carrying a polarity, not the word
+    "carve-out" appearing somewhere in a paragraph. The field name must be
+    followed immediately by the section it invokes, which is what keeps prose
+    about §4.3 from reading as a declaration of it.
+
+    ACCEPTED — grants the exemption (returns True for that field):
+
+        Carve-out (§4.3): yes
+        **Carve-out (§4.3): yes** — a secondary number inside Results …
+        **Carve-out (§4.3):** yes — …
+        Negated number (§4.3): yes — the 96% exists only to be refused
+
+    ACCEPTED — explicitly refuses it (returns False, so the row is CHECKED):
+
+        No carve-out (§4.3)
+        **No carve-out (§4.3)**, and none is available here: …
+        Carve-out (§4.3): no
+
+    REJECTED — no field, so nothing is granted and the row is checked exactly as
+    if its re-check were empty. This is the fail-open direction on purpose:
+
+        "…bars the secondary-number carve-out from the lede…"   (prose)
+        "no carve-out is available here"                        (prose)
+        "the §4.3 carve-out does not apply"       (§4.3 precedes the field name)
+        "carve out"                               (not the field's spelling)
+
+    MALFORMED — the field is named with a justification where its polarity
+    belongs (`**Carve-out (§4.3):** names its round`, or `**Carve-out (§4.3):**
+    no model qualifier, because this arm uses none` — where "no" is the first
+    word of a reason, not a polarity). That is reported as a problem rather than
+    silently granted or silently ignored, because it is the shape every live row
+    used before the polarity existed, and a reader would reasonably expect it to
+    still mean "yes".
+    """
+    found: dict[str, bool] = {}
+    for match in DECLARATION_RE.finditer(recheck):
+        field = re.sub(r"\s+", " ", match.group("field")).lower()
+        negated = match.group("neg") is not None
+        value = (match.group("value") or "").lower()
+        if not value:
+            if not negated:
+                problems.append(
+                    f"{rid}: re-check names the §4.3 '{field}' field with no polarity — a "
+                    f"justification is not a value. Write '{field.capitalize()} (§4.3): yes' to "
+                    f"declare the exemption or 'No {field} (§4.3)' to record that it was "
+                    f"considered and refused (claims-ledger.md §4 step 3)"
+                )
+                continue
+            granted = False
+        else:
+            granted = value == "yes"
+            if negated and granted:
+                problems.append(
+                    f"{rid}: re-check says 'No {field} (§4.3): yes' — the declaration contradicts "
+                    f"itself, and a contradictory declaration grants nothing"
+                )
+                granted = False
+        if field in found and found[field] != granted:
+            problems.append(
+                f"{rid}: re-check declares the §4.3 '{field}' field both ways; a row either "
+                f"takes the exemption or it does not"
+            )
+            granted = False
+        found[field] = granted
+    return found
+
+
 def check_score_qualifiers(rows: list[dict], problems: list[str]) -> None:
     """THE CLAIM RULE applied to the sentence, not just to its coverage.
 
@@ -288,7 +390,8 @@ def check_score_qualifiers(rows: list[dict], problems: list[str]) -> None:
         claim = row["claim"]
         if not SCORE_RE.search(claim):
             continue
-        if CARVE_OUT_RE.search(row["recheck"]) or NEGATED_RE.search(row["recheck"]):
+        declared = row.get("declares") or {}
+        if any(declared.get(field) for field in DECLARATION_FIELDS):
             continue
         missing = []
         if not names_a_model(claim):
@@ -300,9 +403,11 @@ def check_score_qualifiers(rows: list[dict], problems: list[str]) -> None:
         if missing:
             problems.append(
                 f"{row['id']}: a sentence carrying a score is missing {' and '.join(missing)}, "
-                f"and re-check declares neither a carve-out nor a negated number "
-                f"(claims-ledger.md §4 step 3) — this is the EX-BAD-1 shape. Either put the "
-                f"qualifiers in the sentence, or use the carve-out and say so in re-check. "
+                f"and re-check declares neither `Carve-out (§4.3): yes` nor "
+                f"`Negated number (§4.3): yes` (claims-ledger.md §4 step 3) — this is the "
+                f"EX-BAD-1 shape. Either put the qualifiers in the sentence, or take the "
+                f"carve-out by declaring that field. Prose about a carve-out, and a declaration "
+                f"negated ('No carve-out (§4.3)'), both grant nothing. "
                 f"Claim: {norm(claim)[:80]}"
             )
 
@@ -456,15 +561,15 @@ def check_piece_to_rows(
 
     # 4b. §4 step 3's other half, which only the piece can show: a number riding
     #     on the carve-out may "never be the piece's most quotable sentence — not
-    #     the title, not a subhead". Without this, `carve-out` typed into re-check
-    #     would buy an unqualified headline, which is EX-BAD-1 with paperwork.
+    #     the title, not a subhead". Without this, the declaration typed into
+    #     re-check would buy an unqualified headline: EX-BAD-1 with paperwork.
     heads = [norm(line).lstrip("#").strip() for line in lines if line.lstrip().startswith("#")]
     title = norm(fm.get("title") or "")
     for cid in declared:
         row = by_id.get(cid)
         if not row or not SCORE_RE.search(row["claim"]):
             continue
-        if not CARVE_OUT_RE.search(row["recheck"]):
+        if not (row.get("declares") or {}).get("carve-out"):
             continue
         claim = norm(row["claim"]).rstrip(".").strip()
         where = "the title" if claim and title and claim in title else None
@@ -548,6 +653,12 @@ def main() -> int:
         return 1
 
     rows = parse_ledger(ledger_path)
+    for row in rows:
+        # A rejected or retired row's whole purpose can be to carry a bad shape,
+        # so a malformed declaration in one is not reported — but it still never
+        # grants an exemption.
+        sink = problems if row["status"] not in {"rejected", "retired"} else []
+        row["declares"] = parse_declarations(row["id"], row["recheck"], sink)
     by_id = check_rows(rows, problems)
     check_score_qualifiers(rows, problems)
     live_rows = [r for r in rows if r["piece"].startswith(STAGES)]

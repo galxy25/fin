@@ -3,7 +3,7 @@ title: "Same untuned `google/gemma-4-e4b`, two router prompts: 36/51 with the or
 kind: scientific-result
 status: draft
 audience: "Developers evaluating Fin, and anyone who wants to know how we measure the model that decides where your words go"
-claims: [RPI-01, RPI-02, RPI-03, RPI-04, RPI-05, RPI-06, RPI-07, RPI-08, RPI-09, RPI-10, RPI-11, RPI-12, RPI-13, RPI-14, RPI-15, RPI-16, RPI-17, RPI-18, RPI-19, RPI-20, RPI-21, RPI-22, RPI-23, RPI-24, RPI-25, RPI-26, RPI-27, RPI-28, RPI-29, RPI-30, RPI-31, RPI-32, RPI-33, RPI-34, RPI-35, RPI-36, RPI-37]
+claims: [RPI-01, RPI-02, RPI-03, RPI-04, RPI-05, RPI-06, RPI-07, RPI-08, RPI-09, RPI-10, RPI-11, RPI-12, RPI-13, RPI-14, RPI-15, RPI-16, RPI-17, RPI-18, RPI-19, RPI-20, RPI-21, RPI-22, RPI-23, RPI-24, RPI-25, RPI-26, RPI-27, RPI-28, RPI-29, RPI-30, RPI-31, RPI-32, RPI-33, RPI-34, RPI-35, RPI-36, RPI-37, RPI-38, RPI-39]
 labbook: []              # PENDING — see "Lab-book link" below. Must be filled before this leaves review/.
 channel: blog
 date: 2026-09-06
@@ -33,8 +33,8 @@ published_at: ""
 > `evals/tmux-routing/prompts/router.md` — the second correcting the first —
 > and the surviving inline comment still says to "re-score `router_llm.py`
 > against it when a local endpoint is up again." Until that re-score exists,
-> 49/51 describes a prompt revision the tree is already moving away from. See
-> "Corrections owed upstream" at the bottom.
+> this piece's headline result describes a prompt revision the tree is already
+> moving away from. See "Corrections owed upstream" at the bottom.
 
 # Same untuned `google/gemma-4-e4b`, two router prompts: 36/51 with the original, 49/51 with round 3, on the 51-scenario tmux-routing corpus (26 core, 25 hard)
 
@@ -259,11 +259,11 @@ prompt, and neither has been run.
 - **No held-out split, and the prompt was written against the scored misses.**
   Rounds 1 through 4 were each authored by reading the miss list the previous
   round produced on these same 51 scenarios — the round-by-round section above
-  is the record of it. 49/51 therefore measures how well the round-3 prompt
-  fits this corpus, not how it would score on scenarios written after it, and
-  nothing here predicts performance on a corpus its authors had not seen. The
-  "held out by rule" note in Method is about training data and does not apply
-  to prompt work; a prompt-only result has no held-out split at all.
+  is the record of it. The round-3 score therefore measures how well that
+  prompt fits this corpus, not how it would score on scenarios written after
+  it, and nothing here predicts performance on a corpus its authors had not
+  seen. The "held out by rule" note in Method is about training data and does
+  not apply to prompt work; a prompt-only result has no held-out split at all.
 - **No run count is recorded.** `RESULTS.md` gives one score per prompt
   revision and records no repeats, and there are no run logs in the repo, so
   the number of scored runs behind each row is unknown. Treat every figure here
@@ -296,8 +296,10 @@ prompt, and neither has been run.
   2026-09-06 by `7a591f4` and again by `f0ca4af`, both on the unmerged
   `imac-site` branch; the second rewrites the first's correction, and its
   inline comment (now headed "Corrected 2026-09-06 (twice)") is still explicit
-  that a re-score is owed. 49/51 is a fact about `99ed9d9`, not about whatever
-  ships next.
+  that a re-score is owed. The 49/51 in this piece is a fact about one prompt
+  revision — `99ed9d9`, scored with the untuned `google/gemma-4-e4b` on the
+  51-scenario tmux-routing corpus, core 25/26 and hard 24/25 — and not about
+  whatever ships next.
 - **It does not move the champion.** The champion record in
   `scripts/model-factory/evals-champions.json` still reads 36/51 for the
   untuned `google/gemma-4-e4b` on the 51-scenario tmux-routing corpus — core
@@ -331,7 +333,7 @@ unless all 26 core scenarios pass. To reproduce a particular round, check out
 `evals/tmux-routing/prompts/router.md` at that round's commit: round 0 is
 `96ea006`, round 1 `22005c7`, round 2 `f0040f5`, round 3 `99ed9d9`, round 4
 `e7460cd`. Round 3 is the file as of `main @ 704ab09`; it is **not** the newest
-revision in the repository — see the note about `7a591f4` above.
+revision in the repository — see the note about `7a591f4` and `f0ca4af` above.
 
 Expect your numbers to differ. Different LM Studio builds, different hardware
 and a different 30-second timeout margin all move single-run results. The
@@ -417,14 +419,21 @@ the body above; `content/check-claims.py` fails if one does not.
 | RPI-34 | see the ledger | method | `SessionRouting.swift @ 704ab09`; `run_evals.py @ 704ab09` |
 | RPI-35 | see the ledger | method | `.gitignore @ 704ab09`; `scripts/model-factory/README.md @ 704ab09` |
 | RPI-36 | see the ledger | method | `scripts/model-factory/README.md @ 704ab09` Status; `train.log` |
+| RPI-37 | see the ledger | method | `SessionRouting.swift @ 704ab09`; absence of any in-app routing eval |
+| RPI-38 | see the ledger | performance | `RESULTS.md @ d98a031`; `prompts/router.md @ 99ed9d9`; `git log 704ab09..imac-site` |
+| RPI-39 | see the ledger — **`proposed`, not verified** | method | none that is local; visibility is a property of the remote |
 
 The sentences are not duplicated here: a second copy is a second thing to keep
 in sync, and the ledger is the copy that gets audited.
 
 ## Pre-flight
 
-- [x] Every number has a ledger row citing a run artifact, and every row is
-      `verified`
+- [x] Every number has a ledger row citing a run artifact, and every row that
+      carries a number is `verified`. **One row is deliberately not:** `RPI-39`
+      — "every path above is in a repository that is not public" — is
+      `proposed`, because nothing in the tree records the remote's visibility
+      and no local artifact can settle it. It carries no number, and it must be
+      confirmed by Levi or cut before this piece leaves `review/`.
 - [x] The title carries all four qualifiers (it is `RPI-14`), or would carry no
       number at all
 - [x] Every quotable sentence carries model + prompt revision + corpus +
@@ -433,7 +442,11 @@ in sync, and the ledger is the copy that gets audited.
       the champion sentence in "What this does not show" carried none of the
       four and claimed no carve-out (`RPI-12`). Corrected the same day, and
       `check-claims.py` now enforces the box instead of trusting it — see
-      `claims-ledger.md` §8.**
+      `claims-ledger.md` §8. Three more bare `49/51`s were in this file at the
+      same time — `git log -S` puts one in each of the three commits that
+      hardened the claim rule — because the checker asks whether the *token*
+      appears in some declared row, not whether the *sentence* carrying it is
+      qualified. Two are now cut; the third is `RPI-38`.**
 - [x] The losing arms and the regressions are in the results table
 - [x] Flake/timeout counts are reported and marked as non-semantic
 - [x] Run count is stated as **unrecorded**; no averaging or best-of is implied
@@ -453,8 +466,11 @@ in sync, and the ledger is the copy that gets audited.
 - [ ] **Lab-book entry ids are in the front matter and cited in the body** —
       NOT DONE; the book did not exist when this was drafted.
 - [ ] **The measured prompt is the current one, or the piece says which one it
-      is not** — PARTIAL. The body says it; the re-score `7a591f4` asks for has
-      not happened. `RPI-03`, `RPI-04`, `RPI-08`, `RPI-13`, `RPI-14`, `RPI-19`,
+      is not** — PARTIAL. The body says it; the re-score that `7a591f4` and
+      `f0ca4af` between them ask for has not happened —
+      `git log 704ab09..imac-site -- evals/tmux-routing/prompts/router.md` is
+      the search that returns both, and looking up one commit instead of the
+      range is how this box came to name only the first. `RPI-03`, `RPI-04`, `RPI-08`, `RPI-13`, `RPI-14`, `RPI-19`,
       `RPI-28`, `RPI-31`, `RPI-32` and `RPI-33` all go `stale` the moment that
       branch merges.
 - [ ] **All three upstream corrections are filed** — NOT DONE. See "Corrections
