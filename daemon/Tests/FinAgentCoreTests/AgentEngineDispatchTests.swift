@@ -339,9 +339,6 @@ final class AgentEngineDispatchTests: XCTestCase {
     /// `-L fin`, which names that very server.
     func testGuardedSendInputStillDeliversAllowedTmuxCommands() async {
         let session = RecordingStubSession()
-        // The live shell reports it is inside Fin's own tmux server — which is what the
-        // engine asks it before every tmux send.
-        session.environment["TMUX"] = "/private/tmp/tmux-501/fin,4242,0"
         let engine = makeEngine(session: session)
         engine.tmuxGuard = TmuxSendGuard(
             isEnforced: true,
@@ -351,11 +348,11 @@ final class AgentEngineDispatchTests: XCTestCase {
 
         _ = await engine.execute(call(
             AgentToolSpec.sendInput.name,
-            #"{"input": "tmux capture-pane -p -t fin-build", "await_output_seconds": 1}"#
+            #"{"input": "tmux -L fin capture-pane -p -t fin-build", "await_output_seconds": 1}"#
         ))
         _ = await engine.execute(call(
             AgentToolSpec.sendInput.name,
-            #"{"input": "tmux send-keys -t fin 'git status' Enter", "await_output_seconds": 1}"#
+            #"{"input": "tmux -L fin send-keys -t fin 'git status' Enter", "await_output_seconds": 1}"#
         ))
         _ = await engine.execute(call(
             AgentToolSpec.sendInput.name,
@@ -368,36 +365,16 @@ final class AgentEngineDispatchTests: XCTestCase {
         XCTAssertTrue(session.sentInputs[4].contains("-L fin new-session"))
     }
 
-    /// R0 IS ASKED OF THE LIVE SHELL, EVERY TIME. `shellIsOnOwnServer` defaults to true and
-    /// the daemon used to set it once, at launch — but the model may leave its own tmux
-    /// server whenever it likes (`tmux detach`, `exit`, killing its own session are all
-    /// ordinary work ON its own server), and the PTY then drops back to the login shell
-    /// that spawned the client, whose `$TMUX` is empty. From there `tmux send-keys -t main`
-    /// names no socket for R1 to catch and lands on the human's server. So the shell is
-    /// asked again before the send, and a shell that does not answer is not confined.
-    func testTmuxSendsAreCheckedAgainstTheLiveShellNotALaunchTimeSnapshot() async {
-        let session = RecordingStubSession()          // no TMUX: not inside any tmux
-        let engine = makeEngine(session: session)
-        engine.tmuxGuard = TmuxSendGuard(
-            isEnforced: true, ownSession: "fin", ownSocket: .name("fin"),
-            shellIsOnOwnServer: true                  // the stale launch-time "yes"
-        )
-
-        let result = await engine.execute(call(
-            AgentToolSpec.sendInput.name,
-            #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
-        ))
-
-        XCTAssertTrue(session.sentInputs.isEmpty, "an unconfined shell must not type tmux")
-        XCTAssertTrue(result.contains("REFUSED"), "got: \(result)")
-        XCTAssertEqual(session.environmentProbes, ["TMUX"], "the live shell must be asked")
-    }
-
-    /// The sequence the finding described, as one test: a send that leaves the tmux server,
-    /// then the escape. The guard cannot see what `tmux detach` does — it is allowed work on
-    /// Fin's own server — so the only thing that catches the second send is asking the shell
-    /// again.
-    func testLeavingTheTmuxServerIsCaughtBeforeTheNextSend() async {
+    /// NOTHING IS TYPED INTO THE TERMINAL TO DECIDE A REFUSAL. The engine used to probe the
+    /// live shell for `$TMUX` before any send its cheap prefilter thought might be a tmux
+    /// command — and that prefilter answers true for ANY input containing a quote or a
+    /// backslash, because `tm"u"x` runs. So `git commit -m "wip"` typed
+    /// `echo FIN_ENV_123456=$TMUX` + Return into the pane before the real command: in a
+    /// shell it ran, in a REPL or vim it went into the program, and when nothing answered
+    /// (a TUI re-renders the typed line, which the filter then skips) the turn also burned
+    /// the timeout. The guard's rule no longer depends on the shell's environment, so there
+    /// is nothing to ask.
+    func testNoSendProbesTheShellWhateverItsQuoting() async {
         let session = RecordingStubSession()
         session.environment["TMUX"] = "/private/tmp/tmux-501/fin,4242,0"
         let engine = makeEngine(session: session)
@@ -405,40 +382,55 @@ final class AgentEngineDispatchTests: XCTestCase {
             isEnforced: true, ownSession: "fin", ownSocket: .name("fin")
         )
 
-        _ = await engine.execute(call(
-            AgentToolSpec.sendInput.name,
-            #"{"input": "tmux detach", "await_output_seconds": 1}"#
-        ))
-        XCTAssertEqual(session.sentInputs.count, 2, "detaching your own client is allowed")
+        for input in [
+            "git status",                               // no quotes: never probed
+            #"git commit -m \"fix the guard\""#,        // a quote: used to probe
+            #"print(\"hi\")"#,                          // …into a python REPL
+            "echo it's fine",
+            "tmux -L fin ls",                           // a real tmux command: still no probe
+        ] {
+            _ = await engine.execute(call(
+                AgentToolSpec.sendInput.name,
+                #"{"input": "\#(input)", "await_output_seconds": 1}"#
+            ))
+        }
 
-        // …and now the PTY is back at the login shell, where $TMUX is empty.
-        session.environment["TMUX"] = ""
-        let result = await engine.execute(call(
-            AgentToolSpec.sendInput.name,
-            #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
-        ))
-        XCTAssertEqual(session.sentInputs.count, 2, "nothing more may be typed")
-        XCTAssertTrue(result.contains("REFUSED"), "got: \(result)")
-        XCTAssertEqual(session.environmentProbes, ["TMUX", "TMUX"])
+        XCTAssertEqual(session.sentInputs.count, 10, "five sends, each body + Return")
+        XCTAssertTrue(session.environmentProbes.isEmpty,
+                      "no send may type a probe into the pane — got \(session.environmentProbes)")
+        XCTAssertFalse(
+            session.sentInputs.contains { $0.contains("FIN_ENV_") },
+            "and certainly not into a program the model is driving"
+        )
     }
 
-    /// The check is on the tmux path only: ordinary work must not pay a round trip (or put
-    /// an `echo` in the human's terminal) for a rule that cannot apply to it.
-    func testOrdinaryCommandsAreNotChargedForTheConfinementCheck() async {
-        let session = RecordingStubSession()
-        session.environment["TMUX"] = "/private/tmp/tmux-501/fin,4242,0"
-        let engine = makeEngine(session: session)
-        engine.tmuxGuard = TmuxSendGuard(
-            isEnforced: true, ownSession: "fin", ownSocket: .name("fin")
-        )
+    /// The rule that replaced the probe, at the engine boundary: a socket-less tmux command
+    /// is refused no matter what the shell would have said, and naming Fin's own socket is
+    /// allowed no matter what the shell would have said. That is the whole reason the probe
+    /// could go: its answer changed nothing.
+    func testASocketLessTmuxIsRefusedAndTheOwnSocketIsSentWhateverTheShellSays() async {
+        for reported in ["/private/tmp/tmux-501/fin,4242,0", "", "/private/tmp/tmux-501/default,1,0"] {
+            let session = RecordingStubSession()
+            session.environment["TMUX"] = reported
+            let engine = makeEngine(session: session)
+            engine.tmuxGuard = TmuxSendGuard(
+                isEnforced: true, ownSession: "fin", ownSocket: .name("fin")
+            )
 
-        _ = await engine.execute(call(
-            AgentToolSpec.sendInput.name,
-            #"{"input": "git status", "await_output_seconds": 1}"#
-        ))
+            let refused = await engine.execute(call(
+                AgentToolSpec.sendInput.name,
+                #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
+            ))
+            XCTAssertTrue(refused.contains("REFUSED"), "got: \(refused)")
+            XCTAssertTrue(session.sentInputs.isEmpty, "nothing may be typed for a refusal")
 
-        XCTAssertEqual(session.sentInputs.count, 2, "the command still goes out")
-        XCTAssertTrue(session.environmentProbes.isEmpty, "and nothing was probed for it")
+            _ = await engine.execute(call(
+                AgentToolSpec.sendInput.name,
+                #"{"input": "tmux -L fin ls", "await_output_seconds": 1}"#
+            ))
+            XCTAssertEqual(session.sentInputs.count, 2, "the agent's own server is its own")
+            XCTAssertTrue(session.environmentProbes.isEmpty)
+        }
     }
 
     /// A host that never set the guard behaves exactly as it did before the guard
@@ -472,6 +464,29 @@ final class AgentEngineDispatchTests: XCTestCase {
         XCTAssertTrue(result.contains("not available"), "got: \(result)")
         XCTAssertFalse(result.contains("unknown tool"),
                        "an advertised tool must never be answered as unknown")
+    }
+
+    /// A RUNTIME THAT CANNOT SERVE A TOOL MUST NOT ADVERTISE IT. The roster is shared with
+    /// the Fin app, and `read_session` needs the daemon's second SSH exec channel against a
+    /// machine whose tmux sessions it manages — in the app it can only ever answer "not
+    /// available here", while its own description ("this is the only way to see the others",
+    /// "use it whenever you are asked what is running") is written to make the model call
+    /// it. That costs a turn and prints an error row, every time someone asks the app what
+    /// is running elsewhere. The app's routing prompt meanwhile tells the same model to use
+    /// `tmux capture-pane` for that, so the two instructions contradicted each other and the
+    /// tool-shaped one always failed.
+    func testTheRosterDropsReadSessionForARuntimeThatCannotServeIt() {
+        XCTAssertTrue(AgentToolSpec.roster(readSession: true).contains { $0.name == "read_session" })
+        XCTAssertFalse(AgentToolSpec.roster(readSession: false).contains { $0.name == "read_session" })
+        // Nothing else moves: the two rosters differ by exactly that one tool.
+        XCTAssertEqual(
+            AgentToolSpec.roster(readSession: true).count,
+            AgentToolSpec.roster(readSession: false).count + 1
+        )
+        XCTAssertEqual(AgentToolSpec.roster(readSession: true).map(\.name),
+                       AgentToolSpec.all.map(\.name))
+        // …and the dispatch keeps its honest error for a model that names it anyway.
+        XCTAssertTrue(AgentToolSpec.knownToolNames.contains("read_session"))
     }
 
     /// The name reaches the hook validated and unchanged, and the frame tells the model
@@ -561,6 +576,13 @@ final class AgentEngineDispatchTests: XCTestCase {
 
     /// The model cannot ask for a megabyte: `lines` is clamped before the runner sees it,
     /// and the returned text is trimmed to that many lines.
+    ///
+    /// THE CLAMP IS DERIVED FROM THE CONTEXT WINDOW, not from a constant. `maxLines` (400)
+    /// and `maxResponseBytes` (64 KB) bound the exec channel; against this engine's default
+    /// 8k window they are ~2.3x the budget for the WHOLE conversation, and a tool result
+    /// that big does not merely crowd the transcript — compaction drops from the front
+    /// until it fits, which takes the user turn, the assistant turn, and the capture the
+    /// model just asked for with it.
     func testReadSessionClampsLinesAndTrimsTheAnswer() async {
         var requested: [Int] = []
         let engine = makeEngine()
@@ -573,7 +595,10 @@ final class AgentEngineDispatchTests: XCTestCase {
             AgentToolSpec.readSession.name, #"{"session": "main", "lines": 9000}"#
         ))
 
-        XCTAssertEqual(requested, [TmuxSessionRead.maxLines])
+        XCTAssertEqual(
+            requested, [TmuxSessionRead.linesFitting(bytes: 7_040)],
+            "the ask is bounded by what an 8k window can hold, not by maxLines"
+        )
         let body = result.components(separatedBy: "\n")
         XCTAssertLessThanOrEqual(
             body.count, TmuxSessionRead.maxLines + 3,
@@ -581,5 +606,33 @@ final class AgentEngineDispatchTests: XCTestCase {
         )
         XCTAssertTrue(result.contains("900"), "the trim must keep the NEWEST lines")
         XCTAssertFalse(result.contains("\n1\n"), "the oldest lines are the ones dropped")
+    }
+
+    /// …and a runner that ignores the clamp entirely (or a pane whose lines are enormous)
+    /// still cannot evict the conversation: the engine cuts what comes back to its own
+    /// budget and says so, outside the fence.
+    func testAnOversizedCaptureIsCutToFitAndTheModelIsTold() async {
+        let engine = makeEngine()
+        // What a runner may legitimately return: up to the exec channel's 64 KB cap, in
+        // lines as wide as a real terminal. 88 lines (all an 8k window asks for) of a
+        // 200-column pane is already ~18,000 characters — more than the whole budget.
+        engine.onReadSession = { _, _ in
+            .text((1...400).map { "line \($0) " + String(repeating: "=", count: 190) }
+                .joined(separator: "\n"))
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.readSession.name, #"{"session": "main"}"#
+        ))
+
+        XCTAssertLessThan(
+            AgentTranscript.estimatedTokens(result), 2_500,
+            "one tool result must not be able to fill an 8k window"
+        )
+        XCTAssertTrue(result.contains("Only the last"), "the cut must be disclosed — got: \(result.prefix(300))")
+        XCTAssertTrue(result.contains("line 400 "), "and it must keep the NEWEST lines")
+        // The note is in the header, not inside the fence, where a pane could have printed it.
+        let header = result.components(separatedBy: TmuxSessionRead.beginMarker).first ?? ""
+        XCTAssertTrue(header.contains("Only the last"), "got header: \(header)")
     }
 }

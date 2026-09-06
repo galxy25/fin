@@ -274,8 +274,15 @@ final class TmuxSessionReadTests: XCTestCase {
     /// against a byte budget while doing it.
     @MainActor
     func testTheByteCapKeepsTheNewestCompleteLines() {
+        // Bytes in, bytes out: the collector accumulates raw SSH chunks now and decodes
+        // once at the end, so a multi-byte scalar split across two chunks can no longer
+        // become a U+FFFD at the seam.
+        func keep(_ text: String, _ limit: Int) -> String {
+            String(decoding: HeadlessTerminalSession.keepingLastBytes(Array(text.utf8), limit),
+                   as: UTF8.self)
+        }
         let text = (1...500).map { "line \($0)" }.joined(separator: "\n")
-        let kept = HeadlessTerminalSession.keepingLastBytes(text, 200)
+        let kept = keep(text, 200)
         XCTAssertLessThanOrEqual(kept.utf8.count, 200)
         XCTAssertTrue(kept.hasSuffix("line 500"), kept)
         XCTAssertFalse(kept.contains("line 1\n"), "the oldest lines are the ones dropped")
@@ -283,11 +290,64 @@ final class TmuxSessionReadTests: XCTestCase {
         // Under the limit, nothing is touched — including multi-byte text, where a
         // Character count and a byte count disagree.
         let short = "héllo→wörld"
-        XCTAssertEqual(HeadlessTerminalSession.keepingLastBytes(short, 200), short)
+        XCTAssertEqual(keep(short, 200), short)
         // A window that lands mid-scalar still decodes to whole characters.
         let wide = String(repeating: "→", count: 100)
-        let cut = HeadlessTerminalSession.keepingLastBytes(wide, 50)
+        let cut = keep(wide, 50)
         XCTAssertTrue(cut.allSatisfy { $0 == "→" }, cut.debugDescription)
+    }
+
+    /// AND THE SAME BUDGET AGAIN, ONE LAYER UP, AGAINST THE MODEL'S WINDOW. 64 KB is a fine
+    /// bound on an exec channel and a terrible one on an 8k context: at the transcript's own
+    /// ~4-characters-per-token estimate it is ~16,400 tokens, against a budget of ~7,040 for
+    /// the WHOLE conversation — and `AgentTranscript.compactIfNeeded` responds by dropping
+    /// from the front until it fits, which takes the user turn, then the assistant turn, and
+    /// with it the tool result the model just asked for. `fit` is what the engine applies
+    /// with a budget derived from `contextWindowTokens`.
+    func testACaptureIsCutToFitTheContextWindowKeepingTheNewestLines() {
+        let text = (1...500).map { "line \($0)" }.joined(separator: "\n")
+        let fitted = TmuxSessionRead.fit(text, intoBytes: 200)
+        XCTAssertTrue(fitted.trimmed)
+        XCTAssertLessThanOrEqual(fitted.text.utf8.count, 200)
+        XCTAssertTrue(fitted.text.hasSuffix("line 500"), fitted.text)
+        XCTAssertFalse(fitted.text.hasPrefix("ine"), "cut at a line boundary: \(fitted.text)")
+        // Small enough to keep is kept whole, and says so.
+        let small = TmuxSessionRead.fit("two\nlines", intoBytes: 200)
+        XCTAssertEqual(small.text, "two\nlines")
+        XCTAssertFalse(small.trimmed)
+        // Asking for more lines than the budget can hold is pointless; the clamp says how
+        // many are worth asking for.
+        XCTAssertEqual(TmuxSessionRead.linesFitting(bytes: 7_040), 88)
+        XCTAssertEqual(TmuxSessionRead.linesFitting(bytes: 64 * 1024), TmuxSessionRead.maxLines)
+        XCTAssertEqual(TmuxSessionRead.linesFitting(bytes: 100), 20, "a floor, not a zero")
+    }
+
+    /// THE NOTE HAS TO NAME THE CUT IT ACTUALLY MADE. `truncated` was one Bool covering two
+    /// different events: the byte cap, which keeps the NEWEST bytes (so the model really is
+    /// looking at the bottom of the pane), and the read ceiling, which stops collecting
+    /// partway through (so what survives is the MIDDLE). The daemon printed the first
+    /// sentence for both, telling the model it had the last lines of a screen when it had
+    /// the middle of one.
+    func testTheTruncationNoteNamesWhichCutWasMade() throws {
+        XCTAssertNil(TmuxSessionRead.note(for: .none, byteCap: 64 * 1024))
+
+        let oldest = try XCTUnwrap(TmuxSessionRead.note(for: .oldestDropped, byteCap: 64 * 1024))
+        XCTAssertTrue(oldest.contains("OLDEST part was dropped"), oldest)
+        XCTAssertTrue(oldest.contains("64 KB"), oldest)
+
+        let ceiling = try XCTUnwrap(TmuxSessionRead.note(for: .stoppedAtCeiling, byteCap: 64 * 1024))
+        XCTAssertTrue(ceiling.contains("NOT the last lines"), ceiling)
+        XCTAssertTrue(ceiling.contains("middle"), ceiling)
+        XCTAssertFalse(ceiling.contains("newest kept"), "that is the other cut: \(ceiling)")
+        XCTAssertTrue(ceiling.contains("512 KB"), "the ceiling is 8x the cap: \(ceiling)")
+    }
+
+    /// And the flag the caller branches on still answers "was anything lost".
+    @MainActor
+    func testTruncatedIsTrueForEitherCause() {
+        XCTAssertFalse(FixedCommandOutput(output: "x").truncated)
+        XCTAssertTrue(FixedCommandOutput(output: "x", truncation: .oldestDropped).truncated)
+        XCTAssertTrue(FixedCommandOutput(output: "x", truncation: .stoppedAtCeiling).truncated)
     }
 
     /// A FAILED READ SAYS WHAT TMUX SAID. stderr used to be merged into stdout and a

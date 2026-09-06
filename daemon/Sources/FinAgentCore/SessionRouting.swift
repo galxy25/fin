@@ -431,7 +431,8 @@ extension SessionRouter {
                 Two independent facts — never conflate them. For any session name check \
                 both: REGISTERED (in the registry) decides trust — whether the session is \
                 yours to act on at all; LIVE decides existence, and LIVE means live on \
-                YOUR tmux server (`tmux list-sessions`, which lists only yours). \
+                YOUR tmux server (a `list-sessions` against it — spelled with the socket \
+                flag your tmux rules give you — lists only yours). \
                 Registered+live → route. Registered, not on your server, but showing in \
                 read_session's listing → it is somebody else's session on this machine and \
                 it is OFF-LIMITS for writing: read it, report it, and do NOT recreate it — \
@@ -441,10 +442,11 @@ extension SessionRouter {
                 """
             readingParagraph = """
                 LOOKING is not writing, and looking outside your own server has its own \
-                tool. Your shell talks only to YOUR tmux server, so `tmux capture-pane` \
-                and `tmux list-sessions` cannot see the human's sessions or another \
-                agent's — they answer "can't find session", which does not mean the \
-                session is dead. Use read_session for those: with no arguments it lists \
+                tool. Your shell talks only to YOUR tmux server, so a `capture-pane` or \
+                `list-sessions` typed there (with your own socket flag, the only spelling \
+                allowed) cannot see the human's sessions or another agent's — they answer \
+                "can't find session", which does not mean the session is dead. Use \
+                read_session for those: with no arguments it lists \
                 every session on this machine by name, and with a name it returns that \
                 session's screen, read-only. That is how you answer questions about work \
                 that is not yours. Writing stays limited to your own server: never try to \
@@ -459,9 +461,10 @@ extension SessionRouter {
         \(entries.joined(separator: "\n"))
 
         Sessions you start yourself are yours to drive; a `fin-` prefix \
-        (`tmux new-session -d -s fin-<purpose>`) keeps them easy to tell apart from \
-        everyone else's. Nothing writes the registry file for you: a session someone else \
-        started becomes yours only when the user registers it.
+        (`new-session -d -s fin-<purpose>`, spelled with whatever socket flag your tmux \
+        rules require) keeps them easy to tell apart from everyone else's. Nothing writes \
+        the registry file for you: a session someone else started becomes yours only when \
+        the user registers it.
 
         \(livenessParagraph)
 

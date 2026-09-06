@@ -222,6 +222,24 @@ public struct AgentToolSpec {
         readTerminal, sendInput, readSession, remember, recall, requestInput, monitor, notify,
     ]
 
+    /// The roster MINUS the tools a runtime cannot actually provide.
+    ///
+    /// A shared roster is the right default — the app and the daemon should not drift — but
+    /// advertising a tool whose dispatch can only answer "not available here" is a trap the
+    /// model walks into once per conversation: it costs a turn, prints a red error row, and
+    /// the description ("this is the only way to see the others", "use it whenever you are
+    /// asked what is running") is written to make it call. `read_session` is exactly that in
+    /// the Fin app: it needs a second SSH exec channel against a machine whose tmux sessions
+    /// the app is not managing, and the app's own routing prompt tells the model to use
+    /// `tmux capture-pane` for that instead — two contradictory instructions, the
+    /// tool-shaped one always failing.
+    ///
+    /// So the runtime that cannot serve it does not offer it. The dispatch's honest error
+    /// stays as a backstop for a model that names the tool anyway.
+    static func roster(readSession available: Bool) -> [AgentToolSpec] {
+        available ? all : all.filter { $0.name != readSession.name }
+    }
+
     static let knownToolNames: Set<String> = Set(all.map(\.name))
 
     /// Fin's proactively-social persona, appended to the system prompt ONLY when the

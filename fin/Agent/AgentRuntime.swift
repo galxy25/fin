@@ -1644,7 +1644,13 @@ final class AgentRuntime: ObservableObject {
             do {
                 let completion = try await client.complete(
                     messages: transcript.wireMessages,
-                    tools: AgentToolSpec.all
+                    // NOT `.all`: `read_session` needs the daemon's second SSH exec channel
+                    // and a machine whose tmux sessions it manages, so in the app it can
+                    // only ever answer "not available here" — and its own description tells
+                    // the model to reach for it whenever someone asks what is running. The
+                    // app reads other sessions with `tmux capture-pane` through send_input,
+                    // which is what this runtime's routing prompt already says.
+                    tools: AgentToolSpec.roster(readSession: false)
                 )
                 return (completion, attempt, nil)
             } catch {
@@ -1756,7 +1762,7 @@ final class AgentRuntime: ObservableObject {
 
         default:
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
-                + AgentToolSpec.all.map(\.name).joined(separator: ", ") + "."
+                + AgentToolSpec.roster(readSession: false).map(\.name).joined(separator: ", ") + "."
             record(.error, message, toolName: call.name, isFailure: true)
             return message
         }

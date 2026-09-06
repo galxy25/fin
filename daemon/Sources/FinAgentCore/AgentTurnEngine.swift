@@ -140,39 +140,26 @@ public final class AgentTurnEngine {
     /// is then refused.
     public var tmuxGuard: TmuxSendGuard = .unenforced
 
-    /// R0, TAKEN LIVE. `tmuxGuard.shellIsOnOwnServer` is a snapshot, and a snapshot from
-    /// daemon launch is worthless by the second send: the model can leave its own tmux
-    /// server whenever it likes — `tmux detach`, `exit`, `tmux kill-session -t <its own
-    /// session>` are all ordinary, allowed commands on its own server — and the PTY then
-    /// drops back to the login shell that spawned the client, whose `$TMUX` is empty. From
-    /// there `tmux send-keys -t main …` names no socket for R1 to catch and lands on the
-    /// human's server, while a frozen flag still says "confined".
-    ///
-    /// So the shell is asked again, immediately before any send that could be a tmux
-    /// command. The cost is one `echo` round trip on those sends only (the prefilter is the
-    /// same cheap one the guard uses), and a shell that is busy or gone does not answer —
-    /// which is treated as "not confined", the safe direction. There is deliberately NO
-    /// cache: the interesting case is exactly two sends in a row, `tmux detach` then the
-    /// escape, so a proof with any shelf life at all would be a proof of the wrong shell.
-    private func guardForThisSend(_ typed: String) async -> TmuxSendGuard {
-        var policy = tmuxGuard
-        guard policy.isEnforced,
-              policy.ownSocket != .standard,
-              TmuxCommandGuard.mightMentionTmux(typed) else { return policy }
-        let reported = await session.probeEnvironment("TMUX", timeout: 5)
-        policy.shellIsOnOwnServer = TmuxSendGuard.shellReportIsOwnServer(
-            reported, socket: policy.ownSocket
-        )
-        if !policy.shellIsOnOwnServer {
-            record(
-                "notice",
-                "tmux confinement check FAILED before a tmux send ($TMUX "
-                    + (reported.map { $0.isEmpty ? "empty" : $0 } ?? "no answer")
-                    + ", expected \(policy.ownSocket.described)) — the command is refused"
-            )
-        }
-        return policy
-    }
+    // NOTHING IS TYPED INTO THE TERMINAL TO DECIDE A REFUSAL — deleted this round, and
+    // worth a note where the code used to be. `guardForThisSend` re-probed the live shell
+    // for `$TMUX` before any send the guard's cheap prefilter thought might be a tmux
+    // command, so that a socket-less `tmux …` could be allowed when the shell was proven to
+    // be inside Fin's own tmux server. Two things were wrong with it, and the second is why
+    // it is gone rather than fixed:
+    //
+    //   1. The prefilter is a deliberate SUPERSET — it answers true for ANY input holding a
+    //      quote or a backslash, because `tm"u"x` runs. As a guard prefilter that is free;
+    //      as the trigger for a side effect it meant `git commit -m "wip"` and `print("hi")`
+    //      typed `echo FIN_ENV_123456=$TMUX` + Return into the pane first. In a shell that
+    //      ran it; in a REPL, a TUI or vim those bytes went into the program.
+    //   2. The answer came back through the same PTY the model writes to, so the party
+    //      being checked could answer the check (a `sed` filter left running in the pane
+    //      forges any `$TMUX` it likes).
+    //
+    // `TmuxCommandGuard`'s R1 replaced the question: a tmux command on a private-socket
+    // host must NAME its server, so where a socket-less one would have landed is no longer
+    // something anybody has to find out. The daemon still probes `$TMUX` once at launch —
+    // as a log line for the operator, never as a gate.
 
     public init(
         configuration: AgentEngineConfiguration,
@@ -355,7 +342,11 @@ public final class AgentTurnEngine {
             do {
                 let completion = try await client.complete(
                     messages: transcript.wireMessages,
-                    tools: AgentToolSpec.all
+                    // The roster follows the hooks: a runner with no `onReadSession`
+                    // (the app, a test harness) must not be told the tool exists, or the
+                    // model spends a turn calling something that can only answer
+                    // "unavailable here". The dispatch's honest error stays as a backstop.
+                    tools: AgentToolSpec.roster(readSession: onReadSession != nil)
                 )
                 return (completion, nil)
             } catch {
@@ -442,7 +433,8 @@ public final class AgentTurnEngine {
 
         default:
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
-                + AgentToolSpec.all.map(\.name).joined(separator: ", ") + "."
+                + AgentToolSpec.roster(readSession: onReadSession != nil)
+                    .map(\.name).joined(separator: ", ") + "."
             record("error", message, toolName: call.name, isFailure: true)
             return message
         }
@@ -580,7 +572,15 @@ public final class AgentTurnEngine {
             }
             name = validated
         }
-        let lines = TmuxSessionRead.clampLines(requested)
+        // WHAT THIS ANSWER MAY COST THE CONVERSATION, derived from the window rather than
+        // from a constant. `TmuxSessionRead.maxResponseBytes` bounds the exec channel;
+        // this bounds the transcript, and without it one capture evicted the entire
+        // conversation (see the note on `TmuxSessionRead.fit`).
+        let byteBudget = readSessionByteBudget
+        let lines = min(
+            TmuxSessionRead.clampLines(requested),
+            TmuxSessionRead.linesFitting(bytes: byteBudget)
+        )
         record(
             "toolCall",
             name.map { "read_session: \($0) (\(lines) lines)" } ?? "read_session: list sessions",
@@ -602,13 +602,34 @@ public final class AgentTurnEngine {
                    toolArguments: rawArguments, isFailure: true)
             return message
         case .text(let output):
-            guard let name else { return TmuxSessionRead.frameListing(output) }
+            guard let name else {
+                return TmuxSessionRead.frameListing(
+                    TmuxSessionRead.fit(output, intoBytes: byteBudget).text
+                )
+            }
+            let fitted = TmuxSessionRead.fit(
+                TmuxSessionRead.trim(output, toLastLines: lines), intoBytes: byteBudget
+            )
             return TmuxSessionRead.frameCapture(
                 session: name,
                 lines: lines,
-                output: TmuxSessionRead.trim(output, toLastLines: lines)
+                output: fitted.text,
+                note: fitted.trimmed
+                    ? "Only the last \(byteBudget / 1024) KB of that capture is shown — it was "
+                        + "larger than one tool result may occupy in this model's context window, "
+                        + "so the oldest lines were dropped and the newest kept."
+                    : nil
             )
         }
+    }
+
+    /// How many bytes ONE read_session result may add to the transcript: a quarter of the
+    /// context budget, which at the transcript's own ~4-characters-per-token estimate is
+    /// `contextBudget` characters. Everything about this number is a heuristic except the
+    /// property that matters — it is derived from `configuration.contextWindowTokens`, so a
+    /// small window cannot be handed a capture that evicts the conversation it belongs to.
+    private var readSessionByteBudget: Int {
+        max(2_000, min(TmuxSessionRead.maxResponseBytes, contextBudget))
     }
 
     private func executeReadTerminal(lines requested: Int?, rawArguments: String) async -> String {
@@ -644,12 +665,12 @@ public final class AgentTurnEngine {
         // waiting for the next send. The guard normalizes the same way internally, so no
         // caller can get this wrong; passing it here keeps the invariant visible.
         //
-        // AND JUDGED AGAINST THE SHELL AS IT IS NOW: `guardForThisSend` re-takes R0's
-        // confinement proof from the live shell first, because the model is allowed to
-        // leave its own tmux server (`tmux detach`) and everything else here assumes it
-        // has not.
+        // AND JUDGED FROM THE BYTES ALONE: no probe of the live shell, nothing typed into
+        // the pane to work out where a socket-less tmux would land (see the note above
+        // `init`). The decision is pure, so it costs nothing and cannot be answered by the
+        // terminal it is about.
         let typed = AgentTurnLogic.typedBody(input)
-        if case .refuse(let message) = await guardForThisSend(typed).evaluate(typed) {
+        if case .refuse(let message) = tmuxGuard.evaluate(typed) {
             record("error", message, toolName: toolName,
                    toolArguments: rawArguments, isFailure: true)
             return message

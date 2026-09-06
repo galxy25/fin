@@ -322,14 +322,37 @@ if refresh and isinstance(existing, dict):
     #      With `exec`, leaving tmux ends the SSH session instead; the daemon reconnects
     #      (with backoff) and re-attaches. The guard also re-checks confinement before
     #      every tmux command, so this is the second lock on that door, not the only one.
+    # BOTH UPGRADES READ THE COMMAND, NOT A PREFIX OF IT. Matching `startswith("tmux ")`
+    # meant a config that already carried `exec ` — hand-edited, or written by an earlier
+    # half-upgrade — matched neither rule: no `-L` was added, no note was printed, and the
+    # install reported success while the daemon came up on the SHARED default socket, the
+    # human's tmux server, with every document here describing a private-socket site. Same
+    # for an absolute path (`/opt/homebrew/bin/tmux new-session …`). So the command is split
+    # into [optional `exec`] + program + rest, and the program is recognized by its
+    # BASENAME, which is how the daemon's own guard reads it too.
     socket = env.get("FIN_TMUX_SOCKET") or ""
     server_block = config.get("server") or {}
     current = (server_block.get("connectCommand") or "").strip()
+    words = current.split()
+    has_exec = bool(words) and words[0] == "exec"
+    program = words[1] if has_exec and len(words) > 1 else (words[0] if words else "")
+    is_tmux = os.path.basename(program).lower() == "tmux"
+    names_socket = " -L " in current or " -S " in current or "-L" in words or "-S" in words
     upgraded = current
-    if socket and upgraded.startswith("tmux ") and " -L " not in upgraded and " -S " not in upgraded:
-        upgraded = "tmux -L %s %s" % (socket, upgraded[len("tmux "):])
-    if upgraded.startswith("tmux "):
-        upgraded = "exec " + upgraded
+    if is_tmux:
+        body = words[1:] if has_exec else words
+        if socket and not names_socket:
+            body = [body[0], "-L", socket] + body[1:]
+        upgraded = " ".join(["exec"] + body)
+    elif current and not is_tmux:
+        # Not a tmux connectCommand at all. Nothing to upgrade — but the operator is being
+        # told this package installs a private-socket site, so say plainly that this one is
+        # not one rather than letting a successful-looking install imply it.
+        print("warning: connectCommand does not start a tmux session (%r), so this site has no\n"
+              "         private tmux socket: the agent's shell is a plain login shell on the\n"
+              "         machine's default tmux server. scripts/mac-fin-agentd/README.md and\n"
+              "         docs/SITES.md describe the private-socket posture, which this is not."
+              % current, file=sys.stderr)
     if upgraded != current:
         server_block["connectCommand"] = upgraded
         config["server"] = server_block
@@ -341,6 +364,11 @@ if refresh and isinstance(existing, dict):
               "      agent into an unconfined login shell."
               % (current, upgraded), file=sys.stderr)
         mode = "refreshed (URLs + connectCommand)"
+    elif is_tmux and socket and not names_socket:
+        # Unreachable by construction (the branch above rewrites exactly this case), but a
+        # silent no-op here is the failure mode this whole block exists to prevent.
+        print("warning: connectCommand names no tmux socket and could not be upgraded: %r"
+              % current, file=sys.stderr)
 else:
     if refresh:
         print("note: no existing config.json to refresh — writing a full one", file=sys.stderr)
@@ -470,8 +498,9 @@ if not os.path.exists(registry_path):
 # (flush() never GETs the existing object first), so the next launch overwrites
 # fin/transcripts/<slug>.jsonl with only the new process's lines: twice a week, at 04:00,
 # Fin's timeline in the iOS app is truncated to nothing. docs/SITES.md section 7 names
-# this "the restart-overwrites-history bug" and fixes it structurally in 1.5.0 with
-# per-run keys. Until then the least this package can do is keep a local copy, taken with
+# this "the restart-overwrites-history bug"; the structural fix (per-run keys) is NOT in
+# 1.5.0 — that version number is the private-socket contract — so it is still open, and
+# this archive is still the only mitigation. It keeps a local copy, taken with
 # the operator's own credentials (a read; nothing is written to S3) immediately before the
 # restart. Best-effort: a missing object or an offline Mac must never fail a provision.
 archive_state = "skipped"

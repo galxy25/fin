@@ -40,12 +40,15 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
         XCTAssertTrue(guardPolicy.isEnforced)
         XCTAssertEqual(guardPolicy.ownSocket, .name("fin"))
         XCTAssertEqual(guardPolicy.ownSession, "fin")
-        // Its own server: unrestricted, no allow-list, nothing to register.
-        XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t fin-build 'git status' Enter"), .allow)
+        // Its own server, named: unrestricted, no allow-list, nothing to register.
+        XCTAssertEqual(
+            guardPolicy.evaluate("tmux -L fin send-keys -t fin-build 'git status' Enter"), .allow
+        )
         XCTAssertEqual(guardPolicy.evaluate("tmux -L fin ls"), .allow)
-        // The way out: refused.
+        // The ways out: another server, and naming no server at all.
         XCTAssertTrue(guardPolicy.evaluate("tmux -L default send-keys -t main 'rm -rf ~' Enter").isRefusal)
-        XCTAssertTrue(guardPolicy.evaluate("TMUX= tmux kill-session -t main").isRefusal)
+        XCTAssertTrue(guardPolicy.evaluate("TMUX= tmux -L fin kill-session -t main").isRefusal)
+        XCTAssertTrue(guardPolicy.evaluate("tmux send-keys -t main 'rm -rf ~' Enter").isRefusal)
     }
 
     /// NOTHING IS HARDCODED TO "fin". The daemon derives its socket and session names
@@ -79,8 +82,10 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
         XCTAssertTrue(guardPolicy.isEnforced)
         XCTAssertEqual(guardPolicy.ownSession, "fin")
         XCTAssertEqual(guardPolicy.ownSocket, .name("fin"))
-        XCTAssertEqual(guardPolicy.evaluate("tmux send-keys 'git status' Enter"), .allow)
-        XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t fin 'git status' Enter"), .allow)
+        XCTAssertEqual(guardPolicy.evaluate("tmux -L fin send-keys 'git status' Enter"), .allow)
+        XCTAssertEqual(
+            guardPolicy.evaluate("tmux -L fin send-keys -t fin 'git status' Enter"), .allow
+        )
         XCTAssertTrue(guardPolicy.evaluate("tmux -S /tmp/tmux-501/default kill-session -t main").isRefusal)
     }
 
@@ -133,36 +138,41 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
         XCTAssertTrue(session.sentInputs.isEmpty, "nothing may reach the PTY")
     }
 
-    /// THE SAME WIRING, ONE STEP FURTHER: the engine the daemon's factory builds asks the
-    /// LIVE shell where it is before it types a tmux command. A shell that has dropped out
-    /// of tmux (`$TMUX` empty — what `tmux detach` leaves behind) must stop every tmux
-    /// command, even one that names no socket and would otherwise be ordinary work.
+    /// THE SAME WIRING, ONE STEP FURTHER, AND WITHOUT ASKING THE TERMINAL ANYTHING. The
+    /// engine used to probe the live shell for `$TMUX` before every tmux-bearing send, so
+    /// that a socket-less `tmux …` could be allowed when the shell was proven to be inside
+    /// Fin's own server. That proof came back through the same PTY the model types into.
+    /// Now the rule is on the command instead: a socket-less tmux command is refused in a
+    /// shell that reports confinement and in one that does not, identically — and neither
+    /// answer costs a keystroke in the terminal.
     @MainActor
-    func testTheFactorysEngineRefusesTmuxWhenTheLiveShellIsNoLongerConfined() async throws {
-        let session = GuardStubSession()
-        session.reportedTmux = ""                     // detached: back in the login shell
-        let engine = Daemon.makeTurnEngine(
-            configuration: AgentEngineConfiguration(
-                endpointURL: "http://127.0.0.1:1",
-                modelIdentifier: "stub"
-            ),
-            session: session,
-            tmuxGuard: TmuxSendGuard.forHost(
-                connectCommand: "exec tmux -L fin new-session -A -s fin \\; set status off",
-                registryFileURL: try registryURL(sessions: ["fin"])
-            ),
-            audit: { _ in }
-        )
+    func testTheFactorysEngineRefusesASocketLessTmuxWhateverTheShellReports() async throws {
+        for reported in ["/private/tmp/tmux-501/fin,4242,0", "", nil] {
+            let session = GuardStubSession()
+            session.reportedTmux = reported
+            let engine = Daemon.makeTurnEngine(
+                configuration: AgentEngineConfiguration(
+                    endpointURL: "http://127.0.0.1:1",
+                    modelIdentifier: "stub"
+                ),
+                session: session,
+                tmuxGuard: TmuxSendGuard.forHost(
+                    connectCommand: "exec tmux -L fin new-session -A -s fin \\; set status off",
+                    registryFileURL: try registryURL(sessions: ["fin"])
+                ),
+                audit: { _ in }
+            )
 
-        let refused = await engine.execute(AgentToolCall(
-            id: "t1",
-            name: AgentToolSpec.sendInput.name,
-            arguments: #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
-        ))
+            let refused = await engine.execute(AgentToolCall(
+                id: "t1",
+                name: AgentToolSpec.sendInput.name,
+                arguments: #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
+            ))
 
-        XCTAssertTrue(refused.contains("REFUSED"), "got: \(refused)")
-        XCTAssertTrue(refused.contains("not confirmed"), "got: \(refused)")
-        XCTAssertTrue(session.sentInputs.isEmpty, "nothing may reach the PTY")
+            XCTAssertTrue(refused.contains("REFUSED"), "got: \(refused)")
+            XCTAssertTrue(refused.contains("names no tmux server"), "got: \(refused)")
+            XCTAssertTrue(session.sentInputs.isEmpty, "nothing may reach the PTY")
+        }
     }
 
     /// Told, not just enforced: an armed guard appends its paragraph, and it names the
@@ -225,9 +235,10 @@ final class GuardStubSession: AgentSessionDriving {
     let eventLog = TerminalEventLog()
     var isSessionConnected = true
     private(set) var sentInputs: [String] = []
-    /// What the "live shell" answers when the engine re-takes the tmux guard's confinement
-    /// proof. Defaults to a shell inside socket `fin`, which is what the connectCommand in
-    /// these tests would produce; a test that wants the unconfined case clears it.
+    /// What the "live shell" would answer if anything asked it for `$TMUX`. Nothing in the
+    /// engine does any more — the guard's rules are about the command text — but the daemon
+    /// still asks once at launch for its log line, and a test pins that the ANSWER changes
+    /// no verdict.
     var reportedTmux: String? = "/private/tmp/tmux-501/fin,4242,0"
 
     func sendAgentInput(_ text: String) {

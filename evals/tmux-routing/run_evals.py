@@ -37,21 +37,23 @@ HERE = Path(__file__).resolve().parent
 # Guarded executor — the ONLY thing allowed to send keys. The allow-list comes
 # from the registry, never from what happens to exist on the server.
 #
-# PORTED. Production's counterpart is TmuxCommandGuard in
-# daemon/Sources/FinAgentCore/TmuxCommandGuard.swift, wired into
-# AgentTurnEngine.executeSendInput. It differs in one way that mattered: this
-# executor is handed a session NAME, while production is handed a COMMAND STRING
-# the model wrote, so the port is mostly a pessimistic shell/tmux parser in front
-# of the same allow-list. Same policy on both sides — read anything, write only
-# what is registered — so the refuse-scenarios below stay the spec.
+# NOT PORTED ANY MORE, AND THE DIFFERENCE IS THE POINT. Production's counterpart
+# is TmuxCommandGuard in daemon/Sources/FinAgentCore/TmuxCommandGuard.swift, wired
+# into AgentTurnEngine.executeSendInput — and it no longer has an allow-list, a
+# registry snapshot, a session-name check, or a "fin-*" namespace. Eight reviews
+# walked through that design 35 different ways, so the boundary moved out of the
+# parser: the agent's shell runs on its OWN tmux socket (`exec tmux -L fin …`), a
+# different server process from the human's, and every tmux command it types must
+# name that socket explicitly or be refused. Sessions on the agent's own server
+# are all the agent's own, so there is nothing left to register. The human's
+# sessions are READ through a `read_session` tool that runs a fixed argv on a
+# separate SSH channel, and cannot be written at all.
 #
-# Production's allow-list is wider in one deliberate way: sessions named "fin-*"
-# are Fin's own namespace, writable without appearing in any registry. That is
-# what keeps the router's `start` action working there (nothing ever wrote a
-# created session into routing-registry.json, and production reads that file only
-# at launch, because the guarded shell can write it). This harness hands the
-# executor a name from the registry, so it has no `start`-then-drive path to
-# protect and stays registry-only.
+# What this harness still tests is the ROUTER's policy — which session a model
+# should aim at, given a registry — not production's enforcement, which is now a
+# socket boundary plus a small "name your server" rule. The refuse-scenarios below
+# remain the spec for the router's judgment; do not port an allow-list back out of
+# them.
 # ---------------------------------------------------------------------------
 class GuardedTmuxExecutor:
     def __init__(self, socket_name: str, registry: dict):

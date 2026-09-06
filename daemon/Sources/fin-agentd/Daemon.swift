@@ -598,7 +598,7 @@ final class Daemon {
         // of connectCommand. Armed whenever this host has a tmux connect command or a
         // routing registry — a host with neither has no tmux server to stay on and is left
         // untouched.
-        var tmuxGuard = TmuxSendGuard.forHost(
+        let tmuxGuard = TmuxSendGuard.forHost(
             connectCommand: config.server.connectCommand,
             registryFileURL: URL(fileURLWithPath: routingRegistryPath)
         )
@@ -610,28 +610,34 @@ final class Daemon {
         // the shell is a plain login shell, a bare `tmux send-keys -t main …` names no
         // socket for the guard to catch, and it lands on the human's server.
         //
-        // THIS PROBE IS THE LOG LINE, NOT THE GATE. It runs once, and its answer would be
-        // stale the moment the model typed `tmux detach` — so `AgentTurnEngine` re-asks the
-        // live shell before every send that mentions tmux, and that answer is what R0
-        // actually decides on. What this one buys is an operator who learns at launch, in
-        // the log and the audit trail, that the site came up unconfined.
+        // THIS PROBE IS THE LOG LINE, AND NOTHING ELSE DEPENDS ON IT. Its answer is stale
+        // the moment the shell does anything, and it comes back through the same PTY the
+        // model types into — a filter left running in the pane can print whatever answer it
+        // likes — so no refusal is built on it. The guard's rule is instead that every tmux
+        // command must NAME Fin's own socket, which is true or false about the command text
+        // alone. What this probe buys is an operator who learns at launch, in the log and
+        // the audit trail, that the connectCommand did not take effect.
         if tmuxGuard.isEnforced, tmuxGuard.ownSocket != .standard {
             let reported = await session.probeEnvironment("TMUX")
-            tmuxGuard.shellIsOnOwnServer = TmuxSendGuard.shellReportIsOwnServer(
+            let confined = TmuxSendGuard.shellReportIsOwnServer(
                 reported, socket: tmuxGuard.ownSocket
             )
-            if tmuxGuard.shellIsOnOwnServer {
+            if confined {
                 log("tmux confinement confirmed: the shell is inside \(tmuxGuard.ownSocket.described) "
                     + "($TMUX=\(reported ?? ""))")
             } else {
                 let detail = reported.map { $0.isEmpty ? "empty" : $0 } ?? "no answer"
-                log("REFUSING ALL TMUX: the shell is NOT inside \(tmuxGuard.ownSocket.described) "
-                    + "($TMUX \(detail)) — the connectCommand did not take effect, so a tmux command "
-                    + "typed here could reach the human's default socket. read_session still works.")
+                log("TMUX CONFINEMENT NOT CONFIRMED: the shell is NOT inside "
+                    + "\(tmuxGuard.ownSocket.described) ($TMUX \(detail)) — the connectCommand did "
+                    + "not take effect. Fin's tmux commands are still held to naming "
+                    + "\(tmuxGuard.ownSocket.described) explicitly, which reaches Fin's own server "
+                    + "from any shell, so this is not an escape; it does mean the agent's shell is "
+                    + "a plain login shell and its work is not inside a durable session. Fix the "
+                    + "connectCommand (is tmux installed for this user?) and restart.")
                 record(AgentAuditEvent(
                     kind: "error",
-                    text: "tmux confinement NOT confirmed ($TMUX \(detail)); every tmux command "
-                        + "will be refused this run",
+                    text: "tmux confinement NOT confirmed ($TMUX \(detail)); the agent's shell is "
+                        + "not inside \(tmuxGuard.ownSocket.described)",
                     isFailure: true
                 ))
             }
@@ -654,14 +660,20 @@ final class Daemon {
             // second layer, on the default socket it is the only one, and the log has to
             // say which posture this install is actually in.
             let posture = tmuxGuard.ownSocket == .standard
-                ? "SHARED default socket — the human's sessions are in reach of anything the "
-                    + "guard's parser misses; see daemon/README.md"
+                ? "SHARED default socket — the human's sessions are on the same server, and "
+                    + "nothing here is a boundary: see daemon/README.md"
                 : "private socket (\(tmuxGuard.ownSocket.described))"
+            let rule = tmuxGuard.ownSocket == .standard
+                ? "kill-server and signals aimed at tmux are refused, and so is any OTHER "
+                    + "socket; a socket-less tmux is not, because this host's own server is "
+                    + "the default one"
+                : "every tmux command must name \(tmuxGuard.ownSocket.described) or be "
+                    + "refused (naming another server, naming none, TMUX=/TMUX_TMPDIR=, "
+                    + "kill-server and signals aimed at tmux are all refused)"
             log("tmux guard armed: session \"\(tmuxGuard.ownSession ?? "?")\" on \(posture); "
-                + "another server (-L/-S, TMUX=/TMUX_TMPDIR=, a socket-less tmux under "
-                + "ssh/sudo/env -i), kill-server and signals aimed at tmux are refused; "
-                + "confinement is re-checked with the live shell before every tmux command, "
-                + "and read_session reads the default socket read-only")
+                + rule + "; the verdict is a function of the command text alone — nothing is "
+                + "typed into the terminal to decide it — and read_session reads the default "
+                + "socket read-only")
         } else {
             log("tmux guard not armed: connectCommand names neither a tmux session nor a tmux "
                 + "socket, and there is no routing registry")
@@ -1065,13 +1077,19 @@ final class Daemon {
                 return .failed(MemoryRedactor.redact(result.diagnostics))
             }
             var text = MemoryRedactor.redact(result.output)
-            if result.truncated {
-                // APPENDED, not prepended: the engine trims this text to the last N lines
-                // before framing it, so a note at the top would be silently dropped by the
-                // very truncation it is disclosing.
-                text += "\n[read_session note: that screen was larger than the "
-                    + "\(TmuxSessionRead.maxResponseBytes / 1024) KB this tool returns; the OLDEST "
-                    + "part was dropped and the newest kept]"
+            // TWO DIFFERENT CUTS, AND THE NOTE HAS TO NAME THE RIGHT ONE. The byte cap keeps
+            // the newest bytes, so what the model sees really is the bottom of the pane; the
+            // read ceiling stops collecting partway up, so what survives is the MIDDLE, and
+            // telling the model "the oldest part was dropped and the newest kept" there
+            // pointed it at the wrong end of somebody's screen.
+            //
+            // APPENDED, not prepended: the engine trims this text to the last N lines before
+            // framing it, so a note at the top would be silently dropped by the very
+            // truncation it is disclosing.
+            if let note = TmuxSessionRead.note(
+                for: result.truncation, byteCap: TmuxSessionRead.maxResponseBytes
+            ) {
+                text += "\n" + note
             }
             return .text(text)
         } catch {

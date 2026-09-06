@@ -6,18 +6,42 @@ import NIO
 import NIOSSH
 import Crypto
 
+/// WHY a `runFixedCommand` result is short, which is not the same question as WHETHER it
+/// is. The two causes leave the caller looking at different parts of the screen, and the
+/// note the model reads must not claim the wrong one: a single `truncated` Bool had the
+/// daemon telling the model "the oldest part was dropped and the newest kept" for a read
+/// that had in fact stopped collecting halfway up someone's pane.
+public enum FixedCommandTruncation: Sendable, Equatable {
+    /// Everything the command printed is here.
+    case none
+    /// The output was longer than the byte cap, so the OLDEST bytes were dropped. What
+    /// survives is the end of the stream — for `capture-pane`, the bottom of the pane.
+    case oldestDropped
+    /// The command printed more than the read ceiling, so collection stopped counting
+    /// after it. What survives is the newest bytes of what was collected BEFORE the
+    /// ceiling — the middle of the output, not its end.
+    case stoppedAtCeiling
+}
+
 /// What one `runFixedCommand` produced. The two streams stay apart so a caller can frame
-/// pane CONTENT and a tmux ERROR differently; `truncated` says a cap was hit, so the
-/// caller can say so rather than silently shortening someone's screen.
+/// pane CONTENT and a tmux ERROR differently; `truncation` says which cap was hit, so the
+/// caller can say so rather than silently shortening someone's screen — or describing the
+/// cut it did not make.
 public struct FixedCommandOutput: Sendable, Equatable {
     public var output: String
     public var diagnostics: String
-    public var truncated: Bool
+    public var truncation: FixedCommandTruncation
 
-    public init(output: String, diagnostics: String = "", truncated: Bool = false) {
+    public var truncated: Bool { truncation != .none }
+
+    public init(
+        output: String,
+        diagnostics: String = "",
+        truncation: FixedCommandTruncation = .none
+    ) {
         self.output = output
         self.diagnostics = diagnostics
-        self.truncated = truncated
+        self.truncation = truncation
     }
 }
 
@@ -134,6 +158,9 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
         writeChain?.cancel()
         writeChain = nil
         didDispatchConnectCommand = false
+        // A new connection is a new set of SSH session slots, so whatever the old one had
+        // stuck open goes with it (see `runFixedCommand`).
+        abandonedExecStreams = 0
 
         runTask = Task { [weak self] in
             await self?.run(generation: myGeneration)
@@ -198,13 +225,18 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
     /// Asks the LIVE SHELL what one environment variable holds, by typing an echo and
     /// reading the answer back out of the event log. Nil means the shell never answered.
     ///
-    /// This exists to prove the `connectCommand` actually took effect. The private-socket
-    /// design rests entirely on the agent's shell being INSIDE its own tmux server, and
-    /// that is a fact about a command typed into a PTY, which can fail quietly — tmux not
-    /// installed, a startup flush that ate the line, a server that refused to start. If it
-    /// did fail, the shell is a plain login shell whose `$TMUX` is empty, and from there a
-    /// bare `tmux send-keys -t main …` names no socket at all and would reach the human's
-    /// server. So the daemon asks, and treats "no proof" as "not confined".
+    /// ONE CALLER, ONE PURPOSE, AND IT IS NOT A GATE. The daemon calls this once at launch
+    /// to find out whether the `connectCommand` took effect — a command typed into a PTY,
+    /// which can fail quietly (tmux not installed, a startup flush that ate the line, a
+    /// server that refused to start), leaving the agent working in a plain login shell whose
+    /// work dies with the connection. That is worth a loud log line.
+    ///
+    /// It is NOT worth a refusal, and nothing refuses on it. The answer is read back out of
+    /// the same PTY the model writes to, so a filter left running in the pane can print
+    /// whatever answer this function is looking for; a proof the examined party can author
+    /// is not a proof. `TmuxCommandGuard`'s R1 (every tmux command names its own socket) is
+    /// what actually keeps the agent off the human's server, and it reads only the command
+    /// text.
     ///
     /// Same probe shape as `waitForShellReady`: a random token, and a line that carries the
     /// token without carrying the word `echo` is the shell's own output rather than the
@@ -284,6 +316,22 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
         // An unstructured Task, deliberately: a task GROUP awaits its children on the way
         // out, so a child blocked on a stream that never yields would swallow the timeout
         // it is supposed to enforce. This one is abandoned (and cancelled) on timeout.
+        // AND BOUNDED IN SSH SESSIONS, which is the cost of that abandonment. Citadel's
+        // public `executeCommandStream` returns the stream and keeps the `Channel` to
+        // itself (`_executeCommandStream` is internal), so there is no way to close a
+        // channel whose command has not exited: a timed-out read leaves an SSH session slot
+        // held by a remote `tmux` that is still blocked. OpenSSH's default MaxSessions is
+        // 10 and the agent's PTY holds one, so silently repeating that would kill the read
+        // path for the life of the connection — read_session failing forever, with no
+        // symptom but a 15s hang. The count is therefore kept, and when it reaches the
+        // limit the whole SSH connection is recycled: the reconnect loop brings the PTY
+        // straight back (`new-session -A` re-attaches the same tmux session, so no work is
+        // lost) and every abandoned channel dies with the old connection.
+        guard abandonedExecStreams < Self.abandonedExecStreamLimit else {
+            recycleConnectionForAbandonedExecStreams()
+            throw HeadlessSessionError.execChannelsExhausted(count: abandonedExecStreams)
+        }
+
         let box = FixedCommandBox()
         let work = Task { @MainActor in
             do {
@@ -300,6 +348,7 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
         while box.value == nil {
             guard Date() < deadline else {
                 work.cancel()
+                abandonedExecStreams += 1
                 throw HeadlessSessionError.commandTimedOut(seconds: Int(timeout))
             }
             try await Task.sleep(for: .milliseconds(50))
@@ -307,58 +356,91 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
         return try box.value!.get()
     }
 
+    /// Exec streams abandoned on THIS connection whose SSH session slot cannot be
+    /// reclaimed (see `runFixedCommand`). Reset on every connect, because a new connection
+    /// starts with a fresh set of slots.
+    private var abandonedExecStreams = 0
+    /// Two, out of OpenSSH's default ten, with the PTY holding one: far enough from the
+    /// ceiling that a recycle is never a surprise, high enough that a single slow read does
+    /// not cost the agent its terminal.
+    private static let abandonedExecStreamLimit = 2
+
+    private func recycleConnectionForAbandonedExecStreams() {
+        lastError = "recycling the SSH connection: \(abandonedExecStreams) exec channels were "
+            + "abandoned by timed-out reads and cannot be closed individually"
+        disconnect()
+        state = .reconnecting
+        connect()
+    }
+
     /// The streaming half, split out so the timeout above has something to abandon.
+    ///
+    /// BYTES ARE ACCUMULATED, NOT STRINGS. SSH data arrives in channel-window-sized chunks
+    /// with no regard for UTF-8 scalar boundaries, so decoding each chunk on its own put a
+    /// U+FFFD at every boundary that split a box-drawing character, an emoji or an accented
+    /// path — exactly the content a TUI pane is made of. `keepingLastBytes` was already
+    /// careful about this for the trim; the accumulate was not.
     private static func collect(
         _ commandLine: String,
         on client: SSHClient,
         maxResponseBytes: Int
     ) async throws -> FixedCommandOutput {
-        var output = ""
-        var diagnostics = ""
-        var truncated = false
+        var output: [UInt8] = []
+        var diagnostics: [UInt8] = []
+        var truncation = FixedCommandTruncation.none
         var bytesSeen = 0
-        // A ceiling on how much we will read at all: the sliding window below bounds
-        // MEMORY, not time, and a command that prints forever would otherwise only be
-        // stopped by the caller's clock.
+        // A ceiling on how much we will KEEP READING INTO the buffers: the sliding window
+        // below bounds memory, not time, and a command that prints forever would otherwise
+        // only be stopped by the caller's clock. Past it the stream is drained and
+        // discarded rather than abandoned — draining reaches EOF, which is what actually
+        // closes the SSH channel; abandoning it would hold a session slot open (see
+        // `runFixedCommand`).
         let readCeiling = maxResponseBytes * 8
         do {
             for try await chunk in try await client.executeCommandStream(commandLine) {
                 switch chunk {
                 case .stdout(let value):
-                    output += String(buffer: value)
                     bytesSeen += value.readableBytes
-                    if output.utf8.count > maxResponseBytes {
+                    guard truncation != .stoppedAtCeiling else { continue }
+                    output.append(contentsOf: value.readableBytesView)
+                    if output.count > maxResponseBytes {
                         output = keepingLastBytes(output, maxResponseBytes)
-                        truncated = true
+                        if truncation == .none { truncation = .oldestDropped }
                     }
                 case .stderr(let value):
-                    diagnostics += String(buffer: value)
                     bytesSeen += value.readableBytes
-                    if diagnostics.utf8.count > maxResponseBytes {
+                    guard truncation != .stoppedAtCeiling else { continue }
+                    diagnostics.append(contentsOf: value.readableBytesView)
+                    if diagnostics.count > maxResponseBytes {
                         diagnostics = keepingLastBytes(diagnostics, maxResponseBytes)
-                        truncated = true
+                        if truncation == .none { truncation = .oldestDropped }
                     }
                 }
-                if bytesSeen > readCeiling {
-                    truncated = true
-                    break
-                }
+                if bytesSeen > readCeiling { truncation = .stoppedAtCeiling }
             }
         } catch let failure as SSHClient.CommandFailed {
             throw HeadlessSessionError.commandFailed(
                 status: failure.exitCode,
-                detail: firstLine(diagnostics.isEmpty ? output : diagnostics)
+                detail: firstLine(
+                    diagnostics.isEmpty
+                        ? String(decoding: output, as: UTF8.self)
+                        : String(decoding: diagnostics, as: UTF8.self)
+                )
             )
         }
-        return FixedCommandOutput(output: output, diagnostics: diagnostics, truncated: truncated)
+        return FixedCommandOutput(
+            output: String(decoding: output, as: UTF8.self),
+            diagnostics: String(decoding: diagnostics, as: UTF8.self),
+            truncation: truncation
+        )
     }
 
     /// Keeps the last `limit` BYTES (not Characters — the budget is a byte budget), cut
     /// forward to the next newline so the result starts on a whole line and on a whole
     /// UTF-8 scalar.
-    static func keepingLastBytes(_ text: String, _ limit: Int) -> String {
-        var bytes = Array(text.utf8)
-        guard bytes.count > limit else { return text }
+    static func keepingLastBytes(_ input: [UInt8], _ limit: Int) -> [UInt8] {
+        var bytes = input
+        guard bytes.count > limit else { return bytes }
         bytes = Array(bytes.suffix(limit))
         if let newline = bytes.firstIndex(of: 0x0A) {
             bytes = Array(bytes[(newline + 1)...])
@@ -367,7 +449,7 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
             // the first scalar is whole.
             while let first = bytes.first, first & 0xC0 == 0x80 { bytes.removeFirst() }
         }
-        return String(decoding: bytes, as: UTF8.self)
+        return bytes
     }
 
     private static func firstLine(_ text: String) -> String {
@@ -528,6 +610,7 @@ public enum HeadlessSessionError: Error, LocalizedError {
     case notConnected
     case commandFailed(status: Int, detail: String)
     case commandTimedOut(seconds: Int)
+    case execChannelsExhausted(count: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -543,6 +626,11 @@ public enum HeadlessSessionError: Error, LocalizedError {
                 : "\(detail) (exit \(status))"
         case .commandTimedOut(let seconds):
             return "the command produced no result within \(seconds)s and was abandoned."
+        case .execChannelsExhausted(let count):
+            return "\(count) earlier reads timed out and their SSH channels cannot be closed "
+                + "until the remote command exits, so this connection is being recycled rather "
+                + "than run out of session slots. The terminal will reconnect on its own; try "
+                + "again in a few seconds."
         }
     }
 }

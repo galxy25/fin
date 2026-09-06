@@ -30,36 +30,29 @@ import Foundation
 // So this file's job collapsed to a SMALL, PROVABLE rule set. It is a second layer behind
 // a real boundary, not the boundary itself:
 //
-//   R0  NO PROOF, NO TMUX. Every rule below assumes a bare `tmux …` reaches the agent's
-//       OWN server — true only because `$TMUX` points there, which is a fact about a
-//       connectCommand typed into a PTY and can fail quietly. So the shell is asked, and
-//       when the answer does not name our socket EVERY tmux command is refused;
-//       `read_session` still works. THE ANSWER IS NOT CACHED FOR THE RUN: the shell can
-//       leave its tmux client at any time (`tmux detach`, `exit`, killing its own session)
-//       and land back in an unconfined login shell, where a bare `tmux send-keys -t main …`
-//       names no socket for R1 to catch. `AgentTurnEngine` therefore re-asks the LIVE shell
-//       before every send that could be a tmux command (`AgentSessionDriving.probeEnvironment`),
-//       and a shell that does not answer — busy, disconnected, sitting in a full-screen
-//       program — is treated as unproven. The daemon's launch-time probe is a loud log
-//       line, not the authority.
+//   R1  EVERY TMUX COMMAND NAMES ITS SERVER, AND IT IS OURS. On a host with a private
+//       socket, a tmux invocation is allowed only when it says WHICH server it means and
+//       that server is the agent's own (`tmux -L fin …`, or `-S <our path>`). Another
+//       server is refused, and so is naming NO server at all.
 //
-//   R1  SOCKET SELECTION. A tmux invocation that names a socket other than the agent's
-//       own (`-L other`, `-S /path`) is refused. Note tmux's own precedence, which this
-//       parser now mirrors: `-S` WINS over `-L` no matter which came last (man tmux: "If
-//       -S is specified … any -L flag is ignored" — verified on tmux 3.6a, where
-//       `tmux -S /nonexistent -L fintest ls` tried the -S path). Reading the last flag
-//       instead made `tmux -S <human's socket> -L fin …` look like our own server.
-//   R1b WHOSE $TMUX? A tmux command with NO `-L`/`-S` reads its socket out of `$TMUX`, so
-//       it reaches the agent's server only when it runs in the agent's own shell
-//       environment. Under anything that starts a fresh environment — `ssh host tmux …`,
-//       `sudo tmux …`, `env -i … tmux …`, `launchctl submit … tmux …` — `$TMUX` is gone
-//       and tmux falls back to the label `default`, i.e. the human's server. Those are
-//       refused unless they name the agent's own socket explicitly, which is a one-word fix
-//       the refusal spells out. The wrappers are a NAMED list, not "everything I do not
-//       recognize": the fail-closed version refuses `man tmux`. See the residual list.
-//       (Verified: a tmux `run-shell` child DOES inherit `TMUX` — checked on a private
-//       socket — so a tmux command nested inside another tmux command stays on our server
-//       and stays allowed.)
+//       THE SECOND HALF IS THE ONE THAT MATTERS, and it is why the previous round's
+//       machinery is gone. A socket-less `tmux …` picks its server out of `$TMUX` — a fact
+//       about the ENVIRONMENT the command happens to run in, which a byte-level guard can
+//       only guess at. Guessing it took a live probe of the shell before every send (R0), a
+//       named list of wrappers that start a fresh environment (R1b: `ssh`, `sudo`, `env -i`,
+//       `launchctl`…), and an honest admission that both were incomplete — the probe is
+//       answered by the very terminal the model types into, and the wrapper list is a list
+//       of things we thought of. Demanding the flag deletes the question instead of
+//       answering it: `tmux -L fin ls` reaches Fin's own server from a login shell, from
+//       inside `ssh`, under `sudo`, with `env -i`, from a cron job — because the LABEL, not
+//       the environment, chose the socket. tmux's own precedence is mirrored here: `-S`
+//       WINS over `-L` no matter which came last (man tmux: "If -S is specified … any -L
+//       flag is ignored" — verified on tmux 3.6a, where `tmux -S /nonexistent -L fintest ls`
+//       tried the -S path).
+//
+//       The cost is that the model must type six extra characters, and the refusal spells
+//       them out. That is the whole price for a rule whose correctness does not depend on
+//       anything outside the string being judged.
 //   R2  `kill-server`, and every prefix of it tmux would resolve. It ends the agent's own
 //       shell mid-turn, and on a host that never got a private socket it ends everything.
 //   R3  A SIGNAL aimed at tmux — `pkill`/`killall tmux`, and `kill` on a line that names
@@ -67,20 +60,35 @@ import Foundation
 //       tmux server on the machine, which no socket boundary prevents. Judged on the whole
 //       line because the pid comes from somewhere else on it.
 //   R4  ANY command that edits a SOCKET-SELECTING environment variable away (`TMUX= tmux …`,
-//       `env -u TMUX tmux …`, `env -i … tmux …`, `export TMUX_TMPDIR=…`, and a bare
-//       `export TMUX=…` with no tmux command in the same send — the guard judges one send
-//       at a time, so the assignment is its only moment to act). Verified on tmux 3.6a
-//       against two private sockets: with neither `-L` nor `-S`, tmux takes its socket path
-//       from `$TMUX`; and `TMUX_TMPDIR` is the DIRECTORY a `-L <label>` resolves in, so
-//       setting it makes even the agent's OWN label point at any socket file the model
-//       picks (`TMUX_TMPDIR=<dir> tmux -L fintest2 …` connected to
-//       `<dir>/tmux-501/fintest2`). This is the one hole the private socket does NOT close,
-//       and R4 catches only the recognizable spellings of it. See daemon/README.md for the
-//       honest residual list.
+//       `env -u TMUX tmux …`, `export TMUX_TMPDIR=…`, and a bare `export TMUX=…` with no
+//       tmux command in the same send — the guard judges one send at a time, so the
+//       assignment is its only moment to act). `TMUX` matters much less now that R1 refuses
+//       socket-less commands, but `TMUX_TMPDIR` matters MORE: it is the DIRECTORY a
+//       `-L <label>` resolves in, so it re-points even the agent's OWN label at any socket
+//       file the model picks (verified on tmux 3.6a: `TMUX_TMPDIR=<dir> tmux -L fintest2 …`
+//       connected to `<dir>/tmux-501/fintest2`). That is the one hole the private socket
+//       does not close, and R4 catches only the recognizable spellings of it. See
+//       daemon/README.md for the honest residual list.
 //   R5  HALF A COMMAND IS NOT A COMMAND. The PTY concatenates sends, so a line ending in
 //       a continuation or an open quote is refused when it mentions tmux — otherwise
-//       `tmux -L \` and `other kill-server` are two individually-harmless sends the shell
-//       joins at its continuation prompt, and R1 never sees a whole command.
+//       `tmux -L \` and `fin ls` are two individually-harmless sends the shell joins at its
+//       continuation prompt, and R1 never sees a whole command.
+//   R6  A PROGRAM NAME THE GUARD CANNOT READ. `$(which tmux) -L default send-keys -t main …`
+//       puts the word `tmux` and the socket flag in two different lexer segments, so R1 saw
+//       an argument list with no program and a program with no arguments. Any line that
+//       mentions tmux and starts a command with a substitution (`$(…)`/backticks in command
+//       position) is refused whole: which program runs there cannot be read from the line.
+//   R7  A TMUX LINE HANDED TO A SCHEDULER (`crontab -`, `at`, `launchctl`) is refused,
+//       because what it will run later is text this send only PIPES — `echo '… tmux …' |
+//       crontab -` never puts the tmux words in a command position the guard can judge.
+//       Line-level, for the same reason R3 is.
+//
+// DELETED THIS ROUND, with the questions they were answering: R0's live confinement probe
+// (`$TMUX` scraped from the PTY before every tmux-bearing send — a proof produced by the
+// party being checked, and an `echo` typed into whatever program was in the foreground),
+// R1b's environment-crossing wrapper list, and `env -i` detection. R1's second half makes
+// all three unnecessary: no rule below asks any more where a socket-less tmux would land,
+// because a socket-less tmux does not run.
 //
 // DELETED with the classification machinery: the 90-entry tmux command table, prefix
 // resolution, target/`-t` extraction, session-reference parsing, the allow-list and the
@@ -146,50 +154,33 @@ public struct TmuxSendGuard: Sendable, Equatable {
     /// prompt names it, so the model knows which session is its own.
     public var ownSession: String?
     /// The socket the agent's own shell lives on, parsed out of `connectCommand`. THE
-    /// load-bearing field: R1 refuses any explicit socket that is not this one.
+    /// load-bearing field: R1 refuses every tmux invocation that does not name exactly
+    /// this socket.
     public var ownSocket: TmuxSocket
-    /// Whether the shell was PROVEN to be inside `ownSocket`'s server — i.e. whether the
-    /// live shell just reported a `$TMUX` naming this socket.
-    ///
-    /// R0, AND THE REASON IT EXISTS. Every other rule here assumes a bare `tmux …` reaches
-    /// the agent's OWN server, which is true only because `$TMUX` points there — and that
-    /// is a fact about a `connectCommand` typed into a PTY, which can fail quietly. If it
-    /// did, the shell is a plain login shell with an empty `$TMUX`, a bare
-    /// `tmux send-keys -t main …` names no socket for R1 to catch, and it lands on the
-    /// human's server. So when the proof is missing, EVERY tmux invocation is refused: the
-    /// agent still has `read_session` for looking, and a loudly crippled agent beats one
-    /// quietly typing into someone else's terminal.
-    ///
-    /// A PROOF WITH NO SHELF LIFE. This is a snapshot of one moment, and the shell can
-    /// leave its tmux client whenever it likes — `tmux detach`, `exit`, `tmux kill-session
-    /// -t <its own>` — landing back in the login shell that spawned it, whose `$TMUX` is
-    /// empty. A value frozen at daemon launch would keep answering "confined" from there,
-    /// which is precisely the state in which a socket-less tmux command reaches the human's
-    /// server. So the host is expected to REFRESH it per send (`AgentTurnEngine` re-probes
-    /// the live shell before any send that mentions tmux) rather than set it once. It
-    /// defaults to true so a host that has no shell to ask — the app, every test that
-    /// builds a guard by hand — behaves exactly as it did before this field existed.
-    public var shellIsOnOwnServer: Bool
 
     public init(
         isEnforced: Bool,
         ownSession: String?,
-        ownSocket: TmuxSocket = .standard,
-        shellIsOnOwnServer: Bool = true
+        ownSocket: TmuxSocket = .standard
     ) {
         self.isEnforced = isEnforced
         self.ownSession = ownSession
         self.ownSocket = ownSocket
-        self.shellIsOnOwnServer = shellIsOnOwnServer
     }
 
     /// Does `raw` — the shell's own `$TMUX`, `<socket path>,<pid>,<session>` — say the
-    /// shell is inside the server this guard defends? Pure, so the daemon's probe answer
-    /// is testable without a tmux or a PTY.
+    /// shell is inside the server this guard defends?
+    ///
+    /// NOT A GATE, AND DELIBERATELY NOT ONE ANY MORE. The daemon calls this once at launch
+    /// so an operator learns from the log that the `connectCommand` did or did not take
+    /// effect. It is not consulted per send, and no refusal depends on it, because the
+    /// answer comes back through the same PTY the model types into: a filter left running
+    /// in the pane can print whatever this function wants to read. R1's demand that every
+    /// tmux command name its own socket is what replaced it — a rule about the string being
+    /// judged, not about a terminal that can answer for itself.
     ///
     /// `.standard` cannot be proven this way and does not need to be: on the shared socket
-    /// there is no confinement to lose, and requiring proof there would refuse every tmux
-    /// command on a host that deliberately runs without a private socket.
+    /// there is no confinement to lose.
     public static func shellReportIsOwnServer(_ raw: String?, socket: TmuxSocket) -> Bool {
         guard case .standard = socket else {
             guard let raw else { return false }
@@ -241,12 +232,7 @@ public struct TmuxSendGuard: Sendable, Equatable {
         // the agent types goes through here. A command that cannot possibly be about tmux
         // must not pay for the lexer.
         guard TmuxCommandGuard.mightMentionTmux(input) else { return .allow }
-        return TmuxCommandGuard.evaluate(
-            input,
-            ownSocket: ownSocket,
-            ownSession: ownSession,
-            shellIsOnOwnServer: shellIsOnOwnServer
-        )
+        return TmuxCommandGuard.evaluate(input, ownSocket: ownSocket, ownSession: ownSession)
     }
 
     /// The prompt paragraph that tells the model where it lives and what it may do — a
@@ -266,8 +252,7 @@ public enum TmuxCommandGuard {
     public static func evaluate(
         _ input: String,
         ownSocket: TmuxSocket = .standard,
-        ownSession: String? = nil,
-        shellIsOnOwnServer: Bool = true
+        ownSession: String? = nil
     ) -> TmuxGuardVerdict {
         // Fast path AND blast-radius bound: a command that never mentions tmux (or a
         // process-killer aimed at it) is not this guard's business and must behave
@@ -278,11 +263,7 @@ public enum TmuxCommandGuard {
         // a backslash therefore falls through to the lexer, which normalizes exactly those
         // forms, and the real decision is made on lexed words.
         guard mightMentionTmux(input) else { return .allow }
-        let context = Context(
-            ownSocket: ownSocket,
-            ownSession: ownSession,
-            shellIsOnOwnServer: shellIsOnOwnServer
-        )
+        let context = Context(ownSocket: ownSocket, ownSession: ownSession)
 
         // THE GUARD JUDGES THE BYTES THAT ARE TYPED, not the raw tool argument.
         // `AgentTurnEngine` sends `AgentTurnLogic.typedBody(input)` and then a separate
@@ -319,24 +300,6 @@ public enum TmuxCommandGuard {
         }
 
         guard mentions else { return .allow }
-
-        // R0. The confinement this whole design rests on, checked before any rule that
-        // assumes it: if the shell was never proven to be inside its own tmux server, a
-        // bare `tmux …` names no socket for R1 to catch and would land on the default one.
-        guard context.shellIsOnOwnServer else {
-            return refusal(
-                "Fin's shell is not confirmed to be inside its own tmux server RIGHT NOW, so a tmux "
-                    + "command typed here could reach the machine's default tmux server — the one "
-                    + "holding the human's sessions. The shell is asked for $TMUX before every tmux "
-                    + "command; it either answered with a different server (the connectCommand did "
-                    + "not take effect, or something detached the session) or did not answer at all "
-                    + "(busy in a full-screen program, or disconnected). read_session still works. "
-                    + "If the terminal is just busy, finish or interrupt what is running there "
-                    + "first; the check is logged either way.",
-                context: context
-            )
-        }
-
         return evaluate(line: line, depth: 0, context: context)
     }
 
@@ -376,64 +339,75 @@ public enum TmuxCommandGuard {
     }
 
     /// The prompt block the daemon appends when the guard is armed.
+    ///
+    /// TWO POSTURES, AND THEY GET DIFFERENT PARAGRAPHS. On a private socket the model
+    /// really does own every session it can reach, and the rule it must learn is the flag.
+    /// On the SHARED default socket there is no boundary to describe: the human's sessions
+    /// are on the same server, this file cannot tell them from the agent's own, and saying
+    /// "every tmux command acts on YOUR server … create, drive, kill and rename freely"
+    /// there was an invitation contradicting the routing section's OFF-LIMITS rule. The
+    /// shared posture is told the truth instead: the restraint is the instruction, not the
+    /// code.
     public static func promptGuidance(ownSocket: TmuxSocket, ownSession: String?) -> String {
         let session = ownSession ?? "your own"
-        let where_ = ownSocket == .standard
-            ? "Your shell is on this machine's default tmux server."
-            : "Your shell runs on your OWN tmux server (\(ownSocket.described)), which is a "
-                + "different server process from the human's. Sessions you create there are "
-                + "yours; the human's sessions do not exist on it at all."
-        return """
-            tmux (enforced in code, not just here). \(where_) You are in session \
-            "\(session)", and every tmux command you type acts on YOUR server, so you may \
-            create, drive, kill and rename sessions there freely — no allow-list, nothing to \
-            register.
+        guard ownSocket != .standard else {
+            return """
+                tmux. Your shell is on this machine's DEFAULT tmux server — the same server \
+                the human's own sessions live on. You are in session "\(session)". Sessions \
+                you did not create are NOT yours: never send keys to them, never kill, rename \
+                or reconfigure them, and never attach to one. Read them with the read_session \
+                tool (no arguments lists this machine's sessions, a name reads that session's \
+                screen) rather than with the shell.
 
-            To see work OUTSIDE your own terminal — the human's sessions, another agent's \
+                Be honest with yourself about this one: unlike the sites that run on their own \
+                tmux socket, nothing here separates your sessions from the human's at the \
+                process level, so this paragraph — not a gate in code — is what keeps you out \
+                of them. `kill-server` and any signal aimed at tmux (`pkill tmux`, \
+                `kill $(pgrep tmux)`) ARE refused in code, because they would take down every \
+                session on this machine including your own shell.
+                """
+        }
+        return """
+            tmux (enforced in code, not just here). Your shell runs on your OWN tmux server \
+            (\(ownSocket.described)), a different server process from the human's: the human's \
+            sessions do not exist on it at all. You are in session "\(session)", and every \
+            session on your server is yours to create, drive, kill and rename freely — no \
+            allow-list, nothing to register.
+
+            WRITE THE SOCKET FLAG EVERY TIME: `tmux \(ownSocket.described) <command>`, e.g. \
+            `tmux \(ownSocket.described) new-session -d -s build` or \
+            `tmux \(ownSocket.described) send-keys -t build 'swift build' Enter`. A tmux \
+            command with no `-L`/`-S` picks its server out of the $TMUX variable of whatever \
+            shell happens to run it, which is not something Fin can check from the command \
+            text — so a socket-less `tmux …` is refused, whatever it would have done. Adding \
+            the flag is the whole fix, and it works everywhere: in this shell, under `ssh`, \
+            under `sudo`, inside a script.
+
+            To see work OUTSIDE your own server — the human's sessions, another agent's \
             session — use the read_session tool, not the shell. Call read_session with no \
             arguments to list this machine's sessions by name, then call it again with a name \
             to read that session's screen. That is the only path to them, and it is read-only.
 
-            You may NOT point a tmux command at another server: `tmux -L <name>`, \
-            `tmux -S <path>`, or anything that edits the TMUX or TMUX_TMPDIR environment \
-            variables is refused before a byte reaches the terminal, as are `kill-server` and \
-            any signal aimed at tmux (`pkill tmux`, `kill $(pgrep tmux)` — they would end your \
-            own shell, and every other tmux server on this machine). The refusal is final — do \
-            not retry it, rephrase it, or wrap it in a shell. If you need to see another \
-            server's work, read_session is the answer.
-
-            One shape that is allowed but has to be spelled out: a tmux command that runs \
-            somewhere OTHER than this shell — `ssh <host> tmux …`, `sudo tmux …`, \
-            `env -i … tmux …` — does not inherit $TMUX, so it would land on this machine's \
-            default tmux server. Name your own server in those: \
-            `tmux \(ownSocket.described) …`.
+            Also refused before a byte reaches the terminal: any OTHER server \
+            (`tmux -L <other>`, `tmux -S <path>`), anything that edits the TMUX or \
+            TMUX_TMPDIR environment variables (TMUX_TMPDIR re-points even your own label), \
+            `kill-server`, and any signal aimed at tmux (`pkill tmux`, `kill $(pgrep tmux)` — \
+            they would end your own shell, and every other tmux server on this machine). \
+            Those refusals are final — do not retry, rephrase, or wrap them in a shell. If you \
+            need to see another server's work, read_session is the answer.
             """
     }
 
     // MARK: - Context
 
+    /// What the rules are judged against. Note what is NOT in here any more: any notion of
+    /// which environment the command will run in. R1 asks only what the command SAYS.
     struct Context {
         var ownSocket: TmuxSocket
         var ownSession: String?
-        var shellIsOnOwnServer: Bool = true
-        /// R1b. Would a socket-less `tmux …` here read the `$TMUX` this shell was PROVEN to
-        /// have? True while we are still inside the agent's own shell environment; false
-        /// once something on the line starts a fresh one (`ssh`, `sudo`, `env -i`, an
-        /// unknown head), because there `$TMUX` is gone and tmux falls back to the
-        /// machine's default socket.
-        var environmentIsOurs: Bool = true
-        /// The word that took us out of it, for a refusal that names the actual cause.
-        var environmentCrossedBy: String?
 
-        /// Descend into something that runs its own command: `crossedBy` nil means the
-        /// environment carries through (a subshell, a wrapper), a word means it does not.
-        func handingOff(to crossedBy: String?) -> Context {
-            guard let crossedBy else { return self }
-            var next = self
-            next.environmentIsOurs = false
-            next.environmentCrossedBy = environmentCrossedBy ?? crossedBy
-            return next
-        }
+        /// The one-word fix every R1 refusal ends with, spelled the way tmux takes it.
+        var ownSocketFlag: String { ownSocket.described }
     }
 
     /// Wrappers whose FIRST word is not the real command, so the tail has to be
@@ -458,26 +432,19 @@ public enum TmuxCommandGuard {
         "time", "nice", "stdbuf", "ionice", "caffeinate",
     ]
 
-    /// WHO TAKES `$TMUX` AWAY (R1b). These heads run their command in a DIFFERENT
-    /// environment than this shell's — a fresh login (`ssh`, `mosh`, `su`), a reset one
-    /// (`sudo`, `doas`: macOS sudo is `env_reset` by default), or a job handed to another
-    /// supervisor (`launchctl`, `at`, `open`). `$TMUX` does not survive any of them, so a
-    /// tmux command under one with no `-L`/`-S` does not reach the agent's server: tmux
-    /// falls back to the label `default`, which is the human's.
+    /// R7. Heads that take a command now and RUN it later, out of this send's sight. The
+    /// tmux words they carry are almost always data at the moment they are typed —
+    /// `echo '* * * * * tmux -L default kill-server' | crontab -` puts them in a quoted
+    /// argument of `echo`, on a different segment from the scheduler — so no amount of
+    /// per-segment parsing reaches them, and the schedule fires a minute later in a shell
+    /// nobody is judging. Refusing the whole line is the only honest answer, and it is
+    /// judged line-level for exactly the reason R3 is.
     ///
-    /// A NAMED LIST, AND THEREFORE AN INCOMPLETE ONE — deliberately, and the alternative
-    /// was tried and rejected in the same hour. Treating every UNKNOWN head as crossing is
-    /// the fail-closed shape, but it refuses `man tmux`, `which tmux`, `brew install tmux`
-    /// and `grep -e tmux config.fish`: a wrapper this parser does not model is far more
-    /// often a command that merely MENTIONS tmux than one that runs it, and this repo's
-    /// current work is documenting tmux. So the rule fires on wrappers we can name, and the
-    /// gap — some unlisted wrapper that starts a fresh environment and runs a socket-less
-    /// tmux — is written down in daemon/README.md's residual list rather than papered over.
-    /// The upgrade that closes it for real is the dedicated UNIX user, also named there.
-    static let environmentCrossingHeads: Set<String> = [
-        "ssh", "mosh", "su", "sudo", "doas", "launchctl", "at", "batch", "crontab",
-        "open", "systemd-run", "docker", "podman", "chroot", "nsenter", "osascript",
-    ]
+    /// Deliberately SHORT. This is not the old wrapper list reborn: `ssh`, `sudo` and
+    /// `env -i` are gone from the guard entirely, because R1 no longer cares which
+    /// environment a tmux command runs in. These five are here because they defer, not
+    /// because they cross.
+    static let schedulers: Set<String> = ["crontab", "at", "batch", "launchctl", "systemd-run"]
 
     /// Not tmux commands at all, but they reach every tmux server on the machine (R3).
     /// `processKillers` is also part of the cheap prefilter, so it stays limited to the
@@ -518,13 +485,49 @@ public enum TmuxCommandGuard {
         // nothing. So: any signal-sending head anywhere on a line that names tmux is
         // refused. `pkill node` and `killall Dock` are untouched, because the tmux WORD (not
         // merely a process-killer word) has to be on the line.
-        if mentionsTmuxWord(line, depth: depth),
+        let namesTmux = mentionsTmuxWord(line, depth: depth)
+        if namesTmux,
            let killer = all.compactMap({ commandHead($0) }).first(where: { signalSenders.contains($0) }) {
             return refusal(
                 "`\(killer)` on a line that names tmux sends a SIGNAL, which reaches every tmux "
                     + "server on this machine — including the human's, which no socket boundary "
                     + "protects from a signal. Fin's own sessions are ended with "
-                    + "`tmux kill-session -t <name>`, which stays on Fin's server.",
+                    + "`tmux \(context.ownSocketFlag) kill-session -t <name>`, which stays on "
+                    + "Fin's server.",
+                context: context
+            )
+        }
+
+        // R6, LINE-LEVEL, AND FOR THE SAME REASON. `$(which tmux) -L default send-keys -t
+        // main …` hands the guard two halves it cannot join: the lexer makes `(` and `)`
+        // hard boundaries, so the word `tmux` lands in one segment and `-L default …` in
+        // the next, as an argument list whose program name was never a word at all. R1 read
+        // an empty invocation and allowed it. Verified on a private socket that
+        // `$(which tmux) -L fintest … ls` and its backtick spelling really do select the
+        // named socket, so this is a live route with `default` substituted. There is no
+        // parse of this: a substitution's output is known only at runtime.
+        if namesTmux, startsACommandWithSubstitution(line) {
+            return refusal(
+                "that line starts a command with a substitution (`$(…)` or backticks) on a line "
+                    + "that names tmux, so which PROGRAM runs there is decided at runtime and "
+                    + "cannot be read from the command text — `$(which tmux) -L default …` is a "
+                    + "tmux command wearing no tmux word. Write the program out: "
+                    + "`tmux \(context.ownSocketFlag) …`.",
+                context: context
+            )
+        }
+
+        // R7. A scheduler on a tmux line: what it runs happens later, in a shell this send
+        // is not.
+        if namesTmux, let scheduler = all.compactMap({ commandHead($0) }).first(where: {
+            schedulers.contains($0)
+        }) {
+            return refusal(
+                "`\(scheduler)` schedules a command to run LATER, in a shell Fin's guard will "
+                    + "never see, and this line carries tmux text into it (a piped here-string, a "
+                    + "quoted crontab line, a plist argument — none of them are in a command "
+                    + "position this guard can judge). Run the tmux command directly instead: "
+                    + "`tmux \(context.ownSocketFlag) …`.",
                 context: context
             )
         }
@@ -593,12 +596,6 @@ public enum TmuxCommandGuard {
         let head = normalized(basename(words[index].text))
         let tail = Array(words[(index + 1)...])
 
-        // R1b, the prefix half: `sudo tmux …` and `env -i … tmux …` reach the head `tmux`
-        // with the environment already gone. `sudo` resets it (`env_reset`), `env -i`
-        // empties it — either way `$TMUX` does not survive to the tmux that runs, and the
-        // proof R0 took of THIS shell says nothing about that one.
-        let context = context.handingOff(to: parsedHead.crossedBy)
-
         // `xargs` builds tmux's argv out of stdin, which this guard cannot see:
         // `echo "-L default kill-server" | xargs tmux` selects another socket while the
         // guard sees an argument-less `tmux`.
@@ -611,24 +608,28 @@ public enum TmuxCommandGuard {
             )
         }
 
-        // A quoted argument can be its own little command line — but ONLY when the head is
-        // something that RUNS it: `sh -c '…'`, `eval "…"`, an inline interpreter's `-c`/`-e`
-        // payload. Text that merely mentions tmux — `git commit -m "tmux guard: …"`,
-        // `grep "tmux -L fin" daemon/`, `echo "tmux …" >> notes.md` — is data, and refusing
-        // it cost real work in this very repo, whose current subject IS tmux commands.
+        // A word the shell BUILT — by quoting or by escaping — can be its own little
+        // command line, but only when the head is something that RUNS it: `sh -c '…'`,
+        // `eval "…"`, an inline interpreter's `-c`/`-e` payload. Text that merely mentions
+        // tmux — `git commit -m "tmux guard: …"`, `grep "tmux -L fin" daemon/`,
+        // `echo "tmux …" >> notes.md` — is data, and refusing it cost real work in this very
+        // repo, whose current subject IS tmux commands.
+        //
+        // QUOTING IS NOT THE ONLY WAY TO BUILD ONE, and reading only `wasQuoted` was a hole
+        // wide enough to drive the whole guard through: `sh -c tmux\ -L\ default\ send-keys\
+        // -t\ main\ hostname\ Enter` lexes to exactly three words, none of them quoted, the
+        // third being a complete command line the shell hands to `sh` to re-parse (verified
+        // in bash AND fish: `bash -c 'sh -c echo\ hi\ there'` prints the multi-word result).
+        // `mentionsTmux` therefore answered false and `evaluate` short-circuited to .allow
+        // before a single rule ran. So the lexer records HOW a word was built, and both
+        // spellings are unwrapped.
         //
         // `depth > 0` is deliberate: below the top level we are ALREADY inside text some
-        // runner will execute, so every quoted word in it is program text too. That is what
+        // runner will execute, so every built word in it is program text too. That is what
         // reaches the tmux inside `awk 'BEGIN{system("tmux -L x kill-server")}'`.
         if head == "tmux" || commandCarriers.contains(head) || depth > 0 {
-            // R1b travels INTO the payload: `ssh box "tmux ls"` is the same escape as
-            // `ssh box tmux ls`. A tmux command nested in another TMUX command is not a
-            // hand-off — `run-shell`'s child really does inherit `TMUX` (verified on a
-            // private socket: the child's env had `TMUX=/private/tmp/tmux-501/fintest,…`).
-            let inner = context.handingOff(
-                to: environmentCrossingHeads.contains(head) ? head : nil
-            )
-            for word in words[index...] where word.wasQuoted && mentionsTmux(word.text, depth: depth + 1) {
+            for word in words[index...]
+            where word.wasAssembled && mentionsTmux(word.text, depth: depth + 1) {
                 guard depth < maxNestingDepth else {
                     return refusal(
                         "that command nests tmux inside quoted shell text more deeply than Fin's "
@@ -636,13 +637,13 @@ public enum TmuxCommandGuard {
                         context: context
                     )
                 }
-                let verdict = evaluate(line: word.text, depth: depth + 1, context: inner)
+                let verdict = evaluate(line: word.text, depth: depth + 1, context: context)
                 if verdict.isRefusal { return verdict }
             }
         }
 
         if head == "tmux" {
-            return evaluate(invocation: tail, context: context)
+            return evaluate(invocation: tail, context: context, inCommandPosition: true)
         }
 
         // `ssh localhost tmux …`, `sudo -u someone tmux …`, `timeout 60 tmux …`, and — as
@@ -651,18 +652,25 @@ public enum TmuxCommandGuard {
         // the old one were not exotic: `find . -maxdepth 0 -exec tmux …`, `if tmux …; then`,
         // `for i in 1; do tmux …; done`. Only a BARE token counts, so prose keeps the word
         // inside a quoted word.
-        let scanned = (commandCarriers.contains(head) || strippedPrefix)
+        let runsItsArguments = commandCarriers.contains(head) || strippedPrefix
+        let scanned = runsItsArguments
             ? tail.firstIndex(where: { isTmuxToken($0.text) })
-            : tail.firstIndex(where: { isTmuxToken($0.text) && !$0.wasQuoted })
+            : tail.firstIndex(where: { isTmuxToken($0.text) && !$0.wasAssembled })
         if let hit = scanned {
-            // R1b, the wrapper half. `timeout 60 tmux ls` and `find . -exec tmux ls \;`
-            // still run in this shell's environment; `ssh box tmux ls` does not. An
-            // UNKNOWN head is treated as this shell's — the fail-closed reading refuses
-            // `man tmux` and `grep -e tmux config.fish`, which is the trade named in
-            // `environmentCrossingHeads` and in daemon/README.md's residual list.
+            // IS THIS TMUX A COMMAND, OR A WORD ABOUT TMUX? Under a head we recognize as a
+            // runner (`ssh box tmux …`, `timeout 60 tmux …`) or behind a stripped prefix
+            // (`sudo -u levi tmux …`) the token is unambiguously a program, and R1 applies
+            // in full. Under a head this parser does NOT model it is far more often prose —
+            // `man tmux`, `which tmux`, `brew install tmux`, `grep -e tmux config.fish` —
+            // and demanding a socket flag there would refuse an ordinary read of the very
+            // file this guard is configured in. So an unmodelled head keeps the rules that
+            // are unambiguous (another server, `kill-server`) and skips the one that is not.
+            // The gap that leaves — `find . -exec tmux send-keys …`, socket-less, under a
+            // head we don't know — is in daemon/README.md's residual list.
             return evaluate(
                 invocation: Array(tail[(hit + 1)...]),
-                context: context.handingOff(to: environmentCrossingHeads.contains(head) ? head : nil)
+                context: context,
+                inCommandPosition: runsItsArguments
             )
         }
 
@@ -670,13 +678,11 @@ public enum TmuxCommandGuard {
     }
 
     /// Where the real command starts in a segment, with `sudo`/`env FOO=1`/`exec`… and
-    /// their flags stripped off the front — and WHETHER any of those prefixes handed the
-    /// command a different environment than this shell's (R1b). Shared by
-    /// `evaluate(segment:)` and the line-level R3, so both agree on what the head is.
-    static func headIndex(of words: [Word]) -> (index: Int, strippedPrefix: Bool, crossedBy: String?) {
+    /// their flags stripped off the front. Shared by `evaluate(segment:)` and the
+    /// line-level rules, so both agree on what the head is.
+    static func headIndex(of words: [Word]) -> (index: Int, strippedPrefix: Bool) {
         var index = 0
         var strippedPrefix = false
-        var crossedBy: String? = segmentClearsEnvironment(words) ? "env -i" : nil
         while index < words.count {
             let token = words[index].text
             if isEnvAssignment(token) {
@@ -688,16 +694,14 @@ public enum TmuxCommandGuard {
                 index += 1
                 continue
             }
-            let name = normalized(basename(token))
-            if benignPrefixes.contains(name) {
-                if environmentCrossingHeads.contains(name), crossedBy == nil { crossedBy = name }
+            if benignPrefixes.contains(normalized(basename(token))) {
                 index += 1
                 strippedPrefix = true
                 continue
             }
             break
         }
-        return (index, strippedPrefix, crossedBy)
+        return (index, strippedPrefix)
     }
 
     /// The command a segment will actually run, prefixes stripped. Nil when the segment is
@@ -711,7 +715,11 @@ public enum TmuxCommandGuard {
     /// One `tmux …` invocation: R1 on its global flags, then R2 on each `;`-separated
     /// command. Note what is NOT here any more — no verb table, no target extraction, no
     /// allow-list. Every session on the agent's own server is the agent's own.
-    private static func evaluate(invocation args: [Word], context: Context) -> TmuxGuardVerdict {
+    private static func evaluate(
+        invocation args: [Word],
+        context: Context,
+        inCommandPosition: Bool
+    ) -> TmuxGuardVerdict {
         let parsed = parseGlobalFlags(args)
 
         // R1. THE RULE. A socket that is not ours puts the command on another server.
@@ -733,21 +741,28 @@ public enum TmuxCommandGuard {
             )
         }
 
-        // R1b. No socket flag means "whatever `$TMUX` says", and `$TMUX` belongs to the
-        // shell that runs the command. Fin's shell was proven to be inside Fin's server;
-        // the shell `ssh` opens, the process `sudo` starts, the child `env -i` strips, and
-        // whatever an unmodelled head spawns were not — there `$TMUX` is unset and tmux
-        // falls back to the label `default`, which is the human's server. The fix is one
-        // word and the refusal names it, so this is a redirect, not a dead end.
-        if parsed.socket == nil, !context.environmentIsOurs, context.ownSocket != .standard {
-            let via = context.environmentCrossedBy.map { "`\($0)`" } ?? "that wrapper"
+        // R1, THE SECOND HALF — the one that replaced a live shell probe and a list of
+        // wrappers. No socket flag means "whatever `$TMUX` says", and `$TMUX` belongs to
+        // whatever shell ends up running the command: this one, the fresh login `ssh` opens,
+        // the environment `sudo` resets, the empty one `env -i` leaves, the cron shell an
+        // hour from now. With it unset, tmux falls back to the label `default` — the
+        // human's server. The previous rounds tried to work out WHICH of those it would be,
+        // from the command text plus a probe of the live shell; both were incomplete and
+        // the probe was answerable by the model. So the question is deleted instead:
+        // a tmux command on a private-socket host must say which server it means.
+        //
+        // Not on `.standard`. There the agent's own server IS the default one, so there is
+        // no flag that would say anything, and demanding one would refuse every tmux
+        // command on a host deliberately installed without a private socket.
+        if parsed.socket == nil, inCommandPosition, context.ownSocket != .standard {
             return refusal(
-                "that tmux command names no tmux server, and it does not run in Fin's own shell — "
-                    + "\(via) starts a fresh environment where $TMUX (the variable a tmux command "
-                    + "with no -L/-S reads its socket out of) is gone, so tmux would fall back to "
-                    + "this machine's DEFAULT socket: the human's. If you meant your own server, "
-                    + "say so explicitly — `tmux \(context.ownSocket.described) …` — and it is "
-                    + "allowed.",
+                "that tmux command names no tmux server. A tmux command with no `-L`/`-S` takes "
+                    + "its socket from the $TMUX variable of whichever shell runs it — this one, or "
+                    + "a fresh one under ssh/sudo/cron where $TMUX is empty and tmux falls back to "
+                    + "this machine's DEFAULT socket, the one holding the human's sessions. Fin "
+                    + "cannot tell those apart from the command text, so it does not try: write "
+                    + "your own server into the command and it is allowed — "
+                    + "`tmux \(context.ownSocketFlag) \(describe(parsed.arguments))`.",
                 context: context
             )
         }
@@ -849,40 +864,48 @@ public enum TmuxCommandGuard {
         return false
     }
 
-    /// `env -i` / `env -` / `env --ignore-environment`: the command runs with an EMPTY
-    /// environment, `TMUX` and `TMUX_TMPDIR` with it, so a socket-less tmux under it falls
-    /// back to the default socket. It was invisible to `segmentEditsTmuxEnvironment`, which
-    /// only ever looked for a variable NAME, and invisible to the prefix stripper, which
-    /// walked past `env` and then past `-i` as "a flag of a stripped prefix" and reported
-    /// the head as an ordinary `tmux`. Verified here: `env -i /usr/bin/env` prints nothing,
-    /// and `env -i PATH=… tmux -L fintest ls` still runs tmux.
+    /// R6's detector: does this line START a command with a command substitution?
     ///
-    /// Kept SEPARATE from R4's unconditional pre-pass on purpose: unlike `export TMUX=…`,
-    /// this cannot leak into a later send — it shapes only the environment of the command
-    /// `env` itself runs — so it is judged as a hand-off (R1b), where it costs a refusal
-    /// only on a line that is actually running tmux.
-    static func segmentClearsEnvironment(_ words: [Word]) -> Bool {
-        for (position, word) in words.enumerated() where normalized(basename(word.text)) == "env" {
-            var index = position + 1
-            while index < words.count {
-                let argument = normalized(words[index].text)
-                if argument == "-" || argument == "--ignore-environment" { return true }
-                if argument.hasPrefix("--") {
-                    index += 1
-                    continue
+    /// `$(which tmux) -L default send-keys -t main …` is the shape. The lexer makes `(`,
+    /// `)` and backticks hard boundaries — deliberately, so `$(tmux -L other ls)` is judged
+    /// as its own command — and that same boundary splits this line into a segment holding
+    /// the word `tmux` and a segment holding `-L default send-keys …` with no program in
+    /// it. Neither half is a tmux invocation the rest of this file can read, and the two
+    /// were never joined.
+    ///
+    /// The distinguishing feature is COMMAND POSITION: a substitution that begins where a
+    /// program name goes produces the program. `echo $(date)`, `X=$(which tmux)` and
+    /// `kill $(pgrep tmux)` all have their substitution in ARGUMENT position, and none of
+    /// them is refused by this (the last one is R3's business). So the scan tracks one bit
+    /// — has anything but whitespace been seen since the last command boundary — and fires
+    /// only on `$(` or a backtick reached while that bit is false.
+    static func startsACommandWithSubstitution(_ line: String) -> Bool {
+        let characters = Array(line)
+        var index = 0
+        var atCommandStart = true
+        while index < characters.count {
+            let character = characters[index]
+            switch character {
+            case " ", "\t":
+                index += 1
+            case "\n", "\r", ";", "|", "&", "(", ")", "{", "}", "<", ">":
+                // A boundary: whatever follows is the start of a command again. `(` and `)`
+                // are included because `( tmux … )` and the tail of a substitution both
+                // begin a fresh command position; a redirection can precede the program
+                // name too (`> out $(which tmux) …`).
+                atCommandStart = true
+                index += 1
+            case "`":
+                if atCommandStart { return true }
+                index += 1
+            case "$":
+                if atCommandStart, index + 1 < characters.count, characters[index + 1] == "(" {
+                    return true
                 }
-                guard argument.hasPrefix("-") else { break }   // the command env will run
-                var letters = Array(argument.dropFirst())[...]
-                while let key = letters.first {
-                    if key == "i" { return true }
-                    // Value-taking flags swallow the rest of the cluster (or the next
-                    // word), so an `i` inside a PATH is not a flag: `env -C/private/tmp …`.
-                    if key == "u" || key == "c" || key == "s" || key == "p" {
-                        if letters.count == 1 { index += 1 }
-                        break
-                    }
-                    letters = letters.dropFirst()
-                }
+                atCommandStart = false
+                index += 1
+            default:
+                atCommandStart = false
                 index += 1
             }
         }
@@ -890,6 +913,23 @@ public enum TmuxCommandGuard {
     }
 
     // MARK: - Refusal text
+
+    /// The tmux command the model tried, echoed back into the fix so the refusal reads as
+    /// a rewrite rather than a rule. Bounded and stripped of control characters — these
+    /// words came from the model, and the result goes back into its context.
+    static func describe(_ args: [Word]) -> String {
+        // Control characters are replaced rather than passed through: this text goes into
+        // the tool result the model reads AND into the audit trail, and a newline or an
+        // escape sequence in a model-authored word could forge a line in either.
+        let flattened = String(
+            args.map(\.text).joined(separator: " ").unicodeScalars.map { scalar -> Character in
+                guard !CharacterSet.controlCharacters.contains(scalar) else { return " " }
+                return Character(scalar)
+            }
+        )
+        guard !flattened.isEmpty else { return "<command>" }
+        return flattened.count > 60 ? String(flattened.prefix(60)) + "…" : flattened
+    }
 
     /// The refusal the MODEL reads. Its job is to end the attempt and redirect it:
     /// `send_input`'s own description tells the model not to ask before acting, so a vague
@@ -1035,7 +1075,11 @@ public enum TmuxCommandGuard {
                 continue
             }
             let stem = String(word.text.dropLast())
-            if !stem.isEmpty { current.append(Word(text: stem, wasQuoted: word.wasQuoted)) }
+            if !stem.isEmpty {
+                current.append(
+                    Word(text: stem, wasQuoted: word.wasQuoted, wasEscaped: word.wasEscaped)
+                )
+            }
             result.append(current)
             current = []
         }
@@ -1087,9 +1131,22 @@ public enum TmuxCommandGuard {
 
     // MARK: - Lexing
 
+    /// A lexed word, plus HOW the shell built it — which is the difference between data
+    /// and a command line when the word is handed to something that re-parses it.
+    ///
+    /// `wasQuoted` and `wasEscaped` are tracked separately rather than as one flag because
+    /// they are found in different places in the lexer, but every caller wants the union:
+    /// `sh -c 'tmux …'` and `sh -c tmux\ …` are the same command, and the second one used
+    /// to be invisible (three unquoted words, the third a whole command line) which
+    /// short-circuited the entire guard to `.allow` before any rule ran.
     struct Word: Equatable {
         var text: String
         var wasQuoted: Bool
+        var wasEscaped: Bool = false
+
+        /// Did the shell ASSEMBLE this word out of quoting or escaping — i.e. is its text
+        /// something a carrier could re-parse as a command line?
+        var wasAssembled: Bool { wasQuoted || wasEscaped }
     }
 
     enum Lexeme: Equatable {
@@ -1123,12 +1180,18 @@ public enum TmuxCommandGuard {
         var current = ""
         var started = false
         var quoted = false
+        var assembledByEscape = false
 
         func flush() {
-            if started { result.append(.word(Word(text: current, wasQuoted: quoted))) }
+            if started {
+                result.append(
+                    .word(Word(text: current, wasQuoted: quoted, wasEscaped: assembledByEscape))
+                )
+            }
             current = ""
             started = false
             quoted = false
+            assembledByEscape = false
         }
         func separate() {
             flush()
@@ -1156,6 +1219,12 @@ public enum TmuxCommandGuard {
                     }
                     current.append(escaped)
                     started = true
+                    // THE WORD WAS ASSEMBLED BY THE SHELL, exactly as quoting assembles
+                    // one. `sh -c tmux\ -L\ default\ send-keys\ -t\ main\ hostname\ Enter`
+                    // is a single word here — three words on the line — and the payload
+                    // recursion used to unwrap only quoted words, so nothing looked inside
+                    // it and the line was allowed with `-L default` in plain sight.
+                    assembledByEscape = true
                     index += 1
                 }
                 continue
@@ -1251,7 +1320,8 @@ public enum TmuxCommandGuard {
             for word in segment {
                 if isTmuxToken(word.text) { return true }
                 if processKillers.contains(normalized(basename(word.text))) { return true }
-                if word.wasQuoted, depth < maxNestingDepth, mentionsTmux(word.text, depth: depth + 1) {
+                if word.wasAssembled, depth < maxNestingDepth,
+                   mentionsTmux(word.text, depth: depth + 1) {
                     return true
                 }
             }
@@ -1267,7 +1337,7 @@ public enum TmuxCommandGuard {
         for segment in segments(in: line) {
             for word in segment {
                 if isTmuxToken(word.text) { return true }
-                if word.wasQuoted, depth < maxNestingDepth,
+                if word.wasAssembled, depth < maxNestingDepth,
                    mentionsTmuxWord(word.text, depth: depth + 1) {
                     return true
                 }

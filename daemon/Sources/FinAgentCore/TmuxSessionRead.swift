@@ -80,6 +80,46 @@ public enum TmuxSessionRead {
         return min(requested, maxLines)
     }
 
+    // MARK: - Fitting the answer into the model's window
+
+    // THE CAPS ABOVE ARE ABOUT THE WIRE; THESE ARE ABOUT THE CONTEXT WINDOW, and they are
+    // not the same budget. `maxResponseBytes` (64 KB) bounds what one exec channel may
+    // return at all — a pane holding a build log must not blow the daemon's memory. But
+    // 64 KB is ~16,400 tokens by the transcript's own 4-chars-per-token estimate, and the
+    // daemon's default window leaves ~7,040 tokens for the WHOLE conversation. A single
+    // oversized capture does not merely crowd the transcript: `AgentTranscript.compactIfNeeded`
+    // drops from the front until it fits, which removes the user turn, then the assistant
+    // turn, and with it (as an orphaned tool result) the capture the model just asked for —
+    // leaving the next request with nothing but the system prompt. Even a DEFAULT 120-line
+    // read of a 200-column pane (~24,000 characters) does that.
+    //
+    // So the engine hands its own budget in, derived from `contextWindowTokens`, and the
+    // read is cut to fit BEFORE it is framed. The model is told, in the header outside the
+    // fence, that it is looking at the tail of a bigger screen.
+
+    /// How many lines are worth asking for when the answer may only occupy `bytes`.
+    /// 80 bytes/line is the conservative side of a real terminal line; the floor keeps a
+    /// tiny window from asking for a screenful of nothing.
+    public static func linesFitting(bytes: Int) -> Int {
+        max(20, min(maxLines, bytes / 80))
+    }
+
+    /// Cuts `text` to the NEWEST whole lines that fit in `limit` bytes — the bottom of a
+    /// pane is the part that matters, and a cut in the middle of a UTF-8 scalar would
+    /// arrive as replacement characters.
+    public static func fit(_ text: String, intoBytes limit: Int) -> (text: String, trimmed: Bool) {
+        guard limit > 0 else { return (text, false) }
+        var bytes = Array(text.utf8)
+        guard bytes.count > limit else { return (text, false) }
+        bytes = Array(bytes.suffix(limit))
+        if let newline = bytes.firstIndex(of: 0x0A) {
+            bytes = Array(bytes[(newline + 1)...])
+        } else {
+            while let first = bytes.first, first & 0xC0 == 0x80 { bytes.removeFirst() }
+        }
+        return (String(decoding: bytes, as: UTF8.self), true)
+    }
+
     // MARK: - The fixed argv
 
     /// `tmux capture-pane` against the DEFAULT socket. No `-L`/`-S`: this is the one
@@ -132,6 +172,29 @@ public enum TmuxSessionRead {
         return all.suffix(lines).joined(separator: "\n")
     }
 
+    /// The sentence the model reads when a read came back short — and WHICH cut it was.
+    ///
+    /// The two causes leave the reader looking at different parts of a screen: the byte cap
+    /// keeps the newest bytes (so the bottom of the pane, which is what this tool promises),
+    /// while the read ceiling stops collecting partway through (so the middle). One `Bool`
+    /// meant the daemon told the model "the oldest part was dropped and the newest kept"
+    /// for both, pointing it at the wrong end of somebody's screen. Pure, so both sentences
+    /// are pinned by tests rather than by reading the daemon.
+    public static func note(for truncation: FixedCommandTruncation, byteCap: Int) -> String? {
+        switch truncation {
+        case .none:
+            return nil
+        case .oldestDropped:
+            return "[read_session note: that screen was larger than the \(byteCap / 1024) KB this "
+                + "tool returns; the OLDEST part was dropped and the newest kept]"
+        case .stoppedAtCeiling:
+            return "[read_session note: that command printed more than \(byteCap * 8 / 1024) KB and "
+                + "collecting stopped before the end, so these are NOT the last lines of that pane "
+                + "— they are from the middle of what it printed. Ask for fewer lines, or read it "
+                + "again]"
+        }
+    }
+
     // MARK: - Fencing what comes back
 
     // THE PANES THIS TOOL READS ARE UNTRUSTED, and that direction of the risk is not the
@@ -168,14 +231,24 @@ public enum TmuxSessionRead {
 
     /// The frame the model reads. Says which session, and how much of it — a model that
     /// cannot tell a truncated capture from a finished one reports the wrong thing.
-    public static func frameCapture(session: String, lines: Int, output: String) -> String {
+    ///
+    /// `note` (a cut, a byte cap, a read that stopped early) goes in the HEADER, outside
+    /// the fence: inside it, it would be indistinguishable from text the pane printed.
+    public static func frameCapture(
+        session: String,
+        lines: Int,
+        output: String,
+        note: String? = nil
+    ) -> String {
         let body = output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else {
             return "tmux session \"\(session)\" is empty (its current pane has printed nothing "
                 + "that is still on screen)."
         }
         return "tmux session \"\(session)\", last \(lines) lines of its current pane "
-            + "(read-only; you cannot type into it). \(untrustedPreamble)\n"
+            + "(read-only; you cannot type into it). "
+            + (note.map { "\($0) " } ?? "")
+            + "\(untrustedPreamble)\n"
             + fenced(body)
     }
 

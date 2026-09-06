@@ -320,12 +320,24 @@ Installed and rendered; not loaded."
 	# the owner's session on purpose, which this installer will not do.
 	if [ "${FIN_SKIP_TMUX_GUARD_CHECK:-0}" != "1" ]; then
 		PROBE_CMD='env SSH_TTY=/dev/null $SHELL -i -c '\''printf "GUARD LC=%s TMUX=[%s]\n" "$LC_FIN_AGENT" "$TMUX"'\'''
+		# THE EXIT STATUS IS CAPTURED, NOT BRANCHED ON. `|| die "loopback SSH failed"` here
+		# made the most important case unreachable: when the login shell has NO
+		# LC_FIN_AGENT exclusion it exec's tmux, tmux exits 1 for want of a terminal, ssh
+		# propagates that 1 — and the operator was told "Remote Login off? key not
+		# authorized?" about a working SSH and a broken config.fish. ssh uses 255 for its
+		# OWN failures and passes the remote command's status through otherwise, so that is
+		# what separates the two.
+		set +e
 		PROBE="$(LC_FIN_AGENT=1 perl -e 'alarm shift; exec @ARGV' 30 \
 			ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
 			-o ConnectTimeout=5 -o SendEnv=LC_FIN_AGENT -o StrictHostKeyChecking=accept-new \
-			"$(id -un)@127.0.0.1" "$PROBE_CMD" </dev/null 2>&1)" \
-			|| die "loopback SSH with the site key failed: ${PROBE:-no output}
+			"$(id -un)@127.0.0.1" "$PROBE_CMD" </dev/null 2>&1)"
+		PROBE_STATUS=$?
+		set -e
+		if [ "$PROBE_STATUS" = 255 ]; then
+			die "loopback SSH with the site key failed (ssh exit 255): ${PROBE:-no output}
 Remote Login on? key authorized? Installed and rendered; not loaded."
+		fi
 		case "$PROBE" in
 			*"GUARD LC=1 TMUX=[]"*) echo "guard: ${PROBE#*GUARD }" ;;
 			*"GUARD LC=1 TMUX=["*) die "the login shell put an INTERACTIVE session inside tmux even
@@ -335,9 +347,10 @@ the owner's live tmux session. Restore the LC_FIN_AGENT exclusion in ~/.config/f
 Installed and rendered; not loaded." ;;
 			*"GUARD LC="*) die "the LC_FIN_AGENT marker did not cross the SSH boundary
 (${PROBE#*GUARD }) — check sshd's AcceptEnv. Installed and rendered; not loaded." ;;
-			*) die "the interactive login shell never answered the probe: ${PROBE:-no output}
+			*) die "the interactive login shell never answered the probe (exit $PROBE_STATUS): ${PROBE:-no output}
 That is what an auto-attach looks like from here — the shell exec'd tmux instead of running the
-probe (with no PTY, tmux then failed with 'not a terminal', so nothing was attached).
+probe (with no PTY, tmux then failed with 'not a terminal', so nothing was attached, and its
+exit status is the one above).
 Restore the LC_FIN_AGENT exclusion in ~/.config/fish/config.fish.
 Installed and rendered; not loaded." ;;
 		esac
