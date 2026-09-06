@@ -11,7 +11,7 @@ sources:
   - evals/tmux-routing/RESULTS.md:25-27 (36/51 round 0 vs 49/51 round 3, same model)
   - 6b1c95f (12:17, the 36/51 run) vs 22005c7 (12:38, first edit to router.md)
   - evals/tmux-routing/router_llm.py — _prompt_block() reads prompts/router.md at call time
-  - scripts/model-factory/eval_gate.py:110-112 (the rule); d9100b6 gate_sweep.sh:13-17 (the repo's own diagnosis)
+  - scripts/model-factory/eval_gate.py:110-112 (the rule); d9100b6 gate_sweep.sh:14-17 (the repo's own diagnosis; line 13 is step 0, the memory guard)
 related: [P001, P004, E001, O003, O005]
 corrects: []
 superseded-by: null
@@ -45,9 +45,13 @@ fields stored in `evals-champions.json` **cannot have been printed by the
 harness at the time of that run** — they are a post-hoc re-partition of the same
 51 results.
 
-The re-partition is legitimate, and that is checkable: diffing the two revisions
-of `scenarios.json` shows identical scenario ids, queries, `expected` objects and
-registry/live context, with only `hard` flags and `note` fields added; and
+The re-partition is legitimate, and that is checkable: comparing the two
+revisions of `scenarios.json` scenario-by-scenario shows 51 scenarios on both
+sides, identical id sets, and **`hard` as the only key whose value differs
+anywhere** — ids, queries, `expected` objects, registry/live context and `note`
+are all byte-identical, so `2234284`'s +509/−56 is reformatting plus the flags.
+(An earlier version of this sentence said "`hard` flags and `note` fields
+added"; the `note` fields were already there at `6b1c95f`.) And
 E001's round-0 miss list splits 5-core / 10-hard, exactly as recorded. The
 overall 36/51 is untouched by any of this. The record is a re-partition, not a
 re-measurement, and nothing in the file says so.
@@ -82,7 +86,7 @@ credited to the fine-tune.
 ## Status: diagnosed, not fixed
 
 This is the repo's own finding, not an outside audit. `gate_sweep.sh`'s header
-(`d9100b6`, 2026-09-06 08:05) states it:
+(`d9100b6`, 2026-09-06 08:05), lines 14-17, states it:
 
 > *"RE-RECORD THE CHAMPION. evals-champions.json still holds 36/51, which was
 > measured with the round-0 router prompt; the kept round-3 prompt scores 49/51

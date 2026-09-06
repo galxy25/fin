@@ -10,12 +10,18 @@
 The live fine-tune reads `--data datasets/mlx`
 (`models/candidates/fin-foreman-e4b-mlx/launch-train.sh:13`), a directory
 containing `train.jsonl` and `valid.jsonl`. **No committed script produces
-it**: `git grep 'datasets/mlx'` exits 1 with no output. (A plain `grep -rn` over
-the working tree does return two hits, both inside gitignored `models/` — that
-same `launch-train.sh:13` and `adapter_config.json:6` — which are the run's own
-record of the path, not a script that builds it. An earlier draft of this entry
-said the grep returned nothing outside `datasets/`, three lines after quoting
-one of the two hits.) Can the split be recovered from the artifacts alone, so
+it**: `git grep 'datasets/mlx' main` exits 1 with no output, and so does
+`git grep 'datasets/mlx' -- ':(exclude)docs/labbook'
+':(exclude)scripts/model-factory/labbook'` on this branch. Both qualifiers are
+load-bearing. A bare `git grep 'datasets/mlx'` on branch `labbook` exits **0**
+with 24 hits — every one of them a lab-book entry discussing this very fact,
+including this sentence — because writing the book created the references. And
+a plain `grep -rn` over the working tree returns two more, both inside
+gitignored `models/`: that same `launch-train.sh:13` and `adapter_config.json:6`,
+which are the run's own record of the path, not a script that builds it. (An
+earlier draft said the grep returned nothing outside `datasets/`, three lines
+after quoting one of the two hits; its correction said "exits 1 with no output",
+which was true only at `main`.) Can the split be recovered from the artifacts alone, so
 the run is reproducible?
 
 ## Method

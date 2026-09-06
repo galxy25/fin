@@ -31,6 +31,7 @@ directory". Cite across books by path.
 | [O005](year-1/O005-2026-09-06-no-provenance-in-verdicts.md) | 2026-09-06 | OBSERVATION | Nothing in the factory records provenance — no prompt hash, no corpus commit, no dataset manifest | standing |
 | [O006](year-1/O006-2026-09-06-ledger-trained-not-gated.md) | 2026-09-06 | OBSERVATION | A third of the corpus teaches goals-ledger, which nothing gates | standing |
 | [O007](year-1/O007-2026-09-06-labels-are-baseline-output.md) | 2026-09-06 | OBSERVATION | Every routing and ledger label is deterministic-baseline output, and the filter meant to validate them rejected nothing | standing |
+| [O008](year-1/O008-2026-09-06-append-only-broken-on-day-one.md) | 2026-09-06 | OBSERVATION | The append-only rule was broken on day one, by the audit passes that were fixing the book | standing |
 | [H001](year-1/H001-2026-09-06-bits-per-example.md) | 2026-09-06 | HYPOTHESIS | Bits per example is the right currency for a training curriculum | untested |
 | [H002](year-1/H002-2026-09-06-high-information-subset.md) | 2026-09-06 | HYPOTHESIS | A small high-information subset reaches the same gate score in materially fewer iterations | untested |
 | [H003](year-1/H003-2026-09-06-best-checkpoint-not-last.md) | 2026-09-06 | HYPOTHESIS | The best checkpoint is not the last one | untested |
@@ -48,4 +49,4 @@ directory". Cite across books by path.
 
 ## Next free ids
 
-`E006` · `O008` · `H005` · `P005`
+`E006` · `O009` · `H005` · `P005`

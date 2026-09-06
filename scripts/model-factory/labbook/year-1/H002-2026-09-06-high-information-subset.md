@@ -7,7 +7,7 @@ title: A small high-information subset reaches the same gate score in materially
 status: untested
 tags: [curriculum, bits, cost, training]
 sources:
-  - "H001's corpus measurements: xz -9e = 196 bits/example; generator source = 172 bits/example; H(Y) = 8.585 bits/example"
+  - "H001's corpus measurements: xz -9e = 196 bits/example; generating program (six files, 85,536 B) = 290 bits/example; H(Y) = 8.585 bits/example. An earlier version of this line said 172 bits/example for the generator — that is gen_training_data.py alone (50,743 B), the single-file estimate H001 explicitly withdraws, and it contradicted this entry's own body."
   - "local-artifact: train.log — val loss 0.013 nats at iteration 1000, never meaningfully lower through 3500"
   - "local-artifact: checkpoint mtimes (15 files, 0000250 at 2026-09-05 21:16:46 … 0003750 at 2026-09-06 11:21:20) — 60.3 min per 250 iterations over the 14 checkpoint-to-checkpoint intervals; 60.4 over the 15 spans that also count train start (20:15:29 → 0000250)"
   - "memory note training-bits-per-example — 'Standing goal: fewest iterations for equal gate score'"
@@ -54,9 +54,16 @@ Both are stated so the denominator is never ambiguous:
 
 | iterations | wall clock | fraction of run 1 |
 | --- | --- | --- |
-| 4,490 (run 1, 2 epochs) | ≈18.2 h | 100% |
+| 4,490 (run 1, 2 epochs) | **≈18.1 h** | 100% |
 | 2,245 (1 epoch) | ≈9.0 h | 50% |
 | 1,000 | ≈4.0 h | 22% |
+
+All three rows are `iterations ÷ 250 × 60.4 min`. An earlier version of this
+table put the top row at ≈18.2 h while computing the other two at 60.3-60.4;
+18.2 h implies 60.8 min per 250, above every mean stated above it. E004 carries
+the same correction and the later recomputation at the 16th checkpoint, which
+does reach 18.16 h — the honest reading being that 18.1 h is what these mtimes
+gave, and the run then slowed.
 
 If the hypothesis holds at 1,000 iterations, an experiment cycle drops from a
 day to an afternoon — which changes what the factory can do far more than any

@@ -48,11 +48,16 @@ false and should be marked `refuted`. Noise here is not small: the hard tier is
 un-repeated run, so **a drop of ≤2 hard scenarios counts as B, not as A** — the
 same threshold H003 sets for itself.
 
+The three outcomes partition 0-25 with no overlap. An earlier version of this
+table defined B as "holds within 2 scenarios of 24/25", which also covered 25/25
+and so put the single most interesting non-null result in both B and C at once;
+B is bounded **below** 24/25 only.
+
 | outcome | hard tier | reading |
 | --- | --- | --- |
-| **A — distillation dominates** | falls ≥3 scenarios below 24/25 | the fine-tune taught the model to be the baseline. The corpus is the problem, not the recipe. |
-| **B — format-only transfer** *(the refutation)* | holds within 2 scenarios of 24/25 | the base's own reasoning survives; the fine-tune moved output format and easy-case reliability without displacing judgment. The corpus is harmless but weak, and **this hypothesis is wrong**. |
-| **C — improvement** | above 24/25 | something is teaching judgment the labels do not contain. **Look for a confound first**: the stale champion (O002), a prompt change between training and scoring (O003), or a serving difference (P004). |
+| **A — distillation dominates** | ≤ 21/25 (falls ≥3 scenarios below 24/25) | the fine-tune taught the model to be the baseline. The corpus is the problem, not the recipe. |
+| **B — format-only transfer** *(the refutation)* | 22/25, 23/25 or 24/25 — holds within 2 scenarios **below** 24/25 | the base's own reasoning survives; the fine-tune moved output format and easy-case reliability without displacing judgment. The corpus is harmless but weak, and **this hypothesis is wrong**. |
+| **C — improvement** | 25/25 (above 24/25) | something is teaching judgment the labels do not contain. **Look for a confound first**: the stale champion (O002), a prompt change between training and scoring (O003), or a serving difference (P004). |
 
 The interesting result is not which of A/B/C happens, it is *how far*. That
 number tells the factory how much a corpus's label quality actually propagates

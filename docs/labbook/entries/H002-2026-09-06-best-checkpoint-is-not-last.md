@@ -23,12 +23,17 @@ Three independent reasons, each with an artifact.
    over iteration 1,000 — and since the validation split is in-distribution,
    there never was a signal about generalization in it at all.
 
-2. **Continued training on a memorizable corpus is continued memorization.**
-   The corpus has zero conditional entropy and ~180 bits/example of
-   description length against 6.9M trainable parameters
-   ([E004](E004-2026-09-06-bits-per-example.md)). Past the point where the
-   templates are fit, further iterations sharpen template-matching, which is
-   the behavior the adversarial tier is specifically built to punish.
+2. **Continued training on a memorizable corpus has nothing left to average
+   out.** The corpus has zero conditional entropy and 196-290 bits/example of
+   description length — 196 by `xz -9e`, 290 by the six-file generating program
+   — against 6.9M trainable parameters
+   ([E004](E004-2026-09-06-bits-per-example.md)). (An earlier draft of this
+   line said "~180 bits/example", a figure E004 withdrew; see E004's section 3.)
+   Zero label noise means further iterations cannot be denoising the labels,
+   because there is no label noise to denoise. What they *are* doing is not
+   established here: sharpening template-matching is the mechanism this entry
+   assumes, and it is an assumption, not a measurement — the sweep below is
+   what would test it.
 
 3. **The tail of the run is unstable.** Training loss rose from a ~0.008 floor
    to 0.193 / 0.183 / 0.322 at iterations 3,625–3,675
@@ -37,10 +42,15 @@ Three independent reasons, each with an artifact.
    curve rather than a settled one.
 
 This is already the operating assumption of `gate_sweep.sh` (its header,
-lines 7-10: "the LAST checkpoint is not automatically the best one … Loss
-cannot tell those apart; the gate can"). This entry states it as a
-falsifiable prediction with a shape, so the sweep either confirms it or does
-not.
+lines 7-10 at `d9100b6`: "the LAST checkpoint is not automatically the best
+one … Loss cannot tell those apart; the gate can"). **That script is not on
+this branch.** `git branch --contains d9100b6` returns `imac-site` only, and
+`git cat-file -e labbook:scripts/model-factory/gate_sweep.sh` fails with "does
+not exist in 'labbook'" — so every `gate_sweep.sh` line number in this entry is
+against `d9100b6` on `imac-site`, and the command below cannot be run from a
+`labbook` or `main` checkout. This entry states the claim as a falsifiable
+prediction with a shape, so the sweep — once the script is on a branch where
+it can run — either confirms it or does not.
 
 ## Prediction, stated so it can be wrong
 
@@ -62,13 +72,16 @@ been a tenth as long, and the next one should be.
 ## The test
 
 ```sh
+# on a checkout of imac-site (see above — the script is not on main or labbook),
 # after the fine-tune ends, LM Studio serving the champion on :1234
 scripts/model-factory/gate_sweep.sh 1000 2250 3500 final
 ```
 
 It stages, fuses, serves and scores each checkpoint one at a time, deleting
 each ~5 GB fused model afterwards, and writes `models/gate-sweep/results.tsv`.
-That directory does not exist yet — **the sweep has never been run**.
+Two things are missing, not one: the script is absent from this branch, and
+`models/gate-sweep/` does not exist on disk — **the sweep has never been
+run**.
 
 Note the sweep skips iteration 250–750 and 2,500–3,250 checkpoints by
 default. If prediction 1 holds with a peak at 1,000, the interesting

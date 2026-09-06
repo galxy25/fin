@@ -45,12 +45,31 @@ quantities:
 | `learned_bits` | `bits_base − bits_tuned` | the run actually acquired this information from this example |
 | `residual_bits` | `bits_tuned` | genuinely hard **or mislabeled** — and on a synthesized corpus, mislabeled is the likelier cause, which makes it a bug in `gen_training_data.py`, not a hard case |
 
-**A corpus-level `bits_base` is already on record and cost nothing.** Run 1's
-first validation runs before any gradient step, so its 2.463 nats = **3.553
-bits per answer token** is the untuned base's surprise on the held-out split.
-Against a val loss of 0.012 nats (0.017 bits) at iteration 3500, whole-corpus
-`learned_bits` ≈ **3.536 bits/token**. Every future run gets the same
-measurement free in its first log line.
+**One `bits_base` reading is already on record and cost nothing — but state
+its denominator.** Run 1's first validation runs before any gradient step, so
+its 2.463 nats = **3.553 bits per answer token** is the untuned base's surprise
+on a validation pass. Against a val loss of 0.012 nats (0.017 bits) at
+iteration 3500, the difference is ≈**3.536 bits/token**.
+
+The denominator, which an earlier version of this paragraph omitted while
+calling the figure "corpus-level" and the difference "whole-corpus
+`learned_bits`":
+
+- The run passes `--val-batches 25`, so **one validation pass covers 25 of the
+  118 rows in `valid.jsonl` (21%)** — roughly 870 answer tokens, not 2,363
+  examples and not even the whole split (E004, O001:60-61).
+- The two endpoints are **different 25-row draws**. `evaluate()` calls
+  `iterate_batches` with no `seed=` (`trainer.py:195-200`), so the iteration-1
+  and iteration-3500 passes do not see the same rows, and 3.553 − 0.017 is a
+  difference of two independent small samples.
+- There is **no variance estimate**. One pass each, never repeated.
+
+So the honest reading is "the untuned base is surprised by a few bits per
+answer token and the tuned model is not", not "3.536". The hypothesis below
+does not depend on the third decimal — it depends on the *distribution* of
+per-example bits, which is exactly what this free measurement cannot give and
+what the scoring pass in "The measurement" is for. Every future run gets the
+same 21%-of-the-split reading free in its first log line, with the same caveat.
 
 ## Why this corpus in particular
 
@@ -137,9 +156,13 @@ The README requires this section and the first draft of this entry did not have
 one, which made the claim a value judgement rather than a hypothesis. Stated so
 it can lose:
 
-- **`bits_base` is not concentrated.** If the `learned_bits` distribution over
-  the 2,245 training rows is close to uniform — say the top decile carries less
-  than 25% of the total, against the ~50%+ that "concentrated" implies — then
+- **`learned_bits` is not concentrated.** (Earlier drafts headed this bullet
+  `bits_base`, which is a different quantity in the table above —
+  `learned_bits` is `bits_base − bits_tuned`. The test described was always the
+  `learned_bits` one; only the heading was wrong.) If the `learned_bits`
+  distribution over the 2,245 training rows is close to uniform — say the top
+  decile carries less than 25% of the total, against the ~50%+ that
+  "concentrated" implies — then
   ranking by bits gives no useful ordering and there is nothing to select on.
   This is the primary refutation and it is measurable from a single scoring pass,
   before any training run.

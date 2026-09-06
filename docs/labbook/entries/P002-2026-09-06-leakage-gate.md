@@ -22,7 +22,9 @@ itself**. `build_dataset.py` (`a823271`, 2026-09-05 13:03) emits one training
 example per eval scenario, building the system message from the eval
 adapter's own `_system_prompt` and the assistant message from the scenario's
 `expected` label. Its own docstring flags this as a stopgap in capitals
-(lines 32-38):
+(`scripts/model-factory/build_dataset.py:29-33` at main `704ab09`; an earlier
+draft of this entry said "lines 32-38", which covers only the last two lines of
+the quote and then four lines of the unrelated `Usage:` block at 35-39):
 
 > LEAKAGE WARNING […] the eval corpus is the promotion gate, so its literal
 > scenarios must be HELD OUT of any real training run. This builder emits them
@@ -102,7 +104,8 @@ file, `gen_training_data.py`, 1,110 lines. That original self-test is
 | uppercased, punctuation-stripped, `" !!"` appended | 71 | **71 near**, 0 missed |
 
 ```sh
-cd /Users/deepspacenine/forges/levi/fin-wt-labbook
+# from any checkout of main @ 704ab09 — e.g.
+#   git worktree add ../fin-wt-leakcheck 704ab09 && cd ../fin-wt-leakcheck
 python3 -c "
 import importlib.util,sys
 spec=importlib.util.spec_from_file_location('g','scripts/model-factory/gen_training_data.py')

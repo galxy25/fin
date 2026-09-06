@@ -7,7 +7,7 @@ title: Base-model selection — gemma-3-4b chosen, smoke-trained, and dropped fo
 status: closed
 tags: [base-model, negative-result, mlx]
 sources:
-  - "transcript 96d4ea32-4134-4277-824b-975f32754df7.jsonl @ 2026-09-06T03:06:27.301Z = 2026-09-05 20:06:27 PDT — Levi, verbatim"
+  - "local-artifact: ~/.claude/projects/-Users-deepspacenine-forges-levi-fin/96d4ea32-4134-4277-824b-975f32754df7.jsonl @ 2026-09-06T03:06:27.301Z = 2026-09-05 20:06:27 PDT — Levi, verbatim. A Claude Code session transcript: outside the repo, not in git, append-only but deletable, and not one of the artifact classes the README tabulates. The quote below is reproduced verbatim for that reason."
   - "~/.cache/huggingface/hub/.locks/models--mlx-community--gemma-3-4b-it-4bit/ — 14 zero-byte locks, all mtime 2026-09-05 19:28 (the blobs are gone)"
   - "~/.cache/huggingface/hub/.locks/models--mlx-community--gemma-4-E4B-it-qat-4bit/ — mtime 2026-09-05 20:06"
   - "local-artifact: models/candidates/fin-foreman-e4b-mlx/launch-train.sh (header states the reason)"
@@ -39,6 +39,14 @@ It was undone by one question from Levi: *"why gemma 3 and not gemma 4?"*
 followed at **2026-09-05 20:06:27 PDT** by:
 
 > *"good and cleanup the gemma3 model, that was so last year"*
+
+Both quotes are from the session transcript named in the front matter, which
+lives at
+`~/.claude/projects/-Users-deepspacenine-forges-levi-fin/96d4ea32-4134-4277-824b-975f32754df7.jsonl`
+— outside the repo and outside git. They are quoted verbatim rather than
+paraphrased because the file is the only record and may not outlive the entry;
+that is the same `local-artifact` treatment the README prescribes for
+gitignored sources, and the same one E003's memory notes get.
 
 ## The reason the replacement is right
 

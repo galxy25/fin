@@ -143,7 +143,25 @@ correction to that note.
 And a correction to this entry's own first draft, which committed the same
 class of error twice: it opened with "after 1,500 iterations below 0.02" (the
 real stretch is ~500) and headlined a 161× ratio off the run's single lowest
-report while criticising the note for compressing those same two endpoints. Both
-are corrected above. The entry is kept rather than rewritten around the mistake
-because the mistake is instructive: a ratio is a claim about its denominator,
-and picking the extreme one is how a real anomaly gets oversold.
+report while criticising the note for compressing those same two endpoints. The
+mistake is instructive and is worth keeping legible: a ratio is a claim about
+its denominator, and picking the extreme one is how a real anomaly gets
+oversold.
+
+**This entry was rewritten in place, and an earlier version of this paragraph
+denied it.** That sentence read *"The entry is kept rather than rewritten around
+the mistake"*, which `git diff a02cec3 cdb895a --
+scripts/model-factory/labbook/year-1/O004-2026-09-06-late-run-loss-excursion.md`
+refutes on its face: the title changed from *"A 160x training-loss excursion in
+epoch 2…"* to the present one, the opening sentence was rewritten from *"After
+1,500 iterations below 0.02, run 1's training loss rose by more than two orders
+of magnitude"* to *"After a quiet stretch … more than an order of magnitude"*,
+and `INDEX.md`'s row was edited to match. The wrong number was **deleted**, not
+struck through; it survives here only as the corrector's paraphrase two
+paragraphs up — which is exactly the loss the README's rule
+(*"The wrong number staying visible is what makes the correction readable"*)
+exists to prevent. The rewrite happened during the book's first-day authoring
+pass, when the whole book was still a draft; the general case is recorded in
+O008, which also says when the append-only rule starts binding. Claiming the
+rule had been followed when it had not is the part that was not defensible, and
+it is corrected here rather than removed.

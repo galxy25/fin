@@ -7,7 +7,7 @@ title: The best checkpoint is not the last one
 status: untested
 tags: [checkpoints, gate, memorization, promotion]
 sources:
-  - d9100b6 — gate_sweep.sh:6-10, which states this claim in the repo
+  - d9100b6 — gate_sweep.sh:7-10, which states this claim in the repo (line 6 is a bare `#`)
   - "local-artifact: models/candidates/fin-foreman-e4b-mlx/ — 15 checkpoints at 250-iteration granularity, 27,683,964 B each"
   - "local-artifact: train.log — val loss flat 0.005-0.028 from iteration 1000; first Train loss 0.000 at iteration 2675"
   - evals/tmux-routing/scenarios.json — 25 hard scenarios (parsed today)
@@ -22,7 +22,8 @@ superseded-by: null
 hard tier than the final one, because later checkpoints trade generalization
 for template memorization.**
 
-Stated in the repo first, in `gate_sweep.sh:6-10` (`d9100b6`):
+Stated in the repo first, in `gate_sweep.sh:7-10` (`d9100b6`; that script is
+on the `imac-site` line of history and not on `main` or `labbook` — P004:21-24):
 
 > *"the 2026-09-06 run reached train loss 0.000 by iteration ~2900 on
 > programmatically synthesized data, so later checkpoints memorize templates
@@ -35,8 +36,23 @@ Stated in the repo first, in `gate_sweep.sh:6-10` (`d9100b6`):
   0.000 at 2675 (O001). Everything after that is optimization pressure on a
   distribution the model already fits exactly.
 - The corpus has zero conditional entropy (H001), so continued training cannot
-  be averaging out label noise — there is none. It can only be sharpening the
-  model's commitment to template surface forms.
+  be averaging out label noise — there is none. **What it is doing instead is
+  not established.** An earlier version of this bullet concluded "it can only be
+  sharpening the model's commitment to template surface forms", which claims an
+  enumeration this entry never made. Ruling out denoising leaves at least four
+  live candidates, and nothing here separates them:
+
+  | candidate | why it is not ruled out |
+  | --- | --- |
+  | sharpening commitment to template surface forms | the mechanism this hypothesis assumes; it predicts the hard-tier decline below |
+  | almost nothing measurable | 59 of the 162 reports in `train.log` are ≤0.010 and two are exactly 0.000; near-zero gradients move near-zero weight |
+  | drift in the 6.9M LoRA parameters uncorrelated with surface form | no per-parameter or per-example logging exists for this run (O005) |
+  | changes in calibration or format confidence rather than in the decision | the gate scores exact-match decisions and would not see this at all |
+
+  Sharpening is the mechanism this hypothesis *rests on*, so it is stated as an
+  assumption, not deduced. If the prediction below holds, that is evidence for
+  it; if hard score is flat, the second row is the likeliest explanation and
+  this hypothesis is not merely unsupported but pointing at the wrong quantity.
 - The hard tier is, by construction, everything the templates are not:
   paraphrase with zero vocabulary overlap, voice-transcription damage,
   multi-clause misdirection, ordinary words that collide with session names

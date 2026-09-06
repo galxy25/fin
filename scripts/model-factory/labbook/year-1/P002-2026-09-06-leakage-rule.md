@@ -10,7 +10,7 @@ sources:
   - a823271 — dataset scaffold; scripts/model-factory/build_dataset.py:29-33 (its own capitalised LEAKAGE WARNING)
   - 8aa690c — "Model factory: synthesize held-out SFT data for the foreman fine-tune" (2026-09-05 19:26)
   - scripts/model-factory/gen_training_data.py:86 (JACCARD_NEAR), :946-958 (_load_eval_inputs), :960-979 (_leak_verdict), :1068-1071 (the assertion)
-  - main:scripts/model-factory/README.md:167-171 (on branch labbook this is 189-193 — see the line-anchor note in O005)
+  - main:scripts/model-factory/README.md:167-171 (on branch labbook: 198-202; verify with `grep -n '^\*\*Leakage rule:\*\*' scripts/model-factory/README.md` — see the line-anchor note in O005)
   - "local-artifact: datasets/sft-2026-09-05.jsonl (51 lines) — the seed build that violates the rule"
 related: [P001, O007, H004]
 corrects: []
@@ -24,7 +24,7 @@ Its literal scenarios are therefore **held out**: they never appear in
 `train.jsonl` or `valid.jsonl`. Train on generated variants and on telemetry;
 score on the untouched corpus.
 
-`scripts/model-factory/README.md:167-171` (on `main`) states it in one line worth keeping:
+`main:scripts/model-factory/README.md:167-171` (branch `labbook`: 198-202) states it in one line worth keeping:
 *"A gate that measures memorization measures nothing."*
 
 The adversarial hard tier is held out for a second reason on top of the first:
@@ -75,7 +75,7 @@ that check whenever `_normalize` or `JACCARD_NEAR` changes.
 
 Zero drops in the real build is explainable, not suspicious: the generator's
 vocabulary is disjoint from the eval registry by construction — **16 invented
-domains** (`DOMAINS`, `gen_training_data.py:138-153`: orchard, ledgerbook,
+domains** (`DOMAINS`, `gen_training_data.py:138-155`: orchard, ledgerbook,
 trailhead, …) and 10 invented unregistered names (`UNREG_NAMES`: sandbox,
 staging, playground, …) against the eval registry's `fin` / `pocketdj` /
 `africanintellect` and its live-but-unregistered `main` / `scratch` / `deploy` /

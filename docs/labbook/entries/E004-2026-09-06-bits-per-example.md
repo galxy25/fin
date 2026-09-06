@@ -71,7 +71,7 @@ memorize exactly.
 | `xz -9e` | 58,020 B | **196** |
 | the generating program's source | 85,536 B | **290** |
 
-The second row is the whole program, not one file. `gen_training_data.py` is
+The fourth row is the whole program, not one file. `gen_training_data.py` is
 50,743 B, but it loads `router_baseline.decide` and `policy_baseline.decide` to
 label every routing and ledger row and `router_llm._system_prompt`, which reads
 `prompts/router.md` at generation time. At `main`: router_baseline.py 5,693 +
@@ -94,9 +94,20 @@ The run trains with `--mask-prompt` (`launch-train.sh:15`), so only assistant
 tokens carry gradient. From `train.log`, `Trained Tokens 121200` at iteration
 3,500 → **34.6 gradient-bearing tokens per iteration**. Assistant strings
 average 115.5 characters (median 117, min 53, max 177), ≈29 tokens by a
-chars/4 estimate — consistent with **one example per iteration**, and
-inconsistent with two (which would require 17.3 tokens per label, below even
-the shortest one). So `--iters 4490` over a 2,245-row train split is exactly
+chars/4 estimate — consistent with **one example per iteration**. An earlier
+draft ruled out two examples per iteration by claiming 17.3 tokens per label
+was "below even the shortest one"; that argument is withdrawn, because the
+shortest assistant string in the corpus is 53 characters — `{"tool":
+"read_terminal", "arguments": {"lines": 80}}` — which is ≈13.3 tokens at the
+same chars/4 rate, comfortably *below* 17.3. The honest form of the check is
+the mean, not the minimum: 17.3 tokens is 60% of the 29-token average label, so
+two-per-iteration would require the sampler to have drawn systematically short
+labels for 3,500 consecutive iterations. The conclusion is settled
+independently anyway, from the trainer rather than from token arithmetic:
+`mlx_lm/tuner/trainer.py:273-282` zips `range(1, args.iters + 1)` against
+`iterate_batches(batch_size=args.batch_size)` with `--batch-size 1`, so one
+iteration is exactly one example. So `--iters 4490` over a 2,245-row train
+split is exactly
 **2.00 epochs**, and the full run will apply gradient to roughly 155,000
 tokens.
 
@@ -111,15 +122,20 @@ Three numbers, three different honest answers to "bits per example":
 
 - **8.6 bits** — what the model must emit that it could not have guessed from
   the label prior alone.
-- **~180 bits** — the corpus's description length per example, i.e. the size
-  of the program that would regenerate it.
+- **196-290 bits** — the corpus's description length per example: 196 by
+  `xz -9e` (58,020 B ÷ 2,363 rows) and 290 by the size of the program that
+  actually regenerates it (85,536 B, six files — section 3). An earlier draft
+  of this section said "~180 bits", which was the midpoint of a withdrawn
+  pairing that counted `gen_training_data.py` alone (50,743 B = 172 bits);
+  section 3 replaced it and this summary had not followed.
 - **0 bits** — the *residual* uncertainty in a label once the input is known.
 
 The third is the important one. A corpus with zero conditional entropy has a
 perfectly attainable training loss of zero, which is exactly what the run
 shows ([O002](O002-2026-09-06-validation-split-in-distribution.md)), and a
 loss of zero on such a corpus proves nothing about the decision rules — only
-that 50 KB of templates fit inside 6.9M LoRA parameters
+that ~86 KB of generator source (85,536 B, section 3) fits inside 6.9M LoRA
+parameters
 (`train.log:6`: "Trainable parameters: 0.093% (6.914M/7463.013M)").
 
 The lever this suggests: the corpus's information content is bounded by its

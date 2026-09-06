@@ -5,6 +5,18 @@
 - **Corrections:** corrects a figure in `d9100b6`'s commit message (below)
 - **Superseded-by:** —
 
+**On the title.** "the loss curve measures memorization" is stronger than
+anything measured here, and the title is kept only because ids and filenames in
+this book are never renamed. What the observation below actually establishes is
+that the validation split is in-distribution, so the loss curve shows the model
+**fits the corpus's distribution** and is *silent* on which mechanism produced
+that fit. Loss cannot separate "memorized these 2,245 rows", "learned the 65
+templates" and "learned the decision rules" — they score identically on an
+in-distribution split, which is the point of the section below. Asserting the
+memorization branch specifically is an inference, not an observation; the thing
+that would settle it is the adversarial hard tier, not the loss curve
+([H001](H001-2026-09-06-hard-tier-regression.md)).
+
 ## What was noticed
 
 `datasets/mlx/valid.jsonl` is 118 rows drawn by a seeded shuffle from the same

@@ -10,7 +10,7 @@ sources:
   - "local-artifact: models/candidates/fin-foreman-e4b-mlx/launch-train.sh (the exact argv)"
   - "local-artifact: models/candidates/fin-foreman-e4b-mlx/train.log:1 — '=== TRAIN START 2026-09-05 20:15:29 pid 18405 base=mlx-community/gemma-4-E4B-it-qat-4bit ==='"
   - "local-artifact: models/candidates/fin-foreman-e4b-mlx/adapter_config.json (written by mlx-lm at launch)"
-  - scripts/model-factory/.venv/lib/python3.11/site-packages/mlx_lm/tuner/trainer.py:110-142, :247-262, :271-286
+  - "scripts/model-factory/.venv/lib/python3.11/site-packages/mlx_lm/tuner/trainer.py:110-142, :195-200, :247-262, :273-282 (the training loop — `for it, batch in zip(` at 273, the closing `):` at 282), :284-286"
   - "shasum -a 256 datasets/mlx/train.jsonl → 4aa180a204d61e2f87f0ddcbfab70fb50067452d071751294079701c03c00adb (2,245 lines)"
   - 8aa690c — the corpus commit (2026-09-05 19:26)
 related: [E003, O001, O004, P004, H003]
@@ -58,7 +58,7 @@ exec caffeinate -i scripts/model-factory/.venv/bin/python -m mlx_lm lora \
 
 ### What the flags actually mean (read from the installed trainer, not assumed)
 
-- **1 iteration = 1 batch = 1 example.** `trainer.py:271-280` zips
+- **1 iteration = 1 batch = 1 example.** `trainer.py:273-282` zips
   `range(1, args.iters+1)` with `iterate_batches(..., batch_size=1)`. So
   **4490 iterations over 2,245 rows is exactly 2.00 epochs**, and epoch 2
   begins at iteration 2246.
@@ -126,8 +126,17 @@ the installed trainer: **the first validation runs before any gradient step**
 (`trainer.py:284-286`, "the first validation loss is always measured before any
 training"), and each pass covers **25 of the 118 valid rows (21%)**, redrawn
 from the permuted batch order. So **2.463 nats = 3.553 bits per answer token is
-the untuned base's surprise on this corpus**, measured for free — the corpus
-level `bits_base` of H001, already on record.
+the untuned base's surprise on a 25-row draw from the 118-row validation
+split**, measured for free.
+
+State the denominator every time this number is used, because it is small: one
+validation pass is ~25 rows and ~870 answer tokens, not the corpus and not even
+the whole split, and each pass is a *different* draw (`trainer.py:195-200` calls
+`iterate_batches` with no `seed=`). H001 uses this figure as its `bits_base`
+starting point; that is a legitimate use, but "corpus-level" is the wrong word
+for it and an earlier version of this paragraph used it. There is no variance
+estimate — one pass, one draw, never repeated — so the right reading is "the
+base model's surprise is a few bits per answer token", not "3.553".
 
 ### Cost and pace
 
@@ -135,12 +144,35 @@ level `bits_base` of H001, already on record.
 | --- | --- |
 | checkpoints on disk | 15 (`0000250`…`0003750`) + rolling `adapters.safetensors`, **27,683,964 B each** |
 | adapter dtype | 27,683,964 B ÷ 6.914M params ≈ **4.00 bytes/param → fp32** |
-| mean wall clock per 250 iterations | 60.4 min (spread 55.4-68.5) |
+| mean wall clock per 250 iterations | 60.4 min over the 15 spans through `0003750` (spread 55.4-68.5); 60.7 over the 16 spans through `0004000` |
 | It/sec across reports | min 0.055, max 0.118, mean ≈0.072 (≈13.9 s/iter of step time) |
-| average including validation and saves | ≈14.6 s/iter |
+| average including validation and saves | **14.49 s/iter** at the time of writing (54,351 s from train start 20:15:29 to `0003750` at 11:21:20, ÷ 3,750); 14.57 s/iter recomputed at `0004000` (58,289 s ÷ 4,000). An earlier version of this row said ≈14.6, which did not reproduce from the artifacts cited beside it. |
 | validation cost so far | 1,372.98 s = 22.9 min over 8 passes |
 | peak memory | 14.978 GB, flat since iteration 375 (E003) |
-| **projected finish** | **2026-09-06 ≈14:25-14:31 PDT** (DERIVED from checkpoint mtimes; total ≈18.2 h) |
+| **projected finish** | see the note below — **≈14:20 PDT** from the mtimes available when this was written, **≈14:25** after the next checkpoint landed |
+
+**On the projected finish, and how a DERIVED number goes wrong.** The first
+version of this row read *"≈14:25-14:31 PDT (DERIVED from checkpoint mtimes;
+total ≈18.2 h)"*. That did not reproduce from the mtimes it cited. With the 15
+checkpoints then on disk (`0000250` at 2026-09-05 21:16:46 … `0003750` at
+2026-09-06 11:21:20) and train start 20:15:29:
+
+| basis | mean min / 250 iters | 4,490 iters | finish |
+| --- | ---: | ---: | ---: |
+| 14 checkpoint-to-checkpoint intervals (844.6 min) | 60.33 | 18.06 h | 14:18:56 |
+| 15 spans, counting train start → `0000250` | 60.39 | 18.08 h | 14:20:05 |
+| the 5 most recent spans | 59.58 | — | 14:17:42 |
+
+Every route gave ≈14:18-14:20 and ≈18.1 h. 18.2 h implies 60.8 min per 250
+iterations, which was above every mean on record — the figure was rounded up by
+hand and then labelled DERIVED, which is the specific dishonesty rule 2 exists
+to prevent. A label that says DERIVED is a promise that the arithmetic runs.
+
+The run has since written `0004000` at 12:26:58, a 65.6-minute span, and the
+same arithmetic over 16 checkpoints now gives 60.68-60.72 min per 250, **18.16
+h**, finish **14:25:17-14:25:58**. So the original guess landed close — by a
+late slowdown it could not have known about, not by derivation. Both states are
+recorded here because the difference between them is the point.
 
 ## What happens when it finishes
 
@@ -153,8 +185,15 @@ level `bits_base` of H001, already on record.
 
 - **Whether the model learned routing judgment.** The corpus is synthesized
   from template families and the validation split shares them, so the loss
-  curve measures memorization, not generalization (O001). The hard tier of the
-  gate is the only discriminator available.
+  curve shows only that the model **fits the corpus's distribution**; it cannot
+  say which mechanism produced that fit. An earlier version of this bullet said
+  the curve "measures memorization, not generalization (O001)" — O001 says the
+  opposite in terms, and refuses exactly that contrastive claim: loss cannot
+  separate "memorized these rows" from "learned the templates" from "learned
+  the decision rules", because all three score identically on an
+  in-distribution split, and O001 records the 0.005-0.028 nats on 118 unseen
+  rows as mild evidence *against* row-level memorization. The hard tier of the
+  gate is the only discriminator available; the loss curve is silent.
 - **What the ceiling is.** The routing labels are deterministic-baseline output
   (O007), and the baseline scores 3/25 on the hard tier. H004 states the
   prediction that follows.

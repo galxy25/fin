@@ -44,7 +44,9 @@ promoted against the stored 36/51 while being **nine points worse** than the
 untuned base model it is meant to replace. The stale record does not fail
 safe; it fails toward a false promotion.
 
-This is already known and guarded procedurally: `gate_sweep.sh:14-17` refuses
+This is already known and guarded procedurally: `gate_sweep.sh:14-17` at
+`d9100b6` — a commit on the `imac-site` line of history, so the script is not
+in a `labbook` or `main` checkout — refuses
 to let a candidate be judged on the stored number, and
 `models/candidates/fin-foreman-e4b-mlx/fuse-and-gate.md` step 3 is "RE-RECORD
 THE CHAMPION FIRST". Both are runbook text, not enforcement — `eval_gate.py`

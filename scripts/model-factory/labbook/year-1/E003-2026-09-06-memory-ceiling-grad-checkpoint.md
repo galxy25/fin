@@ -37,8 +37,12 @@ E002), on 2026-09-05 evening, differing in three flags.
 | `--max-seq-length` | 3072 | 3072 |
 
 Sequence length was fixed at 3072 for a measured reason, recorded across two
-memory notes. The rule is in `machine-safety-serialized-builds.md:25` — *"(seq
-3072 keeps 100% of examples; 2048 would truncate 38%)"*. The real-tokenizer
+memory notes. The rule is in `machine-safety-serialized-builds.md:24-25`,
+where the sentence wraps — line 24 is *"- Train with `--grad-checkpoint
+--batch-size 1 --grad-accumulation-steps 2` (seq 3072 keeps"* and line 25 is
+*"100% of examples; 2048 would truncate 38%)."* (An earlier version anchored
+the whole parenthetical to `:25`, which holds only its second half.) The
+real-tokenizer
 lengths behind it are in a different note, `foreman-finetune-state.md:22` —
 *"Token lengths (real tokenizer): median 1669, p95 2798, max 2810 →
 `--max-seq-length 3072`"*. Truncating a third of the corpus to save memory
@@ -56,6 +60,8 @@ Against a 24 GB recommended working set: 28 GB is 4 GB past the ceiling;
 14.978 GB is **62% of it**, for a model **1.87× larger** (7.463B vs ~4B) than
 the one that failed.
 
+### Where the 24 GB comes from, and what class of artifact that is
+
 The 24 GB is not a probe this entry ran. It is the figure recorded in
 `machine-safety-serialized-builds.md:15` — *"Metal's max recommended working set
 is only 24 GB of the 32"* — and the command that re-derives it is
@@ -63,6 +69,32 @@ is only 24 GB of the 32"* — and the command that re-derives it is
 GPU-adjacent and so was not run while E004 holds the device. Every memory
 conclusion in this entry and in P003 turns on that one number, so it is worth
 being explicit about which class of artifact it comes from.
+
+**And that class is the weakest one in the book.** "Memory note" means a file
+under `~/.claude/projects/-Users-deepspacenine-forges-levi-fin/memory/` — the
+Claude Code project memory directory, cited throughout this book by bare
+filename. It is worth stating exactly what that citation is worth:
+
+- **Not in any git repository.** `git -C
+  ~/.claude/projects/-Users-deepspacenine-forges-levi-fin/memory rev-parse`
+  returns *"fatal: not a git repository"*, and `git log -- '*machine-safety*'`
+  in this repo returns nothing.
+- **Rewritten in place, with no history.** A number can change between a
+  citation being written and being read, and nothing records that it did.
+- **Outside the repo entirely**, so a reader holding only a clone can resolve
+  none of these citations.
+
+Six entries plus the README lean on these notes (E002, E003, H001, H002, O004,
+P003, and README.md's own provenance section, which cites
+`labbook-and-publishing` as the authority for where this directory lives). They
+are a real artifact class and they are not in the README's durability table.
+Treat them as **`local-artifact`, quoted verbatim** — the same treatment
+gitignored `datasets/` and `models/` files get, and for the same reason: the
+quote may outlive the file. Every memory-note citation in this entry quotes its
+line verbatim for exactly that reason. Ten notes exist in that directory today;
+the ones this book cites are `machine-safety-serialized-builds`,
+`foreman-finetune-state`, `training-bits-per-example`,
+`scaling-and-curriculum-hypotheses` and `labbook-and-publishing`.
 
 The live run's peak memory takes exactly three values across the whole run and
 has not moved since iteration 375:

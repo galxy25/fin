@@ -24,17 +24,31 @@ Run the generator with output redirected outside `datasets/` (the live
 training run is reading that directory), once from each of two repo states,
 and compare sha256 against the artifact:
 
+The commands below are written against *revisions*, not against the throwaway
+worktrees this was actually run in. That is deliberate: the run used
+`/Users/deepspacenine/forges/levi/fin-wt-labbook` and wrote its output under
+`/tmp/scratch/`, and neither will exist a year from now — the sibling book's
+P003:111 states the rule ("**Nothing under `/tmp`.** Worktrees, venvs and
+training artifacts live under the repo or `~/forges`. The reboot is the
+reason") and its E003:104 records a `/tmp/fin-wt-train` worktree being wiped as
+exactly why some of its memory numbers are UNSOURCED today.
+
 ```sh
-# state A: the working checkout, branch imac-site @ cd64914
-cd /Users/deepspacenine/forges/levi/fin
-python3 scripts/model-factory/gen_training_data.py --out /tmp/scratch/regen.jsonl
+REPO=~/forges/levi/fin                 # any clone of this repository
+SCRATCH=$REPO/../fin-scratch; mkdir -p "$SCRATCH"
 
-# state B: a worktree at main @ 704ab09
-cd /Users/deepspacenine/forges/levi/fin-wt-labbook
-python3 scripts/model-factory/gen_training_data.py --out /tmp/scratch/regen-main.jsonl
+# state A: branch imac-site @ cd64914
+git -C "$REPO" worktree add "$SCRATCH/wt-A" cd64914
+python3 "$SCRATCH/wt-A/scripts/model-factory/gen_training_data.py" \
+  --out "$SCRATCH/regen.jsonl"
 
-shasum -a 256 /tmp/scratch/regen*.jsonl \
-  /Users/deepspacenine/forges/levi/fin/datasets/sft-train-2026-09-05.jsonl
+# state B: main @ 704ab09
+git -C "$REPO" worktree add "$SCRATCH/wt-B" 704ab09
+python3 "$SCRATCH/wt-B/scripts/model-factory/gen_training_data.py" \
+  --out "$SCRATCH/regen-main.jsonl"
+
+shasum -a 256 "$SCRATCH"/regen*.jsonl \
+  "$REPO/datasets/sft-train-2026-09-05.jsonl"
 ```
 
 ## Result

@@ -12,7 +12,7 @@ sources:
   - evals/goals-ledger/RESULTS.md — baseline only, 24/35
   - evals/goals-ledger/scenarios.json — 35 scenarios, 21 core + 14 hard (parsed today)
   - e025413 (2026-09-05 12:45) · b623a50 (12:48) · b0f7fea (13:36) — the ledger work that did merge
-  - scripts/model-factory/README.md:44 — "[ ] goals-ledger eval joins the gate (that branch has not merged)"
+  - main:scripts/model-factory/README.md:44 — "[ ] goals-ledger eval joins the gate (that branch has not merged)" (branch labbook: 75; verify with `grep -n '^- \[ \]' scripts/model-factory/README.md` — see the line-anchor note in O005)
 related: [P001, O005, E005]
 corrects: []
 superseded-by: null
@@ -67,7 +67,8 @@ the hard tier is not uniformly "the baseline fails here".
 
 ## Why the README's explanation is stale
 
-`README.md:44` blames an unmerged branch. That is no longer true in the sense
+`main:README.md:44` — line 75 on branch `labbook`, where this entry lives —
+blames an unmerged branch. That is no longer true in the sense
 it was written: `e025413` (the eval corpus), `b623a50` (the
 `decide(tick_input)` contract) and `b0f7fea` ("the eval-proven design lands in
 production") are all on main as of 2026-09-05 13:36. The *design* merged; the

@@ -8,10 +8,10 @@ status: standing
 tags: [prompt, skew, evals, production]
 sources:
   - "git hash-object evals/tmux-routing/prompts/router.md — main: c511bab2bf99…, 166 lines"
-  - "git show imac-site:evals/tmux-routing/prompts/router.md | git hash-object --stdin → a4f7db7ad695…, 178 lines"
+  - "git show 7a591f4:evals/tmux-routing/prompts/router.md | git hash-object --stdin → a4f7db7ad695…, 178 lines, 10,040 B (also reachable as cd64914, the imac-site tip when this entry was written; the branch has since moved — see the note at the end)"
   - 7a591f4 — "Close the tmux guard's parser holes" (2026-09-06 09:52), NOT an ancestor of main
   - main:daemon/Sources/FinAgentCore/SessionRouting.swift — promptSection() at 329-409, prompt literal 345-408
-  - imac-site:daemon/Sources/FinAgentCore/SessionRouting.swift:353 — the "ONE DELIBERATE EXCEPTION" comment, which exists ONLY on that branch
+  - cd64914:daemon/Sources/FinAgentCore/SessionRouting.swift:353 — the "ONE DELIBERATE EXCEPTION" comment, which exists ONLY on the imac-site line of history (at the current tip f0ca4af it is line 376)
   - daemon/Tests/FinAgentDaemonTests/DaemonRoutingPromptTests.swift — 3 tests, no text comparison
 related: [E001, O002, O005, E004]
 corrects: []
@@ -28,9 +28,9 @@ failure the entry is about, so it is counted here.)
 | # | where | size | git blob sha1 | scored? |
 | --- | --- | --- | --- | --- |
 | 1 | `evals/tmux-routing/prompts/router.md` on **main** (round 3, `99ed9d9`) | 166 lines, 9,272 B | `c511bab2bf99495603e199fbfe82a6b9f5c9dab5` | yes — 49/51 (`d98a031`) |
-| 2 | the same path on **`imac-site`** (round 3 + a 2026-09-06 correction, `7a591f4`) | 178 lines, 10,040 B | `a4f7db7ad695b1d7fd6d0b561ca9d86dc06d94fd` | **never** |
+| 2 | the same path at **`7a591f4`** (round 3 + a 2026-09-06 correction; `cd64914` was the `imac-site` tip when this was written) | 178 lines, 10,040 B | `a4f7db7ad695b1d7fd6d0b561ca9d86dc06d94fd` | **never** |
 | 3 | `SessionRouting.swift` on **main** — a hand-written Swift paraphrase (`promptSection()` 329-409, prompt literal 345-408) | — | — | never, and not comparable |
-| 4 | the same file on **`imac-site`**, which `7a591f4` also edits (+11/−1) | — | — | never |
+| 4 | the same file at **`7a591f4`**, which that commit also edits (+11/−1) | — | — | never |
 
 Both `router.md` hashes were computed with `git hash-object`; #1 and the round-3
 commit `fcb10b2` hash identically, confirming `99ed9d9` was an exact revert
@@ -64,11 +64,14 @@ A second comment records a deliberate divergence:
 > *"ONE DELIBERATE EXCEPTION: the 'OFF-LIMITS means writing, not looking'
 > paragraph is production-only and is NOT mirrored into router.md."*
 
-**That second quote is on `imac-site` only, at line 353.** `git grep -n "DELIBERATE
-EXCEPTION" main -- daemon/Sources/FinAgentCore/SessionRouting.swift` returns
-nothing; on `imac-site` it returns line 353. The entry originally attributed it
-to the file with no branch qualifier — in an entry whose whole subject is prompt
-provenance across branches, which is the error it exists to warn about.
+**That second quote is on the `imac-site` line of history only, at line 353 of
+`cd64914`.** `git grep -n "DELIBERATE EXCEPTION" main --
+daemon/Sources/FinAgentCore/SessionRouting.swift` returns nothing; at `cd64914`
+it returns line 353. The entry originally attributed it to the file with no
+branch qualifier — in an entry whose whole subject is prompt provenance across
+branches, which is the error it exists to warn about. The first correction
+supplied the branch name, which was still not enough, for the reason recorded
+at the end of this entry.
 
 The sharpest evidence for this entry's thesis is on the other side of the same
 divergence: **`main:daemon/Sources/FinAgentCore/SessionRouting.swift:352` still
@@ -76,6 +79,29 @@ carries the sentence `7a591f4` corrected as never-true** — "Sessions you creat
 yourself are added to the registry automatically". The correction was made in
 `router.md` and in the Swift text on `imac-site`; on `main` the production prompt
 still ships the false sentence.
+
+### A branch name is not a revision — this entry drifted within the day
+
+Every `imac-site:` citation above has been repinned to a **commit**, because
+the branch moved between this entry being written and being re-read the same
+afternoon. `imac-site` was `cd64914` when the entry was written and is
+`f0ca4af` now, two commits later (`3d8fa17` "A private tmux socket, not a
+parser", then `f0ca4af`), and both of them touch the files this entry cites:
+
+| citation | as written, at `cd64914` | at the tip today, `f0ca4af` |
+| --- | --- | --- |
+| `router.md` blob | `a4f7db7a…`, 178 lines, 10,040 B | `936c93e8…`, 181 lines, 10,228 B |
+| "ONE DELIBERATE EXCEPTION" in `SessionRouting.swift` | line 353 | line **376** |
+
+So a reader running the entry's own front-matter command
+(`git show imac-site:… | git hash-object --stdin`) today gets a hash the entry
+does not mention and concludes the record is wrong. It is not wrong; it was
+under-specified. **A branch name is a moving target and is not a citation** —
+the same class of error as an unqualified line number, one step further out.
+The `main:` anchors in this entry all still verify exactly (`promptSection`
+329-409, the literal 345-408, the comment 341-344, the never-true sentence at
+352) because `main` has not moved; that is luck, not method, and they should be
+read as being against `main` at `704ab09`.
 
 `daemon/Tests/FinAgentDaemonTests/DaemonRoutingPromptTests.swift` has three
 test functions and keys on the string markers `"Session routing:"` and

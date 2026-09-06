@@ -29,8 +29,22 @@ appends, on both baseline-labeled tracks:
 
 Method — monkeypatch the labeler and count, at main `704ab09`:
 
+*Why this is filed as an OBSERVATION and not an EXPERIMENT.* The README's
+one-line gloss on OBSERVATION is "no intervention, no manipulation", and
+monkeypatching a function looks like both. The wrapper here is a **counting
+wrapper**: it calls the original `router_baseline.decide` and returns its value
+unchanged, so the generator's behaviour and output are bit-identical to an
+uninstrumented run. That is read-only instrumentation, not an intervention in
+the system under study — see the "Instrumentation is not intervention" note in
+the README, added after this ambiguity was found. The sibling entry
+[E002](E002-2026-09-06-corpus-census.md) imports and runs the same generator and
+is filed as an EXPERIMENT, correctly: it poses a question in advance (what is
+the census?) and runs a method designed to answer it, rather than recording
+something noticed in passing.
+
 ```sh
-cd /Users/deepspacenine/forges/levi/fin-wt-labbook
+# from any checkout of main @ 704ab09 — e.g.
+#   git worktree add ../fin-wt-filter 704ab09 && cd ../fin-wt-filter
 python3 -c "
 import importlib.util,sys
 spec=importlib.util.spec_from_file_location('g','scripts/model-factory/gen_training_data.py')

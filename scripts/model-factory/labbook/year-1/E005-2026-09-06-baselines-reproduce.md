@@ -10,7 +10,7 @@ sources:
   - "measured 2026-09-06 ~11:26 PDT in the labbook worktree on branch labbook, then at 4705b67 — commands and full output below"
   - evals/tmux-routing/RESULTS.md:25 (the recorded 29/51 row)
   - evals/goals-ledger/RESULTS.md (the recorded 24/35 block)
-  - evals/tmux-routing/run_evals.py:195 · evals/goals-ledger/run_evals.py:131 (the exit rule)
+  - main:evals/tmux-routing/run_evals.py:195 · main:evals/goals-ledger/run_evals.py:131 (the exit rule; the tmux-routing line is 210 on branch imac-site, where that file is 217 lines rather than 202)
 related: [E001, O007, H004, P001]
 corrects: []
 superseded-by: null
@@ -83,8 +83,12 @@ start 13 / clarify 10 / refuse 4. goals-ledger **35 scenarios, 14 hard**.
 
 Both harnesses exit 0 because the exit rule is core-only —
 `return 0 if core_passed == core_total else 1`
-(`tmux-routing/run_evals.py:195`, `goals-ledger/run_evals.py:131`). Hard-tier
-misses report but never fail a run.
+(`main:tmux-routing/run_evals.py:195`, `main:goals-ledger/run_evals.py:131`;
+both anchors also hold on `labbook`, where this entry lives). Hard-tier
+misses report but never fail a run. The tmux-routing anchor is branch-sensitive:
+on `imac-site` that file is 217 lines and the same statement is at line **210**,
+so quote the line rather than the number — `grep -n 'core_passed ==
+core_total' evals/tmux-routing/run_evals.py` resolves it on any branch.
 
 ## What this shows
 

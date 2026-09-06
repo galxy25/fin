@@ -72,7 +72,10 @@ grouping before the cap:
 And the cut is **not a sample**. `gen_training_data.py:1053-1056` keeps
 `sorted(grp, key=lambda r: r["line"])[:cap]` — a deterministic *alphabetical*
 slice of the serialized examples. That removes vocabulary wholesale: all 16
-invented domains (`DOMAINS`, `gen_training_data.py:138-153`) appear in the
+invented domains (`DOMAINS`, `gen_training_data.py:138-155` — `DOMAINS = [` at
+138, the sixteen entries at 139-154 with `atlas` last, `]` at 155; an earlier
+version cited `:138-153`, which cut off `atlas`, a domain the next sentence
+names) appear in the
 `route` and `start` candidate pools, but only **8 of 16** survive into the kept
 `route` rows (atlas, beacon, brewlog, cadence, harbor, kettle, ledgerbook,
 lumen) and only **4 of 16** into the kept `start` rows (atlas, beacon, brewlog,
@@ -135,11 +138,21 @@ Two things follow directly:
 - **The corpus teaches format and the easy cases perfectly.** Every label is
   well-formed JSON in the exact contract, and the core-tier behaviours the
   baseline gets right (26/26) are densely covered.
-- **The corpus contains no examples of the judgment the hard tier tests.** By
-  construction: the baseline cannot produce those answers, so they cannot
-  appear in the labels. The generator deliberately does not reproduce the hard
-  tier (P002), and the deterministic labeler could not label it correctly if it
-  did.
+- **The corpus contains no examples of the judgment the hard tier tests.** The
+  mechanism is the generator's *input* selection, not an inability of the
+  labeler. An earlier version of this bullet said "by construction: the
+  baseline cannot produce those answers", which is too strong and is refuted by
+  this book's own E005: `router_baseline.py` scores **3/25** on the hard tier,
+  so it demonstrably produces three of the answers that tier tests — and on
+  goals-ledger, `h12`-`h14` are annotated in the corpus itself as "model trap,
+  baseline passes". The correct statement is the one the generator's docstring
+  makes (`gen_training_data.py:31-34`): the hard tier's paraphrase, typo and
+  misdirection *input shapes* are deliberately not reproduced, so the labeler is
+  only ever asked questions inside its competence zone (P002). Nothing in the
+  corpus exercises the judgment the hard tier tests, because nothing in the
+  corpus asks for it. The conclusion is unchanged; the "by construction" step
+  was wrong, and it is load-bearing for H004 and for H002's "ceiling this cannot
+  break", so it is worth having right.
 
 H004 states the falsifiable prediction that follows.
 

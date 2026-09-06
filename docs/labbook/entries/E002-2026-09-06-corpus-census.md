@@ -19,7 +19,8 @@ each `gen_*` function directly, counting per `(target, decision)` before the
 cap in `CAPS` (`gen_training_data.py:985-1001`) is applied:
 
 ```sh
-cd /Users/deepspacenine/forges/levi/fin-wt-labbook
+# from any checkout of main @ 704ab09 — e.g.
+#   git worktree add ../fin-wt-census 704ab09 && cd ../fin-wt-census
 python3 -c "
 import importlib.util,sys
 spec=importlib.util.spec_from_file_location('g','scripts/model-factory/gen_training_data.py')

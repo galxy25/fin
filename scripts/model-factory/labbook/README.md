@@ -36,6 +36,23 @@ The format enforces it:
 - That back-pointer is the **sole permitted modification** to a published
   entry. Fixing a typo is fine before the entry is committed and not after.
 
+**When the rule starts binding, and what the draft phase allows.** The rule
+above is written for a book in use. It was broken on day one by the audit
+passes that were fixing the book — 23 already-committed entries rewritten in
+place, zero correction entries written — and O008 records that in full, with
+the counts and the reproducer. The regime, stated so the next person knows
+which one they are in:
+
+| phase | in force from | in-place edits |
+| --- | --- | --- |
+| **draft** | the book's first commit | allowed, and the honest fix: a wrong number is removed, not enshrined. **Never silent** — the entry says it was rewritten and what the earlier text said, so the wrong number stays legible even though the sentence carrying it is gone. |
+| **published** | the merge of branch `labbook` into `main`, or the first citation of an entry from outside this directory, whichever comes first | forbidden. "How a correction works" below is the only route, and `superseded-by:` is the only edit. |
+
+And in both phases: **no entry ever asserts compliance it does not have.** O004
+was rewritten while containing the sentence "the entry is kept rather than
+rewritten"; that is the failure O008 exists to record, and it is worse than the
+rewriting.
+
 A superseded entry keeps its id forever. Ids are never reused and never
 renumbered, because things outside this directory (commit messages, published
 posts, the claims ledger in `content/`) cite them.
@@ -52,12 +69,34 @@ it launders recollection into fact. Every quantity in an entry cites one of:
 | a log line | path + the line quoted verbatim | **no** — see below |
 | a reproducing command | the exact command, so a reader re-derives the number | yes |
 | an S3 key | full `s3://` URI | yes, if the object survives |
+| a **memory note** or a **session transcript** | filename + line, or transcript uuid + ISO timestamp, **and the text quoted verbatim** | **no** — see below |
 
-**`datasets/` and `models/` are gitignored** (`062f896`), so training logs,
-checkpoints and corpora exist only on the iMac's disk. An entry citing them
-says so with the tag `local-artifact`. When such a file is the only source for
-a number, quote the line verbatim in the entry — the quote may outlive the
-file.
+A file citation is only true of a revision. Prefix it (`main:…`,
+`cd64914:…`) whenever the file differs across branches, or when the citing
+entry lives on a branch that has edited it — O005's line-anchor note is the
+worked example, and it got this wrong twice before it got it right. The same
+applies to a **branch name**, which is a moving target and not a citation:
+O003's `imac-site:` references drifted within a single afternoon. Pin to a sha.
+
+**`datasets/` and `models/` are gitignored** — `/datasets/` by `a823271`
+("Model factory scaffold", 2026-09-05 12:59) and `/models/` plus
+`scripts/model-factory/.venv/` by `062f896` ("Ignore the local training venv and
+candidate model artifacts", 19:46) — so training logs, checkpoints and corpora
+exist only on the iMac's disk. An entry citing them says so with the tag
+`local-artifact`. When such a file is the only source for a number, quote the
+line verbatim in the entry — the quote may outlive the file.
+
+**Memory notes and session transcripts are the weakest class and are cited
+throughout this book.** The "memory note X" citations (E002, E003, H001, H002,
+O004, P003, and this README's own provenance section) name files under
+`~/.claude/projects/-Users-deepspacenine-forges-levi-fin/memory/`; the
+transcript citations (E002, E003) name `…/<uuid>.jsonl` in the directory above
+it. Neither is in any git repository — `git -C <that directory> rev-parse`
+returns "fatal: not a git repository" — neither has history, memory notes are
+rewritten in place, and a reader holding only a clone of this repo can resolve
+none of them. Treat both as `local-artifact` and **always quote the line
+verbatim**. E003's "Where the 24 GB comes from, and what class of artifact that
+is" section is the worked example.
 
 A number that is only remembered is written **UNSOURCED**, in capitals,
 together with the artifact that would settle it. Never quietly promote a
@@ -166,6 +205,25 @@ superseded-by: null       # filled in later, by hand, when something corrects TH
 
 Not every heading applies to every kind. `## What this does not show` applies
 to all four and is the heading most likely to be the useful one a year later.
+
+**Use that heading verbatim.** In the 20 entries written on day one it appears
+as written in 10, is renamed in 9 ("What this run cannot show" E004, "What this
+hypothesis is not" H001, "The ceiling this cannot break" H002, "What this
+hypothesis does not address" H003, "What this hypothesis does not claim" H004,
+"What it does not imply" O001, "What this protocol does not cover" P001, "What
+this does not cover" P003, "What this does not do" P004) and is absent from
+P002, which uses "Four things the gate does not check". Each variant reads
+better in place, and the cost is that the one heading a future reader is told to
+rely on cannot be extracted with a grep:
+
+```sh
+grep -rL '^## What this does not show' scripts/model-factory/labbook/year-1
+```
+
+The day-one entries are left as they are — renaming ten headings would be a
+silent rewrite of ten entries for a cosmetic gain, which is the trade O008 is
+about. New entries use the exact heading, and a variant belongs as a *second*
+heading underneath it, not instead of it.
 
 ## How to add an entry
 
