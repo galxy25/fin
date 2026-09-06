@@ -16,6 +16,19 @@ bits that example costs the model. That number is the currency of a curriculum:
 This script emits ONE of those columns per run (the model you point it at).
 ``select_curriculum.py`` joins a base run and a tuned run into all four.
 
+WHAT THE GATE ACTUALLY READS. ``evals/tmux-routing/run_evals.py:matches()``
+compares ``expected["action"]`` and, when present, ``expected["session"]``. It
+never reads ``reason``, ``question`` or any other prose in the answer. Summed
+over the WHOLE assistant turn, most of an example's bits are therefore spent on
+text the arbiter ignores -- on this corpus the gate-scored fields are 9.6%-46.8%
+of each answer by characters (median 17.9%), and by tokens less still, because
+the decisive value is usually a single token while the prose is many. So the
+scorer emits a SECOND column, ``decision_bits``: the same cross-entropy summed
+only over the tokens that spell the gate-scored fields (--decision-fields).
+``select_curriculum.py --bits-column decision`` ranks on it. Neither column is
+"the" right one -- prose bits still shape the model -- but a curriculum meant to
+move the gate should be chosen on what the gate reads.
+
 WHAT IT IS NOT. Bits never certify a model. `evals/tmux-routing` +
 `scripts/model-factory/eval_gate.py` remain the only arbiter of promotion. Bits
 choose which examples to train on; the gate says whether that worked.
@@ -34,15 +47,20 @@ tokenization and masking match `mlx_lm`'s exactly:
     computes it under ``--mask-prompt``.
   * the trainer's mask keeps target index ``j in [offset-1, L-1]`` of
     ``batch[:, 1:]``, i.e. predicted positions ``k in [offset, L]``. Position L
-    is the trailing PAD the batch padder always supplies, so the trainer's
-    ``ntoks`` is ``L - offset + 1``, one more than the real answer. We report the
-    honest ``answer`` count (``L - offset``) as the primary and the trainer's
-    ``L - offset + 1`` as ``trainer_*`` so a port can be validated against a
-    logged loss.
+    is the trailing PAD the batch padder supplies whenever the batch is narrower
+    than ``max_seq_length``, so the trainer's ``ntoks`` is ``L - offset + 1``,
+    one more than the real answer. We report the honest ``answer`` count
+    (``L - offset``) as the primary and the trainer's ``L - offset + 1`` as
+    ``trainer_*`` so a port can be validated against a logged loss. A sequence
+    that FILLS the window (``L >= max_seq_length``, truncated or exact-fit) gets
+    no pad column -- ``iterate_batches`` caps the batch width at
+    ``max_seq_length`` -- so there ``ntoks`` collapses to ``L' - offset``.
 
 Guards. This refuses to touch the GPU while a fine-tune is in flight or while
-free memory is below a threshold -- the same precondition as gate_sweep.sh,
+free memory is below a threshold -- the same precondition as the gate sweep,
 because two models in 34 GB of unified memory is how the machine gets wedged.
+The guard FAILS CLOSED: if ``pgrep`` or ``vm_stat`` cannot be read, the machine
+state is unknown and the run is refused unless ``--allow-unverified-machine``.
 
 Usage:
   score_bits.py --model mlx-community/gemma-4-E4B-it-qat-4bit \\
@@ -77,8 +95,12 @@ from typing import Any, Callable, Iterable, Sequence
 
 LOG2_E = 1.0 / math.log(2.0)
 PAD_ID = 0  # mlx_lm's iterate_batches pads with np.zeros -> token id 0 (<pad>)
-BUSY_EXIT = 75  # EX_TEMPFAIL, same code gate_sweep.sh uses when it refuses
+BUSY_EXIT = 75  # EX_TEMPFAIL, the same code the gate sweep uses when it refuses
 MIN_FREE_GB_DEFAULT = 10
+
+# The fields evals/tmux-routing/run_evals.py:matches() actually compares.
+# Everything else in an answer is prose the arbiter never reads.
+GATE_FIELDS_DEFAULT = ("action", "session")
 
 # The four fine-tune targets, recognised by the first line of the system prompt
 # that gen_training_data.py emits for each track.
@@ -174,6 +196,8 @@ class MaskPlan:
     tokens_lost: int  # how many answer tokens the truncation ate
     usable: bool  # False => nothing to score, skip and report
     note: str = ""
+    window_full: bool = False  # L >= max_seq_length: the batch has no pad column
+    has_pad_step: bool = False  # a trailing PAD row was appended to `rows`
 
 
 def plan_mask(
@@ -193,13 +217,23 @@ def plan_mask(
 
     * primary (``answer_tokens``): ``k in [offset, L'-1]`` -- the real answer.
     * trainer parity (``trainer_tokens``): one more step, ``k = L'``, whose target
-      is the trailing ``<pad>`` the batch padder guarantees. Only exists when the
-      example is NOT truncated -- a truncated batch is exactly ``max_seq_length``
-      wide with no pad column, so ``ntoks`` collapses to ``L' - offset``.
+      is the trailing ``<pad>`` the batch padder guarantees. It exists only while
+      the batch is NARROWER than ``max_seq_length``. ``iterate_batches`` sets the
+      width to ``min(1 + 32*ceil(L/32), max_seq_length)``, so a sequence that
+      fills the window -- truncated (``L > max_seq_length``) OR an exact fit
+      (``L == max_seq_length``) -- has no pad column at all and ``ntoks``
+      collapses to ``L' - offset``. Keying this off ``truncated`` alone would
+      over-count the exact-fit case by one token and one pad step's nats.
+
+    With ``match_trainer=False`` the pad step is dropped from ``rows`` AND from
+    ``trainer_tokens``, so the two stay commensurable: a summary that divides
+    trainer nats by trainer tokens is then a per-token mean over exactly the
+    answer, not a mean biased low by a token whose nats were never summed.
     """
     length = len(tokens)
     effective_length = min(length, max_seq_length)
     truncated = length > max_seq_length
+    window_full = length >= max_seq_length
     tokens_lost = length - effective_length
 
     if offset < 1:
@@ -215,6 +249,7 @@ def plan_mask(
             tokens_lost=tokens_lost,
             usable=False,
             note="offset < 1: no prompt to condition on (position 0 is never a target)",
+            window_full=window_full,
         )
     if offset >= effective_length:
         return MaskPlan(
@@ -232,15 +267,17 @@ def plan_mask(
                 "prompt fills or exceeds max_seq_length: the whole answer is "
                 "truncated away, the example carries no trainable signal"
             ),
+            window_full=window_full,
         )
 
     positions = list(range(offset, effective_length))
     rows = [k - 1 for k in positions]
     targets = [tokens[k] for k in positions]
     answer_tokens = len(positions)
-    trainer_tokens = answer_tokens if truncated else answer_tokens + 1
+    has_pad_step = match_trainer and not window_full
+    trainer_tokens = answer_tokens + 1 if has_pad_step else answer_tokens
 
-    if match_trainer and not truncated:
+    if has_pad_step:
         rows.append(effective_length - 1)
         targets.append(PAD_ID)
 
@@ -256,18 +293,22 @@ def plan_mask(
         tokens_lost=tokens_lost,
         usable=True,
         note="answer truncated by max_seq_length" if truncated else "",
+        window_full=window_full,
+        has_pad_step=has_pad_step,
     )
 
 
-def split_nats(plan: MaskPlan, nats: Sequence[float], match_trainer: bool) -> tuple[float, float]:
-    """(answer_nats, trainer_nats) from the per-row nats ``plan`` asked for."""
+def split_nats(plan: MaskPlan, nats: Sequence[float], match_trainer: bool = True) -> tuple[float, float]:
+    """(answer_nats, trainer_nats) from the per-row nats ``plan`` asked for.
+
+    ``plan.has_pad_step`` -- not ``match_trainer``, not ``truncated`` -- decides
+    whether a pad step was scored, so the nats and the token count in
+    ``plan.trainer_tokens`` always describe the same set of steps.
+    """
     if len(nats) != len(plan.rows):
         raise ValueError(f"expected {len(plan.rows)} nats, got {len(nats)}")
     answer_nats = float(sum(nats[: plan.answer_tokens]))
-    if match_trainer and not plan.truncated:
-        trainer_nats = float(sum(nats))
-    else:
-        trainer_nats = answer_nats
+    trainer_nats = float(sum(nats)) if plan.has_pad_step else answer_nats
     return answer_nats, trainer_nats
 
 
@@ -289,7 +330,105 @@ def nats_from_logits(rows: Sequence[Sequence[float]], targets: Sequence[int]) ->
 
 
 # ---------------------------------------------------------------------------
-# machine guard -- mirrors scripts/model-factory/gate_sweep.sh step 0
+# the DECISION mask: only the tokens the eval gate actually compares
+# ---------------------------------------------------------------------------
+
+
+def field_spans(answer_text: str, fields: Sequence[str]) -> list[tuple[int, int]]:
+    """Character spans of ``"field": value`` members inside the ORIGINAL text.
+
+    Spans must be in the answer's own coordinates -- re-serializing through
+    ``json`` would move every offset -- so this scans the text and lets
+    ``JSONDecoder.raw_decode`` find where each value ends, which is exact for
+    strings with escapes, numbers, nested objects and arrays alike.
+
+    A field that is absent contributes nothing; the caller decides whether the
+    empty result is fatal. ``session`` is legitimately absent from most answers.
+    """
+    decoder = json.JSONDecoder()
+    spans: list[tuple[int, int]] = []
+    for name in fields:
+        key = json.dumps(name)  # the quoted key exactly as it appears
+        start = 0
+        while True:
+            i = answer_text.find(key, start)
+            if i < 0:
+                break
+            start = i + len(key)
+            j = start
+            while j < len(answer_text) and answer_text[j] in " \t\r\n":
+                j += 1
+            if j >= len(answer_text) or answer_text[j] != ":":
+                continue  # a string that merely looks like the key
+            j += 1
+            while j < len(answer_text) and answer_text[j] in " \t\r\n":
+                j += 1
+            try:
+                _, end = decoder.raw_decode(answer_text, j)
+            except ValueError:
+                continue
+            spans.append((i, end))
+    return sorted(spans)
+
+
+def token_char_bounds(
+    decode: Callable[[Sequence[int]], str], tokens: Sequence[int], start: int, end: int
+) -> list[tuple[int, int]] | None:
+    """``[lo, hi)`` character bounds of each token in ``[start, end)``.
+
+    Measured by cumulative decode, which is the only way that stays correct for
+    a BPE/sentencepiece tokenizer where a token's text depends on its
+    neighbours. Returns None if the decode is not monotone (a tokenizer whose
+    prefixes are not prefixes) -- better no decision column than a wrong one.
+    """
+    bounds: list[tuple[int, int]] = []
+    prev = 0
+    for k in range(start, end):
+        piece = decode(list(tokens[start : k + 1]))
+        if len(piece) < prev:
+            return None
+        bounds.append((prev, len(piece)))
+        prev = len(piece)
+    return bounds
+
+
+def decision_indices(
+    plan: MaskPlan,
+    tokens: Sequence[int],
+    answer_text: str,
+    fields: Sequence[str],
+    decode: Callable[[Sequence[int]], str],
+) -> list[int] | None:
+    """Indices into ``plan.rows[:answer_tokens]`` that spell the gate fields.
+
+    None means "could not be established" -- a truncated answer, a template
+    whose decode does not round-trip, or an answer with none of the fields.
+    The caller records that as ``decision_ok: false`` and leaves the column
+    null rather than reporting a zero that would rank like a known-easy example.
+    """
+    if not plan.usable or plan.truncated:
+        return None
+    region = decode(list(tokens[plan.offset : plan.effective_length]))
+    base = region.find(answer_text)
+    if base < 0:
+        return None
+    spans = field_spans(answer_text, fields)
+    if not spans:
+        return None
+    spans = [(a + base, b + base) for a, b in spans]
+    bounds = token_char_bounds(decode, tokens, plan.offset, plan.effective_length)
+    if bounds is None or len(bounds) != plan.answer_tokens:
+        return None
+    keep = [
+        i
+        for i, (lo, hi) in enumerate(bounds)
+        if any(lo < span_end and hi > span_start for span_start, span_end in spans)
+    ]
+    return keep or None
+
+
+# ---------------------------------------------------------------------------
+# machine guard -- the same precondition the gate sweep enforces
 # ---------------------------------------------------------------------------
 
 # Built by concatenation so this file's own text can never satisfy its own pgrep.
@@ -297,7 +436,17 @@ _TRAINING_PATTERN = "mlx_lm lo" + "ra"
 _BUSY_PATTERNS = (_TRAINING_PATTERN, "mlx_lm server", "mlx_lm fuse", "mlx_lm generate")
 
 
+class MachineUnknown(Exception):
+    """The machine's state could not be read. Not the same as 'it is idle'."""
+
+
 def _pgrep(pattern: str) -> list[str]:
+    """PIDs matching ``pattern``. Raises MachineUnknown if pgrep cannot answer.
+
+    A guard that treats "I could not check" as "nothing is running" fails in
+    exactly the direction that wedges the machine, so an unreadable process
+    table propagates instead of returning [].
+    """
     try:
         out = subprocess.run(
             ["pgrep", "-f", pattern],
@@ -305,39 +454,62 @@ def _pgrep(pattern: str) -> list[str]:
             text=True,
             timeout=15,
         )
-    except (OSError, subprocess.SubprocessError):
-        return []
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MachineUnknown(f"pgrep -f {pattern!r} failed: {exc}") from exc
+    if out.returncode not in (0, 1):  # 0 = matches, 1 = none; anything else is an error
+        raise MachineUnknown(f"pgrep -f {pattern!r} exited {out.returncode}")
     return [line for line in out.stdout.split() if line.strip()]
 
 
 def free_gb() -> float:
-    """Free + inactive pages, in GiB. Same arithmetic as gate_sweep.sh's awk."""
+    """Free + inactive pages, in GiB. Same arithmetic as the gate sweep's awk.
+
+    Raises MachineUnknown rather than returning a number that would pass: on a
+    box without vm_stat the honest answer is "unknown", and the caller decides
+    (--allow-unverified-machine) whether unknown is good enough.
+    """
     try:
         out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=15).stdout
-    except (OSError, subprocess.SubprocessError):
-        return float("inf")  # not a Mac / no vm_stat: do not block on a number we cannot read
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MachineUnknown(f"vm_stat failed: {exc}") from exc
     page = re.search(r"page size of (\d+) bytes", out)
     page_size = int(page.group(1)) if page else 16384
     total = 0
+    found = False
     for label in ("Pages free", "Pages inactive"):
         m = re.search(rf"{label}:\s+(\d+)", out)
         if m:
             total += int(m.group(1))
+            found = True
+    if not found:
+        raise MachineUnknown("vm_stat produced no page counts")
     return total * page_size / (1024**3)
 
 
-def guard(min_free: float, label: str = "score_bits") -> None:
+def guard(min_free: float, label: str = "score_bits", allow_unverified: bool = False) -> None:
     """Refuse to compete for the GPU. Exits BUSY_EXIT; never raises past main."""
-    for pattern in _BUSY_PATTERNS:
-        pids = _pgrep(pattern)
-        if pids:
+    try:
+        for pattern in _BUSY_PATTERNS:
+            pids = _pgrep(pattern)
+            if pids:
+                print(
+                    f"[{label}] refusing to run: '{pattern}' is live (pid {' '.join(pids)}). "
+                    "Two models in 34 GB of unified memory is how the machine wedges.",
+                    file=sys.stderr,
+                )
+                sys.exit(BUSY_EXIT)
+        have = free_gb()
+    except MachineUnknown as exc:
+        if not allow_unverified:
             print(
-                f"[{label}] refusing to run: '{pattern}' is live (pid {' '.join(pids)}). "
-                "Two models in 34 GB of unified memory is how the machine wedges.",
+                f"[{label}] refusing to run: cannot verify the machine is idle ({exc}). "
+                "Pass --allow-unverified-machine only if you KNOW no fine-tune is running.",
                 file=sys.stderr,
             )
             sys.exit(BUSY_EXIT)
-    have = free_gb()
+        print(f"[{label}] machine state unverified ({exc}); proceeding on --allow-unverified-machine",
+              file=sys.stderr)
+        return
     if have < min_free:
         print(
             f"[{label}] refusing to run: only {have:.1f} GB free, need >= {min_free:.0f} GB.",
@@ -360,6 +532,14 @@ class Example:
     hash: str
     target: str
     decision: str
+    tools: Any = None  # per-line 'tools', which ChatDataset.process also passes
+
+    @property
+    def answer_text(self) -> str:
+        for m in reversed(self.messages):
+            if m.get("role") == "assistant":
+                return m.get("content") or ""
+        return ""
 
 
 def read_corpus(path: Path, chat_key: str = "messages") -> list[Example]:
@@ -379,6 +559,12 @@ def read_corpus(path: Path, chat_key: str = "messages") -> list[Example]:
                     hash=content_hash(messages),
                     target=target,
                     decision=decision,
+                    # ChatDataset.process passes tools=d.get("tools", None) into
+                    # BOTH apply_chat_template calls. Dropping it here would
+                    # tokenize a tools-carrying example differently from how the
+                    # trainer tokenizes it, and its bits would silently stop
+                    # matching the training loss.
+                    tools=obj.get("tools"),
                 )
             )
     return out
@@ -421,8 +607,17 @@ class StubScorer:
         rows = [[self.logit_fn(r, v) for v in range(self.vocab)] for r in plan.rows]
         return nats_from_logits(rows, plan.targets)
 
+    def decode(self, ids: Sequence[int]) -> str:
+        """A character-level decode: token id == code point.
 
-def chat_tokenize(tokenizer, messages: Sequence[dict]) -> tuple[list[int], int]:
+        That makes the stub a real (if trivial) tokenizer, so a fixture can
+        build tokens from actual answer text with ``[ord(c) for c in text]`` and
+        the decision mask's span -> token mapping is exercised end to end.
+        """
+        return "".join(chr(i) if 0 <= i < 0x110000 else "�" for i in ids)
+
+
+def chat_tokenize(tokenizer, messages: Sequence[dict], tools: Any = None) -> tuple[list[int], int]:
     """(tokens, offset) exactly as ``ChatDataset.process`` computes them under
     ``--mask-prompt``.
 
@@ -430,12 +625,17 @@ def chat_tokenize(tokenizer, messages: Sequence[dict]) -> tuple[list[int], int]:
     ``return_dict=False`` and injects ``enable_thinking=True`` for a model whose
     vocab carries thinking markers. A raw HF tokenizer does neither, and both
     omissions silently change the token count.
+
+    ``tools`` is the corpus line's own ``tools`` value, passed into BOTH calls
+    exactly as ``ChatDataset.process`` does. Today's corpus has none; the tooluse
+    track is the one most likely to grow one, and a hardcoded None there would
+    shift every offset in that track without tripping the prefix assertion.
     """
-    tokens = tokenizer.apply_chat_template(messages, tools=None, return_dict=False)
+    tokens = tokenizer.apply_chat_template(messages, tools=tools, return_dict=False)
     add_generation_prompt = messages[-1].get("role") == "assistant"
     prompt = tokenizer.apply_chat_template(
         messages[:-1],
-        tools=None,
+        tools=tools,
         add_generation_prompt=add_generation_prompt,
         return_dict=False,
     )
@@ -464,8 +664,11 @@ class MLXScorer:
         self.full_forward = full_forward
         self._cross_entropy = nn.losses.cross_entropy
 
-    def tokenize(self, messages: Sequence[dict]) -> tuple[list[int], int]:
-        return chat_tokenize(self.tokenizer, messages)
+    def tokenize(self, messages: Sequence[dict], tools: Any = None) -> tuple[list[int], int]:
+        return chat_tokenize(self.tokenizer, messages, tools)
+
+    def decode(self, ids: Sequence[int]) -> str:
+        return self.tokenizer.decode(list(ids))
 
     def _nats(self, logit_rows, targets) -> list[float]:
         mx = self.mx
@@ -475,7 +678,31 @@ class MLXScorer:
         mx.eval(losses)
         return [float(v) for v in losses.tolist()]
 
+    @staticmethod
+    def expected_rows(plan: MaskPlan) -> list[int]:
+        """The row indices the chunked assembly is about to stand in for.
+
+        The chunked path rebuilds logits rows POSITIONALLY out of two forwards,
+        so it never reads ``plan.rows`` and a unit test driving StubScorer
+        cannot catch an off-by-one in it. Asserting the plan against the shape
+        the assembly assumes turns that into a loud failure at row zero instead
+        of a plausible-looking bits column.
+        """
+        rows = list(range(plan.offset - 1, plan.effective_length - 1))
+        if plan.has_pad_step:
+            rows.append(plan.effective_length - 1)
+        return rows
+
     def row_nats(self, tokens: Sequence[int], plan: MaskPlan) -> list[float]:
+        # FIRST, before touching self.mx -- so a test can drive this check on an
+        # un-initialised instance and the mutation "delete the assertion" fails
+        # a test instead of shipping green.
+        if list(plan.rows) != self.expected_rows(plan):
+            raise ValueError(
+                "mask plan does not match the chunked assembly's assumption "
+                f"(offset={plan.offset}, L'={plan.effective_length}, "
+                f"pad_step={plan.has_pad_step}); refusing to score"
+            )
         mx = self.mx
         seq = list(tokens[: plan.effective_length])
 
@@ -521,7 +748,7 @@ class MLXScorer:
         pieces = [last_prompt_row]
         if answer_logits.shape[1] > 1:
             pieces.append(answer_logits[0, :-1, :])
-        if len(plan.rows) > plan.answer_tokens:  # trainer-parity row
+        if plan.has_pad_step:  # trainer-parity row
             pieces.append(answer_logits[0, -1:, :])
         stacked = mx.concatenate([p.reshape(-1, p.shape[-1]) for p in pieces], axis=0)
         mx.eval(stacked)
@@ -537,6 +764,29 @@ class MLXScorer:
 # ---------------------------------------------------------------------------
 
 
+def run_fingerprint(
+    model_label: str,
+    adapter_label: str | None,
+    max_seq_length: int,
+    match_trainer: bool,
+    full_forward: bool,
+) -> dict:
+    """The settings a bits number is only comparable WITHIN.
+
+    Stored on every row so a resumed run cannot silently splice rows scored
+    under a different model, adapter, window or forward path into one file --
+    which would make ``learned_bits = base - tuned`` a difference of two
+    incommensurable quantities for half the corpus.
+    """
+    return {
+        "model": model_label,
+        "adapter": adapter_label,
+        "max_seq_length": max_seq_length,
+        "match_trainer": match_trainer,
+        "full_forward": full_forward,
+    }
+
+
 def score_example(
     example: Example,
     tokens: Sequence[int],
@@ -546,6 +796,8 @@ def score_example(
     scorer: Any,
     model_label: str,
     adapter_label: str | None,
+    decision_fields: Sequence[str] = GATE_FIELDS_DEFAULT,
+    full_forward: bool = False,
 ) -> dict:
     plan = plan_mask(tokens, offset, max_seq_length, match_trainer=match_trainer)
     record: dict[str, Any] = {
@@ -559,9 +811,10 @@ def score_example(
         "trainer_tokens": plan.trainer_tokens,
         "truncated": plan.truncated,
         "tokens_lost": plan.tokens_lost,
-        "model": model_label,
-        "adapter": adapter_label,
     }
+    record.update(
+        run_fingerprint(model_label, adapter_label, max_seq_length, match_trainer, full_forward)
+    )
     if not plan.usable:
         record.update(
             {
@@ -572,6 +825,9 @@ def score_example(
                 "bits_per_token": None,
                 "trainer_nats": None,
                 "trainer_bits": None,
+                "decision_bits": None,
+                "decision_tokens": 0,
+                "decision_ok": False,
             }
         )
         return record
@@ -589,6 +845,21 @@ def score_example(
             "trainer_bits": bits_from_nats(trainer_nats),
         }
     )
+
+    # The gate-scored subset of the answer. Null, never zero, when it cannot be
+    # located: a zero here would rank exactly like an example the model knows.
+    keep = None
+    if decision_fields and hasattr(scorer, "decode"):
+        keep = decision_indices(plan, tokens, example.answer_text, decision_fields, scorer.decode)
+    if keep:
+        record["decision_bits"] = bits_from_nats(float(sum(nats[i] for i in keep)))
+        record["decision_tokens"] = len(keep)
+        record["decision_ok"] = True
+    else:
+        record["decision_bits"] = None
+        record["decision_tokens"] = 0
+        record["decision_ok"] = False
+
     if plan.note:
         record["note"] = plan.note
     return record
@@ -603,6 +874,8 @@ def summarize(rows: Iterable[dict]) -> dict:
     total_tokens = sum(r["answer_tokens"] for r in scored)
     trainer_tokens = sum(r["trainer_tokens"] for r in scored)
     trainer_nats = sum(r["trainer_nats"] for r in scored)
+    with_decision = [r for r in scored if r.get("decision_bits") is not None]
+    decision_bits = sum(r["decision_bits"] for r in with_decision)
     return {
         "examples": len(rows),
         "scored": len(scored),
@@ -612,6 +885,16 @@ def summarize(rows: Iterable[dict]) -> dict:
         "total_answer_tokens": total_tokens,
         "mean_bits_per_example": total_bits / len(scored) if scored else 0.0,
         "mean_bits_per_token": total_bits / total_tokens if total_tokens else 0.0,
+        # The gate-scored slice: how much of the corpus's surprise is in the
+        # fields evals/tmux-routing actually compares.
+        "decision_scored": len(with_decision),
+        "total_decision_bits": decision_bits,
+        "decision_share_of_bits": decision_bits / total_bits if total_bits else 0.0,
+        "mean_decision_tokens": (
+            sum(r["decision_tokens"] for r in with_decision) / len(with_decision)
+            if with_decision
+            else 0.0
+        ),
         # token-weighted mean nats, directly comparable to a logged VALIDATION
         # loss (trainer.py:206-213). The TRAIN loss line is an unweighted mean of
         # per-batch means, so do not compare it to this without care.
@@ -643,9 +926,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--restart", action="store_true", help="ignore and overwrite an existing --out")
     p.add_argument(
+        "--decision-fields",
+        default=",".join(GATE_FIELDS_DEFAULT),
+        help="comma-separated answer fields the eval gate compares; their tokens get "
+        "their own bits column (decision_bits). Empty string disables the column.",
+    )
+    p.add_argument(
+        "--allow-unverified-machine",
+        action="store_true",
+        help="proceed when pgrep/vm_stat cannot be read. Only if you KNOW the box is idle.",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
-        help="tokenize and report lengths/offsets/truncation; never loads the model",
+        help="tokenize and report lengths/offsets/truncation; never loads the model, "
+        "never touches the GPU, and so runs even while a fine-tune holds the machine",
     )
     return p
 
@@ -662,11 +957,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         examples = examples[: args.limit]
     print(f"[score_bits] {len(examples)} examples from {data}", file=sys.stderr)
 
+    decision_fields = tuple(f.strip() for f in args.decision_fields.split(",") if f.strip())
+    adapter_label = str(Path(args.adapter).resolve()) if args.adapter else None
+    want = run_fingerprint(
+        args.model, adapter_label, args.max_seq_length, match_trainer, args.full_forward
+    )
+
     done: set[str] = set()
     if args.restart and out.exists():
         out.unlink()
     else:
         prior, torn = read_scored(out)
+        # Resume is keyed on content hash, so a file appended to under different
+        # flags would mix incommensurable conditions under one name. Refuse.
+        for r in prior:
+            got = {k: r.get(k) for k in want}
+            if any(k in r for k in want) and got != want:
+                differs = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
+                print(
+                    f"[score_bits] refusing to resume {out}: it holds rows scored under "
+                    f"different settings {differs}. Point --out at a new file, or pass "
+                    "--restart to overwrite.",
+                    file=sys.stderr,
+                )
+                return 2
         done = {r["hash"] for r in prior if "hash" in r}
         if torn:
             with out.open("w", encoding="utf-8") as fh:
@@ -683,22 +997,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(summarize(prior), indent=2, sort_keys=True))
         return 0
 
-    # The guard runs before anything touches the GPU. --dry-run still checks, so
-    # a dry run is an honest rehearsal of the real invocation.
-    guard(args.min_free_gb)
-
     if args.dry_run:
+        # NO GUARD HERE, deliberately: a dry run loads no weights and allocates
+        # nothing on the GPU, so it must stay runnable while a fine-tune holds
+        # the machine -- otherwise the token-count calibration in the README is
+        # a claim you cannot check rather than a command you can run.
         # load_tokenizer resolves a repo id through the HF cache and returns the
         # TokenizerWrapper. No weights, no Metal allocation beyond the import.
         from mlx_lm.utils import load_tokenizer
 
         tokenizer = load_tokenizer(args.model)
-        lengths, offsets, trunc = [], [], 0
+        lengths, offsets, trainer, trunc = [], [], [], 0
         for e in todo:
-            tokens, offset = chat_tokenize(tokenizer, e.messages)
+            tokens, offset = chat_tokenize(tokenizer, e.messages, e.tools)
             plan = plan_mask(tokens, offset, args.max_seq_length, match_trainer)
             lengths.append(plan.length)
             offsets.append(plan.offset)
+            trainer.append(plan.trainer_tokens)
             trunc += 1 if plan.truncated else 0
         print(
             json.dumps(
@@ -709,6 +1024,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "mean_length": sum(lengths) / len(lengths),
                     "mean_offset": sum(offsets) / len(offsets),
                     "mean_answer_tokens": sum(l - o for l, o in zip(lengths, offsets)) / len(lengths),
+                    # compare to the run's own "Trained Tokens / iter"
+                    "mean_trainer_tokens": sum(trainer) / len(trainer),
                     "truncated": trunc,
                 },
                 indent=2,
@@ -717,13 +1034,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
+    # Everything past here loads weights. The guard is the last thing before it.
+    guard(args.min_free_gb, allow_unverified=args.allow_unverified_machine)
+
     scorer = MLXScorer(args.model, args.adapter, args.chunk, args.full_forward)
-    adapter_label = str(Path(args.adapter).resolve()) if args.adapter else None
 
     written = 0
     with out.open("a", encoding="utf-8") as fh:
         for e in todo:
-            tokens, offset = scorer.tokenize(e.messages)
+            tokens, offset = scorer.tokenize(e.messages, e.tools)
             record = score_example(
                 e,
                 tokens,
@@ -733,6 +1052,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 scorer,
                 args.model,
                 adapter_label,
+                decision_fields,
+                args.full_forward,
             )
             fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             fh.flush()
@@ -743,16 +1064,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     rows, _ = read_scored(out)
     stats = summarize(rows)
-    meta = {
-        "model": args.model,
-        "adapter": adapter_label,
-        "data": str(data.resolve()),
-        "max_seq_length": args.max_seq_length,
-        "match_trainer": match_trainer,
-        "full_forward": args.full_forward,
-        "summary": stats,
-    }
+    meta = dict(want)
+    meta.update(
+        {
+            "data": str(data.resolve()),
+            "decision_fields": list(decision_fields),
+            "summary": stats,
+        }
+    )
     Path(str(out) + ".meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
+    if stats["scored"] and stats["decision_scored"] < stats["scored"]:
+        print(
+            f"[score_bits] NOTE: {stats['scored'] - stats['decision_scored']} of "
+            f"{stats['scored']} scored rows have no decision_bits (fields absent, answer "
+            "truncated, or the decode did not round-trip); they rank as unknown, not zero.",
+            file=sys.stderr,
+        )
     if stats["truncated"]:
         print(
             f"[score_bits] WARNING: {stats['truncated']} examples had their ANSWER cut by "

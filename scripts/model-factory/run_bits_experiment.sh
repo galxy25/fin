@@ -15,46 +15,68 @@
 #   4  report                                        -> the numbers to argue about
 #   5  retrain on the subset + gate both             -> the only proof that counts
 #
-# THE CLAIM UNDER TEST (Levi, 2026-09-06): the 2363-example corpus carries far
-# fewer bits than it has examples, so a fraction of it reaches the same EVAL GATE
-# SCORE in a fraction of the iterations. The payoff is gate-score-per-iteration.
-# A negative result -- the subset gates worse -- is a real result; report it.
+# THE CLAIM UNDER TEST (Levi, 2026-09-06): the corpus carries far fewer bits than
+# it has examples, so a fraction of it reaches the same EVAL GATE SCORE in a
+# fraction of the iterations. The payoff is gate-score-per-iteration. A negative
+# result -- the subset gates worse, or the random control matches it, or the full
+# corpus at the same reduced iteration count matches it -- is a real result;
+# report it. (The corpus under test is datasets/mlx/train.jsonl, 2245 examples.
+# datasets/sft-train-2026-09-05.jsonl is that file PLUS the 118 validation
+# examples, and selecting from it would train on the yardstick.)
 #
 # THE ARBITER IS ALWAYS THE GATE. Bits pick the curriculum. eval_gate.py says
 # whether the pick was right. Never promote on a bits number.
 
 set -uo pipefail
 
-REPO=${FIN_REPO:-/Users/deepspacenine/forges/levi/fin}
-PY="$REPO/scripts/model-factory/.venv/bin/python"
+# SCRIPTS is where THIS file lives -- so the script runs the code it shipped
+# with, whether that is the main checkout or a worktree. DATA is where the
+# corpora, models and reports live, and it defaults to the same repo: running
+# from a worktree must not write into another checkout's datasets/ tree.
+SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$SCRIPTS/../.." && pwd)
+DATA=${FIN_DATA_ROOT:-$REPO}
+PY=${FIN_PY:-$DATA/scripts/model-factory/.venv/bin/python}
 BASE=mlx-community/gemma-4-E4B-it-qat-4bit
-ADAPTERS="$REPO/models/candidates/fin-foreman-e4b-mlx"
-TRAIN="$REPO/datasets/mlx/train.jsonl"
-VALID="$REPO/datasets/mlx/valid.jsonl"
-REPORTS="$REPO/reports"
+ADAPTERS=${FIN_ADAPTERS:-$DATA/models/candidates/fin-foreman-e4b-mlx}
+TRAIN="$DATA/datasets/mlx/train.jsonl"
+VALID="$DATA/datasets/mlx/valid.jsonl"
+# Outputs go under the SCRIPTS repo by default, so a worktree run stays in the
+# worktree. Point FIN_OUT_ROOT elsewhere to change that.
+OUT_ROOT=${FIN_OUT_ROOT:-$REPO}
+REPORTS="$OUT_ROOT/reports"
 FRACTION=${FIN_BITS_FRACTION:-0.25}
 SEED=${FIN_BITS_SEED:-17}
+JACCARD=${FIN_BITS_JACCARD:-0.8}
+BITS_COLUMN=${FIN_BITS_COLUMN:-decision}
 
 say() { echo "[bits-experiment] $*"; }
 
-# ---- guard: identical precondition to gate_sweep.sh step 0 -----------------
-# score_bits.py enforces this itself too; duplicated here so a stage that only
-# shells out still refuses early.
+# ---- preflight -------------------------------------------------------------
+for f in "$PY" "$TRAIN" "$VALID"; do
+  [ -e "$f" ] || { say "missing: $f -- set FIN_DATA_ROOT/FIN_PY to the checkout that has it"; exit 1; }
+done
+
+# ---- guard: the same precondition score_bits.py enforces -------------------
+# score_bits.py re-checks on every invocation; duplicated here so a stage that
+# only shells out still refuses early. Keep the pattern list in sync with
+# score_bits._BUSY_PATTERNS -- a subset here is a guard with a hole in it.
 guard() {
-  if pgrep -f "mlx_lm lo""ra" >/dev/null 2>&1; then
-    say "a fine-tune is training -- refusing (it needs the GPU)"; exit 75
-  fi
-  if pgrep -f "mlx_lm server" >/dev/null 2>&1; then
-    say "mlx_lm server is up -- refusing (it is holding a model)"; exit 75
-  fi
+  for pat in "mlx_lm lo""ra" "mlx_lm server" "mlx_lm fuse" "mlx_lm generate"; do
+    if pgrep -f "$pat" >/dev/null 2>&1; then
+      say "'$pat' is live -- refusing (it is holding the GPU)"; exit 75
+    fi
+  done
   FREE=$(vm_stat | awk '/page size of/ { gsub(/[^0-9]/, "", $8); ps = $8 }
     /Pages free/ { gsub(/\./, "", $3); f = $3 } /Pages inactive/ { gsub(/\./, "", $3); i = $3 }
     END { printf "%d", (f + i) * ps / 1073741824 }')
+  # Fail CLOSED: an unreadable vm_stat is "unknown", not "idle".
+  case "$FREE" in ''|*[!0-9]*) say "cannot read free memory -- refusing"; exit 75;; esac
   if [ "$FREE" -lt 10 ]; then say "only ${FREE}GB free; need >=10GB"; exit 75; fi
   say "machine is clear: ${FREE}GB free"
 }
 
-cd "$REPO" || exit 1
+cd "$DATA" || exit 1
 mkdir -p "$REPORTS"
 STAGES=${*:-"1 2 3 4"}
 
@@ -66,15 +88,25 @@ STAGES=${*:-"1 2 3 4"}
 if [[ " $STAGES " == *" 1 "* ]]; then
   guard
   say "stage 1: scoring $TRAIN under the untuned base"
-  "$PY" scripts/model-factory/score_bits.py \
+  "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$TRAIN" \
     --max-seq-length 3072 --chunk 512 \
     --out "$REPORTS/bits-train-base.jsonl" || exit $?
   say "stage 1b: same for the validation split (a sanity check, not a curriculum)"
-  "$PY" scripts/model-factory/score_bits.py \
+  "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$VALID" \
     --max-seq-length 3072 --chunk 512 \
     --out "$REPORTS/bits-valid-base.jsonl" || exit $?
+
+  # The base ranking IS the whole curriculum in base-only mode, so the chunked
+  # KV-cache path has to be validated here too, not only in stage 2.
+  say "stage 1c: parity spot-check on the BASE scores (chunked vs full forward)"
+  "$PY" "$SCRIPTS/score_bits.py" \
+    --model "$BASE" --data "$TRAIN" --limit 20 \
+    --full-forward --out "$REPORTS/bits-train-base-fullfwd.jsonl" || exit $?
+  "$PY" "$SCRIPTS/parity_check.py" \
+    "$REPORTS/bits-train-base.jsonl" "$REPORTS/bits-train-base-fullfwd.jsonl" || {
+      say "PARITY FAILED on the base scores -- do not trust the ranking"; exit 1; }
 fi
 
 # ---------------------------------------------------------------------------
@@ -82,11 +114,11 @@ fi
 #    learned_bits = base - tuned is what those 4490 iterations actually bought.
 #
 #    To score an intermediate checkpoint instead of the final adapter, stage it:
-#      mkdir -p "$REPO/models/bits-stage-3000"
-#      cp "$ADAPTERS/adapter_config.json" "$REPO/models/bits-stage-3000/"
+#      mkdir -p "$DATA/models/bits-stage-3000"
+#      cp "$ADAPTERS/adapter_config.json" "$DATA/models/bits-stage-3000/"
 #      cp "$ADAPTERS/0003000_adapters.safetensors" \
-#         "$REPO/models/bits-stage-3000/adapters.safetensors"
-#      ... --adapter "$REPO/models/bits-stage-3000" --out reports/bits-train-3000.jsonl
+#         "$DATA/models/bits-stage-3000/adapters.safetensors"
+#      ... --adapter "$DATA/models/bits-stage-3000" --out reports/bits-train-3000.jsonl
 #    Doing that for 250/1000/2250/3500/final gives a bits-vs-iteration curve:
 #    the iteration where learned_bits stops growing is the iteration where the
 #    corpus stopped teaching, which is the honest --iters ceiling.
@@ -94,28 +126,22 @@ fi
 if [[ " $STAGES " == *" 2 "* ]]; then
   guard
   say "stage 2: scoring $TRAIN under the final adapter"
-  "$PY" scripts/model-factory/score_bits.py \
+  "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$TRAIN" --adapter "$ADAPTERS" \
     --max-seq-length 3072 --chunk 512 \
     --out "$REPORTS/bits-train-tuned.jsonl" || exit $?
 
   # Port validation, ~2 minutes: --full-forward reproduces the trainer's own
-  # un-cached single forward. The two paths must agree to ~1e-3 bits. If they do
-  # not, the chunked KV-cache path is wrong and every number above is suspect.
+  # un-cached single forward. parity_check.py holds the tolerance (1e-2 bits)
+  # and, crucially, FAILS on an empty or partial overlap -- a comparison over
+  # zero examples agrees perfectly and would validate nothing.
   say "stage 2b: parity spot-check (chunked vs full forward, 20 examples)"
-  "$PY" scripts/model-factory/score_bits.py \
+  "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$TRAIN" --adapter "$ADAPTERS" --limit 20 \
     --full-forward --out "$REPORTS/bits-train-tuned-fullfwd.jsonl" || exit $?
-  "$PY" - <<'PARITY'
-import json, pathlib
-r = pathlib.Path("reports")
-a = {x["hash"]: x for x in map(json.loads, (r / "bits-train-tuned.jsonl").read_text().splitlines()) if x.get("bits") is not None}
-b = [json.loads(l) for l in (r / "bits-train-tuned-fullfwd.jsonl").read_text().splitlines()]
-worst = max((abs(a[x["hash"]]["bits"] - x["bits"]) for x in b if x["hash"] in a), default=0.0)
-print(f"[bits-experiment] max |chunked - full| = {worst:.6f} bits over {len(b)} examples")
-raise SystemExit(0 if worst < 1e-2 else 1)
-PARITY
-  [ $? -eq 0 ] || { say "PARITY FAILED -- do not trust the bits numbers"; exit 1; }
+  "$PY" "$SCRIPTS/parity_check.py" \
+    "$REPORTS/bits-train-tuned.jsonl" "$REPORTS/bits-train-tuned-fullfwd.jsonl" || {
+      say "PARITY FAILED -- do not trust the bits numbers"; exit 1; }
 
   # And against the live run's own log: the token-weighted trainer-parity loss
   # over train.jsonl should sit near the last recorded VALIDATION loss (the train
@@ -129,32 +155,43 @@ fi
 # 3. the curriculum. No GPU: pure stdlib, seconds.
 # ---------------------------------------------------------------------------
 if [[ " $STAGES " == *" 3 "* ]]; then
-  say "stage 3: selecting a ${FRACTION} subset"
-  "$PY" scripts/model-factory/select_curriculum.py \
+  say "stage 3: selecting a ${FRACTION} subset (bits column: ${BITS_COLUMN})"
+  BITS_DIR="$OUT_ROOT/datasets/mlx-bits${FRACTION}"
+  RAND_DIR="$OUT_ROOT/datasets/mlx-rand${FRACTION}"
+  "$PY" "$SCRIPTS/select_curriculum.py" \
     --base "$REPORTS/bits-train-base.jsonl" \
     --tuned "$REPORTS/bits-train-tuned.jsonl" \
-    --corpus "$TRAIN" \
-    --target-fraction "$FRACTION" --seed "$SEED" \
-    --out "$REPO/datasets/mlx-bits${FRACTION}/train.jsonl" \
+    --corpus "$TRAIN" --bits-column "$BITS_COLUMN" \
+    --target-fraction "$FRACTION" --seed "$SEED" --jaccard "$JACCARD" \
+    --out "$BITS_DIR/train.jsonl" \
     --report "$REPORTS/curriculum-${FRACTION}.txt" || exit $?
   # The valid split is NOT subset -- comparing two runs needs one fixed yardstick.
-  mkdir -p "$REPO/datasets/mlx-bits${FRACTION}"
-  cp "$VALID" "$REPO/datasets/mlx-bits${FRACTION}/valid.jsonl"
+  mkdir -p "$BITS_DIR"
+  cp "$VALID" "$BITS_DIR/valid.jsonl"
 
-  # A control arm, and the reason the experiment is honest: a RANDOM subset of
-  # the same size, same class proportions. If bits-selection does not beat
+  # THE CONTROL ARM, and the reason the experiment is honest: a RANDOM subset of
+  # the same size and the same class proportions. If bits-selection does not beat
   # random at the gate, bits bought nothing and the result is negative.
-  "$PY" scripts/model-factory/select_curriculum.py \
+  #
+  # It must differ from the bits arm in ONE thing: the ranking. It therefore runs
+  # at the SAME --jaccard as the bits arm. An earlier version passed 1.01 here
+  # (clustering off) and 0.80 there, which changed the DEDUPLICATION as well.
+  # Measured on the real corpus with stub scores (real bits do not exist yet),
+  # toggling only that threshold moves 10-18% of the 563 picks depending on the
+  # score distribution -- so a gate win would have been attributable to dedup or
+  # to bits with no way to tell them apart, which is the one inference the
+  # control exists to support. Both arms cluster; only the criterion differs.
+  "$PY" "$SCRIPTS/select_curriculum.py" \
     --base "$REPORTS/bits-train-base.jsonl" \
     --corpus "$TRAIN" --target-fraction "$FRACTION" --seed 999 \
-    --rank-by random --jaccard 1.01 \
-    --out "$REPO/datasets/mlx-rand${FRACTION}/train.jsonl" \
+    --rank-by random --jaccard "$JACCARD" \
+    --out "$RAND_DIR/train.jsonl" \
     --report "$REPORTS/curriculum-random-${FRACTION}.txt" >/dev/null || exit $?
-  mkdir -p "$REPO/datasets/mlx-rand${FRACTION}"
-  cp "$VALID" "$REPO/datasets/mlx-rand${FRACTION}/valid.jsonl"
-  say "control arm: --rank-by random draws the same budget with the same class"
-  say "proportions but blind to bits; --jaccard 1.01 also switches clustering off"
-  say "so the only difference between the arms is the information criterion."
+  mkdir -p "$RAND_DIR"
+  cp "$VALID" "$RAND_DIR/valid.jsonl"
+  say "control arm: same budget, same class proportions, same clustering"
+  say "(--jaccard $JACCARD), blind to bits. The ONLY difference between the arms"
+  say "is the information criterion."
 fi
 
 # ---------------------------------------------------------------------------
@@ -185,25 +222,42 @@ fi
 #        --seed 17 --save-every 250 \
 #        --adapter-path models/candidates/fin-foreman-e4b-bits25
 #
-#    Then gate BOTH arms through the existing machinery -- fuse, serve, score:
+#    FOUR ARMS, NOT THREE. The fourth is the one that can kill the claim:
 #
-#      scripts/model-factory/gate_sweep.sh final          # re-uses the champion
-#      # or, per candidate, once it is serving somewhere:
+#      D. the FULL corpus, trained for the SAME ITERS as the subset arms
+#         --data datasets/mlx --iters "$ITERS"
+#         --adapter-path models/candidates/fin-foreman-e4b-full-short
+#
+#    Without D, "the bits subset ties 4490 iterations at 1126" is satisfiable by
+#    early stopping alone: the live run's val loss is already 0.005-0.013 from
+#    iteration 2000, so the full corpus truncated to 1126 iterations may well tie
+#    4490 by itself -- and then every arm ties and the criterion reports a
+#    success that selection had no part in. D is also the DIRECT competitor for
+#    "fewest iterations at equal gate score": at identical compute it sees 1126
+#    DISTINCT examples once, where the subset arms see 563 examples twice. More
+#    diversity per iteration is exactly the hypothesis's rival.
+#
+#    Then gate ALL arms through the existing machinery -- fuse, serve, score.
+#    (`gate_sweep.sh` is the wrapper that does fuse+serve+score in one; it lands
+#    with the gate-sweep branch and is NOT in this checkout, so the portable
+#    instruction is eval_gate.py against whatever is serving:)
+#
 #      "$PY" scripts/model-factory/eval_gate.py \
 #        --base-url http://127.0.0.1:8080/v1 --model fin-foreman-bits25 \
 #        --out reports/gate-bits25.json
 #
 #    THE METRIC: gate score per iteration.
 #
-#      full corpus : <core>/<total> at 4490 iters
-#      bits subset : <core>/<total> at  ITERS
-#      random ctrl : <core>/<total> at  ITERS
+#      A. full corpus, full run : <core>/<total> at 4490 iters
+#      B. bits subset           : <core>/<total> at  ITERS
+#      C. random control        : <core>/<total> at  ITERS
+#      D. full corpus, ITERS    : <core>/<total> at  ITERS   <-- the honest floor
 #
-#    The claim is proved if the bits subset ties or beats the full corpus's gate
-#    score at strictly fewer iterations AND beats the random control. It is
-#    disproved if the subset gates worse, or if random matches it -- in which
-#    case the redundancy was real but bits added nothing over counting, and that
-#    is worth writing down too.
+#    The claim is proved only if B ties or beats A at strictly fewer iterations
+#    AND beats C AND beats D. It is disproved if B gates worse than A; if C
+#    matches B (the redundancy was real but bits added nothing over counting); or
+#    if D matches B (the saving was early stopping, not curriculum). Write down
+#    whichever happens -- a negative result honestly reported is a good result.
 # ---------------------------------------------------------------------------
 if [[ " $STAGES " == *" 5 "* ]]; then
   say "stage 5 is documented, not automated: it is a multi-hour GPU job."
