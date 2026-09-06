@@ -530,6 +530,13 @@ def _provision_config(agent, config_key):
         "{{INBOX_GET_URL}}": sign("get_object", INBOX_KEY.format(agent=slug)),
         "{{TRANSCRIPT_PUT_URL}}": sign("put_object", TRANSCRIPT_KEY.format(agent=slug)),
     })
+    # fin-agentd 1.4.1 seeds the inbox as history on a first run unless the config
+    # says the launcher emptied the inbox first — create_worker does, right before
+    # the instance launch — so a message sent while the worker boots still applies.
+    # setdefault: a template that already says so (either way) wins.
+    supervision = config.get("supervision")
+    if isinstance(supervision, dict):
+        supervision.setdefault("inboxResetAtLaunch", True)
 
     try:
         S3.put_object(

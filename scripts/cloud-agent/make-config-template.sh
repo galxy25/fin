@@ -56,6 +56,9 @@ jq --arg name "$NAME" --arg slug "$SLUG" '
   | .supervision.directiveURL = "{{DIRECTIVE_GET_URL}}"
   | .supervision.statusURL = "{{STATUS_PUT_URL}}"
   | .supervision.inboxURL = "{{INBOX_GET_URL}}"
+  # Every instantiation is launched by POST /workers, which empties the inbox
+  # first; fin-agentd 1.4.1 exempts the inbox from its first-run seed on this.
+  | .supervision.inboxResetAtLaunch = true
   | .transcript.putURL = "{{TRANSCRIPT_PUT_URL}}"
   | walk(
       if type == "string"

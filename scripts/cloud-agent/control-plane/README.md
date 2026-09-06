@@ -118,6 +118,15 @@ fills them:
 | `{{INBOX_GET_URL}}` | presigned GET `fin/inbox/<slug>.json` |
 | `{{TRANSCRIPT_PUT_URL}}` | presigned PUT `fin/transcripts/<slug>.jsonl` |
 
+The Lambda also sets `supervision.inboxResetAtLaunch: true` on the instantiated
+config when the template doesn't say either way: `POST /workers` empties the
+per-agent inbox right before the launch, and that flag is how fin-agentd 1.4.1+
+knows a message it finds in the inbox on its first run arrived while the worker
+booted (deliver it) rather than being backlog (seed it as history — the
+resident-install rule). A **hand-provisioned** config launched through
+`POST /workers` needs the flag added by hand; one launched with `launch.sh`
+(which does not reset the inbox) must leave it off.
+
 Sharp edges:
 
 - **Auto-provisioned agents share the template's LLM route.** The template
