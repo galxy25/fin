@@ -232,7 +232,10 @@ final class DaemonDirectiveClient {
     ///     alone can't tell a fresh box from a 1.3.0 box that never applied anything;
     ///     seeding the latter would swallow the next directive as history. The verdict
     ///     is written as an empty, non-pending ledger, so the next launch reads it back
-    ///     instead of re-deriving it from the audit log's existence.
+    ///     instead of re-deriving it from the audit log's existence. And because a
+    ///     first run writes its own (pending) ledger at init, before any document is
+    ///     read, this rule can only fire on a genuine 1.3.0 box: a 1.4.x first run
+    ///     leaves a ledger behind even when every read failed.
     ///   - fetch: The transport; nil (the default) is the real one — streaming and
     ///     body-capped on Darwin, buffered under a total-time timeout on Linux.
     init(
@@ -343,12 +346,25 @@ final class DaemonDirectiveClient {
             // A box this daemon has never run on: the shared supervision document is
             // history to it, not instructions — and so is the inbox's backlog, unless
             // the launcher emptied the inbox first. Seeded on the first fresh fetch.
+            //
+            // The pending verdict is written down NOW, before any document is read.
+            // A first run leaves the audit log behind whatever its reads did, and a
+            // restart must not be judged by that alone: a resident install whose
+            // presigned URLs are stale (403 on every read, so no seed ever lands),
+            // restarted with re-minted URLs in the same state directory, would read
+            // "audit log, no ledger" — the 1.3.0-upgrade rule above — and deliver the
+            // whole backlog, the exact replay the seed exists to prevent. With this
+            // file on disk the next launch is `.loaded` with the seeds still pending
+            // and resumes the wait; the upgrade rule can then only fire on a genuine
+            // 1.3.0 box. A write that fails is audited (throttled, like every ledger
+            // write), and that next launch is judged by the audit log after all.
             self.appliedIDs = []
             self.seededIDs = []
             self.seededInboxIDs = []
             self.seededLookup = []
             self.directiveDocument.seedPending = true
             self.inboxDocument?.seedPending = !inboxResetAtLaunch
+            persistLedger(failurePrefix: "[s3] first run: could not persist the pending ledger")
         case .corrupt:
             // Starting with an empty dedupe set means already-applied directives may
             // replay; the supervisor must be able to see why. Not a first run — the
@@ -668,10 +684,12 @@ final class DaemonDirectiveClient {
     /// since 1.4.0 the file is this object, because the first-run seed needs things a
     /// capped array can't hold: the seeded ids themselves, uncapped (`seededIDs`), and
     /// whether a first run is still waiting for its directive document, so a restart in
-    /// that window — systemd's `Restart=always` after a failed-turn exit, with an inbox
-    /// message already applied and persisted — resumes the wait instead of replaying
-    /// the whole document once the directive URL recovers. 1.4.1 adds the inbox's own
-    /// pair. Every key is optional on read, each defaulting to "nothing": a file with
+    /// that window — systemd's `Restart=always` after a failed-turn exit, stale
+    /// presigned URLs re-minted by the operator — resumes the wait instead of replaying
+    /// the whole document once the directive URL recovers. Since 1.4.1 the first run
+    /// writes the file with that flag set at init, before any document is read, so the
+    /// restart always finds it; 1.4.1 also adds the inbox's own pair. Every key is
+    /// optional on read, each defaulting to "nothing": a file with
     /// only `applied` keeps its applied ids instead of counting as corrupt and
     /// resetting dedupe — the same forward tolerance the directive document has.
     struct LedgerFile: Codable, Equatable {
@@ -708,9 +726,10 @@ final class DaemonDirectiveClient {
     }
 
     /// The three ways the ledger file can come back at init, kept distinct on purpose:
-    /// `missing` is a first run and seeds (`seedLedgerIfFirstRun`) — unless the daemon
-    /// has other evidence it ran here (`hasRunHereBefore`), in which case the init
-    /// writes an empty ledger so that verdict is on disk from then on; `loaded` — even
+    /// `missing` is a first run: the init writes the ledger with its seeds pending, and
+    /// `seedLedgerIfFirstRun` completes them — unless the daemon has other evidence it
+    /// ran here (`hasRunHereBefore`), in which case the init writes an empty ledger so
+    /// that verdict is on disk from then on; `loaded` — even
     /// an empty `[]` — means the daemon has run here before and every unapplied
     /// directive is delivered (unless the file itself says a seed is still pending);
     /// `corrupt` is a reset worth one audit line (the init writes it), because it can

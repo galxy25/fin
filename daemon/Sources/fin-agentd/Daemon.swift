@@ -238,7 +238,8 @@ final class Daemon {
     /// keeps running, idle, and a later directive (or `monitor start`) re-arms it.
     private var heartbeatEnabled = true
     /// The S3 supervision consumer; nil when the config has no `supervision` block.
-    private var supervision: DaemonDirectiveClient?
+    /// Readable so the launch-order tests can poll it and see what a launch delivers.
+    private(set) var supervision: DaemonDirectiveClient?
     /// The cloud transcript uplink; nil when the config has no `transcript` block.
     private var transcript: DaemonTranscriptUplink?
     /// The push-notification client; nil when the config has no `controlPlane` block.

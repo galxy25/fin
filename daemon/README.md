@@ -216,9 +216,11 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
 
   **First run (1.4.0; refined in 1.4.1).** A box the daemon has never run on — a fresh
   cloud worker, a new install: no ledger file, and (1.4.1) no audit log from an earlier
-  launch either — treats the first directive document it successfully reads as history,
+  launch either — first writes its ledger with the seeds recorded as owed
+  (`"seed_pending": true`, before any document is read; *Not a first run* below says
+  why), then treats the first directive document it successfully reads as history,
   not instructions: every id in it (matching this agent or not, well-formed or not) is
-  recorded as seeded without being injected, the ledger is written, and one line audits
+  recorded as seeded without being injected, the ledger is rewritten, and one line audits
   `[s3] first run: N historical directive(s) in the supervision doc marked applied, not
   replayed`. That read happens **at launch** — before the SSH connect, the readiness
   probes and the first task turn, which together can run for minutes — so a directive
@@ -259,7 +261,12 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   restarts in the same state directory — no longer a first run — and every unapplied
   directive plus the whole inbox backlog replay, one model turn each. So a 403 is what
   it was under 1.4.0, a plain `[s3] poll failed: HTTP 403` (or `inbox poll failed`),
-  and the seed stays pending until a document is actually read. A missing key reads 404
+  and the seed stays pending until a document is actually read — pending *on disk*: a
+  first run writes its ledger with `"seed_pending": true` (and `inbox_seed_pending`)
+  at launch, before any document is read, so the restart after the re-mint finds that
+  file and resumes the wait rather than being judged by the audit log the first launch
+  created (the upgrade rule below), and the first documents actually read seed the
+  directive document's N ids and the inbox's M, delivering none. A missing key reads 404
   to the signers that matter — the control plane holds ListBucket on the bucket
   (`control-plane/deploy.sh`, `SeeMissingAgentObjects`), and so do the operator's own
   credentials. A signer without it sees the seed deferred until the document exists
@@ -276,20 +283,29 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   log is the evidence it ran, and `[s3] no directive ledger, but the audit log predates
   this launch — not a first run, nothing seeded` says so — once: that launch writes an
   empty, non-pending ledger, so from then on the verdict is read back from the file
-  rather than re-derived from the audit log's existence at every start. The one case
-  where a ledger exists yet a seed is still owed is one the first run itself wrote while
-  waiting (an inbox message applied while the directive URL was failing, then a restart
-  — systemd's `Restart=always`): the file says so (`"seed_pending": true`), the next
-  launch audits `[s3] first run: resumed with the directive seed still pending`, and
-  the seed lands when the document finally arrives instead of the document replaying.
+  rather than re-derived from the audit log's existence at every start. A ledger that
+  exists yet still owes a seed is a first run's own: every first run writes the file
+  with `"seed_pending": true` (and `"inbox_seed_pending"`, in the resident posture) the
+  moment it starts, before any document is read, and rewrites it as each seed lands —
+  so a restart in that window (stale URLs, a dead bucket, an inbox message applied
+  while the directive URL was failing, then systemd's `Restart=always`) finds the file,
+  audits `[s3] first run: resumed with the directive seed still pending`, and the seed
+  lands when the document finally arrives instead of the document replaying. That is
+  also what keeps the audit-log rule to genuine 1.3.0 boxes: a 1.4.x first run leaves a
+  ledger behind even when every read failed, so "audit log, no ledger" can't be one.
 
   *If the ledger can't be written* (1.4.1) — a state directory owned by another uid, a
-  read-only mount, a full disk — the seed audits `[s3] first run: could not persist the
-  seed — <reason>` and every later write `[s3] ledger write failed — <reason>`
-  (throttled like other failures). The process keeps working from memory, and the next
-  launch is a first run again — which seeds, and drops, whatever was written in between.
-  Under 1.3.0 a lost ledger meant a replay (noisy, nothing lost); with the seed it means
-  a silent drop unless it is said out loud, so it is.
+  read-only mount, a full disk — the first run's launch write audits `[s3] first run:
+  could not persist the pending ledger — <reason>`, the seed `[s3] first run: could not
+  persist the seed — <reason>`, and every later write `[s3] ledger write failed —
+  <reason>` (throttled like other failures). The process keeps working from memory, and
+  the next launch is judged by the audit-log rule above: with the audit log there (a
+  full disk that still let the empty log be created), it is not a first run — every
+  unapplied directive is delivered, the 1.3.0 posture; with no audit log either (the
+  whole state directory unwritable), it is a first run again — which seeds, and drops,
+  whatever was written in between. Under 1.3.0 a lost ledger meant a replay (noisy,
+  nothing lost); with the seed it can mean a silent drop unless it is said out loud, so
+  it is.
 
   ```json
   {"version": 1, "directives": [
@@ -363,8 +379,10 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   `[s3] first run: no supervision directive document yet (HTTP 404) — nothing to seed`
   (or `no inbox document yet`) when the object doesn't exist; `[s3] first run: N
   message(s) already in the inbox marked applied, not replayed` for a seeded inbox
-  backlog; `[s3] first run: could not persist the seed — <reason>` when the ledger
-  write failed (later writes: `[s3] ledger write failed — <reason>`, throttled). And
+  backlog; `[s3] first run: could not persist the pending ledger — <reason>` when the
+  launch write that records the seeds as owed failed, and `[s3] first run: could not
+  persist the seed — <reason>` when the seed's own did (later writes: `[s3] ledger
+  write failed — <reason>`, throttled). And
   once, at startup, `[s3] no directive ledger, but the audit log predates this launch —
   not a first run, nothing seeded` on a 1.3.0 box that never applied a directive — the
   launch that also writes that box its empty ledger. A 403 on either URL is only ever

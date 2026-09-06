@@ -38,10 +38,11 @@ final class DaemonLaunchOrderTests: XCTestCase {
     }
 
     /// The deployed cloud config's shape: no `environment`, no `connectCommand`.
-    private func makeDaemon(supervision: Bool = true) throws -> Daemon {
+    private func makeDaemon(supervision: Bool = true, inbox: Bool = false) throws -> Daemon {
+        let inboxField = inbox ? #", "inboxURL": "https://bucket.example/inbox.json""# : ""
         let supervisionBlock = supervision ? """
         ,
-          "supervision": {"directiveURL": "https://bucket.example/directives.json", "agentName": "finbot"}
+          "supervision": {"directiveURL": "https://bucket.example/directives.json", "agentName": "finbot"\(inboxField)}
         """ : ""
         let json = """
         {
@@ -67,8 +68,31 @@ final class DaemonLaunchOrderTests: XCTestCase {
         return (body, response)
     }
 
+    private func inboxBacklog() -> (Data, URLResponse) {
+        let body = Data("""
+        {"version": 1, "directives": [
+          {"id": "m-1", "kind": "user_message", "text": "three weeks ago"},
+          {"id": "m-2", "kind": "user_message", "text": "last tuesday"}
+        ]}
+        """.utf8)
+        let response = HTTPURLResponse(url: URL(string: "https://bucket.example/inbox.json")!,
+                                       statusCode: 200, httpVersion: nil, headerFields: nil)!
+        return (body, response)
+    }
+
+    /// What a stale presigned URL answers: S3's 403, on any slot.
+    private func denied(_ request: URLRequest) -> (Data, URLResponse) {
+        let response = HTTPURLResponse(url: request.url!, statusCode: 403, httpVersion: nil, headerFields: nil)!
+        return (Data(), response)
+    }
+
     private func auditLog() throws -> String {
         try String(contentsOfFile: auditPath, encoding: .utf8)
+    }
+
+    private func ledger() throws -> DaemonDirectiveClient.LedgerFile {
+        try JSONDecoder().decode(DaemonDirectiveClient.LedgerFile.self,
+                                 from: Data(contentsOf: URL(fileURLWithPath: ledgerPath)))
     }
 
     func testLaunchDrawsTheFirstRunSeedBeforeConstructingTheSession() async throws {
@@ -149,6 +173,71 @@ final class DaemonLaunchOrderTests: XCTestCase {
         let audit = try auditLog()
         XCTAssertTrue(audit.contains("no directive ledger, but the audit log predates this launch — not a first run, nothing seeded"),
                       "got: \(audit)")
+    }
+
+    /// The refuted scenario, end to end and across two launches in one state directory:
+    /// a resident install starts with stale presigned URLs — 403 on both slots, so
+    /// neither seed can land — and the operator re-mints the URLs and restarts. The
+    /// first launch created the audit log, so the second finds "audit log, no ledger"
+    /// unless the first wrote one — and that is the 1.3.0-upgrade rule above, which
+    /// would call this "not a first run", persist an empty non-pending ledger, and
+    /// deliver the whole directive + inbox backlog on the first successful poll: the
+    /// exact replay the seed exists to prevent, cemented on disk. So a first run writes
+    /// its pending ledger before any document is read, and the second launch resumes
+    /// the wait: the first successful read seeds N + M and delivers none of them.
+    func testStaleURLsAtFirstRunThenReMintedURLsOnRestartSeedTheWholeBacklogNotZero() async throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: auditPath), "a box the daemon has never run on")
+        let firstLife = try makeDaemon(inbox: true)
+        var firstLifeFetches = 0
+        firstLife.supervisionFetch = { request in
+            firstLifeFetches += 1
+            return self.denied(request)
+        }
+        firstLife.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        firstLife.terminate = { _ in }
+
+        let firstSession = await firstLife.launch()
+        XCTAssertNotNil(firstSession, "stale URLs never stop the daemon starting")
+        XCTAssertEqual(firstLifeFetches, 2, "the prime read both slots")
+        let firstLifeDelivered = await firstLife.supervision?.poll()
+        XCTAssertEqual(firstLifeDelivered?.map(\.id), [], "nothing readable, nothing delivered")
+        firstLife.shutdown(exitCode: 0)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: auditPath),
+                      "the audit log the next launch would otherwise be judged by")
+        XCTAssertEqual(try ledger(), DaemonDirectiveClient.LedgerFile(seedPending: true, inboxSeedPending: true),
+                       "the first life left its own evidence: both seeds owed, nothing seeded")
+        let firstAudit = try auditLog()
+        XCTAssertTrue(firstAudit.contains("[s3] poll failed: HTTP 403"), "got: \(firstAudit)")
+        XCTAssertTrue(firstAudit.contains("[s3] inbox poll failed: HTTP 403"), "got: \(firstAudit)")
+        XCTAssertTrue(firstAudit.contains("directive document not read at launch — seed deferred to the next poll"), "got: \(firstAudit)")
+        XCTAssertFalse(firstAudit.contains("nothing to seed"), "403 is never 'absent': \(firstAudit)")
+
+        // URLs re-minted, same state directory: the audit log predates THIS launch.
+        let secondLife = try makeDaemon(inbox: true)
+        secondLife.supervisionFetch = { request in
+            request.url?.absoluteString.contains("inbox") == true ? self.inboxBacklog() : self.history()
+        }
+        secondLife.makeSession = { HeadlessTerminalSession(configuration: $0) }
+        secondLife.terminate = { _ in }
+
+        let secondSession = await secondLife.launch()
+        XCTAssertNotNil(secondSession)
+
+        XCTAssertEqual(try ledger(),
+                       DaemonDirectiveClient.LedgerFile(seeded: ["d-1", "d-2", "d-3"], inboxSeeded: ["m-1", "m-2"]),
+                       "N = 3 + M = 2 seeded on the first documents actually read; both seeds done, nothing applied")
+        let secondLifeDelivered = await secondLife.supervision?.poll()
+        XCTAssertEqual(secondLifeDelivered?.map(\.id), [], "zero delivered: the backlog is history")
+        XCTAssertEqual(secondLife.supervision?.isFirstRun, false)
+        secondLife.shutdown(exitCode: 0)
+
+        let audit = try auditLog()
+        XCTAssertTrue(audit.contains("[s3] first run: resumed with the directive seed still pending"), "got: \(audit)")
+        XCTAssertTrue(audit.contains("[s3] first run: resumed with the inbox seed still pending"), "got: \(audit)")
+        XCTAssertTrue(audit.contains("3 historical directive(s) in the supervision doc marked applied, not replayed"), "got: \(audit)")
+        XCTAssertTrue(audit.contains("2 message(s) already in the inbox marked applied, not replayed"), "got: \(audit)")
+        XCTAssertFalse(audit.contains("not a first run, nothing seeded"), "the upgrade rule did not fire: \(audit)")
     }
 
     /// SIGTERM (systemd) or Ctrl-C while the launch fetch is in flight — on a fresh
