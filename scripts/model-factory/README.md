@@ -334,3 +334,153 @@ both gate and seed data:
    relay. SFT examples for this track are tool-call transcripts, not
    decision JSON — the dataset builder grows a track per target as each
    corpus lands.
+
+## Curriculum by information
+
+> Levi, 2026-09-06: *"measure the bits of information per example, so that as we
+> collect and train on different examples we find the best mix of high value
+> examples to allow us to do the fewest training iterations."*
+
+Cross-entropy **is** information. Summing `-log2 p(token)` over an example's
+ANSWER tokens — under exactly the mask training uses — gives the number of bits
+that example costs the model. That number is the currency of a curriculum.
+
+### The four quantities
+
+| quantity | how | what it means |
+| --- | --- | --- |
+| `bits_base` | score under the UNTUNED base | what the base does **not** already know. Low ⇒ the base already emits that answer ⇒ the example teaches nothing and only burns iterations. |
+| `bits_tuned` | score under a trained adapter | what the candidate still does not know. |
+| `learned_bits` | `bits_base - bits_tuned` | the information those iterations actually **bought**. |
+| `residual_bits` | `bits_tuned` | genuinely hard **or mislabelled**. In a corpus this templated, noise is the likelier cause — and a mislabel is a bug in `gen_training_data.py`, not a hard example. |
+
+`bits_per_token` normalises away the near-constant JSON scaffold, so a short
+high-information answer is not buried under a long one.
+
+### Running it
+
+```sh
+V=scripts/model-factory/.venv/bin/python
+
+# 1. bits_base — the untuned base
+$V scripts/model-factory/score_bits.py \
+    --model mlx-community/gemma-4-E4B-it-qat-4bit \
+    --data datasets/mlx/train.jsonl \
+    --max-seq-length 3072 --chunk 512 \
+    --out reports/bits-train-base.jsonl
+
+# 2. bits_tuned — the same corpus under a candidate
+$V scripts/model-factory/score_bits.py ... \
+    --adapter models/candidates/fin-foreman-e4b-mlx \
+    --out reports/bits-train-tuned.jsonl
+
+# 3. the curriculum (no GPU, ~2s on 2363 examples)
+$V scripts/model-factory/select_curriculum.py \
+    --base reports/bits-train-base.jsonl \
+    --tuned reports/bits-train-tuned.jsonl \
+    --corpus datasets/mlx/train.jsonl \
+    --target-fraction 0.25 \
+    --out datasets/mlx-bits0.25/train.jsonl \
+    --report reports/curriculum-0.25.txt
+```
+
+`scripts/model-factory/run_bits_experiment.sh` wires all of that together plus
+the retrain and the gate. `scripts/model-factory/tests/test_bits_curriculum.py`
+(stdlib `unittest`, 57 tests, **no model, no GPU, no network**) covers the bits
+formula, the masking indices, truncation flagging and every selector property.
+
+### Fidelity to training — the part that is easy to get wrong
+
+`score_bits.py` reproduces `mlx_lm`'s tokenization and masking exactly, because
+a bits number that does not match the trainer's is not measuring the training:
+
+* **Tokenize through mlx-lm's `TokenizerWrapper`, never the raw HF tokenizer.**
+  The wrapper forces `return_dict=False` (transformers 5.x otherwise returns a
+  `BatchEncoding` whose `len()` is **2** — the number of dict keys, the classic
+  "my prompts are 2 tokens long" bug) and injects `enable_thinking=True`, which
+  makes the gemma-4 template emit `<|think|>\n` in the first system turn. Each
+  omission shifts every example by ~2 tokens.
+* **The offset** is `len(apply_chat_template(messages[:-1], add_generation_prompt=
+  messages[-1]["role"] == "assistant"))`, exactly `ChatDataset.process` under
+  `--mask-prompt`. The scorer asserts the prefix property (`tokens[:offset] ==
+  prompt_tokens`) and refuses to score if it fails.
+* **The indices.** `default_loss` keeps target `j ∈ [offset-1, L-1]` of
+  `batch[:, 1:]`, i.e. predicted positions `k ∈ [offset, L]` read from rows
+  `k-1`. Position `L` is the trailing `<pad>` the batch padder always supplies,
+  so the trainer's `ntoks` is **`L - offset + 1`** — one more than the real
+  answer. We report the honest `answer_tokens = L - offset` as the primary
+  number and `trainer_tokens` alongside it, so the port can be validated against
+  a logged loss. (Check: mean `L-offset+1` over train.jsonl is 34.686; the live
+  run logs 127129 trained tokens at iter 3675 = 34.593/iter.)
+* **Truncation is flagged, never silent.** An example whose ANSWER is cut by
+  `--max-seq-length` gets `truncated: true` and its bits are a lower bound; one
+  whose prompt alone fills the window is `skipped`, not scored as zero. (For the
+  2026-09-05 corpus max length is 2826, so nothing truncates at 3072 — the check
+  exists for the next corpus.)
+* **Comparing to logged loss:** the TRAIN loss line is an unweighted mean of
+  per-batch per-token means; VALIDATION is token-weighted. The summary's
+  `trainer_parity_loss_nats` is token-weighted, so compare it to validation.
+
+The scorer **refuses to run** while `mlx_lm lora`/`server`/`fuse` is alive or
+free memory is under 10 GB — the same precondition as `gate_sweep.sh`. It is
+resumable (skips hashes already in `--out`, `fsync` per row) and deterministic.
+
+### Honest caveats
+
+* **Bits are a property of the PAIR (example, model), not of the data alone.**
+  A different base — or the same base after any training — reorders the list.
+  Re-score when the base changes; never treat a stale bits file as ground truth.
+* **A low-bits example is not worthless.** It may be the only thing holding a
+  behaviour in place. Dropping the whole low-bits mass can cause forgetting that
+  shows up only in the gate, which is exactly why the gate is the arbiter.
+* **The redundancy estimate is SURFACE redundancy.** Word 3-gram Jaccard cannot
+  see two examples that teach the same rule in disjoint vocabulary, and it could
+  over-merge two examples that differ only in the token that flips the label —
+  so clustering is confined to a single `(target, decision_class)` partition,
+  making that second failure impossible *across* labels. Single-linkage also
+  chains (A~B, B~C ⇒ one cluster), which under-counts clusters and therefore
+  over-states redundancy: the conservative direction for a keep decision. And it
+  is threshold-dependent, so the report prints a curve rather than one number.
+* **High residual does not mean "drop it".** It is reported and never
+  auto-dropped: deleting genuinely hard cases is how a curriculum quietly
+  removes the thing the gate measures.
+* **The leakage rule outranks every number here.** Selection must never touch
+  `evals/tmux-routing/` or `evals/goals-ledger/`; `select_curriculum.py` refuses
+  a `--corpus` under `evals/` outright.
+* **Bits never certify a model.** They choose a curriculum. `eval_gate.py` says
+  whether the choice was right.
+
+### The experiment that proves the value
+
+Hypothesis (strong prior, not yet tested): the 2363-example corpus carries far
+fewer bits than it has examples — train loss hit 0.000 by iteration ~2900 and
+validation has sat near 0.01 since iteration 1000 — so a small subset reaches the
+same gate score in a fraction of the iterations.
+
+1. Score the corpus under the base and under the final adapter.
+2. Select a subset at `--target-fraction 0.25`, and a **random control arm** of
+   the same size and the same class proportions (`--rank-by random`).
+3. Retrain each arm for the SAME NUMBER OF EPOCHS (so `iters = 2 × |subset|`,
+   vs the live run's 4490 = 2 epochs of 2245), all other flags identical.
+4. Gate all three through `gate_sweep.sh` / `eval_gate.py` against the
+   re-recorded champion.
+
+**The metric is gate score per iteration.** The claim is proved if the bits
+subset ties or beats the full corpus's gate score at strictly fewer iterations
+**and** beats the random control. It is disproved if the subset gates worse, or
+if random matches it — in which case the redundancy was real but bits added
+nothing over counting. Write down whichever happens; a negative result honestly
+reported is a good result.
+
+**Nothing above has been run yet.** It was written 2026-09-06 while a fine-tune
+held ~15 GB of the machine, and every GPU stage refuses to start until that is
+clear. What HAS been measured is the redundancy estimate, which needs only text:
+at Jaccard 0.80 the 2363 examples collapse to **1817 clusters (23.1% surface
+redundancy)**, very unevenly — `ledger/ingest` 81.8%, `ledger/clarify` 70.0%,
+`routing/refuse` 60.0%, but `routing/route`, `routing/clarify`, all of `elicit`
+and all of `tooluse` at **0.0%**. Loosening the threshold collapses it fast
+(0.70 → 1335 clusters, 0.60 → 532, 0.50 → 121). Note what that already says
+against the hypothesis: **one representative per cluster at 0.80 still needs
+76.9% of the corpus**, so a 25% budget is decided by the ranking, not by
+deduplication — which is precisely the thing the bits numbers are for, and
+precisely why the gate has to settle it.
