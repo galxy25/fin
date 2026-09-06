@@ -19,14 +19,16 @@ final class TmuxCommandGuardTests: XCTestCase {
         allowed: Set<String>? = nil,
         own: String? = "fin",
         socket: TmuxSocket = .standard,
-        hasRegistry: Bool = true
+        hasRegistry: Bool = true,
+        aliases: Set<String> = []
     ) -> TmuxGuardVerdict {
         TmuxCommandGuard.evaluate(
             input,
             allowedSessions: allowed ?? self.allowed,
             ownSession: own,
             ownSocket: socket,
-            hasRegistry: hasRegistry
+            hasRegistry: hasRegistry,
+            localHostAliases: aliases
         )
     }
 
@@ -35,10 +37,11 @@ final class TmuxCommandGuardTests: XCTestCase {
         allowed: Set<String>? = nil,
         own: String? = "fin",
         socket: TmuxSocket = .standard,
+        aliases: Set<String> = [],
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        let result = verdict(input, allowed: allowed, own: own, socket: socket)
+        let result = verdict(input, allowed: allowed, own: own, socket: socket, aliases: aliases)
         XCTAssertEqual(
             result, .allow,
             "expected ALLOW for \(input) — got: \(result.refusalMessage ?? "")",
@@ -53,10 +56,14 @@ final class TmuxCommandGuardTests: XCTestCase {
         own: String? = "fin",
         socket: TmuxSocket = .standard,
         hasRegistry: Bool = true,
+        aliases: Set<String> = [],
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        let result = verdict(input, allowed: allowed, own: own, socket: socket, hasRegistry: hasRegistry)
+        let result = verdict(
+            input, allowed: allowed, own: own, socket: socket,
+            hasRegistry: hasRegistry, aliases: aliases
+        )
         guard let message = result.refusalMessage else {
             return XCTFail("expected REFUSE for \(input)", file: file, line: line)
         }
@@ -666,6 +673,240 @@ final class TmuxCommandGuardTests: XCTestCase {
         // A global flag that would block a mutation does not block a read.
         assertAllows("tmux -f /dev/null list-sessions")
         assertRefuses("tmux -f /tmp/evil.conf send-keys -t fin hi")
+    }
+
+    // MARK: - tmux's own global flags
+
+    /// `parseGlobalFlags` used to read `letters[0]` only, so a value-taking global flag
+    /// anywhere but first was skipped and ITS VALUE became the verb: `tmux -2f ls
+    /// send-keys …` looked like the read-only `ls` and the entire mutation behind it was
+    /// never examined. Verified on 3.6a against a private socket — `tmux -2f ls send-keys
+    /// -t victim 'touch PWNED' Enter` really did deliver the keys, and a missing `-f` file
+    /// is not fatal, so nothing has to exist for the laundering value to work.
+    func testAClusteredGlobalFlagCannotLaunderAMutationIntoARead() {
+        assertRefuses("tmux -2f ls send-keys -t main 'rm -rf ~/forges' Enter")
+        assertRefuses("tmux -uf has kill-session -t main")
+        assertRefuses("tmux -Nf show send-keys -t main hi")
+        assertRefuses("tmux -vf lsp kill-server")
+        // The socket flag hides in a cluster the same way.
+        assertRefuses("tmux -2L other send-keys -t fin hi")
+        assertRefuses("tmux -2S /tmp/other.sock kill-session -t fin")
+        // …and `-c`, whose value is a shell command, is refused wherever it sits.
+        assertRefuses("tmux -2c 'rm -rf ~/forges'")
+        // Reads under any global flag, clustered or not, stay allowed.
+        assertAllows("tmux -2f /dev/null list-sessions")
+        assertAllows("tmux -2u ls")
+    }
+
+    /// The guard's contract is "an honest tool result the model can read and recover from
+    /// — never a crash". A value-taking global flag in LAST position used to advance the
+    /// index twice, so `args[index...]` was built from `count + 1` and Swift trapped: four
+    /// characters of `send_input` killed the daemon (and, since launchd restarts it, gave
+    /// the model a relaunch primitive for free).
+    func testAValueFlagAtTheEndOfTheLineIsAVerdictNotACrash() {
+        assertAllows("tmux -f")
+        assertAllows("tmux -L")
+        assertAllows("tmux -S")
+        assertAllows("tmux -T")
+        assertAllows("tmux -2f")
+        assertAllows("sh -c \"tmux -L\"")
+        // Same path, reached at startup rather than per-send.
+        XCTAssertNil(TmuxCommandGuard.ownSessionName(inConnectCommand: "tmux -f"))
+        XCTAssertNil(TmuxCommandGuard.ownSessionName(inConnectCommand: "tmux -L"))
+        XCTAssertEqual(TmuxCommandGuard.socket(inConnectCommand: "tmux -L"), .name(""))
+    }
+
+    // MARK: - Wrappers this parser does not model
+
+    /// The carrier list is a list of things we happened to think of, and the ways past it
+    /// were not exotic: an exec wrapper, three shell KEYWORDS, and a pipeline into a
+    /// stdin-reading shell. In each one the word `tmux` and its target sit unquoted in the
+    /// string the guard just read, so an unrecognized head is not a reason to stop
+    /// looking. (All verified to really run tmux on a private socket.)
+    func testTmuxUnderAnUnmodelledWrapperIsStillChecked() {
+        assertRefuses("find . -maxdepth 0 -exec tmux send-keys -t main 'rm -rf ~' Enter \\;", naming: "main")
+        assertRefuses("if tmux kill-server; then echo done; fi")
+        assertRefuses("! tmux send-keys -t main 'launchctl bootout gui/501' Enter", naming: "main")
+        assertRefuses("for i in 1; do tmux kill-session -t main; done", naming: "main")
+        assertRefuses("if ! tmux has-session -t main; then tmux send-keys -t main x Enter; fi", naming: "main")
+        // A pipeline into a shell has exactly the stdin-invisibility problem `xargs tmux`
+        // is refused for: the left side spells the command, the right side runs it.
+        assertRefuses("echo tmux kill-server | sh")
+        assertRefuses("printf 'tmux send-keys -t main hi\\n' | bash")
+        assertRefuses("echo tmux kill-server | sudo sh")
+        assertRefuses("echo tmux kill-server | bash -x")
+        // A shell that HAS a program of its own is parsed, not blanket-refused.
+        assertAllows("tmux capture-pane -p -t main | sh -c 'grep swift'")
+    }
+
+    /// The inline interpreters: one line, the literal word `tmux`, no indirection and
+    /// nothing assembled at runtime. `sh -c` was already closed, which is precisely why
+    /// leaving these open was worse than useless — a reader would assume the class was
+    /// closed.
+    func testInlineInterpreterPayloadsAreUnwrapped() {
+        assertRefuses("python3 -c 'import os; os.system(\"tmux kill-session -t main\")'", naming: "main")
+        assertRefuses("perl -e 'system(\"tmux kill-server\")'")
+        assertRefuses("node -e 'require(\"child_process\").execSync(\"tmux kill-server\")'")
+        assertRefuses("osascript -e 'do shell script \"tmux send-keys -t main x Enter\"'", naming: "main")
+        assertRefuses("awk 'BEGIN{system(\"tmux kill-server\")}'")
+        assertRefuses("su levi -c 'tmux kill-server'")
+        // The interpreter is not banned — only a tmux command line inside it.
+        assertAllows("python3 -c 'import os; print(os.getcwd())'")
+        assertAllows("python3 scripts/build.py --target fin")
+    }
+
+    /// The other half of the last-resort scan: prose and package management keep working.
+    /// Only a BARE token counts, and the verb after it is resolved leniently, so a word
+    /// that is merely ABOUT tmux is not a tmux command.
+    func testTheWordTmuxUnderAnUnknownHeadIsNotAutomaticallyACommand() {
+        assertAllows("man tmux")
+        assertAllows("brew install tmux")
+        assertAllows("which tmux")
+        assertAllows("ps aux | grep tmux")
+        assertAllows("file /opt/homebrew/bin/tmux")
+        assertAllows("git log --oneline -- daemon/Sources/FinAgentCore/TmuxCommandGuard.swift")
+    }
+
+    // MARK: - Spellings of the word
+
+    /// The fourth spelling in the `TMUX` / `t\mux` / `tm"u"x` family: ANSI-C and locale
+    /// quoting keep the `$` glued to the word unless the lexer drops it, and `$'tmux'`
+    /// runs tmux in bash and zsh (verified).
+    func testDollarQuotedTmuxIsStillTmux() {
+        assertRefuses("$'tmux' send-keys -t main 'rm -rf ~' Enter", naming: "main")
+        assertRefuses("$'tmux' kill-session -t main", naming: "main")
+        assertRefuses("$\"tmux\" kill-server")
+        assertRefuses("sh -c $'tmux send-keys -t main hi'", naming: "main")
+        // A `$` that is not quoting anything still lexes as it always did.
+        assertRefuses("tmux send-keys -t $0 hi")
+        assertAllows("echo $HOME")
+    }
+
+    /// A backslash-newline is DELETED by every shell, not escaped, so one send can spell
+    /// the word across a line continuation. Appending the newline to the word produced the
+    /// token `t\nmux` — not tmux to this parser, tmux to the shell.
+    func testALineContinuationInsideOneSendStillSpellsTmux() {
+        assertRefuses("t\\\nmux kill-session -t main", naming: "main")
+        assertRefuses("tm\\\nux send-keys -t main hi", naming: "main")
+        assertRefuses("tmux send-keys -t \\\nmain hi", naming: "main")
+        assertAllows("git commit \\\n  -m \"a normal wrapped command\"")
+    }
+
+    /// The half-typed-line refusal is computed on the bytes that get TYPED. The engine
+    /// strips trailing newlines (`AgentTurnLogic.typedBody`) and its forced
+    /// pre-classification path appends one to every command it extracts — so judging the
+    /// raw argument meant the normal shape silently disarmed the check.
+    func testATrailingNewlineDoesNotDisarmTheHalfCommandRefusal() {
+        assertRefuses("tmux ls \\\n")
+        assertRefuses("t\\\n")
+        assertRefuses("tm\\\r\n")
+        assertRefuses("tmux send-keys -t fin 'echo hi\n")
+        // And the non-tmux traffic it must not touch keeps its behavior.
+        assertAllows("ls -la \\\n")
+        assertAllows("git status\n")
+    }
+
+    /// The one refusal the model SHOULD retry — re-joined onto one line. The standard
+    /// refusal is wrong here in both directions: it forbids the retry that is the fix, and
+    /// it offers `capture-pane` as the alternative when the refused half-line may itself
+    /// be a capture-pane.
+    func testTheHalfCommandRefusalTellsTheModelToResendOnOneLine() throws {
+        let message = try XCTUnwrap(verdict("tmux capture-pane -p -t main \\").refusalMessage)
+        XCTAssertTrue(message.contains("REFUSED"))
+        XCTAssertTrue(message.contains("one line"), "got: \(message)")
+        XCTAssertTrue(message.contains("SHOULD retry"), "got: \(message)")
+        XCTAssertFalse(message.contains("do not retry"), "got: \(message)")
+    }
+
+    /// A here-doc body is data, but the parser sees the same words — the one legitimate
+    /// shape it cannot distinguish. The refusal has to name the way through, or a
+    /// documentation task in this very repo dead-ends on "do not rephrase".
+    func testTheRefusalNamesAWayToWriteTmuxTextIntoAFile() throws {
+        assertRefuses("cat > docs/guard.md <<'EOF'\ntmux send-keys -t main hi\nEOF")
+        let message = try XCTUnwrap(verdict("tmux send-keys -t main hi").refusalMessage)
+        XCTAssertTrue(message.contains("printf"), "got: \(message)")
+        XCTAssertTrue(message.contains("here-doc"), "got: \(message)")
+        // …and that way through really is allowed.
+        assertAllows("printf 'tmux send-keys -t main hi\\n' >> docs/guard.md")
+    }
+
+    // MARK: - ssh destinations
+
+    /// "Remote is out of scope" is a statement about NAMESPACES: another machine's session
+    /// names are not in this registry. Reaching THIS machine under one of its own names is
+    /// the same namespace by a different road, and it lands on the very tmux server the
+    /// guard exists to defend.
+    func testSshToThisMachineUnderItsOwnNameIsLocal() {
+        let mine: Set<String> = ["levis-imac.local", "levis-imac", "192.168.1.42"]
+        assertRefuses("ssh Levis-iMac.local tmux send-keys -t main 'rm -rf ~' Enter", naming: "main", aliases: mine)
+        assertRefuses("ssh levis-imac tmux kill-server", aliases: mine)
+        assertRefuses("ssh deepspacenine@192.168.1.42 tmux kill-session -t main", naming: "main", aliases: mine)
+        // Loopback in every spelling, with no aliases at all.
+        assertRefuses("ssh ::ffff:127.0.0.1 tmux kill-server")
+        assertRefuses("ssh 127.0.0.53 tmux kill-server")
+        assertRefuses("ssh [::1] tmux kill-server")
+        assertRefuses("ssh localhost. tmux kill-server")
+        // A genuinely other machine stays out of scope, which is the product behavior.
+        assertAllows("ssh cloud-box tmux send-keys -t worker 'ls' Enter", aliases: mine)
+        assertAllows("ssh 10.0.0.9 tmux kill-server", aliases: mine)
+    }
+
+    /// getopt clustering in the one place a mis-read sends the whole command down the
+    /// "remote, out of scope" path: `-4p 22 localhost` used to leave `22` to be read as
+    /// the destination.
+    func testClusteredSshFlagsCannotHideALocalDestination() {
+        assertRefuses("ssh -4p 22 localhost tmux kill-session -t main", naming: "main")
+        assertRefuses("ssh -qp 22 localhost tmux kill-server")
+        assertRefuses("ssh -nl levi localhost tmux kill-server")
+        assertRefuses("ssh -4i ~/.ssh/id_ed25519 localhost tmux kill-server")
+        // The un-clustered spellings behaved correctly and still do, both ways.
+        assertRefuses("ssh -p 22 localhost tmux kill-server")
+        assertAllows("ssh -4p 2222 cloud-box tmux kill-server")
+    }
+
+    /// The collector that feeds the matcher above. It runs once per daemon launch, never
+    /// per send, and it must at minimum know the name the host calls itself.
+    func testTheHostKnowsItsOwnNames() {
+        let names = TmuxCommandGuard.thisMachineNames()
+        let hostName = ProcessInfo.processInfo.hostName.lowercased()
+        XCTAssertTrue(names.contains(hostName), "got: \(names.sorted())")
+        XCTAssertTrue(names.contains("127.0.0.1"), "loopback is always an interface — got: \(names.sorted())")
+        // An address must never contribute a bogus short name.
+        XCTAssertFalse(names.contains("127"), "got: \(names.sorted())")
+        XCTAssertTrue(TmuxCommandGuard.isLocalDestination("LEVI@" + hostName, aliases: names))
+        XCTAssertFalse(TmuxCommandGuard.isLocalDestination("cloud-box", aliases: names))
+    }
+
+    // MARK: - Flags that are not targets
+
+    /// `paste-buffer -s <separator>` is a literal string, not a source session (3.6a:
+    /// `paste-buffer [-dpr] [-s separator] [-b buffer-name] [-t target-pane]`), so reading
+    /// it as a target refused a paste into Fin's OWN session while naming a "session" that
+    /// was never one.
+    func testPasteBufferSeparatorIsNotASessionTarget() {
+        assertAllows("tmux paste-buffer -s ' ' -t fin")
+        assertAllows("tmux paste-buffer -s ',' -t fin")
+        assertAllows("tmux paste-buffer -t fin")
+        // The target itself is still checked, and `-s` on the commands where it really is
+        // a source session/window/pane is untouched.
+        assertRefuses("tmux paste-buffer -s ' ' -t main", naming: "main")
+        assertRefuses("tmux swap-window -s main -t fin", naming: "main")
+        assertRefuses("tmux join-pane -s main -t fin", naming: "main")
+    }
+
+    /// `invocations(in:)` compared a raw basename while every other site case-folds, so a
+    /// `connectCommand` whose command word was not lowercase silently produced
+    /// `ownSession == nil` — which disarms the fail-closed fallback the design leans on.
+    func testConnectCommandParsingIsCaseFoldedLikeEveryOtherSite() {
+        XCTAssertEqual(TmuxCommandGuard.ownSessionName(inConnectCommand: "TMUX new-session -A -s fin"), "fin")
+        XCTAssertEqual(
+            TmuxCommandGuard.ownSessionName(inConnectCommand: "/opt/homebrew/bin/TMUX new-session -A -s fin"),
+            "fin"
+        )
+        XCTAssertEqual(
+            TmuxCommandGuard.socket(inConnectCommand: "TMUX -L fin new-session -A -s fin"),
+            .name("fin")
+        )
     }
 
     func testOwnSocketIsParsedOutOfTheConnectCommand() {

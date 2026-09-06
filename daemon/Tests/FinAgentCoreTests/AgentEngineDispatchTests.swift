@@ -308,6 +308,32 @@ final class AgentEngineDispatchTests: XCTestCase {
         )
     }
 
+    /// THE GUARD JUDGES THE BYTES THAT GET TYPED. `typedBody` strips the trailing newline
+    /// before the PTY sees the line, and the forced pre-classification path appends one to
+    /// every command it extracts — so a guard judging the raw tool argument decided
+    /// `"tmux ls \\\n"` did not end in a backslash and allowed it, while the terminal
+    /// really was left at PS2 with `tmux ls \` waiting for the next send to complete it.
+    /// The trailing newline is the NORMAL shape, not an exotic one.
+    func testHalfTypedSendInputIsRefusedDespiteTheTrailingNewline() async {
+        let session = RecordingStubSession()
+        let engine = makeEngine(session: session)
+        engine.tmuxGuard = TmuxSendGuard(
+            isEnforced: true,
+            ownSession: "fin",
+            registrySessions: ["fin"],
+            hasRegistry: true
+        )
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "tmux ls \\\n"}"#
+        ))
+
+        XCTAssertTrue(session.sentInputs.isEmpty, "a half-typed line must never reach the PTY")
+        XCTAssertTrue(result.contains("REFUSED"), "got: \(result)")
+        XCTAssertTrue(result.contains("one line"), "got: \(result)")
+    }
+
     /// The other half: the guard is a target check, not a tmux ban. Reading any session
     /// and writing a registered one both go through untouched, split-Return and all.
     func testGuardedSendInputStillDeliversAllowedTmuxCommands() async {

@@ -528,7 +528,15 @@ public final class AgentTurnEngine {
         // its refusal is the more actionable one — it names the session and tells the
         // model to read it instead. Deliberately ahead of the connected-session check too,
         // so a refusal is deterministic whether or not the PTY happens to be up.
-        if case .refuse(let message) = tmuxGuard.evaluate(input) {
+        //
+        // JUDGED ON THE EXACT BYTES THAT GET TYPED. `typedBody` is what reaches the PTY
+        // below, and the difference is not cosmetic: judging the raw argument meant a
+        // trailing newline — which the forced pre-classification path appends to EVERY
+        // command it extracts — made `"tmux ls \\\n"` not "end in a backslash", so the
+        // half-typed-line refusal never fired while the terminal really was left at PS2
+        // waiting for the next send. The guard normalizes the same way internally, so no
+        // caller can get this wrong; passing it here keeps the invariant visible.
+        if case .refuse(let message) = tmuxGuard.evaluate(AgentTurnLogic.typedBody(input)) {
             record("error", message, toolName: toolName,
                    toolArguments: rawArguments, isFailure: true)
             return message

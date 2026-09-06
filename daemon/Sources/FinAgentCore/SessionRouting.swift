@@ -358,6 +358,18 @@ extension SessionRouter {
         // change the scored prompt without changing any decision it grades. Its
         // production counterpart is TmuxCommandGuard, whose own tests are the
         // regression suite for what it claims.
+        //
+        // THIS PARAGRAPH STATES THE RULE; IT MUST NOT CLAIM CODE ENFORCEMENT. Its
+        // first draft said "the write half is enforced in code… that refusal is
+        // final" — but this section is not daemon-only: AgentRuntime renders it in
+        // the Fin app too (fin/Agent/AgentRuntime.swift, wired at finApp.swift from
+        // the app's own registry), and the app's send path has no TmuxCommandGuard
+        // at all (`AgentTurnEngine.tmuxGuard` defaults to `.unenforced` and nothing
+        // app-side assigns it). An app user in auto-approve mode would have been
+        // promised a gate that does not exist there — the same false "enforced, not
+        // instructed" claim this branch set out to delete from the README. The
+        // enforcement sentence lives in `TmuxCommandGuard.promptGuidance`, which is
+        // appended only when a guard is actually armed.
         return """
         Session routing: you manage terminal work across multiple tmux sessions, and every \
         request that involves terminal work starts with a routing decision.
@@ -382,10 +394,9 @@ extension SessionRouter {
         OFF-LIMITS means writing, not looking. READING any session is always allowed and \
         always useful — `tmux capture-pane -p -t <session>`, `tmux list-sessions`, \
         `tmux list-windows -t <session>` work for every session on this machine, registered \
-        or not, and that is how you answer questions about work that is not yours. The write \
-        half is enforced in code, not only here: send_input refuses a tmux command that would \
-        send keys to, kill, rename, reconfigure or attach to an unregistered session before a \
-        byte reaches the terminal, and that refusal is final — do not retry or rephrase it.
+        or not, and that is how you answer questions about work that is not yours. Writing is \
+        the half that is limited: never send keys to, kill, rename, reconfigure or attach to a \
+        session outside the registry — read it and say what you found instead.
 
         For each request, decide one of:
         - route — the work belongs to a registered session that is live. Match the request \

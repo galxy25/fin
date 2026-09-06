@@ -160,8 +160,21 @@ Two deliberate properties of that sentence:
   the allow-list writable *by the thing it constrains*: a `python3 -c` that appends
   `{"session": "main"}` — a command with no tmux in it, which neither this guard nor
   `DestructiveCommandHeuristic` looks at — followed by `tmux send-keys -t main …` on the
-  very next call. Widening now takes the user, on the host, and applies at the next launch.
-  The refusal text deliberately does **not** name the file, for the same reason.
+  very next call. The refusal text deliberately does **not** name the file, for the same
+  reason.
+
+  **But a snapshot is a speed bump, not a barrier, and the earlier wording here
+  ("widening takes the user, on the host") overstated it. The agent controls the
+  relaunch.** The LaunchAgent is `KeepAlive: true`, `ThrottleInterval: 15`, so anything
+  that ends the process brings back a daemon that re-reads the file — write the registry,
+  end the daemon (`launchctl kickstart -k gui/$UID/dev.levischoen.fin.agentd`, a plain
+  `kill`, or any crash; `DestructiveCommandHeuristic` matches none of those), and ≤15s
+  later the allow-list is whatever was written. Three sends, none of which mention tmux.
+  The snapshot buys a restart and a delay, nothing more. **The real fix is an allow-list
+  the guarded uid cannot write** — a root-owned file, an installer-owned config outside
+  `$HOME`, or the dedicated-socket posture below, which needs no allow-list at all. Until
+  one of those lands, the registry's protection is against a model that improvises, not
+  against one that persists.
 - **`fin-` is the daemon's own namespace**, and it is what pays for that snapshot. The
   router's `start` action has to keep working: create a session, then drive it. Nothing in
   this codebase has ever written a created session into the registry
@@ -182,7 +195,7 @@ Two deliberate properties of that sentence:
 | Registered targets only | everything else that mutates — `send-keys`, `paste-buffer`, `kill-session`/`-window`/`-pane`, `new-window`, `split-window`, `respawn-*`, `swap`/`move`/`join`/`break`/`link`/`unlink`, `rename-*`, `select-*`, `resize-*`, `clear-history`, `pipe-pane`, `set-option`/`set-window-option`/`set-environment` | Allowed only when every session it names is on the allow-list. `set-*` with `-g`/`-s` is refused outright (global/server scope escapes the session). |
 | Creation | `new-session` | Creating a session stays legal — it is the router's `start` action. `-t <unregistered>` (grouping shares the target's windows) and `-A -s <unregistered>` (attach-or-create) are not. |
 | Flags that make `-t` lie | `kill-session -a`, `send-keys -c <client>` / `-K` | Refused before the target check. `-a` inverts the target — `kill-session -a -t fin` kills every session *except* `fin` (verified on 3.6a: fin/main/bystander in, only `fin` left), i.e. `kill-server`'s blast radius wearing an allowed name. `-c` addresses a *client*, so the keys land wherever that client is attached — on the shared socket, the human's terminal — and there is no `-t` to check. (`tmux list-clients`, an allowed read, prints the ttys.) |
-| Not one command | `xargs tmux …`, a line ending in `\` or an open quote | Refused. `xargs` builds tmux's argv out of stdin, which the guard cannot see (verified: `echo "rename-session -t victim OWNED" \| xargs tmux` renames while the guard sees an argument-less `tmux`). A half-typed line is worse: the PTY concatenates sends, so `tmux \` and then `send-keys -t main …` are two individually-harmless calls the shell joins at its continuation prompt. A trailing fragment in command position that could still *become* `tmux` (`t\`, `tm\`) counts. |
+| Not one command | `xargs tmux …`, `… \| sh` (a shell with no script and no `-c`), a line ending in `\` or an open quote | Refused. `xargs` builds tmux's argv out of stdin, which the guard cannot see (verified: `echo "rename-session -t victim OWNED" \| xargs tmux` renames while the guard sees an argument-less `tmux`). A pipeline into a stdin-reading shell is the same blind spot one pipe over — `echo tmux kill-server \| sh` and `printf 'tmux send-keys -t main …\n' \| bash` both really run it (verified) — so a line that mentions tmux and contains a bare `sh`/`bash`/`zsh`/`dash`/`fish`/`ksh` segment is refused whole. A half-typed line is worse: the PTY concatenates sends, so `tmux \` and then `send-keys -t main …` are two individually-harmless calls the shell joins at its continuation prompt. A trailing fragment in command position that could still *become* `tmux` (`t\`, `tm\`) counts — **including when the send ends in a newline**, which is the normal shape (`AgentTurnLogic.typedBody` strips it before the PTY sees the line, and the guard now judges those same bytes; judging the raw argument let `"tmux ls \\\n"` pass as "does not end in a backslash"). |
 
 Parsing details that matter, all covered by `TmuxCommandGuardTests`: multiple commands per
 line (`;`, `&&`, `||`, `|`, newline, `$( )`, backticks); leading env assignments and
@@ -211,17 +224,44 @@ verified against real tmux 3.6a on a private socket and are now handled:
 - `tmux send-keys "-t" main …` — quoting the *flag* used to make it invisible; quoting says
   nothing, so `wasQuoted` is no longer consulted when finding flags.
 
-The same lesson applies to the command word: `TMUX`, `t\mux` and `tm"u"x` all run tmux on
-this case-insensitive volume, so the word is looked for in **lexed, case-folded** words, not
-as a substring of the raw string.
+The same lesson applies to the command word: `TMUX`, `t\mux`, `tm"u"x`, `$'tmux'` (ANSI-C
+quoting — bash and zsh both run it) and a word spelled across a **line continuation**
+(`t\` + newline + `mux …`, which every shell joins by *deleting* the backslash-newline
+pair) all run tmux, so the word is looked for in **lexed, case-folded** words, not as a
+substring of the raw string, and the lexer normalizes each of those forms.
+
+tmux's own **global** flags cluster like any other getopt options, and reading only the
+first letter of a cluster was a hole with the whole guard behind it: `tmux -2f ls send-keys
+-t main …` parses as `-2`, `-f ls`, then `send-keys` — the value of a value-taking flag
+became the verb, the verb was the read-only `ls`, and the entire mutation after it was
+never examined. Verified: `tmux -2f ls kill-session -t victim` destroyed the session (a
+missing `-f` file is not fatal, so nothing has to exist first). The same routine used to
+walk off the end of argv on a bare `tmux -f` and **trap**, which a four-character
+`send_input` could reach — the guard's contract is a verdict, never a crash.
 
 The command table was diffed against `tmux 3.6a`'s `list-commands`, names *and* aliases, over
 every prefix of every command: no prefix this guard calls read-only resolves to something
 else in real tmux, and no prefix real tmux resolves is unknown here.
 
+**An unrecognized head is not a reason to stop looking.** The wrapper list is a list of
+things we happened to think of, and four ways past it were found in one review — none of
+them exotic, all verified to really run tmux on a private socket: `find . -maxdepth 0
+-exec tmux send-keys -t main … \;` (an exec wrapper), `if tmux kill-server; then …` and
+`for i in 1; do tmux kill-session -t main; done` (shell **keywords**, which are neither a
+command this parser models nor a prefix it strips), and `echo tmux kill-server | sh`.
+So any segment that carries a **bare** `tmux` token — one that is not inside a quoted word —
+is parsed from that token on, whatever its head is. Two things keep that from refusing
+ordinary work: prose keeps the word inside a quoted word (`grep "tmux kill-server" daemon/`),
+and the verb after it is resolved leniently, so `man tmux`, `brew install tmux`,
+`which tmux` and `ps aux | grep tmux` stay allowed.
+
 Quoted shell text is unwrapped one level (up to three) **when the head is something that
-runs it** — `sh -c 'tmux send-keys -t main …'`, `eval "…"`, and the two-hop
-`tmux send-keys -t fin 'tmux send-keys -t main …'` are all caught. Text that merely mentions
+runs it** — `sh -c 'tmux send-keys -t main …'`, `eval "…"`, the inline interpreters'
+`-c`/`-e` payloads (`python3`, `perl`, `ruby`, `node`, `osascript`, `awk`, `php`, plus
+`su … -c`), and the two-hop `tmux send-keys -t fin 'tmux send-keys -t main …'` are all
+caught. Below the top level every quoted word is program text too, which is what reaches
+the tmux inside `os.system("tmux …")`, `system("tmux …")`, `execSync("tmux …")` and
+`do shell script "tmux …"`. Text that merely mentions
 tmux is data: `git commit -m "tmux guard: …"`, `grep "tmux kill-server" daemon/` and
 `echo "tmux …" >> notes.md` are untouched, which matters in a repo whose current work *is*
 tmux. Inside a payload, an unrecognized verb is prose rather than a refusal — real tmux would
@@ -229,6 +269,16 @@ answer "unknown command" and do nothing. A **remote** `ssh <host> tmux …` is d
 of scope (another machine's session names mean nothing to this allow-list, and driving Fin's
 own cloud box over ssh is a product behavior); `ssh localhost tmux …` is local and is checked.
 As a bonus, `pkill`/`killall` aimed at tmux is refused — it ends the same way `kill-server` does.
+
+**"Remote" is a statement about namespaces, so this host's own names are local.** An ssh
+hop to `Levis-iMac.local`, to the short hostname, or to a LAN address of this machine lands
+on the very tmux server the guard defends — the same namespace by a different road — and
+used to be classified remote and allowed unparsed. `TmuxSendGuard.forHost` therefore
+collects the host's own names once at launch (hostname long and short, the `.local` form,
+and every interface address via `getifaddrs`) and `isLocalDestination` also treats the whole
+`127.0.0.0/8` block, `::1`, `[::1]`, `::ffff:127.0.0.1` and a rooted FQDN as local. ssh's
+own option clustering is parsed the same way tmux's is, because `ssh -4p 22 localhost tmux
+kill-session -t main` used to read `22` as the destination and take the remote exit.
 
 **Honest limits.** This is defense in depth over a natural-language channel, not a sandbox.
 It closes the direct path — the one a local model actually takes when it decides to be
@@ -238,17 +288,32 @@ guard can reach:
 - variable or alias indirection (`T=tmux; $T send-keys …`, `alias t=tmux` in a rc file);
 - encoding (`eval $(echo dG11eA== | base64 -d) …`), or any construction that assembles the
   word `tmux` at runtime — including `sh -c "$CMD"`, where the payload is a variable;
+- **an argv built structurally inside an interpreter**:
+  `python3 -c 'subprocess.run(["tmux", "send-keys", "-t", "main", …])'`. The string form
+  (`subprocess.run("tmux send-keys …", shell=True)`, `os.system("tmux …")`) *is* caught,
+  because it contains a command line; a list of separate quoted words never is one, and
+  reassembling it would mean parsing Python. Same family as runtime assembly, one line up;
+- **rewriting `routing-registry.json` and forcing a relaunch.** The file is in the daemon's
+  own state directory, owned by the uid the guarded shell runs as, and the LaunchAgent is
+  `KeepAlive`; see the snapshot bullet above. Nothing in this guard can fix that — the
+  allow-list has to move somewhere the guarded uid cannot write, or the socket has to stop
+  being shared;
+- an `ssh` config `Host` alias that points at this machine (`Host box` → `HostName
+  127.0.0.1`). This side cannot resolve `~/.ssh/config`; the machine's real names and
+  addresses are covered, an alias for them is not;
 - a helper script, Makefile target, or shell function that runs tmux on the model's behalf;
 - writing `~/.tmux.conf` (or any file) with one command and having tmux read it later (the
   direct `source-file` is refused; the write is not);
 - `ssh <other host> tmux …` — a remote server is out of this guard's world **by policy**,
-  not by oversight: its session names are not in this registry's namespace. A *local*
-  `ssh localhost tmux …` is caught;
+  not by oversight: its session names are not in this registry's namespace. Reaching *this*
+  host is not remote, however it is spelled: `ssh localhost`, any `127.x`, `::1`, and the
+  machine's own hostname or interface addresses are all parsed (see above);
 - **a command split across two `send_input` calls whose halves say nothing about tmux.**
   The obvious shapes are closed — a line ending in `\` or an open quote is refused when it
   mentions tmux, and so is a trailing fragment in command position that could still become
-  the word (`t\`, `tm\`) — but a fragment that is *not* in command position (`FOO=bar t\`)
-  still gets through. Same family as variable indirection: the guard sees one send at a time;
+  the word (`t\`, `tm\`), now including the trailing-newline spelling that used to slip
+  past — but a fragment that is *not* in command position (`FOO=bar t\`) still gets
+  through. Same family as variable indirection: the guard sees one send at a time;
 - entirely non-tmux damage: `pkill -f mlx_lm`, `launchctl bootout`, `rm` shapes
   `DestructiveCommandHeuristic` misses (`pkill tmux` specifically *is* caught);
 - a human session named `fin-…`, which is inside the namespace the guard treats as Fin's;
@@ -258,7 +323,17 @@ guard can reach:
 False refusals it *does* make, all in the safe direction: `-t 0`, `-t %3`, `-t @2` (a bare
 index or a pane/window id can point into any session, so it cannot be proven); a quoted
 `send-keys` payload whose first characters look like a flag (`'-tail -f log'`); `tmux -f
-<conf> <mutation>` (a read under `-f` is fine); and a half-typed line that mentions tmux.
+<conf> <mutation>` (a read under `-f` is fine); a half-typed line that mentions tmux —
+including a `capture-pane` split over two lines, the one place a read is not allowed, which
+is why that refusal has its own text telling the model to re-send it on one line rather
+than the standard "do not retry"; a tmux command line quoted *inside* text a runner will
+execute (`sh -c 'echo "tmux kill-server" >> notes'`); the bare word in an unquoted
+non-command position (`echo tmux kill-server`); a bare shell anywhere in a line that
+mentions tmux (`tmux ls; bash`); and **file content that happens to be a tmux command** —
+a here-doc body, a script or a doc being written. Nothing executes it, but the parser sees
+the same words and cannot tell. The way through is a quoted argument, which is data:
+`printf 'tmux send-keys -t main hi\n' >> notes.md` is allowed, and the refusal text says
+so, because this repo's own current work is documenting tmux commands.
 
 **The structural fix is a dedicated socket.** Set
 `"connectCommand": "tmux -L fin new-session -A -s fin"` and the human's sessions stop
@@ -276,6 +351,18 @@ is optional and the user's own quick-fill session name is literally `main`, so e
 there by default would refuse the user's own terminal. When the guard is armed the daemon
 also appends a prompt paragraph telling the model the gate exists and what it may do
 instead — a refusal the model understands beats a refusal it fights.
+
+**Only the armed guard's own paragraph may claim enforcement.** `SessionRouter.promptSection`
+states the routing rule and nothing more, deliberately: it is not daemon-only —
+`AgentRuntime` renders the same paragraph in the Fin app, where `AgentTurnEngine.tmuxGuard`
+is `.unenforced` and no guard exists — so a sentence there promising that "send_input
+refuses … before a byte reaches the terminal" would tell an app user in auto-approve mode
+about a gate that is not running. That sentence lives in `TmuxCommandGuard.promptGuidance`,
+which is appended only when `isEnforced`. The wiring from `forHost` through
+`Daemon.makeTurnEngine` to the engine is itself covered by
+`DaemonTmuxGuardPromptTests` — before that factory existed, deleting the one line that
+armed the engine left the whole suite green while the prompt still told the model the gate
+was there.
 
 ## Run
 

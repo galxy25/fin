@@ -6,10 +6,13 @@ import XCTest
 /// this proves the SHIPPED daemon derives it and tells the model about it — the gap that
 /// let the previous version's README claim a guarantee the running code did not have.
 ///
-/// `Daemon.run()` is an un-unit-testable async loop, so the two seams it uses are tested
+/// `Daemon.run()` is an un-unit-testable async loop, so its three seams are tested
 /// directly: `TmuxSendGuard.forHost` (what arms the guard, from the same `connectCommand`
-/// the installer writes) and `Daemon.composedSystemPrompt(…tmuxGuard:)` (what the model
-/// is told). If either regresses, production runs unguarded or silently guarded.
+/// the installer writes), `Daemon.makeTurnEngine` (the wiring that hands it to the running
+/// engine — the seam a review found untested, where a deleted assignment left the whole
+/// suite green and production unguarded), and `Daemon.composedSystemPrompt(…tmuxGuard:)`
+/// (what the model is told). If any regresses, production runs unguarded or silently
+/// guarded.
 final class DaemonTmuxGuardPromptTests: XCTestCase {
 
     private func registryURL(sessions: [String] = []) throws -> URL {
@@ -38,6 +41,62 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
         XCTAssertTrue(guardPolicy.evaluate("tmux send-keys -t main 'rm -rf ~' Enter").isRefusal)
         XCTAssertEqual(guardPolicy.evaluate("tmux capture-pane -p -t main"), .allow)
         XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t pocketdj 'git status' Enter"), .allow)
+    }
+
+    /// The connectCommand the installer ACTUALLY writes
+    /// (`scripts/mac-fin-agentd/provision-config.sh`), `\;` and all — the shape that ships
+    /// on the resident site. The simplified `tmux new-session -A -s fin` every other test
+    /// passes exercises a different lexer path: here the `\;` must survive as a bare `;`
+    /// word so `subcommands` splits on it, and the trailing `set status off` must not
+    /// itself be refused. A regression there ships a guard whose ownSession is nil, which
+    /// refuses every no-`-t` command in the daemon's own session.
+    func testGuardArmsFromTheConnectCommandTheInstallerActuallyWrites() throws {
+        let url = try registryURL(sessions: ["pocketdj"])
+        let guardPolicy = TmuxSendGuard.forHost(
+            connectCommand: "tmux new-session -A -s fin \\; set status off",
+            registryFileURL: url
+        )
+        XCTAssertTrue(guardPolicy.isEnforced)
+        XCTAssertEqual(guardPolicy.ownSession, "fin")
+        XCTAssertEqual(guardPolicy.resolved().allowed, ["fin", "pocketdj"])
+        // The own-session fallback is what a no-`-t` command depends on.
+        XCTAssertEqual(guardPolicy.evaluate("tmux send-keys 'git status' Enter"), .allow)
+        XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t fin 'git status' Enter"), .allow)
+        XCTAssertTrue(guardPolicy.evaluate("tmux kill-session -t main").isRefusal)
+    }
+
+    /// THE WIRING ITSELF. `forHost` and `composedSystemPrompt` were each covered while the
+    /// line that joins them to the running engine was not: deleting `engine.tmuxGuard =
+    /// tmuxGuard` left the whole suite green while production ran unguarded — and worse
+    /// than unguarded, because the prompt still told the model the gate existed. The
+    /// assertion is on a refused send, not on the property, so it fails if any link in
+    /// factory → engine → send_input comes apart.
+    @MainActor
+    func testTheDaemonsOwnEngineFactoryArmsTheGuardOnTheSendPath() async throws {
+        let session = GuardStubSession()
+        let guardPolicy = TmuxSendGuard.forHost(
+            connectCommand: "tmux new-session -A -s fin \\; set status off",
+            registryFileURL: try registryURL(sessions: ["fin"])
+        )
+        let engine = Daemon.makeTurnEngine(
+            configuration: AgentEngineConfiguration(
+                endpointURL: "http://127.0.0.1:1",  // never reached on this path
+                modelIdentifier: "stub"
+            ),
+            session: session,
+            tmuxGuard: guardPolicy,
+            audit: { _ in }
+        )
+
+        let refused = await engine.execute(AgentToolCall(
+            id: "t1",
+            name: AgentToolSpec.sendInput.name,
+            arguments: #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
+        ))
+
+        XCTAssertTrue(refused.contains("REFUSED"), "got: \(refused)")
+        XCTAssertTrue(refused.contains("main"), "got: \(refused)")
+        XCTAssertTrue(session.sentInputs.isEmpty, "nothing may reach the PTY")
     }
 
     /// Told, not just enforced: an armed guard appends its paragraph, and it names the
@@ -88,5 +147,19 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
         )
         XCTAssertFalse(guardPolicy.isEnforced)
         XCTAssertNil(guardPolicy.promptSection)
+    }
+}
+
+/// Minimal `AgentSessionDriving` for the wiring test: no SSH, no PTY, and it records what
+/// would have been typed so a refusal can be proven by absence.
+@MainActor
+final class GuardStubSession: AgentSessionDriving {
+    let eventLog = TerminalEventLog()
+    var isSessionConnected = true
+    private(set) var sentInputs: [String] = []
+
+    func sendAgentInput(_ text: String) {
+        sentInputs.append(text)
+        eventLog.recordInput(Array(text.utf8))
     }
 }

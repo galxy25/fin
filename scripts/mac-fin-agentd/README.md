@@ -240,21 +240,35 @@ old `fin/sites/fin/<site8>/status.json` in S3 is left for the operator.
   nesting. Three flags get refused before any target check because they make the target
   lie: `kill-session -a` (kills every session *except* the one named), and `send-keys -c`/
   `-K` (address a client, so the keys land in whatever session the human is attached to).
-  `xargs tmux …` is refused whole — its argv comes from stdin — and so is a line ending in
-  `\` or an open quote, because the PTY concatenates sends and the shell would join it with
-  the next one. **Reading is deliberately unrestricted** — `capture-pane`,
+  `xargs tmux …` is refused whole — its argv comes from stdin — and so is `echo tmux
+  kill-server | sh` (a shell with no script runs what the pipe hands it: same blind spot,
+  one pipe over) and a line ending in `\` or an open quote, because the PTY concatenates
+  sends and the shell would join it with the next one. An **unrecognized head is not a
+  reason to stop looking**: a bare `tmux` token anywhere in a segment is parsed from that
+  token on, which is what catches `find … -exec tmux …`, `if tmux kill-server; then`, and
+  `for i in 1; do tmux …; done` — all verified to really run tmux on a private socket. The
+  inline interpreters (`python3 -c`, `perl -e`, `node -e`, `osascript -e`, `awk`, `su -c`)
+  get their payloads unwrapped like `sh -c` does. tmux's **global** flags are parsed as the
+  getopt clusters they are, after `tmux -2f ls kill-session -t victim` (whose `-f` swallows
+  `ls`, making the read-only verb a decoy) destroyed a session on the probe socket, and a
+  bare `tmux -f` now returns a verdict instead of trapping. **Reading is deliberately unrestricted** — `capture-pane`,
   `list-sessions`, `list-windows`, `has-session`, `display-message -p` work against `main`
   and every other session, because seeing the iMac's real work is the whole point of a
   resident site. Refusals are honest tool results (they name the session and hand back the
   read commands) and land in the audit log as failures. Coverage:
   `daemon/Tests/FinAgentCoreTests/TmuxCommandGuardTests.swift`.
 
-  **The allow-list is read once, at launch.** `routing-registry.json` lives in the same home
-  directory as the shell the guard constrains, so a per-send re-read would let the model
-  widen its own allow-list with two commands the guard never inspects (append a session with
-  `python3 -c …`, then send keys to it). Registering a session is therefore a *user* action
-  on this Mac that applies at the next launch — and the refusal text deliberately does not
-  name the file. What keeps the router's `start` action working is a namespace instead of a
+  **The allow-list is read once, at launch — a speed bump, not a barrier.**
+  `routing-registry.json` lives in the same home directory as the shell the guard
+  constrains, so a per-send re-read would let the model widen its own allow-list with two
+  commands the guard never inspects (append a session with `python3 -c …`, then send keys
+  to it). The refusal text deliberately does not name the file. But **the agent controls
+  the relaunch**: this LaunchAgent is `KeepAlive` with a 15s throttle, so writing the file
+  and then ending the process (`launchctl kickstart -k`, a plain `kill`, a crash — none of
+  which `DestructiveCommandHeuristic` matches) brings back a daemon that reads what was
+  written. Registering a session is a *user* action in practice, not in enforcement; the
+  real fix is an allow-list this uid cannot write (root-owned or installer-owned outside
+  `$HOME`) or the dedicated socket below. What keeps the router's `start` action working is a namespace instead of a
   file: sessions named `fin-…` are Fin's own, so `tmux new-session -d -s fin-build` then
   `tmux send-keys -t fin-build …` works end to end. Don't name your own sessions `fin-`.
 
@@ -263,9 +277,13 @@ old `fin/sites/fin/<site8>/status.json` in S3 is left for the operator.
   server that hosts Levi's live `main` session, and a byte-level guard over a
   natural-language channel cannot close indirection: `T=tmux; $T send-keys …`, a
   base64/`eval` reconstruction, a helper script or Makefile target that runs tmux, an alias
-  or shell function, writing `~/.tmux.conf` and having tmux read it later, `ssh <remote>
-  tmux …` (out of scope by policy — a remote box's session names are not in this registry's
-  namespace), a command split across two sends whose halves never spell the word, or plain
+  or shell function, writing `~/.tmux.conf` and having tmux read it later, an argv built
+  structurally inside an interpreter (`subprocess.run(["tmux", "send-keys", …])` — the
+  string form is caught, a list of words is not), rewriting the registry and forcing a
+  relaunch (above), an `ssh` config alias pointing back at this box, `ssh <remote> tmux …`
+  (out of scope by policy — a remote box's session names are not in this registry's
+  namespace, though this machine's *own* names and addresses are now treated as local), a
+  command split across two sends whose halves never spell the word, or plain
   non-tmux damage (`pkill -f mlx_lm`, `launchctl bootout`, an `rm` shape
   `DestructiveCommandHeuristic` misses — its patterns still match **nothing** in a tmux
   verb). The guard closes the direct path a model actually takes; treat `main` as protected

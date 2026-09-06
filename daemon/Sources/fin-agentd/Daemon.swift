@@ -317,6 +317,38 @@ final class Daemon {
     /// empty, or unreadable file → that section stays out, so a host with neither file
     /// sees the base prompt byte-for-byte. Nonisolated and path-parameterized so tests
     /// drive the real absent/present forks; the ledger URL defaults to nil so
+    /// The engine the daemon actually runs, built in ONE testable place.
+    ///
+    /// This exists because of a seam that nothing covered: deleting `engine.tmuxGuard =
+    /// tmuxGuard` from `run()` left all 251 tests green while production ran unguarded —
+    /// `AgentEngineDispatchTests` assigns the guard itself, and `DaemonTmuxGuardPromptTests`
+    /// exercises `forHost` and `composedSystemPrompt` but never the wiring between them.
+    /// The failure was worse than unguarded-and-honest: `composedSystemPrompt` still
+    /// appended the guard paragraph, so the model would be TOLD a gate existed that did
+    /// not. `DaemonTmuxGuardPromptTests.testTheDaemonsOwnEngineFactoryArmsTheGuard` is now
+    /// the regression test, and it asserts on a refusal, not on the property.
+    ///
+    /// The guard is set ALWAYS — even when unarmed, so the assignment (not an omission) is
+    /// what decides. Its allow-list is a launch-time snapshot: the registry is not re-read
+    /// per send, because that file sits in the same home directory the guarded shell can
+    /// write, and a live read would let the thing being constrained edit its own
+    /// allow-list. Sessions the agent starts for itself stay drivable through
+    /// `TmuxCommandGuard.ownedSessionPrefix`, which needs no file at all.
+    static func makeTurnEngine(
+        configuration: AgentEngineConfiguration,
+        session: any AgentSessionDriving,
+        tmuxGuard: TmuxSendGuard,
+        audit: @escaping (AgentAuditEvent) -> Void
+    ) -> AgentTurnEngine {
+        let engine = AgentTurnEngine(
+            configuration: configuration,
+            session: session,
+            audit: audit
+        )
+        engine.tmuxGuard = tmuxGuard
+        return engine
+    }
+
     /// routing-only callers stay unchanged.
     nonisolated static func composedSystemPrompt(
         base: String,
@@ -587,7 +619,7 @@ final class Daemon {
             log("goals ledger enabled: ledger at \(goalsLedgerPath)")
         }
 
-        let engine = AgentTurnEngine(
+        let engine = Self.makeTurnEngine(
             configuration: AgentEngineConfiguration(
                 endpointURL: config.agent.endpointURL,
                 modelIdentifier: config.agent.modelIdentifier,
@@ -599,15 +631,9 @@ final class Daemon {
                 terminalContextLines: config.agent.terminalContextLines ?? 160
             ),
             session: session,
+            tmuxGuard: tmuxGuard,
             audit: { [weak self] event in self?.record(event) }
         )
-        // Set, always — even when unarmed, so the assignment (not an omission) is what
-        // decides. The allow-list is the snapshot taken just above: the registry is NOT
-        // re-read per send, because the file sits in the same home directory the guarded
-        // shell can write, and a live read would let the thing being constrained edit its
-        // own allow-list. Sessions the agent starts for itself stay drivable through
-        // TmuxCommandGuard.ownedSessionPrefix, which needs no file at all.
-        engine.tmuxGuard = tmuxGuard
 
         // The model's request_input tool: record + notify — the engine already wrote the
         // question into the audit trail as the tool call, this surfaces it to a human.
