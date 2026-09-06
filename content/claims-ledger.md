@@ -575,7 +575,7 @@ as good as its parser. These four add the other half — a rule made mechanical 
 only as good as the *set* it quantifies over, and a correction is only as good
 as the search that finds its instances.
 
-**Known and not fixed, recorded rather than opened as another round.** Three
+**Known and not fixed, recorded rather than opened as another round.** Four — three
 gaps found while fixing the four above, none of them worth a further pass, all
 of them the next reader's business. (a) `check_tables` proves a run of `|`
 lines is a table; it does not prove the columns line up, and nothing here
@@ -589,6 +589,8 @@ on it. The heading arm is unaffected. (c) The count sweep behind the seventh
 entry was a `grep` over `content/` for counted nouns, read by hand —
 repeatable, not automated, and a count phrased in a way the pattern missed is
 still possible.
+
+A fourth, found by the verification pass on `9e6ceaa` after the ATX bypass it mirrors was closed: **the headline guard sees only `#` headings.** `check_piece_to_rows` builds its heading list from lines beginning with `#`, so a *setext* heading — a line of prose underlined with `===` or `---` — is invisible to it, and a row that declares an exemption can put an unqualified score there and pass. No live piece uses setext headings and the `title:` arm is unaffected, so it is recorded here rather than fixed in that round. The fix is to count an underlined line as a heading when building that list.
 
 **Standing instruction that follows from both.** When a row's evidence is the
 *absence* of something, the **evidence** column names the search that would have
