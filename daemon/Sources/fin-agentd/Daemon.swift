@@ -329,11 +329,10 @@ final class Daemon {
     /// the regression test, and it asserts on a refusal, not on the property.
     ///
     /// The guard is set ALWAYS — even when unarmed, so the assignment (not an omission) is
-    /// what decides. Its allow-list is a launch-time snapshot: the registry is not re-read
-    /// per send, because that file sits in the same home directory the guarded shell can
-    /// write, and a live read would let the thing being constrained edit its own
-    /// allow-list. Sessions the agent starts for itself stay drivable through
-    /// `TmuxCommandGuard.ownedSessionPrefix`, which needs no file at all.
+    /// what decides. Since the private-socket redesign it carries no allow-list at all: it
+    /// knows which tmux SERVER is the agent's own (parsed out of `connectCommand`) and
+    /// refuses the ways off it. Every session on that server is the agent's, so there is
+    /// nothing left for the registry to widen.
     static func makeTurnEngine(
         configuration: AgentEngineConfiguration,
         session: any AgentSessionDriving,
@@ -586,14 +585,44 @@ final class Daemon {
         // ledger itself, so goal CONTENT stays fresh; only the taxonomy section is
         // launch-pinned.) The marker checks are safe: both markers are load-bearing
         // strings the prompt-gating tests key on.
-        // The send-keys guard's allow-list: this daemon's own tmux session (parsed out of
-        // connectCommand, so a missing or corrupt registry still yields a working one)
-        // unioned with every registered session. Armed whenever this host has either —
-        // a host with neither has no tmux namespace to defend and is left untouched.
-        let tmuxGuard = TmuxSendGuard.forHost(
+        // The tmux guard's notion of "my own server": socket and session, both parsed out
+        // of connectCommand. Armed whenever this host has a tmux connect command or a
+        // routing registry — a host with neither has no tmux server to stay on and is left
+        // untouched.
+        var tmuxGuard = TmuxSendGuard.forHost(
             connectCommand: config.server.connectCommand,
             registryFileURL: URL(fileURLWithPath: routingRegistryPath)
         )
+
+        // PROVE THE SHELL LANDED ON ITS OWN TMUX SERVER, rather than assuming the
+        // connectCommand worked. Everything the private-socket design promises rests on
+        // `$TMUX` pointing at Fin's own socket: if the attach failed quietly — tmux not
+        // installed, a startup flush that ate the line, a server that refused to start —
+        // the shell is a plain login shell, a bare `tmux send-keys -t main …` names no
+        // socket for the guard to catch, and it lands on the human's server. So ask the
+        // shell, once, and let the answer decide: no proof means every tmux command is
+        // refused for this run (read_session still works, and the refusal says why).
+        if tmuxGuard.isEnforced, tmuxGuard.ownSocket != .standard {
+            let reported = await session.probeEnvironment("TMUX")
+            tmuxGuard.shellIsOnOwnServer = TmuxSendGuard.shellReportIsOwnServer(
+                reported, socket: tmuxGuard.ownSocket
+            )
+            if tmuxGuard.shellIsOnOwnServer {
+                log("tmux confinement confirmed: the shell is inside \(tmuxGuard.ownSocket.described) "
+                    + "($TMUX=\(reported ?? ""))")
+            } else {
+                let detail = reported.map { $0.isEmpty ? "empty" : $0 } ?? "no answer"
+                log("REFUSING ALL TMUX: the shell is NOT inside \(tmuxGuard.ownSocket.described) "
+                    + "($TMUX \(detail)) — the connectCommand did not take effect, so a tmux command "
+                    + "typed here could reach the human's default socket. read_session still works.")
+                record(AgentAuditEvent(
+                    kind: "error",
+                    text: "tmux confinement NOT confirmed ($TMUX \(detail)); every tmux command "
+                        + "will be refused this run",
+                    isFailure: true
+                ))
+            }
+        }
         let basePrompt = config.agent.systemPrompt ?? Self.defaultSystemPrompt
         let systemPrompt = Self.composedSystemPrompt(
             base: basePrompt,
@@ -608,10 +637,16 @@ final class Daemon {
             log("session routing enabled: registry at \(routingRegistryPath)")
         }
         if tmuxGuard.isEnforced {
-            let allowed = tmuxGuard.resolved().allowed.sorted().joined(separator: ", ")
-            log("tmux guard armed: mutating tmux commands limited to [\(allowed)] plus "
-                + "\(TmuxCommandGuard.ownedSessionPrefix)* (Fin's own namespace); "
-                + "reads (capture-pane, list-*, has-session) are unrestricted")
+            // The socket is the interesting half now: on a private socket the guard is a
+            // second layer, on the default socket it is the only one, and the log has to
+            // say which posture this install is actually in.
+            let posture = tmuxGuard.ownSocket == .standard
+                ? "SHARED default socket — the human's sessions are in reach of anything the "
+                    + "guard's parser misses; see daemon/README.md"
+                : "private socket (\(tmuxGuard.ownSocket.described))"
+            log("tmux guard armed: session \"\(tmuxGuard.ownSession ?? "?")\" on \(posture); "
+                + "another server (-L/-S, TMUX=…) and kill-server are refused, "
+                + "read_session reads the default socket read-only")
         } else {
             log("tmux guard not armed: no tmux session in connectCommand and no routing registry")
         }
@@ -656,6 +691,14 @@ final class Daemon {
         // tool tells the model the truth instead of promising a delivery that no-oped.
         engine.onNotify = { [weak self] title, body in
             self?.notifyFromTool(title: title, body: body) ?? false
+        }
+        // The model's read_session tool. THE READ HALF of the private-socket design: the
+        // agent's shell can only see its own tmux server, so the one path to the machine's
+        // real sessions runs here, on a channel the agent cannot type into, from a name it
+        // does not get to shape into a command line.
+        engine.onReadSession = { [weak self] name, lines in
+            guard let self else { return .failed("the daemon is shutting down.") }
+            return await self.readSession(name: name, lines: lines)
         }
 
         if let uplink = transcript {
@@ -943,6 +986,60 @@ final class Daemon {
     /// the model to lean on it.
     private var hasNotifyChannel: Bool {
         notifyClient != nil || (config.notifyCommand.map { !$0.isEmpty } ?? false)
+    }
+
+    /// The model's `read_session` tool, wired to `engine.onReadSession`.
+    ///
+    /// EVERY BYTE OF THE COMMAND IS THIS FUNCTION'S EXCEPT ONE WORD. `TmuxSessionRead`
+    /// builds a fixed argv — `tmux capture-pane -p -J -t <name> -S -<lines>`, or
+    /// `tmux list-sessions -F <fixed format>` — and the only thing the model contributed is
+    /// `<name>`, which `AgentTurnEngine` already validated and this function validates
+    /// AGAIN. Two validations of the same rule is not belt-and-braces theater: the engine's
+    /// is what protects a host that wires this hook to something else, and this one is what
+    /// protects the argv actually sent from a future engine change.
+    ///
+    /// It deliberately runs against the DEFAULT socket (no `-L`): that is the server
+    /// holding the human's sessions, which is the whole point of the tool. The command is
+    /// read-only, and the channel is an SSH exec channel, not the agent's PTY — the agent
+    /// cannot type into it, cannot see it, and cannot influence it beyond the name.
+    ///
+    /// The output is redacted with `MemoryRedactor` before it is returned, the same scrub
+    /// the cloud transcript applies: this is the one tool that pipes ANOTHER user's
+    /// terminal into the model's context, and that pane may be showing a token.
+    private func readSession(name: String?, lines: Int) async -> AgentReadSessionOutcome {
+        guard let session else {
+            return .failed("the daemon has no SSH session open.")
+        }
+        let argv: [String]
+        if let name {
+            guard let validated = TmuxSessionRead.validate(name: name) else {
+                // Unreachable through the engine, which validates first; if it is ever
+                // reached, the answer is a refusal, never a best-effort quote.
+                return .failed("\"\(name)\" is not a legal tmux session name.")
+            }
+            argv = TmuxSessionRead.captureArguments(
+                session: validated,
+                lines: min(max(lines, 1), TmuxSessionRead.maxLines)
+            )
+        } else {
+            argv = TmuxSessionRead.listArguments()
+        }
+        let commandLine = TmuxSessionRead.commandLine(argv)
+        do {
+            let output = try await session.runFixedCommand(
+                commandLine,
+                maxResponseBytes: TmuxSessionRead.maxResponseBytes
+            )
+            record(AgentAuditEvent(
+                kind: "notice",
+                text: "read_session ran: \(commandLine) (\(output.utf8.count) bytes)"
+            ))
+            return .text(MemoryRedactor.redact(output))
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            log("read_session failed: \(reason)")
+            return .failed(reason)
+        }
     }
 
     /// The model's `notify` tool, wired to `engine.onNotify`. Unlike `notify(event:)`,

@@ -180,7 +180,47 @@ public struct AgentToolSpec {
         ]
     )
 
-    static let all: [AgentToolSpec] = [readTerminal, sendInput, remember, recall, requestInput, monitor, notify]
+    /// The read half of the private-socket design, in the model's hands as a NAME, never
+    /// as a command line (`TmuxSessionRead`). Fin's shell lives on its own tmux socket, so
+    /// `tmux capture-pane -t main` typed into that shell reaches Fin's own server, where
+    /// the human's sessions do not exist. This tool is the supported path to them: the
+    /// runner runs a fixed `tmux capture-pane` argv on a separate channel against the
+    /// machine's default socket, and the only thing the model contributes is one validated
+    /// session name.
+    ///
+    /// The listing is folded into the same tool rather than split into a second one, so
+    /// the discovery step is impossible to miss: no arguments lists, a name reads.
+    static let readSession = AgentToolSpec(
+        name: "read_session",
+        description: "Look at ANOTHER terminal session on this machine — the owner's own work, "
+            + "or another agent's session. Call it with NO arguments to list the sessions by name, "
+            + "then call it again with one of those exact names to see that session's screen. Use "
+            + "it whenever you are asked what is running, what another session printed, or how "
+            + "someone else's work is going. read_terminal shows only YOUR terminal; this is the "
+            + "only way to see the others, and it is read-only — it cannot type into them.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "session": [
+                    "type": "string",
+                    "description": "The session's name, exactly as the listing printed it. "
+                        + "Omit to list the sessions instead of reading one. A name only — not a "
+                        + "command, not a tmux argument.",
+                ],
+                "lines": [
+                    "type": "integer",
+                    "description": "How many trailing lines of that session's screen to return "
+                        + "(1-\(TmuxSessionRead.maxLines)). Omit for the default "
+                        + "(\(TmuxSessionRead.defaultLines)).",
+                ],
+            ],
+            "required": [String](),
+        ]
+    )
+
+    static let all: [AgentToolSpec] = [
+        readTerminal, sendInput, readSession, remember, recall, requestInput, monitor, notify,
+    ]
 
     static let knownToolNames: Set<String> = Set(all.map(\.name))
 

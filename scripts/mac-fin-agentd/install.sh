@@ -280,20 +280,55 @@ Installed and rendered; not loaded."
 	# ~/.config/fish/config.fish — a file this package neither owns nor installs, and one
 	# Fin itself can write. Lose that line to a dotfile restore and the daemon's
 	# FIN_READY_* probe and every keystroke of every turn land in the owner's live `main`
-	# session (the 2026-09-05 incident the marker exists to prevent). NEVER run this
-	# without the marker: without it the login shell would attach `main`, which is the
-	# thing being tested for.
+	# session (the 2026-09-05 incident the marker exists to prevent).
+	#
+	# THE PREVIOUS VERSION OF THIS CHECK WAS VACUOUS, and a check that always passes is
+	# worse than none. It ran `ssh host <command>`, which sshd runs as `$SHELL -c …` — a
+	# NON-INTERACTIVE shell — while the auto-attach it was testing is gated on
+	# `status is-interactive`. The block under test never ran, so the probe printed
+	# `TMUX=[]` and passed whether the guard was there or not.
+	#
+	# What it does now, and why in this exact shape:
+	#   * `$SHELL -i -c` forces an INTERACTIVE shell, so `status is-interactive` is true
+	#     and the auto-attach block is actually evaluated. That is the gate that was
+	#     being skipped.
+	#   * `SSH_TTY=/dev/null` is set because the block's "am I remote?" test accepts
+	#     SSH_CONNECTION *or* SSH_TTY, and only a PTY session sets the latter — so a
+	#     future config keyed on SSH_TTY would otherwise slip past a PTY-less probe.
+	#   * NO PTY IS REQUESTED, deliberately, and this is the one place the check differs
+	#     from the session it models. With a PTY, the FAILING branch would really attach
+	#     the owner's live `main` (resizing their windows) for as long as the probe took.
+	#     Without one, that same branch runs `tmux new-session -A -s main` and tmux exits
+	#     with "open terminal failed: not a terminal" (verified, tmux 3.6a) — no client,
+	#     no resize, no keystrokes — and the GUARD line never prints, so the probe fails
+	#     closed. Testing a guard must not be able to cause the damage the guard prevents.
+	#   * The payload is single-quoted twice on purpose: the OUTER remote shell must not
+	#     expand $TMUX (it is unset there, so it would print `TMUX=[]` no matter what the
+	#     interactive shell did — the same vacuity in a new disguise).
+	# What it still cannot prove: that the auto-attach works AT ALL. A config that never
+	# attaches anything passes this too. The only check for that direction is to attach
+	# the owner's session on purpose, which this installer will not do.
 	if [ "${FIN_SKIP_TMUX_GUARD_CHECK:-0}" != "1" ]; then
-		PROBE="$(LC_FIN_AGENT=1 ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
+		PROBE_CMD='env SSH_TTY=/dev/null $SHELL -i -c '\''printf "GUARD LC=%s TMUX=[%s]\n" "$LC_FIN_AGENT" "$TMUX"'\'''
+		PROBE="$(LC_FIN_AGENT=1 perl -e 'alarm shift; exec @ARGV' 30 \
+			ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
 			-o ConnectTimeout=5 -o SendEnv=LC_FIN_AGENT -o StrictHostKeyChecking=accept-new \
-			"$(id -un)@127.0.0.1" 'printf "GUARD LC=%s TMUX=[%s]\n" "$LC_FIN_AGENT" "$TMUX"' 2>&1)" \
+			"$(id -un)@127.0.0.1" "$PROBE_CMD" </dev/null 2>&1)" \
 			|| die "loopback SSH with the site key failed: ${PROBE:-no output}
 Remote Login on? key authorized? Installed and rendered; not loaded."
 		case "$PROBE" in
-			*"TMUX=[]"*) echo "guard: ${PROBE#*GUARD }" ;;
-			*) die "the login shell did NOT honour LC_FIN_AGENT (${PROBE#*GUARD }).
+			*"GUARD LC=1 TMUX=[]"*) echo "guard: ${PROBE#*GUARD }" ;;
+			*"GUARD LC=1 TMUX=["*) die "the login shell put an INTERACTIVE session inside tmux even
+with LC_FIN_AGENT set (${PROBE#*GUARD }).
 Starting now would type the daemon's readiness probe and every keystroke of every turn into
 the owner's live tmux session. Restore the LC_FIN_AGENT exclusion in ~/.config/fish/config.fish.
+Installed and rendered; not loaded." ;;
+			*"GUARD LC="*) die "the LC_FIN_AGENT marker did not cross the SSH boundary
+(${PROBE#*GUARD }) — check sshd's AcceptEnv. Installed and rendered; not loaded." ;;
+			*) die "the interactive login shell never answered the probe: ${PROBE:-no output}
+That is what an auto-attach looks like from here — the shell exec'd tmux instead of running the
+probe (with no PTY, tmux then failed with 'not a terminal', so nothing was attached).
+Restore the LC_FIN_AGENT exclusion in ~/.config/fish/config.fish.
 Installed and rendered; not loaded." ;;
 		esac
 	fi

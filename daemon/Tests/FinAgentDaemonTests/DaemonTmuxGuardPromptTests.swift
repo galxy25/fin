@@ -28,19 +28,39 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
         return url
     }
 
-    /// The resident-site posture the installer actually writes: a tmux `connectCommand`
-    /// and a registry. Both halves of the allow-list have to survive the trip.
+    /// The resident-site posture the installer actually writes SINCE THE PRIVATE SOCKET:
+    /// a `-L`-bearing tmux `connectCommand`. Both facts the guard needs — which socket,
+    /// which session — have to survive the trip out of that one string.
     func testGuardArmsFromTheShippedResidentSiteShape() throws {
-        let url = try registryURL(sessions: ["fin", "pocketdj"])
+        let url = try registryURL(sessions: ["fin"])
         let guardPolicy = TmuxSendGuard.forHost(
-            connectCommand: "tmux new-session -A -s fin",
+            connectCommand: "tmux -L fin new-session -A -s fin",
             registryFileURL: url
         )
         XCTAssertTrue(guardPolicy.isEnforced)
-        XCTAssertEqual(guardPolicy.resolved().allowed, ["fin", "pocketdj"])
-        XCTAssertTrue(guardPolicy.evaluate("tmux send-keys -t main 'rm -rf ~' Enter").isRefusal)
-        XCTAssertEqual(guardPolicy.evaluate("tmux capture-pane -p -t main"), .allow)
-        XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t pocketdj 'git status' Enter"), .allow)
+        XCTAssertEqual(guardPolicy.ownSocket, .name("fin"))
+        XCTAssertEqual(guardPolicy.ownSession, "fin")
+        // Its own server: unrestricted, no allow-list, nothing to register.
+        XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t fin-build 'git status' Enter"), .allow)
+        XCTAssertEqual(guardPolicy.evaluate("tmux -L fin ls"), .allow)
+        // The way out: refused.
+        XCTAssertTrue(guardPolicy.evaluate("tmux -L default send-keys -t main 'rm -rf ~' Enter").isRefusal)
+        XCTAssertTrue(guardPolicy.evaluate("TMUX= tmux kill-session -t main").isRefusal)
+    }
+
+    /// NOTHING IS HARDCODED TO "fin". The daemon derives its socket and session names
+    /// from whatever `connectCommand` the config carries — a site provisioned with
+    /// FIN_TMUX_SOCKET=wharf must guard `wharf`, and must then refuse `-L fin`.
+    func testSocketAndSessionNamesComeFromTheConfigNotFromAConstant() throws {
+        let guardPolicy = TmuxSendGuard.forHost(
+            connectCommand: "tmux -L wharf new-session -A -s dockside \\; set status off",
+            registryFileURL: try registryURL()
+        )
+        XCTAssertTrue(guardPolicy.isEnforced)
+        XCTAssertEqual(guardPolicy.ownSocket, .name("wharf"))
+        XCTAssertEqual(guardPolicy.ownSession, "dockside")
+        XCTAssertEqual(guardPolicy.evaluate("tmux -L wharf kill-session -t dockside-old"), .allow)
+        XCTAssertTrue(guardPolicy.evaluate("tmux -L fin ls").isRefusal)
     }
 
     /// The connectCommand the installer ACTUALLY writes
@@ -51,18 +71,32 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
     /// itself be refused. A regression there ships a guard whose ownSession is nil, which
     /// refuses every no-`-t` command in the daemon's own session.
     func testGuardArmsFromTheConnectCommandTheInstallerActuallyWrites() throws {
-        let url = try registryURL(sessions: ["pocketdj"])
+        let url = try registryURL(sessions: ["fin"])
         let guardPolicy = TmuxSendGuard.forHost(
-            connectCommand: "tmux new-session -A -s fin \\; set status off",
+            connectCommand: "tmux -L fin new-session -A -s fin \\; set status off",
             registryFileURL: url
         )
         XCTAssertTrue(guardPolicy.isEnforced)
         XCTAssertEqual(guardPolicy.ownSession, "fin")
-        XCTAssertEqual(guardPolicy.resolved().allowed, ["fin", "pocketdj"])
-        // The own-session fallback is what a no-`-t` command depends on.
+        XCTAssertEqual(guardPolicy.ownSocket, .name("fin"))
         XCTAssertEqual(guardPolicy.evaluate("tmux send-keys 'git status' Enter"), .allow)
         XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t fin 'git status' Enter"), .allow)
-        XCTAssertTrue(guardPolicy.evaluate("tmux kill-session -t main").isRefusal)
+        XCTAssertTrue(guardPolicy.evaluate("tmux -S /tmp/tmux-501/default kill-session -t main").isRefusal)
+    }
+
+    /// The FAIL-CLOSED half of that derivation. A `connectCommand` this parser cannot
+    /// read yields `.standard`, and on `.standard` every explicit socket is somebody
+    /// else's — so a site that loses its `-L` (a hand-edited config, an old install)
+    /// degrades to refusing MORE, never less.
+    func testAConnectCommandWithoutASocketDegradesToRefusingEverySocket() throws {
+        let guardPolicy = TmuxSendGuard.forHost(
+            connectCommand: "tmux new-session -A -s fin",
+            registryFileURL: try registryURL()
+        )
+        XCTAssertEqual(guardPolicy.ownSocket, .standard)
+        XCTAssertTrue(guardPolicy.evaluate("tmux -L fin ls").isRefusal)
+        XCTAssertTrue(guardPolicy.evaluate("tmux -L default ls").isRefusal)
+        XCTAssertEqual(guardPolicy.evaluate("tmux ls"), .allow)
     }
 
     /// THE WIRING ITSELF. `forHost` and `composedSystemPrompt` were each covered while the
@@ -75,7 +109,7 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
     func testTheDaemonsOwnEngineFactoryArmsTheGuardOnTheSendPath() async throws {
         let session = GuardStubSession()
         let guardPolicy = TmuxSendGuard.forHost(
-            connectCommand: "tmux new-session -A -s fin \\; set status off",
+            connectCommand: "tmux -L fin new-session -A -s fin \\; set status off",
             registryFileURL: try registryURL(sessions: ["fin"])
         )
         let engine = Daemon.makeTurnEngine(
@@ -91,11 +125,11 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
         let refused = await engine.execute(AgentToolCall(
             id: "t1",
             name: AgentToolSpec.sendInput.name,
-            arguments: #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
+            arguments: #"{"input": "tmux -L default send-keys -t main 'rm -rf ~/forges' Enter"}"#
         ))
 
         XCTAssertTrue(refused.contains("REFUSED"), "got: \(refused)")
-        XCTAssertTrue(refused.contains("main"), "got: \(refused)")
+        XCTAssertTrue(refused.contains("-L default"), "got: \(refused)")
         XCTAssertTrue(session.sentInputs.isEmpty, "nothing may reach the PTY")
     }
 
@@ -104,7 +138,7 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
     func testArmedGuardAppendsItsParagraphToTheSystemPrompt() throws {
         let registry = try registryURL(sessions: ["fin"])
         let guardPolicy = TmuxSendGuard.forHost(
-            connectCommand: "tmux new-session -A -s fin",
+            connectCommand: "tmux -L fin new-session -A -s fin",
             registryFileURL: registry
         )
         let prompt = Daemon.composedSystemPrompt(
@@ -113,10 +147,12 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
             tmuxGuard: guardPolicy
         )
         XCTAssertTrue(prompt.hasPrefix(Daemon.defaultSystemPrompt), "the guard section is additive")
-        XCTAssertTrue(prompt.contains("tmux guard"), "got: \(prompt)")
-        XCTAssertTrue(prompt.contains("capture-pane"))
-        XCTAssertTrue(prompt.contains(TmuxCommandGuard.ownedSessionPrefix))
-        XCTAssertTrue(prompt.contains("Sessions you may act on: fin"))
+        XCTAssertTrue(prompt.contains("tmux (enforced in code"), "got: \(prompt)")
+        // The model must be told BOTH halves: its own server is unrestricted, and the
+        // human's sessions are reachable only through read_session.
+        XCTAssertTrue(prompt.contains("-L fin"), "got: \(prompt)")
+        XCTAssertTrue(prompt.contains("read_session"), "got: \(prompt)")
+        XCTAssertTrue(prompt.contains("\"fin\""), "got: \(prompt)")
     }
 
     /// The default parameter is `.unenforced`, so a caller that forgets the argument must
@@ -134,7 +170,7 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
         )
         XCTAssertEqual(base, Daemon.defaultSystemPrompt)
         XCTAssertEqual(explicit, base)
-        XCTAssertFalse(base.contains("tmux guard"))
+        XCTAssertFalse(base.contains("tmux (enforced in code"))
     }
 
     /// A host with no tmux session and no registry has no namespace to defend: the guard

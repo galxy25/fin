@@ -22,7 +22,8 @@
 # This script never prints a URL or the control-plane token. Overridable knobs:
 #   FIN_AGENTD_HOME, FIN_AWS_PROFILE, FIN_AWS_REGION, FIN_BUCKET, FIN_PRESIGN_SECONDS,
 #   FIN_CONTROL_PLANE_TOKEN_FILE, FIN_CONTROL_PLANE_URL, FIN_LLM_URL, FIN_MODEL,
-#   FIN_AGENT_ID, FIN_AGENT_NAME, FIN_SSH_USER, FIN_TMUX_SESSION, FIN_PYTHON
+#   FIN_AGENT_ID, FIN_AGENT_NAME, FIN_SSH_USER, FIN_TMUX_SESSION, FIN_TMUX_SOCKET,
+#   FIN_PYTHON
 set -euo pipefail
 
 FIN_AGENTD_HOME="${FIN_AGENTD_HOME:-$HOME/Library/Application Support/fin-agentd}"
@@ -38,6 +39,15 @@ AGENT_ID="${FIN_AGENT_ID:-F573F461-3C9C-46E4-8E1E-30A6A4663D7B}"
 AGENT_NAME="${FIN_AGENT_NAME:-Fin}"
 SSH_USER="${FIN_SSH_USER:-$(id -un)}"
 TMUX_SESSION="${FIN_TMUX_SESSION:-fin}"
+# THE PRIVATE TMUX SOCKET. `tmux -L <name>` puts the daemon's shell on its own tmux
+# SERVER — a different process with a different socket file from the one hosting the
+# owner's sessions — so nothing typed inside that shell can reach them. That boundary is
+# topological, not a parser: it does not depend on classifying what the model typed.
+# Reading the owner's sessions moves to the daemon's read_session tool, which runs a fixed
+# `tmux capture-pane` argv against the DEFAULT socket on a separate SSH channel.
+# Set FIN_TMUX_SOCKET="" to go back to the shared default socket (not recommended; the
+# guard is then the only thing between the agent and the owner's tmux).
+TMUX_SOCKET="${FIN_TMUX_SOCKET-fin}"
 
 SITE8_FILE="$FIN_AGENTD_HOME/site8"
 CONFIG_PATH="$FIN_AGENTD_HOME/config.json"
@@ -154,6 +164,7 @@ FIN_AGENT_ID="$AGENT_ID" \
 FIN_AGENT_NAME="$AGENT_NAME" \
 FIN_SSH_USER="$SSH_USER" \
 FIN_TMUX_SESSION="$TMUX_SESSION" \
+FIN_TMUX_SOCKET="$TMUX_SOCKET" \
 FIN_DAEMON_VERSION="${FIN_DAEMON_VERSION:-}" \
 exec "$PYTHON" - <<'PY'
 import datetime
@@ -292,6 +303,31 @@ if refresh and isinstance(existing, dict):
               "was signed for %r — run a full provision to realign" % (config.get("deviceToken8"), site8, site8),
               file=sys.stderr)
     mode = "refreshed (URLs only)"
+
+    # THE PRIVATE-SOCKET MIGRATION. A refresh normally keeps every field but the URLs,
+    # because a re-install must not silently revert a hand-tuned model id. connectCommand
+    # is the exception: it is not a preference, it is where the agent's shell LIVES, and
+    # the legacy value (`tmux new-session -A -s fin`, no -L) puts it on the same tmux
+    # server as the owner's sessions — the posture this design replaced. An install that
+    # kept it would run a daemon whose prompt and guard both say "your own server" while
+    # its shell sits on the human's.
+    #
+    # Narrow on purpose: it upgrades ONLY the legacy shape — a tmux attach with no socket
+    # flag at all — and says so out loud, with the old value. A connectCommand that
+    # already names a socket (any socket) is a deliberate choice and is left alone.
+    socket = env.get("FIN_TMUX_SOCKET") or ""
+    server_block = config.get("server") or {}
+    current = (server_block.get("connectCommand") or "").strip()
+    if socket and current.startswith("tmux ") and " -L " not in current and " -S " not in current:
+        upgraded = "tmux -L %s %s" % (socket, current[len("tmux "):])
+        server_block["connectCommand"] = upgraded
+        config["server"] = server_block
+        print("note: connectCommand upgraded to the private tmux socket -L %s\n"
+              "      was: %s\n      now: %s\n"
+              "      The daemon's shell now runs on its OWN tmux server, so nothing it types can\n"
+              "      reach the owner's sessions; it reads them with the read_session tool instead."
+              % (socket, current, upgraded), file=sys.stderr)
+        mode = "refreshed (URLs + private tmux socket)"
 else:
     if refresh:
         print("note: no existing config.json to refresh — writing a full one", file=sys.stderr)
@@ -304,9 +340,18 @@ else:
             "port": 22,
             "username": env["FIN_SSH_USER"],
             "privateKeyPath": key_path,
-            # The tested cloud shape: attach-or-create the daemon's OWN session. The
-            # human's session ("main" on the iMac) is never named anywhere in this file.
-            "connectCommand": "tmux new-session -A -s %s \\; set status off" % env["FIN_TMUX_SESSION"],
+            # Attach-or-create the daemon's OWN session on its OWN tmux server. The
+            # `-L <socket>` is the whole boundary: a different socket file is a different
+            # tmux server process, so the owner's sessions are not merely off-limits to
+            # this shell, they do not exist in it. The human's session ("main" on the
+            # iMac) is never named anywhere in this file. The daemon parses this string
+            # for both facts it needs — its socket and its session — so renaming either
+            # here is enough; nothing downstream is hardcoded to "fin".
+            "connectCommand": (
+                "tmux %snew-session -A -s %s \\; set status off"
+                % ("-L %s " % env["FIN_TMUX_SOCKET"] if env.get("FIN_TMUX_SOCKET") else "",
+                   env["FIN_TMUX_SESSION"])
+            ),
         },
         "agent": {
             "endpointURL": env["FIN_LLM_URL"],

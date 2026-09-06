@@ -167,6 +167,39 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
         throw HeadlessSessionError.connectTimeout(seconds: Int(timeout))
     }
 
+    /// Asks the LIVE SHELL what one environment variable holds, by typing an echo and
+    /// reading the answer back out of the event log. Nil means the shell never answered.
+    ///
+    /// This exists to prove the `connectCommand` actually took effect. The private-socket
+    /// design rests entirely on the agent's shell being INSIDE its own tmux server, and
+    /// that is a fact about a command typed into a PTY, which can fail quietly — tmux not
+    /// installed, a startup flush that ate the line, a server that refused to start. If it
+    /// did fail, the shell is a plain login shell whose `$TMUX` is empty, and from there a
+    /// bare `tmux send-keys -t main …` names no socket at all and would reach the human's
+    /// server. So the daemon asks, and treats "no proof" as "not confined".
+    ///
+    /// Same probe shape as `waitForShellReady`: a random token, and a line that carries the
+    /// token without carrying the word `echo` is the shell's own output rather than the
+    /// echoed keystrokes.
+    public func probeEnvironment(_ name: String, timeout: TimeInterval = 8) async -> String? {
+        guard state == .connected else { return nil }
+        let token = "FIN_ENV_\(UInt32.random(in: 100_000...999_999))"
+        let baseline = eventLog.events.last?.id
+        let sentAt = Date()
+        sendAgentInput("echo \(token)=$\(name)\r")
+
+        let deadline = sentAt.addingTimeInterval(timeout)
+        while Date() < deadline {
+            let response = eventLog.outputText(after: baseline, orRecordedAfter: sentAt)
+            for line in response.split(separator: "\n") where line.contains(token) && !line.contains("echo") {
+                guard let range = line.range(of: "\(token)=") else { continue }
+                return String(line[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+        return nil
+    }
+
     public func disconnect() {
         generation += 1
         runTask?.cancel()
@@ -184,6 +217,57 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
     public func sendAgentInput(_ text: String) {
         guard !text.isEmpty else { return }
         send(bytes: Array(text.utf8))
+    }
+
+    /// Runs a command on a SEPARATE SSH exec channel — not the PTY, not the agent's shell.
+    ///
+    /// This exists for exactly one caller: `read_session`. The agent's shell lives on its
+    /// own tmux socket, so a `capture-pane` typed into it can only ever see the agent's own
+    /// server; reading the machine's real sessions has to happen somewhere the agent cannot
+    /// type. A second channel on the same authenticated connection is that somewhere.
+    ///
+    /// The `commandLine` is the CALLER's, byte for byte — `TmuxSessionRead` builds it from
+    /// a fixed argv plus one validated session name — and this function adds nothing to it.
+    /// Deliberately no `inShell:`, so sshd runs it directly rather than through an
+    /// interactive shell path; the login shell still expands the string (that is what an
+    /// SSH exec request is), which is why the name that goes into it is validated to a
+    /// charset with no shell meaning at all.
+    ///
+    /// Non-zero exit is NOT an exception here: `tmux capture-pane -t nope` exits 1 and
+    /// prints `can't find session: nope`, and that sentence is the honest answer to give
+    /// the model. Output is capped at `maxResponseBytes`, oldest-kept, with a marker.
+    public func runFixedCommand(
+        _ commandLine: String,
+        maxResponseBytes: Int = 64 * 1024
+    ) async throws -> String {
+        guard let client else { throw HeadlessSessionError.notConnected }
+        var collected = ""
+        var truncated = false
+        do {
+            for try await chunk in try await client.executeCommandStream(commandLine) {
+                let buffer: ByteBuffer
+                switch chunk {
+                case .stdout(let value): buffer = value
+                case .stderr(let value): buffer = value
+                }
+                collected += String(buffer: buffer)
+                if collected.utf8.count > maxResponseBytes {
+                    truncated = true
+                    break
+                }
+            }
+        } catch let failure as SSHClient.CommandFailed {
+            // The command ran and said something; the exit status only matters when it
+            // said nothing at all.
+            if collected.isEmpty {
+                throw HeadlessSessionError.commandFailed(status: failure.exitCode)
+            }
+        }
+        if truncated {
+            collected = String(collected.prefix(maxResponseBytes))
+                + "\n[truncated at \(maxResponseBytes) bytes]"
+        }
+        return collected
     }
 
     private func send(bytes: [UInt8]) {
@@ -317,6 +401,8 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
 public enum HeadlessSessionError: Error, LocalizedError {
     case connectFailed(String)
     case connectTimeout(seconds: Int)
+    case notConnected
+    case commandFailed(status: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -324,6 +410,10 @@ public enum HeadlessSessionError: Error, LocalizedError {
             return "SSH connection failed: \(detail)"
         case .connectTimeout(let seconds):
             return "SSH connection didn't come up within \(seconds)s."
+        case .notConnected:
+            return "the SSH session is not connected."
+        case .commandFailed(let status):
+            return "the command exited \(status) without printing anything."
         }
     }
 }

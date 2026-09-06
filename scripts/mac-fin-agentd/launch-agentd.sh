@@ -21,12 +21,14 @@
 #   1. config.json exists and parses
 #   2. the brain answers AND serves the configured model id  (a 404 from a running
 #      LM Studio with no model loaded is not a brain)
-#   3. the login shell honours the LC_FIN_AGENT marker — i.e. an SSH session with the
-#      marker set lands in a PLAIN shell, not in the owner's `main` tmux session. This
-#      lives in ~/.config/fish/config.fish, a file this package does not own and Fin
+#   3. the login shell honours the LC_FIN_AGENT marker — i.e. an INTERACTIVE SSH session
+#      with the marker set lands in a PLAIN shell, not in the owner's `main` tmux session.
+#      This lives in ~/.config/fish/config.fish, a file this package does not own and Fin
 #      itself can write; if it is ever lost, the daemon's readiness probes and every
 #      keystroke of every turn land in the owner's live session (the 2026-09-05 iMac
-#      incident). Checked at every launch, not once at install.
+#      incident). Checked at every launch, not once at install. INTERACTIVE is the word
+#      that matters — see the long note at the check itself for why the previous version
+#      of it could not fail.
 #   4. presigned-URL expiry — warn only. Expired URLs 403; the daemon treats a 403 as a
 #      poll failure and keeps running (daemon/README.md, "403 is never absent"), so this
 #      is loud in the log rather than fatal.
@@ -87,24 +89,50 @@ if [ "${FIN_SKIP_BRAIN_CHECK:-0}" != "1" ]; then
 fi
 
 # --- 3. the login-shell guard ------------------------------------------------------------
+# THE OLD VERSION OF THIS CHECK WAS VACUOUS. It ran `ssh host <command>`, which sshd runs
+# as `$SHELL -c …` — a NON-INTERACTIVE shell — while the auto-attach it is testing is gated
+# on `status is-interactive` (~/.config/fish/config.fish). The block under test never ran,
+# so the probe printed `TMUX=[]` and passed whether the guard was there or not. A check
+# that always passes is worse than no check: it retires the operator's suspicion.
+#
+# The real path, and the two deliberate differences from it:
+#   * `$SHELL -i -c` forces an INTERACTIVE shell, so the auto-attach block is evaluated.
+#   * `SSH_TTY=/dev/null` is exported because the block's remote test accepts
+#     SSH_CONNECTION *or* SSH_TTY, and only a PTY session sets the latter.
+#   * NO PTY is requested. With one, the FAILING branch would attach the owner's live
+#     `main` and resize their windows for as long as the probe ran. Without one, that
+#     branch runs `tmux new-session -A -s main`, tmux exits "open terminal failed: not a
+#     terminal" (verified, tmux 3.6a), nothing attaches, and the GUARD line never prints —
+#     so the probe fails closed. A guard's test must not be able to do the damage the
+#     guard prevents.
+#   * The payload is single-quoted twice: the OUTER remote shell must not expand $TMUX,
+#     which is unset there and would print `TMUX=[]` whatever the interactive shell did.
+# What it still cannot prove: that the auto-attach works at all — a config that never
+# attaches passes too. Checking that direction means attaching the owner's session on
+# purpose, which this launcher will not do. See scripts/mac-fin-agentd/README.md.
 if [ "${FIN_SKIP_TMUX_GUARD_CHECK:-0}" != "1" ]; then
 	[ -r "$KEY_PATH" ] || refuse "site key unreadable: $KEY_PATH"
-	# NEVER run this without LC_FIN_AGENT=1: without the marker the login shell would
-	# attach the owner's `main` session, which is the thing being tested for.
-	probe="$(LC_FIN_AGENT=1 ssh -i "$KEY_PATH" \
-		-o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
+	# NEVER run this without LC_FIN_AGENT=1: without the marker an interactive login shell
+	# is SUPPOSED to attach, which is the thing being tested for.
+	probe_cmd='env SSH_TTY=/dev/null $SHELL -i -c '\''printf "GUARD LC=%s TMUX=[%s]\n" "$LC_FIN_AGENT" "$TMUX"'\'''
+	probe="$(LC_FIN_AGENT=1 perl -e 'alarm shift; exec @ARGV' 30 \
+		ssh -i "$KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
 		-o SendEnv=LC_FIN_AGENT -o StrictHostKeyChecking=accept-new \
-		"$SSH_USER@127.0.0.1" 'printf "GUARD LC=%s TMUX=[%s]\n" "$LC_FIN_AGENT" "$TMUX"' 2>&1)" \
+		"$SSH_USER@127.0.0.1" "$probe_cmd" </dev/null 2>&1)" \
 		|| refuse "loopback SSH with the site key failed: ${probe:-no output} (Remote Login off? key not authorized?)"
 	case "$probe" in
-		*"TMUX=[]"*) : ;;
-		*) refuse "the login shell did NOT honour LC_FIN_AGENT — it put the session inside tmux (${probe##*GUARD }).
+		*"GUARD LC=1 TMUX=[]"*) : ;;
+		*"GUARD LC=1 TMUX=["*)
+			refuse "the login shell put an INTERACTIVE session inside tmux even with LC_FIN_AGENT set (${probe##*GUARD }).
 Starting now would type the daemon's readiness probe and every keystroke of every turn into
 the owner's live session. Restore the LC_FIN_AGENT exclusion in ~/.config/fish/config.fish." ;;
-	esac
-	case "$probe" in
-		*"LC=1"*) : ;;
-		*) refuse "the LC_FIN_AGENT marker did not cross the SSH boundary (${probe##*GUARD }) — check sshd's AcceptEnv" ;;
+		*"GUARD LC="*)
+			refuse "the LC_FIN_AGENT marker did not cross the SSH boundary (${probe##*GUARD }) — check sshd's AcceptEnv" ;;
+		*)
+			refuse "the interactive login shell never answered the probe: ${probe:-no output}
+That is what an auto-attach looks like from here — the shell exec'd tmux instead of running the
+probe (with no PTY, tmux then failed with 'not a terminal', so nothing was attached).
+Restore the LC_FIN_AGENT exclusion in ~/.config/fish/config.fish." ;;
 	esac
 fi
 

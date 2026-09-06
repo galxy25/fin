@@ -100,10 +100,10 @@ public final class AgentTurnEngine {
 
     // MARK: - Runner hooks
     //
-    // The engine advertises the full shared tool roster (`AgentToolSpec.all`), but three
-    // of those tools act on state the engine doesn't own — the runner's heartbeat loop
-    // and its notification surface. The runner (fin-agentd) wires these; a runner that
-    // leaves them nil gets an honest "unavailable" tool result instead of a lie.
+    // The engine advertises the full shared tool roster (`AgentToolSpec.all`), but several
+    // of those tools act on state the engine doesn't own — the runner's heartbeat loop, its
+    // notification surface, its second SSH channel. The runner (fin-agentd) wires these; a
+    // runner that leaves them nil gets an honest "unavailable" tool result instead of a lie.
 
     /// Fired when the model calls `request_input`; the runner surfaces the question
     /// (notify hook, push service, …). The tool result mirrors the app's acknowledgment.
@@ -121,15 +121,23 @@ public final class AgentTurnEngine {
     /// tool can tell the model the truth. Nil hook → the tool reports it's unavailable in
     /// this runtime, the same honesty as the headless memory tools.
     public var onNotify: ((_ title: String, _ body: String) -> Bool)?
+    /// Fired when the model calls `read_session`. `session` is a name the engine has
+    /// ALREADY validated (`TmuxSessionRead.validate`) or nil for "list the sessions";
+    /// `lines` is already clamped. The runner turns that into a fixed argv on a channel of
+    /// its own — the model never contributes a command line — and answers with the text or
+    /// an honest failure. Nil hook → the tool reports it is unavailable in this runtime,
+    /// exactly like `onNotify`: the roster is shared with the app, and an advertised tool
+    /// must never be answered with a lie or an "unknown tool".
+    public var onReadSession: ((_ session: String?, _ lines: Int) async -> AgentReadSessionOutcome)?
 
-    /// The tmux send-keys guard (see `TmuxCommandGuard`). NOT an optional hook, on
-    /// purpose: a nil hook reads as "allow", and a guard must never be disarmed by
-    /// omission. `.unenforced` is the explicit, named opt-out for a host with no tmux
-    /// namespace of its own — the app drives an arbitrary SSH session where tmux is
-    /// optional and the user's own session is often literally named `main`. The daemon
-    /// sets it from its `connectCommand` + routing registry (`TmuxSendGuard.forHost`),
-    /// where the fail-closed default lives: no registry → the allow-list is exactly the
-    /// agent's own session.
+    /// The tmux guard (see `TmuxCommandGuard`). NOT an optional hook, on purpose: a nil
+    /// hook reads as "allow", and a guard must never be disarmed by omission.
+    /// `.unenforced` is the explicit, named opt-out for a host with no tmux server of its
+    /// own — the app drives an arbitrary SSH session where tmux is optional and the user's
+    /// own session is often literally named `main`. The daemon sets it from its
+    /// `connectCommand` (`TmuxSendGuard.forHost`), where the fail-closed default lives: a
+    /// connect command with no socket in it yields `.standard`, and every explicit socket
+    /// is then refused.
     public var tmuxGuard: TmuxSendGuard = .unenforced
 
     public init(
@@ -391,6 +399,13 @@ public final class AgentTurnEngine {
                 rawArguments: call.arguments
             )
 
+        case AgentToolSpec.readSession.name:
+            return await executeReadSession(
+                session: call.argument("session"),
+                lines: call.argument("lines").flatMap(Int.init),
+                rawArguments: call.arguments
+            )
+
         default:
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
                 + AgentToolSpec.all.map(\.name).joined(separator: ", ") + "."
@@ -504,6 +519,64 @@ public final class AgentTurnEngine {
                 + "important in your reply text instead, and keep going."
     }
 
+    /// The model's `read_session` tool: validate the NAME, clamp the size, hand both to
+    /// the runner's hook, frame what comes back.
+    ///
+    /// THE VALIDATION LIVES HERE, above every runner, and it is a whitelist that rejects
+    /// rather than a sanitizer that rewrites. That is the whole security argument for this
+    /// tool: a name that survives `TmuxSessionRead.validate` contains no character any
+    /// shell treats as anything but a literal, so the fixed argv the runner builds around
+    /// it has exactly one variable word and nothing to escape. A runner is expected to
+    /// validate again — the daemon does — but a host that forgot could not be handed a
+    /// hostile name from here.
+    private func executeReadSession(
+        session raw: String?,
+        lines requested: Int?,
+        rawArguments: String
+    ) async -> String {
+        let toolName = AgentToolSpec.readSession.name
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var name: String?
+        if let trimmed, !trimmed.isEmpty {
+            guard let validated = TmuxSessionRead.validate(name: trimmed) else {
+                let message = TmuxSessionRead.rejectionMessage(for: trimmed)
+                record("error", message, toolName: toolName,
+                       toolArguments: rawArguments, isFailure: true)
+                return message
+            }
+            name = validated
+        }
+        let lines = TmuxSessionRead.clampLines(requested)
+        record(
+            "toolCall",
+            name.map { "read_session: \($0) (\(lines) lines)" } ?? "read_session: list sessions",
+            toolName: toolName, toolArguments: rawArguments
+        )
+        guard let onReadSession else {
+            let message = "Error: read_session is not available in this runtime — there is no way "
+                + "to read another session from here. Use read_terminal for your own terminal, and "
+                + "say plainly in your reply that you cannot see the others."
+            record("error", message, toolName: toolName,
+                   toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onReadSession(name, lines) {
+        case .failed(let why):
+            let message = "Error: read_session could not read "
+                + (name.map { "session \"\($0)\"" } ?? "this machine's sessions") + ": \(why)"
+            record("error", message, toolName: toolName,
+                   toolArguments: rawArguments, isFailure: true)
+            return message
+        case .text(let output):
+            guard let name else { return TmuxSessionRead.frameListing(output) }
+            return TmuxSessionRead.frameCapture(
+                session: name,
+                lines: lines,
+                output: TmuxSessionRead.trim(output, toLastLines: lines)
+            )
+        }
+    }
+
     private func executeReadTerminal(lines requested: Int?, rawArguments: String) async -> String {
         let lines = min(max(requested ?? configuration.terminalContextLines, 1), 400)
         let snapshot = session.eventLog.recentText(maxLines: lines)
@@ -523,11 +596,11 @@ public final class AgentTurnEngine {
     ) async -> String {
         let toolName = AgentToolSpec.sendInput.name
 
-        // THE TMUX GUARD, FIRST: read anything, write only what is registered. This runs
-        // before the destructive heuristic because it is the more specific violation and
-        // its refusal is the more actionable one — it names the session and tells the
-        // model to read it instead. Deliberately ahead of the connected-session check too,
-        // so a refusal is deterministic whether or not the PTY happens to be up.
+        // THE TMUX GUARD, FIRST: stay on your own tmux server. This runs before the
+        // destructive heuristic because it is the more specific violation and its refusal
+        // is the more actionable one — it names the server and points at read_session
+        // instead. Deliberately ahead of the connected-session check too, so a refusal is
+        // deterministic whether or not the PTY happens to be up.
         //
         // JUDGED ON THE EXACT BYTES THAT GET TYPED. `typedBody` is what reaches the PTY
         // below, and the difference is not cosmetic: judging the raw argument meant a
