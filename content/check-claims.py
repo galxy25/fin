@@ -6,7 +6,7 @@ file existed, every gate in the pipeline was a markdown checkbox an agent ticked
 about its own work, and the seed draft shipped two ticked boxes that were false.
 This is what makes the checkable half actually checked.
 
-It walks BOTH directions:
+It walks these directions:
 
   rows -> piece   every ledger row's exact sentence is present in the piece it names
   piece -> rows   every score in a piece is covered by a row it declares, every
@@ -14,8 +14,14 @@ It walks BOTH directions:
                   ledger *rejected* appears in a piece, and no banned phrase or
                   infrastructure name does either
   row  -> itself  a rowed score carries its qualifiers IN the sentence, or the row
-                  declares the §4.3 carve-out AS A FIELD WITH A POLARITY
-                  (`Carve-out (§4.3): yes`) and does not spend it on a headline
+                  declares a §4.3 exemption AS A FIELD WITH A POLARITY
+                  (`Carve-out (§4.3): yes`, `Negated number (§4.3): yes`) and
+                  does not spend it on a headline — EVERY field that grants the
+                  exemption is bound by the headline rule, by construction
+  file -> reader  every run of `|` lines in a markdown file is really a table
+                  (`check_tables`) — a blank line inside a table body silently
+                  ends it, and rows that render as a paragraph are rows nobody
+                  reads. Three had accumulated in the ledger's own §6.
 
 The second direction is the one that enforces THE CLAIM RULE. It was missing
 until 2026-09-06, and an injected `published/` piece asserting a fabricated
@@ -28,11 +34,17 @@ CAN be rowed and still be the sentence `EX-BAD-1` rejects. `RPI-12` shipped
 "36/51" appeared in a row's claim text and that was the whole test. Coverage is
 not qualification. See `claims-ledger.md` §8.
 
-The third check then spent a day granting its own exemption to any row whose
-re-check mentioned a carve-out *in any polarity*, `RPI-12`'s honest "No
-carve-out (§4.3), and none is available here" included. A substring search over
-prose is not a parser. The exemption is now a parsed field with a token
-polarity; `parse_declarations` below states exactly which shapes it accepts.
+The third check then spent 22 minutes granting its own exemption to any row
+whose re-check mentioned a carve-out *in any polarity*, `RPI-12`'s honest "No
+carve-out (§4.3), and none is available here" included — a negation written in
+the very commit that shipped the bug. `git log -S CARVE_OUT_RE -- <this file>`
+puts it in `e84f4fd` (2026-09-06 12:44:30 -0700) and out of `17c7db1` (13:06:47
+-0700); `git log -S 'and none is available here'` returns the same two commits.
+An earlier revision of this docstring said "a day", overstating its own defect's
+lifetime by about 65x — see `claims-ledger.md` §8's eighth entry. A substring
+search over prose is not a parser. The exemption is now a parsed field with a
+token polarity; `parse_declarations` below states exactly which shapes it
+accepts.
 
 What it still CANNOT do is open an artifact and read it — the part that matters
 most. Two narrower holes, stated rather than papered over. A score in prose is
@@ -121,20 +133,29 @@ EXCUSE_WORDS = ("never", "bad:", "do not", "don't", "forbid", "rejected", "avoid
 # the row's re-check column stand in for them, and both are decisions a reviewer
 # can audit rather than omissions a writer makes silently:
 #
-#   carve-out       §4.3's structurally-attached number. Checked further in
-#                   check_piece_to_rows: such a sentence may not be a heading or
-#                   the piece's title, which is what stops the declaration from
-#                   being typed in to buy an unqualified headline.
+#   carve-out       §4.3's structurally-attached number.
 #   negated number  a figure present only in order to be refused (RPI-37). It
 #                   must NOT acquire qualifiers; that would make it an assertion.
 #
+# BOTH grant the same total exemption from the qualifier check, so BOTH carry the
+# same price: check_piece_to_rows refuses to let such a sentence be a heading or
+# the piece's title, which is what stops a declaration from being typed in to buy
+# an unqualified headline. That price is charged by `granted_exemptions` below,
+# which reads DECLARATION_FIELDS — the one list — so a third declaration kind
+# added here inherits the headline guard without a second edit. It did not always
+# work that way: `Negated number (§4.3): yes` bought the full exemption while the
+# headline check tested the `carve-out` field alone, and a negated figure could
+# therefore have taken the piece's most quotable line with no guard at all.
+#
 # A declaration is a FIELD WITH A POLARITY, and the polarity is a token. This
-# check spent 2026-09-06 as `re.search(r"carve[-\s]?out", recheck)` — a substring
-# test, blind to negation — so `RPI-12`'s re-check, rewritten that same morning
-# to say "No carve-out (§4.3), and none is available here", MATCHED, and the
-# round that corrected `RPI-12` permanently exempted it from the rule it had just
-# been corrected under. Nothing about that was visible in a green run. The
-# polarity is a token now, so a sentence cannot argue its way into an exemption.
+# check was `re.search(r"carve[-\s]?out", recheck)` — a substring test, blind to
+# negation — for the 22 minutes between `e84f4fd` (2026-09-06 12:44:30 -0700) and
+# `17c7db1` (13:06:47 -0700), so `RPI-12`'s re-check, rewritten to say "No
+# carve-out (§4.3), and none is available here" in that same `e84f4fd`, MATCHED,
+# and the round that corrected `RPI-12` permanently exempted it from the rule it
+# had just been corrected under. Nothing about that was visible in a green run.
+# The polarity is a token now, so a sentence cannot argue its way into an
+# exemption.
 #
 # This is a shape test, not a reading. It cannot tell whether the model named is
 # the model that was run — that half is human work and always will be.
@@ -377,6 +398,26 @@ def parse_declarations(rid: str, recheck: str, problems: list[str]) -> dict[str,
     return found
 
 
+def granted_exemptions(row: dict) -> list[str]:
+    """Which §4.3 exemptions this row actually takes, in DECLARATION_FIELDS order.
+
+    ONE predicate, read by BOTH halves of §4 step 3: `check_score_qualifiers`
+    skips a row that takes any of these, and `check_piece_to_rows` (check 4b)
+    refuses to let any of them sit in a heading or in the piece's `title:`. The
+    exemption and its price are therefore keyed off the same list, so a third
+    declaration kind added to DECLARATION_FIELDS inherits the headline guard by
+    construction — there is no second place to remember to edit.
+
+    That is the fix for a real hole, not a hypothetical one. Check 4b used to
+    test `declares['carve-out']` by name while `Negated number (§4.3): yes`
+    granted the identical total exemption, so a row could put an unqualified
+    score in the piece's title or a subhead and pass — EX-BAD-1 with paperwork,
+    which is exactly what the headline rule exists to stop.
+    """
+    declared = row.get("declares") or {}
+    return [field for field in DECLARATION_FIELDS if declared.get(field)]
+
+
 def check_score_qualifiers(rows: list[dict], problems: list[str]) -> None:
     """THE CLAIM RULE applied to the sentence, not just to its coverage.
 
@@ -390,8 +431,7 @@ def check_score_qualifiers(rows: list[dict], problems: list[str]) -> None:
         claim = row["claim"]
         if not SCORE_RE.search(claim):
             continue
-        declared = row.get("declares") or {}
-        if any(declared.get(field) for field in DECLARATION_FIELDS):
+        if granted_exemptions(row):
             continue
         missing = []
         if not names_a_model(claim):
@@ -560,27 +600,32 @@ def check_piece_to_rows(
                 )
 
     # 4b. §4 step 3's other half, which only the piece can show: a number riding
-    #     on the carve-out may "never be the piece's most quotable sentence — not
-    #     the title, not a subhead". Without this, the declaration typed into
+    #     on ANY §4.3 exemption may "never be the piece's most quotable sentence —
+    #     not the title, not a subhead". Without this, the declaration typed into
     #     re-check would buy an unqualified headline: EX-BAD-1 with paperwork.
+    #     `granted_exemptions` is the same predicate check_score_qualifiers uses
+    #     to skip the qualifiers, so every field that buys the exemption pays this
+    #     price and a future field inherits it without an edit here.
     heads = [norm(line).lstrip("#").strip() for line in lines if line.lstrip().startswith("#")]
     title = norm(fm.get("title") or "")
     for cid in declared:
         row = by_id.get(cid)
         if not row or not SCORE_RE.search(row["claim"]):
             continue
-        if not (row.get("declares") or {}).get("carve-out"):
+        taken = granted_exemptions(row)
+        if not taken:
             continue
         claim = norm(row["claim"]).rstrip(".").strip()
         where = "the title" if claim and title and claim in title else None
         if not where and any(claim and claim in head for head in heads):
             where = "a heading"
         if where:
+            fields = " and ".join(f"§4.3 {f}" for f in taken)
             problems.append(
-                f"{rel}: {cid} declares the §4.3 carve-out but its sentence is {where} — "
-                f"a carve-out number may never be the most quotable line in the piece "
-                f"(claims-ledger.md §4 step 3). Qualify it in the sentence instead. "
-                f"Claim: {claim[:80]}"
+                f"{rel}: {cid} declares the {fields} exemption but its sentence is {where} — "
+                f"a number that skips the qualifiers on a declaration may never be the most "
+                f"quotable line in the piece (claims-ledger.md §4 step 3). Qualify it in the "
+                f"sentence instead, or take it out of {where}. Claim: {claim[:80]}"
             )
 
     # 5. Infrastructure names. STYLE.md §2's one written exemption is the
@@ -630,6 +675,60 @@ def check_style_prescribed(style_text: str, rows: list[dict], problems: list[str
             )
 
 
+TABLE_DELIM_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$")
+
+
+def check_tables(root: pathlib.Path, problems: list[str]) -> None:
+    """Every run of `|` lines in a markdown file must actually BE a table.
+
+    A blank line inside a table body ends the table: the rows after it are not
+    rows any more, they are a paragraph of pipe characters. That is invisible in
+    the source — the columns still line up in a text editor — and total in the
+    rendered view, which is the view a reviewer reads.
+
+    It had already happened here. Three blank lines had accumulated inside §6's
+    ledger table (after `RPI-24`, `RPI-36` and `RPI-38`, one per round of
+    appending), so `RPI-01` through `RPI-24` rendered as a table and everything
+    from `RPI-25` on — every row the last two rounds added, `RPI-37`, `RPI-38`
+    and `RPI-39` included — rendered as paragraph text. Nothing about that was
+    visible to `parse_ledger`, which reads lines and does not care what a
+    renderer would do with them, so every run stayed green while the rows a
+    reader could see went down. A ledger row nobody can see is not in the ledger.
+    """
+    def close(rel: str, block: list[tuple[int, str]]) -> None:
+        """A finished run of `|` lines: a table needs a header and a delimiter row."""
+        if not block:
+            return
+        body = [ln for _, ln in block]
+        if len(body) >= 2 and TABLE_DELIM_RE.match(body[1]) and not TABLE_DELIM_RE.match(body[0]):
+            return
+        problems.append(
+            f"{rel}: lines {block[0][0]}-{block[-1][0]} are {len(block)} line(s) starting "
+            f"with '|' that are NOT a table — no header + `|---|` delimiter above them, so "
+            f"they render as a paragraph, not as rows. A blank line inside a table body is "
+            f"the usual cause; remove it (claims-ledger.md §8)"
+        )
+
+    for path in sorted(root.rglob("*.md")):
+        rel = str(path.relative_to(root))
+        fenced = False
+        block: list[tuple[int, str]] = []
+        for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").split("\n"), 1):
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+                close(rel, block)
+                block = []
+                continue
+            if fenced:
+                continue
+            if line.lstrip().startswith("|"):
+                block.append((n, line))
+            else:
+                close(rel, block)
+                block = []
+        close(rel, block)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--content-dir", default=str(pathlib.Path(__file__).resolve().parent))
@@ -651,6 +750,8 @@ def main() -> int:
     if not ledger_path.exists():
         print(f"FAIL: no claims ledger at {ledger_path}")
         return 1
+
+    check_tables(root, problems)
 
     rows = parse_ledger(ledger_path)
     for row in rows:
