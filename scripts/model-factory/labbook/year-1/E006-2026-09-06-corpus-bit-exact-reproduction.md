@@ -1,9 +1,28 @@
-# E001 — The training corpus reproduces bit-for-bit, and names the commit it was built at
+---
+id: E006
+date: 2026-09-06
+occurred: 2026-09-06
+kind: EXPERIMENT
+title: The training corpus reproduces bit-for-bit, and names the commit it was built at
+status: closed
+tags: [corpus, reproducibility, provenance, prompt]
+sources:
+  - "shasum -a 256 datasets/sft-train-2026-09-05.jsonl -> 9552ac13e49351a9d9869f089cc5bfe804d17864db047f7fcbec912188dd25b5 (2,363 lines, 16,142,664 B, mtime 2026-09-05 19:46)"
+  - "regenerated at main 704ab09 -> 9552ac13...; at imac-site cd64914 -> 4f25702b81c6b7e5232464ada428dec4f5e01a3f237373abdd3f11b72b45a9e2"
+  - 8aa690c — the generator commit (2026-09-05 19:26) · 99ed9d9 — the round-3 prompt (2026-09-05 13:07)
+  - 7a591f4 — "Close the tmux guard's parser holes" (2026-09-06 09:52), NOT an ancestor of main
+  - scripts/model-factory/gen_training_data.py:98-101 (the system message is built by router_llm._system_prompt)
+related: [E007, E008, O003, O005, P005]
+corrects: []
+superseded-by: null
+---
 
-- **Kind:** EXPERIMENT
-- **Date:** 2026-09-06
-- **Corrections:** —
-- **Superseded-by:** —
+**Migrated entry.** Written as `docs/labbook/entries/E001-2026-09-06-corpus-bit-exact-reproduction.md`
+in the parallel book opened at `4705b67`, and renumbered `E001 -> E006` when the
+two books were consolidated into this one (O009). The body is unchanged apart
+from its header block, which was converted from that book's bold-field form to
+this book's YAML front matter, and its cross-references, which now name this
+book's ids.
 
 ## Question
 
@@ -27,11 +46,16 @@ and compare sha256 against the artifact:
 The commands below are written against *revisions*, not against the throwaway
 worktrees this was actually run in. That is deliberate: the run used
 `/Users/deepspacenine/forges/levi/fin-wt-labbook` and wrote its output under
-`/tmp/scratch/`, and neither will exist a year from now — the sibling book's
-P003:111 states the rule ("**Nothing under `/tmp`.** Worktrees, venvs and
-training artifacts live under the repo or `~/forges`. The reboot is the
-reason") and its E003:104 records a `/tmp/fin-wt-train` worktree being wiped as
-exactly why some of its memory numbers are UNSOURCED today.
+`/tmp/scratch/`, and neither will exist a year from now — P003:111 states the
+rule ("**Nothing under `/tmp`.** Worktrees, venvs and training artifacts live
+under the repo or `~/forges`. The reboot is the reason") and E003:136 records a
+`/tmp/fin-wt-train` worktree being wiped as exactly why some of its memory
+numbers are UNSOURCED today. (Both anchors are against this book at `0fe0883`.
+Written in the other book these read "the sibling book's P003:111" and "its
+E003:104"; P003:111 was right and E003:104 was wrong — the `/tmp/fin-wt-train`
+sentence is at E003:**136**, and was at 136 when the anchor was written. The
+consolidation kept the number that verifies and corrected the one that did not
+rather than deleting it silently.)
 
 ```sh
 REPO=~/forges/levi/fin                 # any clone of this repository
@@ -101,7 +125,7 @@ Chain of custody for the corpus, then:
 `sha256:9552ac13…` is now a name that means something: "the output of
 `gen_training_data.py` at any repo state between `99ed9d9` and `704ab09`."
 A model manifest can cite it and the claim is checkable by anyone with the
-repo. See [P001](P001-2026-09-06-reproduce-a-dataset.md) for the protocol.
+repo. See P005 for the protocol.
 
 The consequence of the `7a591f4` divergence is recorded separately in
-[O003](O003-2026-09-06-prompt-skew-mid-run.md).
+O003.

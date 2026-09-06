@@ -56,8 +56,11 @@ Run only when the GPU is free (P003).
    because `eval_gate.py:75-80` uses a strict `>`: against a stored 36/51 the
    worst candidate that still promotes scores 37, and 49 − 37 = 12. 13 is the
    separate and also-true number — the gap between the stored record and what
-   the base actually scores today. O002:72-77 derives both; an earlier version
-   of this step attached the record gap to the candidate.) The script's closing
+   the base actually scores today. **O002:92-97** derives both — an anchor that
+   moved once already when O002 received merged content (O009), so resolve it
+   with `grep -n '12, not 13' O002-2026-09-06-stale-champion.md` rather than
+   with the number. An earlier version of this step attached the record gap to
+   the candidate.) The script's closing
    line is the guard: `champion: … || echo 'NOT RE-RECORDED — do not promote
    on the stale 36/51'`.
 2. **Per checkpoint, one at a time:** stage → `mlx_lm.fuse` → serve with

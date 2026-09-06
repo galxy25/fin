@@ -11,12 +11,35 @@ sources:
   - 8aa690c — commit message claiming "an independent baseline re-derivation"
   - evals/tmux-routing/RESULTS.md:25-27 — baseline 3/25 hard vs model 24/25 hard
   - "measured today (E005): router_baseline 29/51 core 26/26 hard 3/25; policy_baseline 24/35 core 21/21 hard 3/14"
-  - "generator instrumentation by a sibling survey, 2026-09-06: routing 3,054 baseline calls / 3,054 passed the filter / 0 rejected; ledger 769 / 769 / 0"
+  - "generator instrumentation, 2026-09-06 from a clean checkout at 704ab09: routing 3,054 baseline calls / 3,054 passed the filter / 0 rejected; ledger 769 / 769 / 0 — counting wrapper, command below"
   - "re-derived here 2026-09-06: import gen_training_data, run gen_routing(), group by (target, decision), apply CAPS (gen_training_data.py:985-1001, sliced at :1053-1056) → 3,054 candidates, 890 kept"
-related: [E005, H004, P002, O001]
+  - scripts/model-factory/gen_training_data.py:27-35 (the "correct twice over" docstring claim)
+  - "merged from docs/labbook/entries/O001-2026-09-06-baseline-filter-never-fires.md (the parallel book, 4705b67) — see the merge note below"
+related: [E005, E007, H004, P002, O001, O003]
 corrects: []
 superseded-by: null
 ---
+
+**Merged from two drafts.** Both books recorded that the label filter never
+fires: this entry, `scripts/model-factory/labbook/year-1/O007-2026-09-06-labels-are-baseline-output.md`,
+and `docs/labbook/entries/O001-2026-09-06-baseline-filter-never-fires.md`. The
+consolidation (O009) kept this one — it carries the caps analysis, the
+vocabulary-survival measurement, the three consequences and the labeler
+competence table — and folded the other's reproducer, its "tripwire, not a
+validator" framing and its filing rationale into the sections below. The counts
+in the two drafts were identical, and both had already filed the same two
+corrections to `8aa690c`'s commit message, in the same words.
+
+**On why this is an OBSERVATION and not an EXPERIMENT.** The instrumentation
+below monkeypatches the labeler, which looks like intervention. It is a
+**counting wrapper**: it calls the original `router_baseline.decide` and returns
+its value unchanged, so the generator's behaviour and output are bit-identical
+to an uninstrumented run. That is read-only instrumentation, and the README's
+"Instrumentation is not intervention" convention — added to this book by the
+consolidation, from the other book's README — states the line. E007 imports and
+runs the same generator and is filed as an EXPERIMENT, correctly: it poses a
+question in advance and builds a method to answer it, rather than recording
+something noticed in passing.
 
 ## What was observed
 
@@ -42,14 +65,33 @@ def keep(query, registry, live, intended_action, intended_session=None):
 The assistant message is `decision` — the baseline's output object, serialized.
 The ledger path (`:540-552`) is the same shape against `policy_baseline.decide`.
 
-The generator's docstring calls this being "correct twice over": the template
-knows the intended class, and the baseline is asked to agree before the row is
-kept.
+The generator's docstring makes the claim in full (`:27-35`):
+
+> We generate inputs inside the baseline's competence zone […] then KEEP an
+> example only when the baseline's decision equals the class we generated it
+> for. Label == baseline rule output AND == intended class: correct twice over.
+
+The template knows the intended class, and the baseline is asked to agree before
+the row is kept.
 
 ## The filter never fired
 
 Instrumenting the generator (counting `decide` invocations against appends, run
 2026-09-06 from a clean checkout at `704ab09`):
+
+```sh
+# from any checkout of main @ 704ab09 — e.g.
+#   git worktree add ../fin-wt-filter 704ab09 && cd ../fin-wt-filter
+python3 -c "
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location('g','scripts/model-factory/gen_training_data.py')
+m=importlib.util.module_from_spec(spec); sys.argv=['g']; spec.loader.exec_module(m)
+n=[0]; orig=m.router_baseline.decide
+m.router_baseline.decide=lambda *a,**k: (n.__setitem__(0,n[0]+1), orig(*a,**k))[1]
+r=m.gen_routing(); print('consulted',n[0],'kept',len(r))
+"
+```
+
 
 | track | baseline consulted | passed the filter | rejected |
 | --- | --- | --- | --- |
@@ -94,10 +136,20 @@ Three consequences worth carrying:
 - **H004 reasons about what inputs the model was "pushed" on.** It was pushed on
   a quarter of the `start` vocabulary the generator can write.
 
-The baseline filter itself is a tripwire, not a validator. It eliminated nothing the templates did not
-already guarantee — which is the expected outcome when the templates are
-written to produce exactly the inputs the baseline handles well, but it means
-the "correct twice over" claim carries no independent evidence.
+The baseline filter itself is a **tripwire, not a validator**. It eliminated
+nothing the templates did not already guarantee — the second check rejected 0 of
+3,823 candidates, which is the expected outcome when the templates are written
+to produce exactly the inputs the baseline handles well, as the docstring in
+fact says they are. Keeping it is still right: it would catch a future template
+that drifts outside the baseline's competence. What it does not do is certify
+anything about the corpus that exists, so "correct twice over" is technically
+true and practically vacuous, and the claim carries no independent evidence.
+
+The corollary is the sharper statement, and it is this entry's title: since no
+candidate was ever rejected, the routing and ledger labels are, **without
+exception**, `router_baseline.decide` and `policy_baseline.decide` evaluated on
+generated inputs. Nothing in the pipeline currently checks a routing or ledger
+label against anything other than the baseline that produced it.
 
 Two corrections to `8aa690c`'s commit message, filed here:
 

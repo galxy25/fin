@@ -11,10 +11,23 @@ sources:
   - "local-artifact: models/candidates/fin-foreman-e4b-mlx/ — 15 checkpoints at 250-iteration granularity, 27,683,964 B each"
   - "local-artifact: train.log — val loss flat 0.005-0.028 from iteration 1000; first Train loss 0.000 at iteration 2675"
   - evals/tmux-routing/scenarios.json — 25 hard scenarios (parsed today)
-related: [O001, P004, E004, H002]
+  - "git branch --contains d9100b6 → imac-site only; git cat-file -e labbook:scripts/model-factory/gate_sweep.sh → fails ('does not exist in labbook')"
+  - "merged from docs/labbook/entries/H002-2026-09-06-best-checkpoint-is-not-last.md (the parallel book, 4705b67) — see the merge note below"
+related: [O001, O004, P004, E004, H001, H002]
 corrects: []
 superseded-by: null
 ---
+
+**Merged from two drafts.** Both lab books opened on 2026-09-06 wrote this
+hypothesis: `scripts/model-factory/labbook/year-1/H003-2026-09-06-best-checkpoint-not-last.md`
+(this entry) and `docs/labbook/entries/H002-2026-09-06-best-checkpoint-is-not-last.md`.
+The consolidation (O009) kept this one — it carries the enumeration of what
+continued training might be doing, the statistical-power threshold and the
+serving confound — and folded the other's overall-score predictions, its
+saturation reading of a flat result, its verification that `gate_sweep.sh` is
+not on a runnable branch, and its follow-up sweep into the sections below. The
+two drafts agreed on the claim and on the ≥3-scenario threshold; neither
+contradicted the other on any number.
 
 ## The claim
 
@@ -77,12 +90,58 @@ anything. Only a difference of ≥3 hard scenarios between the best and the
 final checkpoint should count as support. Nothing here has a variance
 estimate (E001's scores are single runs), so treat small differences as noise.
 
+### The overall-score form of the same prediction
+
+The merged draft stated it on the 51-scenario total rather than per tier, and
+both forms are worth having because they fail differently:
+
+1. **Overall score is non-monotonic in iteration**, peaking at or before 2,250.
+2. The spread between the best and the final checkpoint is **≥3 scenarios of
+   51** — large enough that checkpoint selection matters more than any
+   hyperparameter in this run.
+3. The variation is concentrated in the **hard** tier; **core** moves by at most
+   one scenario across all four checkpoints.
+
+The per-tier form above is the sharper test, because core is expected to be flat
+and dilutes the effect in any overall number. The overall form is the one a
+sweep prints without extra work, so it is the one that will be looked at first;
+if it is flat while the hard column is not, believe the hard column.
+
+**What a flat result would mean, stated before the fact.** If overall is flat
+across all four checkpoints — spread ≤1 — the hypothesis is wrong, and the
+useful conclusion is not "checkpoint choice does not matter" but *this corpus
+saturates the adapter before iteration 1,000*: the run should have been a tenth
+as long, and the next one should be. That is H002's claim arriving by a
+different road, which is why a refutation here is nearly as valuable as a
+confirmation.
+
 ## The experiment
 
 P004's sweep, exactly as written: score checkpoints `1000 2250 3500 final`,
 one at a time, against a **re-recorded** champion (O002), fusing and deleting
 each in turn. 15 checkpoints exist at 250-iteration granularity if a finer
 sweep is warranted after the first pass.
+
+```sh
+# on a checkout of imac-site — see below; after the fine-tune ends,
+# with LM Studio serving the champion on :1234
+scripts/model-factory/gate_sweep.sh 1000 2250 3500 final
+```
+
+**The script cannot be run from this branch, and that is two problems, not
+one.** `git branch --contains d9100b6` returns `imac-site` only, and
+`git cat-file -e labbook:scripts/model-factory/gate_sweep.sh` fails with "does
+not exist in 'labbook'" — so every `gate_sweep.sh` line number in this entry and
+in P004 is against `d9100b6` on `imac-site`, and the command above needs that
+checkout. Separately, `models/gate-sweep/` does not exist on disk: **the sweep
+has never been run.** Landing the script somewhere it can run from is a
+precondition of testing this hypothesis at all.
+
+**The follow-up worth planning now.** The default sweep skips the 250-750 and
+2,500-3,250 checkpoints. If the peak lands at 1,000, the interesting second pass
+is 250/500/750 — because the earliest checkpoint that clears the gate is also
+the cheapest model to retrain, and finding where the curve turns is worth more
+than knowing that it does.
 
 Report the table as core and hard separately. The overall number will hide the
 effect if it exists, because core is expected to be flat and would dilute it.

@@ -11,10 +11,25 @@ sources:
   - "local-artifact: train.log:9 — 'Iter 1: Val loss 2.463' measured before any gradient step (trainer.py:284-286)"
   - "d4901d4 on branch bits-curriculum (2026-09-06 11:25:38) — 'Bits per example: measure what each training example actually teaches': score_bits.py, select_curriculum.py, run_bits_experiment.sh, tests/test_bits_curriculum.py, README.md, 2,640 insertions"
   - "corpus measurements re-derived here on sha256 9552ac13… (2,363 lines, 16,142,664 B): xz -9e | wc -c → 58020; per-role character sums and label entropies by parsing the jsonl; generating-program size by git cat-file -s at main"
-related: [H002, O001, O004, O007, E004]
+  - "local-artifact: train.log — 'Trained Tokens 121200' at iteration 3500; assistant-string length statistics parsed from the corpus"
+  - scripts/model-factory/.venv/lib/python3.11/site-packages/mlx_lm/tuner/trainer.py:273-282 (one iteration is one example)
+  - "merged from docs/labbook/entries/E004-2026-09-06-bits-per-example.md (the parallel book, 4705b67) — see the merge note below"
+related: [H002, O001, O004, O007, E004, E006, E007]
 corrects: []
 superseded-by: null
 ---
+
+**Merged from two drafts.** Two lab books were opened on 2026-09-06 and both
+wrote up bits-per-example: this entry, `scripts/model-factory/labbook/year-1/H001-2026-09-06-bits-per-example.md`,
+as a HYPOTHESIS, and `docs/labbook/entries/E004-2026-09-06-bits-per-example.md`
+as an EXPERIMENT that measured the corpus. The consolidation (O009) kept this
+one — it carries the falsifiable form, the refutation criteria and the two
+provenance constraints — and folded the other's measurement method, its extra
+label statistics, its account of what the optimizer actually sees and its
+reproducer into "The measurement, in full" below. Their overlapping numbers
+agreed exactly, including the withdrawal of the "two estimators converge"
+claim, which both drafts had already corrected independently. Nothing was
+dropped; the other file is deleted and this entry is the whole record.
 
 ## The claim
 
@@ -57,7 +72,10 @@ calling the figure "corpus-level" and the difference "whole-corpus
 
 - The run passes `--val-batches 25`, so **one validation pass covers 25 of the
   118 rows in `valid.jsonl` (21%)** — roughly 870 answer tokens, not 2,363
-  examples and not even the whole split (E004, O001:60-61).
+  examples and not even the whole split (E004; **O001:99**, which moved from
+  `O001:60-61` when O001 received merged content — resolve it with
+  `grep -n 'Each validation pass covers' O001-2026-09-06-zero-loss-flat-validation.md`,
+  not with the number).
 - The two endpoints are **different 25-row draws**. `evaluate()` calls
   `iterate_batches` with no `seed=` (`trainer.py:195-200`), so the iteration-1
   and iteration-3500 passes do not see the same rows, and 3.553 − 0.017 is a
@@ -133,6 +151,110 @@ draft quoted the byte shares while calling them character shares.)
 Zero conditional entropy is the signature of label-by-construction and explains
 O001 directly: with no ambiguity anywhere in 2,363 rows, a training loss of
 zero is attainable and proves nothing.
+
+## The measurement, in full
+
+From the merged draft, which posed this as a measurement question — *how much
+does one training example actually tell the model?* — and answered it with four
+estimators of two different kinds, each cheap and each reproducible on
+`sha256 9552ac13…`:
+
+1. **Shannon entropy of the label** — the empirical distribution over the 2,363
+   assistant strings.
+2. **Conditional entropy** H(label | input) over the same distribution.
+3. **Compressed length** — `gzip -9` and `xz -9e`, empirical upper bounds on
+   description length.
+4. **Program length** — the size of the generator that emits the corpus.
+
+### The label side, with the statistics the table above leaves out
+
+| quantity | value | how |
+| --- | --- | --- |
+| examples | 2,363 | `wc -l` |
+| distinct assistant strings | 991 | `Counter` over `messages[2].content` |
+| label entropy H(Y) | **8.585 bits/example** | empirical; ceiling log₂991 = 9.953 |
+| decision-class entropy | **3.669 bits over 14 classes** | ceiling log₂14 = 3.807 |
+| most repeated single label | **113×** — `{"decision": "idle", "reason": "no message, nothing drivable…"}` | `Counter` |
+| distinct `(system, user)` pairs | **2,363 of 2,363** | set over the pair |
+| distinct *user* texts alone | **2,147** | 216 user strings recur under a different registry, and the system message disambiguates them |
+
+That last row is what makes H(label | input) = 0 a statement about the corpus
+rather than an artifact of how the input was defined: the pairs are distinct
+even though the user texts are not, so I(input; label) = H(label) = 8.585
+bits/example.
+
+Zero conditional entropy is the signature of label-by-construction. For routing
+and ledger the label *is* the deterministic baseline's output on that input
+(`gen_training_data.py:276-285`, O007); for elicit and tool-use it is fixed by
+the template family that emitted the input (`:798-815`, `:912-935`). No noise,
+no disagreement, no ambiguity anywhere in 2,363 rows — the model is not being
+taught a distribution, it is being shown a function it can in principle memorize
+exactly.
+
+### Description length, with the two rows the summary table compresses
+
+| estimator | size | bits/example |
+| --- | ---: | ---: |
+| raw corpus | 16,142,664 B | 54,647 |
+| `gzip -9` | 1,074,174 B | 3,637 |
+| `xz -9e` | 58,020 B | **196** |
+| the generating program's source (six files) | 85,536 B | **290** |
+
+### What the optimizer actually sees
+
+The run trains with `--mask-prompt`, so only assistant tokens carry gradient.
+`Trained Tokens 121200` at iteration 3,500 → **34.6 gradient-bearing tokens per
+iteration**. Assistant strings average **115.5 characters** (median 117, min 53,
+max 177), ≈29 tokens at chars/4 — consistent with one example per iteration.
+
+The merged draft first ruled out two-examples-per-iteration by claiming 17.3
+tokens per label was "below even the shortest one". **That argument is
+withdrawn**: the shortest assistant string in the corpus is 53 characters —
+`{"tool": "read_terminal", "arguments": {"lines": 80}}` — which is ≈13.3 tokens
+at the same rate, comfortably *below* 17.3. The honest form of the check is the
+mean, not the minimum: 17.3 is 60% of the 29-token average, so two-per-iteration
+would need the sampler to have drawn systematically short labels for 3,500
+consecutive iterations. And the question is settled independently anyway, from
+the trainer rather than from token arithmetic — `trainer.py:273-282` zips
+`range(1, args.iters + 1)` against `iterate_batches(batch_size=1)`, so one
+iteration is exactly one example, `--iters 4490` over 2,245 rows is exactly
+**2.00 epochs** (E004), and the full run applies gradient to roughly 155,000
+tokens.
+
+### Three honest answers to "bits per example"
+
+- **8.6 bits** — what the model must emit that it could not have guessed from
+  the label prior alone.
+- **196-290 bits** — the corpus's description length per example: 196 by
+  `xz -9e`, 290 by the program that actually regenerates it. (An earlier draft
+  of the merged entry said "~180 bits", the midpoint of a withdrawn pairing that
+  counted `gen_training_data.py` alone at 50,743 B = 172 bits. Both books
+  withdrew it; H002's source line records the same correction.)
+- **0 bits** — the *residual* uncertainty in a label once the input is known.
+
+The third is the important one, and it is the one that needs no compressor: a
+corpus with zero conditional entropy has a perfectly attainable training loss of
+zero, which is what the run shows (O001), and a loss of zero on such a corpus
+proves nothing about the decision rules — only that ~86 KB of generator source
+fits inside 6.9M LoRA parameters (`train.log:6`: "Trainable parameters: 0.093%
+(6.914M/7463.013M)").
+
+### Reproduce
+
+```sh
+python3 - <<'EOF'
+import json, math
+from collections import Counter
+P='datasets/sft-train-2026-09-05.jsonl'   # sha256 9552ac13…
+rows=[json.loads(l) for l in open(P)]
+A=[r['messages'][2]['content'] for r in rows]; n=len(A); c=Counter(A)
+H=-sum(v/n*math.log2(v/n) for v in c.values())
+print('n=%d distinct=%d H=%.3f bits/example'%(n,len(c),H))
+print('distinct (system,user) pairs:',
+      len({(r['messages'][0]['content'], r['messages'][1]['content']) for r in rows}))
+EOF
+xz -9e -c datasets/sft-train-2026-09-05.jsonl | wc -c
+```
 
 ## The prediction
 

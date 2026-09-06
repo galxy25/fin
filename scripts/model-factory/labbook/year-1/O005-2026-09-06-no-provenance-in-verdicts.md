@@ -10,12 +10,25 @@ sources:
   - "grep -n 'prompt|commit|sha' scripts/model-factory/eval_gate.py → no matches"
   - scripts/model-factory/eval_gate.py:114-144 (the verdict dict; 113 is blank)
   - main:scripts/model-factory/README.md:173-175 (the manifest that is specified but never written) — see the line-anchor note at the end of this entry
-  - "ls datasets/ — no manifest.json anywhere; git grep 'datasets/mlx' main → exit 1, no output (on branch labbook the same grep returns 24 hits, all of them inside these two lab books — see the section below)"
+  - "ls datasets/ — no manifest.json anywhere; git grep -n 'datasets/mlx' <rev> -- ':(exclude)scripts/model-factory/labbook' → exit 1, no output, at main and at 0fe0883 on labbook (the exclusion is mandatory — see the section below)"
   - scripts/model-factory/train/qlora_config.yaml:7 — base_model: google/gemma-3-4b-it
-related: [O002, O003, E002, E004, P001]
+  - "local-artifact: models/candidates/fin-foreman-e4b-mlx/fuse-and-gate.md step 6 — the docs fix list"
+  - "merged from docs/labbook/entries/O005-2026-09-06-factory-docs-drift.md (the parallel book, 4705b67) — see the merge note below"
+related: [O002, O003, O006, E002, E004, E006, E008, P001, P005]
 corrects: []
 superseded-by: null
 ---
+
+**Merged from two drafts.** Both books numbered an entry `O005` on 2026-09-06:
+this one, `scripts/model-factory/labbook/year-1/O005-2026-09-06-no-provenance-in-verdicts.md`,
+and `docs/labbook/entries/O005-2026-09-06-factory-docs-drift.md`. Same id,
+different framing of an overlapping fact — this entry treats the drifted
+checklist as one symptom of the factory recording no provenance at all; the
+other treated the checklist as the subject. The consolidation (O009) kept this
+one as the wider frame and folded the other's two extra drift rows and its
+argument for why a docs bug belongs in a lab book into "Committed docs
+contradict the running system" below. The four README rows the two drafts share
+were identical in both.
 
 ## What was observed
 
@@ -69,24 +82,43 @@ of archaeology.
 ### And no record of how `datasets/mlx/` was made
 
 **No file that is part of the factory references it.** The exact command
-matters, and two earlier drafts of this sentence got it wrong in two different
-ways.
+matters, and three successive drafts of this sentence got it wrong in three
+different ways — the third being the one that produced this book's
+self-referential-count rule.
 
 | command | exit | output |
 | --- | ---: | --- |
 | `git grep -n 'datasets/mlx' main` | 1 | none |
-| `git grep -n 'datasets/mlx'` (branch `labbook`) | **0** | **24 hits**, every one of them inside `docs/labbook/` or `scripts/model-factory/labbook/` — including this sentence |
-| `git grep -n 'datasets/mlx' -- ':(exclude)docs/labbook' ':(exclude)scripts/model-factory/labbook'` | 1 | none |
+| `git grep -n 'datasets/mlx' 0fe0883` (bare, on `labbook`) | **0** | **30 hits** — every one of them inside a lab book, including the row above it |
+| **`git grep -n 'datasets/mlx' <rev> -- ':(exclude)scripts/model-factory/labbook'`** | **1** | **none** — at `main` and at `0fe0883` |
 | `grep -rn 'datasets/mlx'` over the working tree | 0 | 2 hits under gitignored `models/`, plus the lab-book hits |
 
-The first draft said "`grep -rn` returns nothing", which ignored the working
-tree's gitignored artifacts. The correction said "`git grep 'datasets/mlx'`
-exits 1 with no output" — true at `main`, and **false on the branch this entry
-lives on**, because writing the lab book created 24 tracked references to the
-string. That is the same defect this entry's line-anchor note is about: a
-command result is a provenance claim, and it is only true of a stated revision.
-The third form above is the durable one, because it asks the question actually
-meant — does anything in the *factory* reference the path?
+The third form is the durable one, because it asks the question actually meant:
+*does anything in the factory reference this path?*
+
+**How the other three failed, in order.** The first draft said "`grep -rn`
+returns nothing", ignoring the working tree's gitignored artifacts. The
+correction said "`git grep 'datasets/mlx'` exits 1 with no output" — true at
+`main`, false on the branch this entry lives on. The third draft caught that and
+wrote the bare-`labbook` row as **24 hits**, "every one of them inside
+`docs/labbook/` or `scripts/model-factory/labbook/` — including this sentence".
+That was true for about an hour. At `0fe0883` the same command returns **30**,
+and it went up because the book kept being written; it will move again at the
+next commit, in the direction of whoever edits the book last.
+
+**So the number was never evidence about the factory. It was a measurement of
+this book, taken by this book, cited as if it were about something else.** That
+is the failure the README's conventions now name in one line: *a count of the
+book by itself is not evidence.* Updating 24 to 30 would fix the arithmetic and
+leave the defect exactly where it was. The fix is the pathspec — and the entry
+already knew the `--` exclusion form, since it is the third row of its own
+table.
+
+Note also that the exclusion is now **one** pathspec, not two: `docs/labbook/`
+no longer exists (O009 consolidated it into this book), so excluding it would be
+excluding nothing. That is itself a small demonstration of the rule — a command
+written against the shape of the repository on one afternoon stops meaning what
+it meant when the repository changes.
 
 The two working-tree hits are both inside gitignored `models/` —
 `models/candidates/fin-foreman-e4b-mlx/launch-train.sh:13` (`--train --data
@@ -112,8 +144,22 @@ once.
 | `main:README.md:44` | "[ ] goals-ledger eval joins the gate (that branch has not merged)" | the design merged `2026-09-05 12:45` (`e025413`); the *gate wiring* did not (O006) |
 | `main:README.md:29-33` | leakage caveat on the seed build | superseded by `8aa690c` (P002) |
 
-A checklist showing "first fine-tune, human go required" unchecked while one
-runs will eventually be trusted at the wrong moment.
+Two more rows, folded in from the merged draft:
+
+| file | says | reality |
+| --- | --- | --- |
+| `train/README-local.md` | names gemma-3 as the base | run 1 uses `mlx-community/gemma-4-E4B-it-qat-4bit` (`launch-train.sh:12`, E002). Already on the fix list — `fuse-and-gate.md` step 6 — and unfixed |
+| `main:README.md` "Eval gate" section | describes the gate as the routing corpus alone | **accurate**, and that is the point: `evals/goals-ledger` is merged but `eval_gate.py` never mentions it, so the *behaviour* is honest while the *checklist* is not (O006) |
+
+**Why a docs bug belongs in a lab book at all**, which the merged draft argued
+and this entry had only implied: the Status block is load-bearing for the "human
+go required" rule. A reader checking whether a fine-tune has been authorized
+reads an unchecked box next to those words while a fine-tune is running. The run
+itself is legitimate — the standing rule exempts local mlx runs, see "What this
+does not show" below — but a checklist that contradicts the machine's process
+table is a checklist that will eventually be trusted at the wrong moment. The
+lab book records it because the lab book is where the factory's claims get
+checked against the factory.
 
 ## Smallest fix with the highest leverage
 
@@ -167,10 +213,26 @@ a reader looking for `## Eval gate` to line 262, which on this branch is exactly
 **How to keep this true.** Do not hand-propagate a shift; re-run the grep. Any
 commit that edits `scripts/model-factory/README.md` invalidates the middle
 column of this table, and the only defence that survives is the right-hand one.
-The entry's own subject, demonstrated on itself twice now: a line number is a
-provenance claim, and it is only true of a stated revision — including when the
-revision is the one you are writing.
+The entry's own subject, demonstrated on itself three times now — twice in this
+table's line numbers and once in the grep count above: **a line number, a hit
+count and a command's exit code are all provenance claims, and each is only true
+of a stated revision — including when the revision is the one you are writing.**
+When the thing being counted is the book itself, the number is not evidence at
+all until it is both pinned to a revision and scoped away from the book's own
+paths.
 
 **Anchors that defer to this note:** P001 (`## Eval gate`), P002 (`**Leakage
-rule:**`) and O006 (the goals-ledger checkbox). Each states both columns
-inline so none of them depends on a reader finding this table.
+rule:**`), O006 (the goals-ledger checkbox), and — added by the consolidation —
+O003 and P005 (the dataset-manifest spec, 173-175 / 204-206). Each states both
+columns inline so none of them depends on a reader finding this table.
+
+**Checked after the consolidation (O009).** That pass rewrote
+`scripts/model-factory/README.md`'s "Lab book" section, replacing an
+eight-line block with an eight-line block, so the file is still 367 lines on
+this branch against 336 on `main` and **every anchor in the table above still
+resolves exactly**. It was luck that the replacement was the same length; the
+right-hand column is what was actually re-run to confirm it. Two anchors
+*inside this book* did move in that pass — `O002:72-77` and `O001:60-61`, both
+because the entries they point into received merged content — and P004 and H001
+were corrected to the new numbers with a grep beside each. Same lesson, one
+directory closer to home.

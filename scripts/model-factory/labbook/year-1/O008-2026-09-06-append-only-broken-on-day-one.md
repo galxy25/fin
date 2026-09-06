@@ -12,10 +12,10 @@ sources:
   - cdb895a — "Lab book audit pass: correct every number that did not trace to its artifact" (26 files modified, **0 added**; 23 of the 26 are already-published entry files)
   - "git show --name-status cdb895a --format='' | grep -c '^A' → 0"
   - scripts/model-factory/labbook/README.md — rule 1 and "How a correction works"
-  - docs/labbook/README.md — the same rule, stated more briefly
-related: [O004, O005, P001]
+  - "0fe0883:docs/labbook/README.md — the same rule, stated more briefly, in the book that has since been consolidated into this one (O009); pinned to a revision because the path no longer exists"
+related: [O004, O005, P001, O009]
 corrects: []
-superseded-by: null
+superseded-by: O009
 ---
 
 ## What was observed
@@ -126,6 +126,13 @@ Appended to the READMEs alongside this entry:
 - **It does not settle where the book lives.** Two independently-numbered books
   with 13 colliding ids sit on this branch; that reconciliation is Levi's call
   and is still open (README.md, "Provenance of this directory").
+
+  *(That question has since been settled — this location won, `docs/labbook/`
+  was consolidated into it and deleted. **O009** is the record, and this entry's
+  `superseded-by:` names it. The sentence above is left standing because it was
+  true when written and the back-pointer is the only permitted edit; read the
+  two together, which is what `superseded-by:` means here. O009 is also the
+  third instance of exactly the behaviour this entry records, and says so.)*
 - **It does not claim the append-only rule is wrong.** It is the right rule for
   a book that is being read. The error was applying its language to a book that
   was being written, and then not saying which regime was in force.

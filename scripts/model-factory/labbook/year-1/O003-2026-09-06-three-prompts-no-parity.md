@@ -13,10 +13,24 @@ sources:
   - main:daemon/Sources/FinAgentCore/SessionRouting.swift — promptSection() at 329-409, prompt literal 345-408
   - cd64914:daemon/Sources/FinAgentCore/SessionRouting.swift:353 — the "ONE DELIBERATE EXCEPTION" comment, which exists ONLY on the imac-site line of history (at the current tip f0ca4af it is line 376)
   - daemon/Tests/FinAgentDaemonTests/DaemonRoutingPromptTests.swift — 3 tests, no text comparison
-related: [E001, O002, O005, E004]
+  - scripts/model-factory/build_dataset.py — docstring: "training and inference must see byte-identical framing"; main:scripts/model-factory/README.md:154
+  - "grep -n 'router.md\|prompts/' evals/tmux-routing/router_baseline.py → nothing (the offline baseline does not read the prompt)"
+  - "merged from docs/labbook/entries/O003-2026-09-06-prompt-skew-mid-run.md (the parallel book, 4705b67) — see the merge note below"
+related: [E001, E004, E006, O002, O005, P002, P005]
 corrects: []
 superseded-by: null
 ---
+
+**Merged from two drafts.** Both books wrote up the `router.md` divergence on
+2026-09-06 and both numbered it `O003`: this entry,
+`scripts/model-factory/labbook/year-1/O003-2026-09-06-three-prompts-no-parity.md`,
+and `docs/labbook/entries/O003-2026-09-06-prompt-skew-mid-run.md`. Same id,
+overlapping subject, different scope — this one counts four prompt texts across
+two branches and the Swift paraphrases; the other took one of them, `7a591f4`,
+and worked out what a mid-run edit does to a candidate. The consolidation (O009)
+kept this entry as the wider frame and folded the other's timeline, its
+character-level reading of the edit, and its manual pre-gate check into the
+sections below. Neither draft contradicted the other.
 
 ## What was observed
 
@@ -35,6 +49,38 @@ failure the entry is about, so it is counted here.)
 Both `router.md` hashes were computed with `git hash-object`; #1 and the round-3
 commit `fcb10b2` hash identically, confirming `99ed9d9` was an exact revert
 (E001). Only **one** of the four texts has a score attached to it.
+
+### The property the whole builder rests on, and when it broke
+
+`build_dataset.py`'s docstring and the factory README (`main`, line 154) state
+the design in one line:
+
+> training and inference must see byte-identical framing
+
+It is enforced by construction — both the eval adapter and the generator build
+the system message through `router_llm._system_prompt`, which reads
+`evals/tmux-routing/prompts/router.md`. That makes the framing byte-identical
+*at a given repo state*, and silently divergent across states. The timeline is
+what turns that from a design note into this entry:
+
+| event | when |
+| --- | --- |
+| corpus built | 2026-09-05 19:46 (`datasets/sft-train-2026-09-05.jsonl` mtime) |
+| training started | 2026-09-05 20:15:29 (`train.log:1`) |
+| **`router.md` edited (`7a591f4`)** | **2026-09-06 09:52 — mid-run** |
+| training still running | iteration 3,775 of 4,490 at the time of writing |
+
+`7a591f4` replaces one sentence and adds a **seven**-line HTML correction
+comment: +13/−1 lines overall (4 lines of replacement prose, a blank, the
+7-line `<!-- Corrected 2026-09-06: … -->` block, a trailing blank), taking the
+file from 9,172 to 9,936 characters. **764 characters**, every one of them
+inside the system message of every routing example — which is why regenerating
+the corpus at the edited state changes exactly the 890 routing rows and nothing
+else (E006).
+
+The failure mode is quiet and asymmetric: nothing errors, nothing warns, the
+candidate is simply scored under framing it was not trained on, and any
+resulting score change is indistinguishable from a real capability change.
 
 ### #2 has never been measured, and says so itself
 
@@ -118,11 +164,12 @@ convention held by a comment.
 3. **Run 1's training data froze #1 into 890 system messages.** The corpus was
    written 2026-09-05 19:46 and training started 20:15:29; `7a591f4` landed
    2026-09-06 09:52, mid-run. The candidate has never seen those 764 characters
-   and cannot have learned them. A sibling survey demonstrated the consequence
-   directly: regenerating the corpus at main (`704ab09`) reproduces
-   `sha256 9552ac13…` exactly, while regenerating at the `imac-site` checkout
-   (`cd64914`) produces `4f25702b…` — **differing in exactly 890 lines**, the
-   routing count, the other 1,473 byte-identical.
+   and cannot have learned them. **E006 demonstrated the consequence directly**
+   (it was the sibling book's experiment before the consolidation): regenerating
+   the corpus at main (`704ab09`) reproduces `sha256 9552ac13…` exactly, while
+   regenerating at the `imac-site` checkout (`cd64914`) produces `4f25702b…` —
+   **differing in exactly 890 lines**, the routing count, the other 1,473
+   byte-identical.
 4. **The factory's own claim is narrower than it reads.**
    `scripts/model-factory/README.md` says training and inference "see
    byte-identical framing". True of *eval* inference. Not true of the app or
@@ -136,6 +183,21 @@ convention held by a comment.
 - A prompt hash recorded with every score (O005), so a number cannot be quoted
   against the wrong text.
 - Re-scoring #2 before `imac-site` merges.
+- **The corpus recording the prompt it was built from.** The factory README
+  specifies a per-build manifest — "source list, example counts per track,
+  per-split sha256, corpus git commit, build date" (`main:README.md:173-175`;
+  branch `labbook`: 204-206, see O005's line-anchor note) — and nothing writes
+  one. A manifest carrying the sha256 of `prompts/router.md` beside the corpus
+  sha256 would turn this entry from archaeology into an assertion the gate could
+  make on its own. P005 is the protocol that works around its absence.
+
+Until then the check is manual and belongs in the gate protocol:
+
+```sh
+# does the prompt the gate will use still match the one the corpus was built from?
+git log -1 --format='%h %ad' --date=format:'%F %H:%M' -- evals/tmux-routing/prompts/router.md
+# must be at or before the corpus mtime; 99ed9d9 (2026-09-05 13:07) for sha256:9552ac13…
+```
 
 ## What this does not show
 

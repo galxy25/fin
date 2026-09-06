@@ -12,10 +12,26 @@ sources:
   - 6b1c95f (12:17, the 36/51 run) vs 22005c7 (12:38, first edit to router.md)
   - evals/tmux-routing/router_llm.py — _prompt_block() reads prompts/router.md at call time
   - scripts/model-factory/eval_gate.py:110-112 (the rule); d9100b6 gate_sweep.sh:14-17 (the repo's own diagnosis; line 13 is step 0, the memory guard)
-related: [P001, P004, E001, O003, O005]
+  - "local-artifact: models/candidates/fin-foreman-e4b-mlx/fuse-and-gate.md step 3 — 'RE-RECORD THE CHAMPION FIRST'"
+  - "models/gate-sweep/champion.txt does not exist — no re-record has been performed"
+  - "merged from docs/labbook/entries/O004-2026-09-06-stale-champion-record.md (the parallel book, 4705b67) — see the merge note below"
+related: [P001, P004, E001, O003, O005, H004]
 corrects: []
 superseded-by: null
 ---
+
+**Merged from two drafts.** Both books recorded the stale champion on
+2026-09-06: this entry, `scripts/model-factory/labbook/year-1/O002-2026-09-06-stale-champion.md`,
+and `docs/labbook/entries/O004-2026-09-06-stale-champion-record.md`. The
+consolidation (O009) kept this one — it carries the commit-ordering proof, the
+tier-split re-partition finding, the 12-vs-13 derivation and the three unchosen
+fixes — and folded the other's residual-miss reading and its check that no
+re-record has actually happened into the sections below. The one place the two
+drafts differed is instructive and is resolved here: the other draft's title
+says the shipped prompt "scores 13 higher", which is the record gap; this
+entry's title says a candidate can be "12 points worse", which is the
+false-promotion window. Both are true, they are different quantities, and
+"Why it matters" below derives each.
 
 ## What was observed
 
@@ -104,6 +120,12 @@ But:
   main` fails) and has never been run: `models/gate-sweep/` does not exist.
 - The guard is runbook text, not code. `eval_gate.py` never reads `recordedAt`;
   nothing in the gate can notice that a champion is stale.
+- **The re-record has demonstrably not happened.** `gate_sweep.sh` step 1 scores
+  the untuned model at the current prompt and caches the result to
+  `models/gate-sweep/champion.txt`; that file does not exist. So does
+  `models/candidates/fin-foreman-e4b-mlx/fuse-and-gate.md` step 3, "RE-RECORD
+  THE CHAMPION FIRST" — also runbook text. Two documents say to do it and no
+  artifact says it was done.
 
 ## What would fix it
 
@@ -124,6 +146,23 @@ code: `evals-champions.json` in the repo, `models/champion.json` in S3 (which
 `README.md` calls "the authoritative record" — **UNSOURCED**, not read, AWS is
 read-only here), and `gate_sweep.sh`'s scratch file
 `models/gate-sweep/champion.txt`.
+
+## The residual misses, and the one that decides the gate
+
+Under the round-3 prompt the untuned base misses exactly two scenarios
+(`RESULTS.md`, "Remaining misses"): **c01** (core, expected `clarify`) — "run
+the tests" routes to `fin` on a bare-vocabulary rationalization — and **h08**
+(hard) — a contrast clause outweighing the imperative. E001 has both in full.
+
+The consequence for this entry, folded in from the merged draft, is worth
+stating on its own: core stands at 25/26, so **c01 is the only thing between
+the untuned base model and passing the gate's non-negotiable half outright**.
+Any candidate that fixes c01 without breaking the other 25 clears the core
+condition — and then the only question left is which champion number it is
+being compared against, which is this entry's subject. H004 notes that the
+baseline gets c01 right, so the fine-tune may well fix it; that makes a
+correctly-recorded champion the difference between a real promotion and a
+flattering one.
 
 ## What this does not show
 

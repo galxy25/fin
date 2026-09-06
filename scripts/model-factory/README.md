@@ -41,14 +41,14 @@ Read first if you are new to the factory:
 | `year-1/E001-…-router-prompt-rounds.md` | how the current 49/51 prompt was arrived at, and the round that was reverted |
 | `year-1/O002-…-stale-champion.md` | the recorded champion is stale; do not promote against it |
 
-**A second, independently-numbered lab book exists** at
-[`../../docs/labbook/`](../../docs/labbook/) — 13 entries written the same
-morning from an overlapping set of facts, committed in `4705b67`. It is not a
-subset of this one and it is not superseded by it; thirteen of its ids collide
-with ids here while meaning different things. Which of the two becomes canonical
-is an open decision (see `labbook/README.md`, "Provenance of this directory").
-**Until it is made, cite entries by path, never by bare id**, and read both when
-a question matters.
+**There was briefly a second lab book** at `docs/labbook/` — 13 entries written
+the same morning (`4705b67`) from an overlapping set of facts, with thirteen ids
+colliding with ids here while meaning different things. It has been consolidated
+into this one and deleted; nine of its entries were merged into their
+counterparts here and four were renumbered into this book's sequence. The id
+mapping and the full account are in
+[`labbook/year-1/O009-2026-09-06-two-books-one-factory.md`](labbook/year-1/O009-2026-09-06-two-books-one-factory.md).
+**There is one lab book, and a bare id in it is unambiguous again.**
 
 ## Status
 

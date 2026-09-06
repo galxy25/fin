@@ -12,10 +12,22 @@ sources:
   - scripts/model-factory/.venv/lib/python3.11/site-packages/mlx_lm/lora.py:320 (np.random.seed(args.seed))
   - "local-artifact: adapter_config.json — lr_schedule: null, learning_rate 1e-4"
   - "memory note training-bits-per-example — Levi's directive, written while watching this"
-related: [E004, H001, O001]
+  - "partly merged from docs/labbook/entries/O002-2026-09-06-validation-split-in-distribution.md (the parallel book, 4705b67), whose 'A late-run rise' section recorded the same excursion — see the note below"
+related: [E004, H001, O001, H003]
 corrects: []
 superseded-by: null
 ---
+
+**Partly merged.** The parallel book's
+`docs/labbook/entries/O002-2026-09-06-validation-split-in-distribution.md`
+recorded this excursion as a section of its own entry rather than as an entry.
+It reached the same reading independently — same reports, same candidate causes,
+same "cause UNSOURCED, per-example loss logging is the artifact that would
+settle it", and the same correction that the unbroken sub-0.02 stretch before
+the rise is iterations 3,025-3,525 (about 500) and not 1,500. The consolidation
+(O009) sent its validation-split half to O001 and folded its excursion half
+here; nothing in it contradicted this entry, and its one addition is recorded
+below.
 
 ## What was observed
 
@@ -76,6 +88,12 @@ Context that rules out the obvious explanations:
 - **Not a memory event.** Peak memory is flat at 14.978 GB throughout.
 - **Not a learning-rate schedule.** `lr_schedule: null`, learning rate constant
   at 1.000e-04 on every report.
+- **Not a shuffle boundary either, though the shuffle is a candidate cause.**
+  The merged draft added the placement: the run is at **82% of 4,490
+  iterations** and in epoch 2 of 2, so the excursion sits deep inside the second
+  pass rather than at either of its edges. Its candidate list is this entry's
+  list, with `mlx_lm`'s per-epoch shuffle named explicitly as the data-order
+  mechanism — which is candidate 1 below, stated as the trainer implements it.
 
 ## Candidate explanations (none tested)
 

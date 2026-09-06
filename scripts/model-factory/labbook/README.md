@@ -39,9 +39,11 @@ The format enforces it:
 **When the rule starts binding, and what the draft phase allows.** The rule
 above is written for a book in use. It was broken on day one by the audit
 passes that were fixing the book — 23 already-committed entries rewritten in
-place, zero correction entries written — and O008 records that in full, with
-the counts and the reproducer. The regime, stated so the next person knows
-which one they are in:
+place at `cdb895a`, zero correction entries written — and O008 records that in
+full, with the counts pinned to their commits and the reproducer. A third pass,
+the consolidation of two books into this one, did the same at larger scale and
+is recorded in O009. The regime, stated so the next person knows which one they
+are in:
 
 | phase | in force from | in-place edits |
 | --- | --- | --- |
@@ -103,6 +105,35 @@ together with the artifact that would settle it. Never quietly promote a
 memory to a measurement. Two of the entries here rest partly on UNSOURCED
 recollections (E003 in particular); saying so is the point.
 
+### A count of the book by itself is not evidence
+
+The book is inside the repository it writes about, so a `grep` over the
+repository counts the book. A hit count, an exit code and a line number are all
+provenance claims, and one that includes this directory measures the hour it was
+taken rather than the thing it claims to be about.
+
+Two forms are permitted and nothing else is:
+
+1. **Cite counts of things outside the book.** Exclude this directory from the
+   command, with the pathspec written into the entry so a reader runs the same
+   thing:
+
+   ```sh
+   git grep -n '<pattern>' <rev> -- ':(exclude)scripts/model-factory/labbook'
+   ```
+
+2. **When the book itself is the subject** — O008 counting its own rewritten
+   entries, or a census of headings across `year-1/` — **pin the count to an
+   explicit revision**, because an unpinned count of a living book changes every
+   time someone writes in it.
+
+The worked example is O005, which cited "**24 hits**" for
+`git grep 'datasets/mlx'` on this branch as evidence that nothing in the factory
+references the path. Every one of those hits was a lab-book entry saying so. The
+same command at `0fe0883` returns **30**. The arithmetic was never the problem:
+the number measured the book, and updating it would only reset the clock. O009
+records the sweep that applied this rule to every entry.
+
 **Honest negative results are first-class.** An abandoned approach, with the
 reason it was abandoned, is among the most valuable things in this book: it is
 the only record that stops the same road being walked twice. E001 (a prompt
@@ -120,16 +151,31 @@ downloaded, smoke-trained and deleted) are here because they failed.
 | **HYPOTHESIS** | `H001` | a claim not yet tested, stated together with the experiment that would settle it. A hypothesis without a falsifying test does not belong here. |
 | **PROCESS** | `P001` | a reusable protocol — the way we do a thing, written down so it is done the same way twice. |
 
+**Instrumentation is not intervention.** An OBSERVATION may import a module,
+wrap a function in a counter and run it, provided the wrapper does not change
+what the system does — a counting wrapper that calls the original and returns
+its value unchanged leaves the output bit-identical, so what is recorded is the
+system as it already behaves. What makes an entry an EXPERIMENT is a question
+posed in advance and a method built to answer it, not the mere fact that code
+was executed. O007 (a read-only counter over the label filter) and E007 (a
+census run to answer a stated question) use the same machinery and sit on
+opposite sides of that line for that reason. This convention arrived with the
+consolidation (O009); it was the deleted book's, and it is the better statement
+of the distinction.
+
 Numbering is **per kind**, monotonic, never reused: `E001, E002, …` and
 `O001, O002, …` run independently. Numbering does not restart at a new year;
 `year-2/` continues from wherever year 1 stopped, so an id identifies exactly
 one entry for the life of **this** book.
 
-**That guarantee does not hold across the branch as it currently stands**, and
-the qualifier is not pedantry — see "Provenance of this directory" at the end of
-this file. A second, independently-numbered lab book sits at `docs/labbook/` on
-the same branch, and **thirteen ids collide with different subjects**. Until the
-two are reconciled, a bare `O002` is ambiguous on branch `labbook`.
+For one day that guarantee did not hold across the branch: a second,
+independently-numbered lab book sat at `docs/labbook/` and thirteen of its ids
+collided with ids here while meaning different things. It was consolidated into
+this book and deleted on 2026-09-06 — **there is one book, and a bare id is
+unambiguous again.** Four of its entries were renumbered into these sequences,
+once, at that moment; nothing is renumbered again. O009 carries the id map and
+the whole account, and "Provenance of this directory" at the end of this file is
+the short version.
 
 ### Status values
 
@@ -206,24 +252,42 @@ superseded-by: null       # filled in later, by hand, when something corrects TH
 Not every heading applies to every kind. `## What this does not show` applies
 to all four and is the heading most likely to be the useful one a year later.
 
-**Use that heading verbatim.** In the 20 entries written on day one it appears
-as written in 10, is renamed in 9 ("What this run cannot show" E004, "What this
-hypothesis is not" H001, "The ceiling this cannot break" H002, "What this
+**Use that heading verbatim.** It is not used consistently, and the census is
+pinned to a revision because it is a count of the book by itself (see the rule
+above). **At `0fe0883`, across the 21 entries this book then held:** the exact
+heading appears in 11, is renamed in 9 ("What this run cannot show" E004, "What
+this hypothesis is not" H001, "The ceiling this cannot break" H002, "What this
 hypothesis does not address" H003, "What this hypothesis does not claim" H004,
 "What it does not imply" O001, "What this protocol does not cover" P001, "What
-this does not cover" P003, "What this does not do" P004) and is absent from
-P002, which uses "Four things the gate does not check". Each variant reads
-better in place, and the cost is that the one heading a future reader is told to
-rely on cannot be extracted with a grep:
+this does not cover" P003, "What this does not do" P004), and is absent from
+P002, which uses "Four things the gate does not check". The four entries the
+consolidation brought over from the deleted book (E006, E007, E008, P005) use
+their own closing headings and are not counted in those 21.
+
+Do not carry those three numbers forward by hand — re-run the census, which is
+the part that does not rot:
 
 ```sh
-grep -rL '^## What this does not show' scripts/model-factory/labbook/year-1
+git grep -L '^## What this does not show' <rev> -- scripts/model-factory/labbook/year-1
 ```
 
-The day-one entries are left as they are — renaming ten headings would be a
-silent rewrite of ten entries for a cosmetic gain, which is the trade O008 is
-about. New entries use the exact heading, and a variant belongs as a *second*
-heading underneath it, not instead of it.
+Each variant reads better in place, and the cost is that the one heading a
+future reader is told to rely on cannot be extracted with a grep. The existing
+entries are left as they are — renaming ten headings would be a silent rewrite
+of ten entries for a cosmetic gain, which is the trade O008 is about. New
+entries use the exact heading, and a variant belongs as a *second* heading
+underneath it, not instead of it.
+
+## Reproduction commands
+
+Write them against a **revision**, never against a worktree that happens to
+exist today, and never write output under `/tmp`. `git worktree add
+../fin-wt-<purpose> <sha>` and a scratch directory beside the repo; P003:111 has
+the rule and E003:136 has the incident that produced it — a `/tmp/fin-wt-train`
+worktree wiped by a reboot, which is why some of E003's numbers are UNSOURCED
+today. (Both anchors are against `0fe0883`.) This convention arrived with the
+consolidation (O009), from the deleted book's README; E006 and P005 are the
+entries that follow it most closely.
 
 ## How to add an entry
 
@@ -255,56 +319,66 @@ this alongside", not "ignore".
 
 ## Provenance of this directory
 
-The location `scripts/model-factory/labbook/` follows the record in the
-project memory note `labbook-and-publishing` (2026-09-06), which fixes it
-alongside a separate publishing pipeline under `content/`.
+The location `scripts/model-factory/labbook/` follows the record in the project
+memory note `labbook-and-publishing` (2026-09-06), which fixes it alongside a
+separate publishing pipeline under `content/`. It is also the argument that
+settled the consolidation below: **the lab book belongs with the factory it
+records.**
 
-A parallel draft of the same book exists on this branch at `docs/labbook/`,
-committed the same morning (`4705b67`, 2026-09-06 11:21) by a sibling agent
-working from an overlapping set of facts. Its 13 entries are numbered in their
-own sequence and **its ids do not correspond to the ids here**.
+### There were two books, and now there is one
 
-### The collision, stated exactly
+A parallel draft of the same book existed on this branch at `docs/labbook/`,
+committed the same morning (`4705b67`, 2026-09-06 11:21:40) by a sibling agent
+working from an overlapping set of facts — twelve minutes before this book's
+first commit, `a02cec3`. Its 13 entries were numbered in their own sequence and
+**every one of its ids collided with an id here, with a different subject behind
+it.** The crossings were the dangerous part: the stale champion was `O004` there
+and `O002` here; bits per example was `E004` there and `H001` here; "the best
+checkpoint is not the last" was `H002` there and `H003` here.
 
-Branch `labbook` carries both books: `4705b67` (`docs/labbook/`, 13 entries) and
-`a02cec3` (`scripts/model-factory/labbook/`, 20 entries). **Thirteen ids appear
-in both with different subjects** — every id the smaller book uses:
+**The two books were consolidated into this one on 2026-09-06 and
+`docs/labbook/` was deleted.** Nine of its entries were merged into the entry
+here that shared their subject; four were renumbered into this book's sequence
+and kept whole:
 
-| id | `docs/labbook/` | `scripts/model-factory/labbook/` |
+| `docs/labbook/` | subject | now |
 | --- | --- | --- |
-| E001 | corpus bit-exact reproduction | router prompt rounds 0-4 |
-| E002 | corpus census | base-model selection |
-| E003 | mlx split recovery | memory ceiling / grad-checkpoint |
-| E004 | bits per example | run 1, the E4B LoRA |
-| O001 | baseline filter never fires | zero loss, flat validation |
-| O002 | validation split in distribution | stale champion |
-| O003 | prompt skew mid-run | three prompts, no parity |
-| O004 | stale champion record | late-run loss excursion |
-| O005 | factory docs drift | no provenance in verdicts |
-| H001 | hard-tier regression | bits per example |
-| H002 | best checkpoint is not last | high-information subset |
-| P001 | reproduce a dataset | the promotion protocol |
-| P002 | the leakage gate | the leakage rule |
+| E001 | corpus reproduces bit-for-bit | **E006** |
+| E002 | corpus census | **E007** |
+| E003 | mlx split recovery | **E008** |
+| E004 | bits per example | merged into **H001** |
+| H001 | hard-tier regression | merged into **H004** |
+| H002 | best checkpoint is not last | merged into **H003** |
+| O001 | baseline filter never fires | merged into **O007** |
+| O002 | validation split in distribution | merged into **O001** (excursion half → **O004**) |
+| O003 | prompt skew mid-run | merged into **O003** |
+| O004 | stale champion record | merged into **O002** |
+| O005 | factory docs drift | merged into **O005** |
+| P001 | reproduce a dataset | **P005** |
+| P002 | the leakage gate | merged into **P002** |
 
-Note the crossings, which are what make bare ids actively dangerous rather than
-merely ambiguous: the stale champion is `O004` in one book and `O002` in the
-other; bits per example is `E004` in one and `H001` in the other; "the best
-checkpoint is not the last" is `H002` there and `H003` here.
+**O009 is the full record** — why two books existed, which draft won each merge
+and what the other contributed, what a merge cost that a renumber did not, and
+the two findings the pass fixed on the way through. Every entry that received
+merged content carries a "Merged from two drafts" note naming both original
+filenames, so the fact that there were two survives the file that proved it.
 
-### The rule until it is reconciled
+The deleted book can still be read as itself at `git show 0fe0883:docs/labbook/`.
 
-1. **Cite entries across books by path, never by bare id.** Inside one book, a
-   bare id means an entry of that same book — that is how the cross-references
-   in all 20 entries here should be read, and it is the only reading under which
-   they are correct.
-2. **Neither book renumbers.** Ids are never reused and never renumbered (rule
-   1); a merge that renumbered one of them would break every cross-reference in
-   it and every external citation of it.
-3. **`scripts/model-factory/README.md`'s reading list points at both**, so
-   neither is orphaned while the question is open.
+### What this changed about the rules
 
-**Reconciling the two into one canonical location is Levi's call and has not
-been made.** It wants making before this branch merges, not after: the longer
-both live on `main`, the more outside references accumulate against ambiguous
-ids. The location `scripts/model-factory/labbook/` follows the memory note
-`labbook-and-publishing`; that is a reason, not a decision.
+Three of this book's conventions came out of that pass and are stated above
+rather than here, because they apply to every future entry and not just to the
+merge:
+
+- **A count of the book by itself is not evidence** — rule 2's new subsection.
+  It came from O005 citing a hit count that the writing of the book had inflated.
+- **Instrumentation is not intervention** — the EXPERIMENT/OBSERVATION line,
+  taken from the deleted book's README, which stated it better.
+- **Reproduction commands are written against a revision** — also the deleted
+  book's, and the reason E006 and P005 read the way they do.
+
+One thing did *not* change, and it is worth saying: ids are still never reused
+and never renumbered. The four entries that moved were renumbered exactly once,
+at the moment two independent sequences became one, and the map above is
+permanent. Nothing here is renumbered again.

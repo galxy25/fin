@@ -1,9 +1,27 @@
-# P001 — Protocol: reproduce a dataset bit-for-bit before you trust a number about it
+---
+id: P005
+date: 2026-09-06
+occurred: 2026-09-06
+kind: PROCESS
+title: "Reproduce a dataset bit-for-bit before you trust a number about it"
+status: active
+tags: [data, reproducibility, provenance, manifest]
+sources:
+  - a823271 — "Model factory scaffold" (2026-09-05 12:59), the commit that gitignores /datasets/
+  - "main:scripts/model-factory/README.md:173-175 (the dataset manifest that is specified but never written; branch labbook: 204-206 — see the line-anchor note in O005)"
+  - "grep -in manifest scripts/model-factory/build_dataset.py -> zero matches"
+  - E006 — the worked example this protocol generalizes
+related: [E006, E007, E008, O003, O005]
+corrects: []
+superseded-by: null
+---
 
-- **Kind:** PROCESS
-- **Date:** 2026-09-06
-- **Corrections:** —
-- **Superseded-by:** —
+**Migrated entry.** Written as `docs/labbook/entries/P001-2026-09-06-reproduce-a-dataset.md`
+in the parallel book opened at `4705b67`, and renumbered `P001 -> P005` when the
+two books were consolidated into this one (O009). Body unchanged apart from the
+header block and the cross-references, which now name this book's ids. Note that
+`P001` in this book is **the promotion protocol**, a different entry entirely;
+the collision is the reason the consolidation happened.
 
 ## Why this protocol exists
 
@@ -15,7 +33,7 @@ name. Every downstream number — a val loss, a gate score, a promotion verdict
 cannot be tied back to committed source.
 
 This protocol takes a dataset from "an artifact someone made" to "the output
-of commit X", which is the state E001 put `sha256:9552ac13…` into.
+of commit X", which is the state E006 put `sha256:9552ac13…` into.
 
 ## The protocol
 
@@ -40,7 +58,7 @@ python3 scripts/model-factory/gen_training_data.py --out "$SCRATCH/regen-main.js
 ```
 
 **3. Compare sha256, not counts.** Matching example counts prove nothing —
-E001's two builds both emitted 2,363 rows and differed in 890 of them.
+E006's two builds both emitted 2,363 rows and differed in 890 of them.
 
 ```sh
 shasum -a 256 "$SCRATCH/regen-main.jsonl" datasets/<the artifact>.jsonl
@@ -50,7 +68,7 @@ shasum -a 256 "$SCRATCH/regen-main.jsonl" datasets/<the artifact>.jsonl
 first; if the count equals a track's example count, the divergence is in that
 track's shared inputs (prompt file, registry, baseline), not in the
 generator. Then diff one matched pair — same user text and same label,
-different system message — and read the hunk. E001 went from "the hashes
+different system message — and read the hunk. E006 went from "the hashes
 differ" to "commit `7a591f4` added 764 characters to `router.md`" in two
 steps this way.
 
@@ -84,6 +102,6 @@ Until a build emits `manifest.json` carrying the corpus sha256, the input
 shas, and the corpus commit, provenance is reconstructed by hand every time.
 That is the single highest-leverage fix in the data pipeline, and it is
 smaller than any of the entries that had to be written because it is missing —
-[E001](E001-2026-09-06-corpus-bit-exact-reproduction.md),
-[E003](E003-2026-09-06-mlx-split-recovery.md),
-[O003](O003-2026-09-06-prompt-skew-mid-run.md).
+E006,
+E008,
+O003.

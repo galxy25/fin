@@ -1,9 +1,33 @@
-# E002 — Corpus census: where 4,527 generated candidates become 2,363 training rows
+---
+id: E007
+date: 2026-09-06
+occurred: 2026-09-06
+kind: EXPERIMENT
+title: "Corpus census: where 4,527 generated candidates become 2,363 training rows"
+status: closed
+tags: [corpus, data, caps, census]
+sources:
+  - scripts/model-factory/gen_training_data.py:985-1001 (CAPS), :1053-1056 (the lexicographic slice)
+  - "measured 2026-09-06 by importing the generator from a worktree at main 704ab09 and calling each gen_* function directly — command below"
+  - "generator stdout from the E006 reproduction run (kept counts, `deduped: 4527`, `dropped for overlap: 0`)"
+related: [E006, O007, P002, H001]
+corrects: []
+superseded-by: null
+---
 
-- **Kind:** EXPERIMENT
-- **Date:** 2026-09-06
-- **Corrections:** —
-- **Superseded-by:** —
+**Migrated entry.** Written as `docs/labbook/entries/E002-2026-09-06-corpus-census.md`
+in the parallel book opened at `4705b67`, and renumbered `E002 -> E007` when the
+two books were consolidated into this one (O009). Body unchanged apart from the
+header block and the cross-references, which now name this book's ids.
+
+**Relationship to O007.** O007 states the routing quarter of the table below —
+3,054 candidates cut to 890 by a lexicographic slice — as one of its supporting
+facts, and draws the vocabulary-survival consequence from it (8 of 16 domains
+reach the kept `route` rows, 4 of 16 the kept `start` rows). The two entries were
+written independently in the two books from the same instrumentation run and
+they agree row for row; this one is the full census of all four targets, O007 is
+the argument about what the labels are. Neither was folded into the other,
+because their subjects are different.
 
 ## Question
 
@@ -29,7 +53,7 @@ for fn in (m.gen_routing, m.gen_ledger, m.gen_elicit, m.gen_tooluse): ...
 "
 ```
 
-Kept counts are the generator's own stdout from the E001 reproduction run.
+Kept counts are the generator's own stdout from the E006 reproduction run.
 
 ## Result
 
@@ -55,7 +79,7 @@ Kept counts are the generator's own stdout from the E001 reproduction run.
 By target, kept: routing 890, ledger 769, tooluse 384, elicit 320.
 Deduplication by full serialized line removed nothing (`deduped: 4527`).
 The leakage gate dropped nothing (`dropped for overlap: 0`) — see
-[P002](P002-2026-09-06-leakage-gate.md).
+P002.
 
 ## Reading
 
