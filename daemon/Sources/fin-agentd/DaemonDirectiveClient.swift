@@ -99,11 +99,28 @@ private struct PolledDocument {
     /// Audit prefix for this source's failures; the directive channel's strings predate
     /// the inbox and stay unchanged.
     let failurePrefix: String
+    /// How the first-run audit lines name this source.
+    let seedNoun: SeedNoun
     var etag: String?
     var cached: DaemonDirectiveDocument?
     /// False after a hard failure, so a source that just failed contributes nothing this
     /// pass instead of replaying a stale cache. The other source is unaffected.
     var isFresh = false
+    /// First run only: the HTTP status of a read that found NO object at the URL — 404,
+    /// or the 403 S3 answers for a missing key when the signer lacks ListBucket. Reset by
+    /// every read, and only ever set while `seedPending`: after the seed those statuses
+    /// are poll failures again, exactly as before.
+    var absentStatus: Int?
+    /// True while this source's first-run high-water hasn't been drawn yet — see
+    /// `seedLedgerIfFirstRun`. Each slot draws its own, independently.
+    var seedPending = false
+
+    struct SeedNoun {
+        /// "no supervision directive document yet" / "no inbox document yet"
+        let absent: String
+        /// Formats the seeded-count line.
+        let seeded: (Int) -> String
+    }
 }
 
 /// The daemon's consumer of the S3 remote-supervision channel: polls the directive URL
@@ -126,7 +143,12 @@ final class DaemonDirectiveClient {
     static let userMessageKind = "user_message"
     /// Reported in the status document so a supervisor can tell which harness features
     /// (stayResident, cloud transcript, inbox, push notify) this agent has.
-    static let daemonVersion = "1.4.0"
+    static let daemonVersion = "1.4.1"
+    /// The statuses that mean "no such object" on a first-run read: S3 answers 404 for a
+    /// missing key when the signer may ListBucket (the control plane grants it for
+    /// exactly that reason) and 403 when it may not — a hand-provisioned resident
+    /// config's presigned GET typically sees the latter.
+    static let absentStatuses: Set<Int> = [404, 403]
 
     #if !canImport(Darwin)
     /// Linux only: the default fetch's buffered read runs through this session, whose
@@ -160,20 +182,21 @@ final class DaemonDirectiveClient {
     /// Ids this daemon applied (or hard-skipped) itself, oldest first, capped at
     /// `appliedIDsCap` with the oldest evicted.
     private(set) var appliedIDs: [String]
-    /// The first-run high-water: every id in the directive document the first time a
-    /// fresh box read it. Kept apart from `appliedIDs` and never capped — the document
-    /// can hold more than `appliedIDsCap` entries, and a seeded id evicted from the cap
-    /// would replay, which is the very thing the seed exists to stop. Written once by
-    /// `seedLedgerIfFirstRun`, then only ever read.
+    /// The first-run high-water of the DIRECTIVE document: every id in it, in document
+    /// order, the first time a fresh box read it. Kept apart from `appliedIDs` and never
+    /// capped — the document can hold more than `appliedIDsCap` entries, and a seeded id
+    /// evicted from the cap would replay, which is the very thing the seed exists to
+    /// stop. Written once by `seedLedgerIfFirstRun`, then only ever read.
     private(set) var seededIDs: [String] {
-        didSet { seededLookup = Set(seededIDs) }
+        didSet { rebuildSeededLookup() }
+    }
+    /// The inbox's own first-run high-water, kept apart so the status document's
+    /// `last_applied_id` can keep reporting the directive mark: inbox ids are opaque
+    /// (`m-<uuid>`) and mean nothing to a supervisor reading that field.
+    private(set) var seededInboxIDs: [String] {
+        didSet { rebuildSeededLookup() }
     }
     private var seededLookup: Set<String>
-    /// True from a first run (no ledger file at init, or a ledger persisted while the
-    /// seed was still pending) until the first successfully fetched directive document
-    /// has been seeded — see `seedLedgerIfFirstRun`. Never true again in this process
-    /// afterwards.
-    private var awaitingFirstRunSeed: Bool
     /// Skip audits are once per directive id, so a permanently bad entry writes one
     /// line, not one per poll.
     private var auditedSkips: Set<String> = []
@@ -182,16 +205,64 @@ final class DaemonDirectiveClient {
     private var lastFailureAuditAt: [String: Date] = [:]
     private var lastPollAt: Date?
 
+    /// - Parameters:
+    ///   - inboxResetAtLaunch: Whether whatever launched this daemon emptied the inbox
+    ///     document first — the control plane's `POST /workers` does, right before the
+    ///     instance launch. True exempts the inbox from the first-run seed (anything in
+    ///     it by the first read arrived while the worker booted and must apply); false,
+    ///     the default and the resident-install posture, seeds the inbox's backlog as
+    ///     history like the directive document's.
+    ///   - hasRunHereBefore: Evidence from outside the ledger that the daemon has run on
+    ///     this box — the daemon passes whether its audit log already existed at launch.
+    ///     A 1.3.0 daemon wrote the ledger only on its first apply, so a missing ledger
+    ///     alone can't tell a fresh box from a 1.3.0 box that never applied anything;
+    ///     seeding the latter would swallow the next directive as history.
+    ///   - fetch: The transport; nil (the default) is the real one — streaming and
+    ///     body-capped on Darwin, buffered under a total-time timeout on Linux.
     init(
         directiveURL: String,
         statusURL: String?,
         inboxURL: String? = nil,
+        inboxResetAtLaunch: Bool = false,
         agentName: String,
         pollSeconds: Int,
         deviceToken8: String = DaemonConfig.defaultDeviceToken8,
         stateFilePath: String,
+        hasRunHereBefore: Bool = false,
         audit: @escaping (String) -> Void = { _ in },
-        fetch: @escaping (URLRequest) async throws -> (Data, URLResponse) = { request in
+        fetch: ((URLRequest) async throws -> (Data, URLResponse))? = nil,
+        put: @escaping (URLRequest) async throws -> URLResponse = { request in
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return response
+        }
+    ) {
+        self.directiveURL = directiveURL
+        self.statusURL = statusURL
+        self.inboxURL = inboxURL
+        self.agentName = agentName
+        self.pollSeconds = max(5, pollSeconds)
+        self.deviceToken8 = deviceToken8
+        self.stateFilePath = stateFilePath
+        self.directiveDocument = PolledDocument(
+            url: directiveURL,
+            failurePrefix: "[s3] poll failed",
+            seedNoun: .init(
+                absent: "no supervision directive document yet",
+                seeded: { "\($0) historical directive(s) in the supervision doc marked applied, not replayed" }
+            )
+        )
+        self.inboxDocument = inboxURL.map {
+            PolledDocument(
+                url: $0,
+                failurePrefix: "[s3] inbox poll failed",
+                seedNoun: .init(
+                    absent: "no inbox document yet",
+                    seeded: { "\($0) message(s) already in the inbox marked applied, not replayed" }
+                )
+            )
+        }
+        self.audit = audit
+        self.fetch = fetch ?? { request in
             #if canImport(Darwin)
             // Streaming, not `URLSession.data`: the body cap must bound memory, so a
             // hostile multi-hundred-MB (or slow-drip) object is cancelled one byte
@@ -219,64 +290,70 @@ final class DaemonDirectiveClient {
             // body dies on the clock, with the poll's post-read size check intact.
             return try await DaemonDirectiveClient.linuxBufferedSession.data(for: request)
             #endif
-        },
-        put: @escaping (URLRequest) async throws -> URLResponse = { request in
-            let (_, response) = try await URLSession.shared.data(for: request)
-            return response
         }
-    ) {
-        self.directiveURL = directiveURL
-        self.statusURL = statusURL
-        self.inboxURL = inboxURL
-        self.agentName = agentName
-        self.pollSeconds = max(5, pollSeconds)
-        self.deviceToken8 = deviceToken8
-        self.stateFilePath = stateFilePath
-        self.directiveDocument = PolledDocument(
-            url: directiveURL, failurePrefix: "[s3] poll failed"
-        )
-        self.inboxDocument = inboxURL.map {
-            PolledDocument(url: $0, failurePrefix: "[s3] inbox poll failed")
-        }
-        self.audit = audit
-        self.fetch = fetch
         self.put = put
         switch Self.loadLedger(from: stateFilePath) {
         case .loaded(let ledger):
             self.appliedIDs = ledger.applied
             self.seededIDs = ledger.seeded
-            self.seededLookup = Set(ledger.seeded)
-            // A ledger persisted while a first run was still waiting for its directive
-            // document (an inbox message applied, then a restart) resumes the wait —
-            // it is not a "has run before", or the whole shared document would replay
-            // the moment the directive URL recovers.
-            self.awaitingFirstRunSeed = ledger.seedPending
+            self.seededInboxIDs = ledger.inboxSeeded
+            self.seededLookup = Set(ledger.seeded).union(ledger.inboxSeeded)
+            // A ledger persisted while a first run was still waiting for a document (an
+            // inbox message applied, then a restart) resumes the wait — it is not a
+            // "has run before", or the whole shared document would replay the moment
+            // the directive URL recovers. Each slot resumes its own.
+            self.directiveDocument.seedPending = ledger.seedPending
             if ledger.seedPending {
                 audit("[s3] first run: resumed with the directive seed still pending")
             }
-        case .missing:
-            // A box this daemon has never run on: the shared supervision document is
-            // history to it, not instructions. Seeded on the first fresh fetch.
+            if inboxDocument != nil, ledger.inboxSeedPending {
+                self.inboxDocument?.seedPending = true
+                audit("[s3] first run: resumed with the inbox seed still pending")
+            }
+        case .missing where hasRunHereBefore:
+            // No ledger, but the box has run this daemon: a 1.3.0 daemon that never
+            // applied a directive left no ledger behind, only its audit log. Not a
+            // first run — every unapplied directive is delivered, as 1.3.0 would have.
             self.appliedIDs = []
             self.seededIDs = []
+            self.seededInboxIDs = []
             self.seededLookup = []
-            self.awaitingFirstRunSeed = true
+            audit("[s3] no directive ledger, but the audit log predates this launch — not a first run, nothing seeded")
+        case .missing:
+            // A box this daemon has never run on: the shared supervision document is
+            // history to it, not instructions — and so is the inbox's backlog, unless
+            // the launcher emptied the inbox first. Seeded on the first fresh fetch.
+            self.appliedIDs = []
+            self.seededIDs = []
+            self.seededInboxIDs = []
+            self.seededLookup = []
+            self.directiveDocument.seedPending = true
+            self.inboxDocument?.seedPending = !inboxResetAtLaunch
         case .corrupt:
             // Starting with an empty dedupe set means already-applied directives may
             // replay; the supervisor must be able to see why. Not a first run — the
             // daemon HAS run here — so nothing is seeded and the replay is visible.
             self.appliedIDs = []
             self.seededIDs = []
+            self.seededInboxIDs = []
             self.seededLookup = []
-            self.awaitingFirstRunSeed = false
             audit("[s3] state file unreadable — dedupe reset")
         }
+    }
+
+    private func rebuildSeededLookup() {
+        seededLookup = Set(seededIDs).union(seededInboxIDs)
     }
 
     /// Whether enough time has passed since the last poll attempt.
     var pollIsDue: Bool {
         guard let lastPollAt else { return true }
         return Date().timeIntervalSince(lastPollAt) >= TimeInterval(pollSeconds)
+    }
+
+    /// True while any slot still owes its first-run seed.
+    var isFirstRun: Bool {
+        directiveDocument.seedPending || inboxDocument?.seedPending == true
     }
 
     // MARK: - Polling
@@ -289,61 +366,104 @@ final class DaemonDirectiveClient {
     func poll() async -> [DaemonRemoteDirective] {
         lastPollAt = Date()
         directiveDocument = await refreshed(directiveDocument)
-        seedLedgerIfFirstRun()
         if let inbox = inboxDocument { inboxDocument = await refreshed(inbox) }
+        seedLedgerIfFirstRun()
         return pendingDirectives()
     }
 
-    /// The launch-time half of the first run: reads the directive document once, right
-    /// now, so the high-water is drawn at LAUNCH — the same moment the control plane
-    /// empties the per-agent inbox — rather than at the first poll, which the daemon only
-    /// reaches after its first task turn (minutes of model and tool calls, during which
-    /// every directive an operator wrote would otherwise be stamped history). The daemon
-    /// calls this before it even opens SSH. No-op unless this is a first run. A fetch
-    /// that fails here audits once (beyond the throttled failure line) and leaves the
-    /// seed pending for the poll loop; the bucket never stops the daemon starting. Not a
-    /// poll: the loop's first poll still runs on schedule, and its conditional GET rides
-    /// the ETag this fetch recorded.
+    /// The launch-time half of the first run: reads each still-unseeded document once,
+    /// right now, so the high-water is drawn at LAUNCH — before the SSH connect, the
+    /// readiness probes and the first task turn, which together can run for minutes,
+    /// during which every directive an operator wrote would otherwise be stamped
+    /// history. The daemon calls this before it even opens SSH. No-op unless this is a
+    /// first run. A fetch that fails here audits once (beyond the throttled failure
+    /// line) and leaves that slot's seed pending for the poll loop; the bucket never
+    /// stops the daemon starting. Not a poll: the loop's first poll still runs on
+    /// schedule, and its conditional GET rides the ETag this fetch recorded.
     func primeFirstRunSeed() async {
-        guard awaitingFirstRunSeed else { return }
-        directiveDocument = await refreshed(directiveDocument)
+        guard isFirstRun else { return }
+        if directiveDocument.seedPending {
+            directiveDocument = await refreshed(directiveDocument)
+        }
+        if let inbox = inboxDocument, inbox.seedPending {
+            inboxDocument = await refreshed(inbox)
+        }
         seedLedgerIfFirstRun()
-        if awaitingFirstRunSeed {
+        if directiveDocument.seedPending {
             audit("[s3] first run: directive document not read at launch — seed deferred to the next poll")
+        }
+        if inboxDocument?.seedPending == true {
+            audit("[s3] first run: inbox document not read at launch — seed deferred to the next poll")
         }
     }
 
-    /// First run only: the first directive document actually read becomes the high-water
-    /// mark. Every id in it — matching this agent or not, well-formed or not — is
-    /// recorded in `seededIDs` without being injected, because on a fresh box (a new
-    /// cloud worker, a new install) that document is the supervisor's whole history,
-    /// and replaying it burns a model turn re-answering every week-old prompt. The
-    /// control plane empties the per-agent INBOX at launch for the same reason but
-    /// cannot empty the directive document, which every agent shares — so the daemon
-    /// draws the line itself. The inbox is deliberately NOT seeded: launch reset it, so
-    /// anything in it by the first poll arrived while the worker booted and must apply.
+    /// First run only: the first document actually read from a slot becomes that slot's
+    /// high-water mark. Every id in it — matching this agent or not, well-formed or not
+    /// — is recorded as seeded without being injected, because on a fresh box (a new
+    /// cloud worker, a new install) the shared directive document is the supervisor's
+    /// whole history and the inbox is the phone's, and replaying either burns a model
+    /// turn re-answering every week-old prompt. The control plane can empty the
+    /// per-agent inbox at launch (and a config with `inboxResetAtLaunch` says it did,
+    /// which exempts the inbox here) but cannot empty the directive document, which
+    /// every agent shares — so the daemon draws that line itself.
     ///
-    /// Keyed on the directive slot alone (not `refreshed`, which serves both slots): a
-    /// failed or unparseable first fetch leaves the seed pending for the next poll, and
-    /// in that window `matching(in:)` returns nothing for the slot anyway. Persisting
-    /// even an empty seed creates the ledger file, so an in-place restart is no longer
-    /// a first run.
+    /// A slot whose object does not exist yet (`absentStatus`) has no history: its seed
+    /// completes empty, so the first entry written afterwards is delivered rather than
+    /// becoming the "first successful read" and getting seeded. A failed or unparseable
+    /// read leaves the seed pending for the next poll, and in that window
+    /// `matching(in:)` returns nothing for the slot anyway. Persisting even an empty
+    /// seed creates the ledger file, so an in-place restart is no longer a first run.
     private func seedLedgerIfFirstRun() {
-        guard awaitingFirstRunSeed, directiveDocument.isFresh,
-              let cached = directiveDocument.cached else { return }
-        awaitingFirstRunSeed = false
-        var seen = Set<String>()
-        seededIDs = cached.directives.map(\.id).filter { seen.insert($0).inserted }
-        persistLedger()
-        if !seededIDs.isEmpty {
-            audit("[s3] first run: \(seededIDs.count) historical directive(s) in the supervision doc marked applied, not replayed")
+        var persist = false
+        if directiveDocument.seedPending,
+           let resolution = Self.seedResolution(of: directiveDocument) {
+            directiveDocument.seedPending = false
+            persist = true
+            switch resolution {
+            case .absent(let status):
+                audit("[s3] first run: \(directiveDocument.seedNoun.absent) (HTTP \(status)) — nothing to seed")
+            case .document(let ids):
+                seededIDs = ids
+                if !ids.isEmpty { audit("[s3] first run: \(directiveDocument.seedNoun.seeded(ids.count))") }
+            }
         }
+        if let inbox = inboxDocument, inbox.seedPending,
+           let resolution = Self.seedResolution(of: inbox) {
+            inboxDocument?.seedPending = false
+            persist = true
+            switch resolution {
+            case .absent(let status):
+                audit("[s3] first run: \(inbox.seedNoun.absent) (HTTP \(status)) — nothing to seed")
+            case .document(let ids):
+                seededInboxIDs = ids
+                if !ids.isEmpty { audit("[s3] first run: \(inbox.seedNoun.seeded(ids.count))") }
+            }
+        }
+        if persist {
+            persistLedger(failurePrefix: "[s3] first run: could not persist the seed")
+        }
+    }
+
+    private enum SeedResolution {
+        case absent(status: Int)
+        case document([String])
+    }
+
+    /// What a slot's most recent read says for its seed: nil when it said nothing usable
+    /// (failed, unparseable, or a 304 with no cached body — a caching proxy can answer
+    /// that even to an unconditional first GET).
+    private static func seedResolution(of slot: PolledDocument) -> SeedResolution? {
+        if let status = slot.absentStatus { return .absent(status: status) }
+        guard slot.isFresh, let cached = slot.cached else { return nil }
+        var seen = Set<String>()
+        return .document(cached.directives.map(\.id).filter { seen.insert($0).inserted })
     }
 
     /// One conditional GET, returning the slot with its ETag and cached parse updated.
     private func refreshed(_ slot: PolledDocument) async -> PolledDocument {
         var document = slot
         document.isFresh = false
+        document.absentStatus = nil
         guard let url = URL(string: document.url), !document.url.isEmpty else {
             registerFailure("\(document.failurePrefix): invalid URL")
             return document
@@ -362,6 +482,13 @@ final class DaemonDirectiveClient {
                 return document
             }
             guard (200..<300).contains(status) else {
+                if document.seedPending, Self.absentStatuses.contains(status) {
+                    // First run, and no object at this URL: not a failure — there is
+                    // no history here. `seedLedgerIfFirstRun` completes the seed
+                    // empty. After the seed the same status is a poll failure again.
+                    document.absentStatus = status
+                    return document
+                }
                 registerFailure("\(document.failurePrefix): HTTP \(status)")
                 return document
             }
@@ -422,7 +549,7 @@ final class DaemonDirectiveClient {
         return pending
     }
 
-    /// Applied by this daemon, or in the first-run seed — either way, never injected.
+    /// Applied by this daemon, or in a first-run seed — either way, never injected.
     private func isApplied(_ id: String) -> Bool {
         seededLookup.contains(id) || appliedIDs.contains(id)
     }
@@ -476,8 +603,11 @@ final class DaemonDirectiveClient {
             "daemon_version": Self.daemonVersion,
             "agent": agentName,
             "state": snapshot.state,
-            // After a first-run seed and before any real apply, the newest seeded id —
-            // the high-water mark itself.
+            // After a first-run seed and before any real apply, the LAST id in the
+            // directive document as seeded — the high-water mark when the supervisor
+            // appends, which is the document's contract; the seed keeps document
+            // order and never sorts. The inbox seed is deliberately not consulted:
+            // its ids are opaque, and this field is the supervisor's mark.
             "last_applied_id": (appliedIDs.last ?? seededIDs.last) as Any? ?? NSNull(),
             "last_turn_at": snapshot.lastTurnAt.map(iso.string(from:)) as Any? ?? NSNull(),
             "last_assistant_preview": preview as Any? ?? NSNull(),
@@ -509,28 +639,54 @@ final class DaemonDirectiveClient {
     // MARK: - Ledger persistence
 
     /// The on-disk ledger. 1.3.0 wrote a bare `[String]` of applied ids (still loaded);
-    /// since 1.4.0 the file is this object, because the first-run seed needs two things
-    /// a capped array can't hold: the seeded ids themselves, uncapped (`seededIDs`), and
+    /// since 1.4.0 the file is this object, because the first-run seed needs things a
+    /// capped array can't hold: the seeded ids themselves, uncapped (`seededIDs`), and
     /// whether a first run is still waiting for its directive document, so a restart in
     /// that window — systemd's `Restart=always` after a failed-turn exit, with an inbox
     /// message already applied and persisted — resumes the wait instead of replaying
-    /// the whole document once the directive URL recovers.
+    /// the whole document once the directive URL recovers. 1.4.1 adds the inbox's own
+    /// pair. Every key is optional on read, each defaulting to "nothing": a file with
+    /// only `applied` keeps its applied ids instead of counting as corrupt and
+    /// resetting dedupe — the same forward tolerance the directive document has.
     struct LedgerFile: Codable, Equatable {
         var applied: [String]
         var seeded: [String]
         var seedPending: Bool
+        var inboxSeeded: [String]
+        var inboxSeedPending: Bool
 
         enum CodingKeys: String, CodingKey {
             case applied, seeded
             case seedPending = "seed_pending"
+            case inboxSeeded = "inbox_seeded"
+            case inboxSeedPending = "inbox_seed_pending"
+        }
+
+        init(applied: [String] = [], seeded: [String] = [], seedPending: Bool = false,
+             inboxSeeded: [String] = [], inboxSeedPending: Bool = false) {
+            self.applied = applied
+            self.seeded = seeded
+            self.seedPending = seedPending
+            self.inboxSeeded = inboxSeeded
+            self.inboxSeedPending = inboxSeedPending
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            applied = try container.decodeIfPresent([String].self, forKey: .applied) ?? []
+            seeded = try container.decodeIfPresent([String].self, forKey: .seeded) ?? []
+            seedPending = try container.decodeIfPresent(Bool.self, forKey: .seedPending) ?? false
+            inboxSeeded = try container.decodeIfPresent([String].self, forKey: .inboxSeeded) ?? []
+            inboxSeedPending = try container.decodeIfPresent(Bool.self, forKey: .inboxSeedPending) ?? false
         }
     }
 
     /// The three ways the ledger file can come back at init, kept distinct on purpose:
-    /// `missing` is a first run and seeds (`seedLedgerIfFirstRun`); `loaded` — even an
-    /// empty `[]` — means the daemon has run here before and every unapplied directive
-    /// is delivered (unless the file itself says its seed is still pending); `corrupt`
-    /// is a reset worth one audit line (the init writes it), because it can replay
+    /// `missing` is a first run and seeds (`seedLedgerIfFirstRun`) — unless the daemon
+    /// has other evidence it ran here (`hasRunHereBefore`); `loaded` — even an empty
+    /// `[]` — means the daemon has run here before and every unapplied directive is
+    /// delivered (unless the file itself says a seed is still pending); `corrupt` is a
+    /// reset worth one audit line (the init writes it), because it can replay
     /// directives the previous run already applied.
     private enum LedgerLoad {
         case missing
@@ -545,7 +701,7 @@ final class DaemonDirectiveClient {
         guard let data = FileManager.default.contents(atPath: path) else { return .corrupt }
         let decoder = JSONDecoder()
         if let ids = try? decoder.decode([String].self, from: data) {
-            return .loaded(LedgerFile(applied: Array(ids.suffix(appliedIDsCap)), seeded: [], seedPending: false))
+            return .loaded(LedgerFile(applied: Array(ids.suffix(appliedIDsCap))))
         }
         guard var ledger = try? decoder.decode(LedgerFile.self, from: data) else { return .corrupt }
         ledger.applied = Array(ledger.applied.suffix(appliedIDsCap))
@@ -558,11 +714,25 @@ final class DaemonDirectiveClient {
         }
     }
 
-    private func persistLedger() {
-        let ledger = LedgerFile(applied: appliedIDs, seeded: seededIDs, seedPending: awaitingFirstRunSeed)
+    /// Writes the ledger atomically. A write that fails is audited under `failurePrefix`
+    /// (throttled like any failure, so an unwritable state directory writes one line
+    /// per window, not one per apply) rather than swallowed: since the first-run seed,
+    /// a ledger that silently never lands turns the next launch into a first run again,
+    /// which seeds — and drops — whatever was written in between.
+    private func persistLedger(failurePrefix: String = "[s3] ledger write failed") {
+        let ledger = LedgerFile(
+            applied: appliedIDs,
+            seeded: seededIDs,
+            seedPending: directiveDocument.seedPending,
+            inboxSeeded: seededInboxIDs,
+            inboxSeedPending: inboxDocument?.seedPending ?? false
+        )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        guard let data = try? encoder.encode(ledger) else { return }
-        try? data.write(to: URL(fileURLWithPath: stateFilePath), options: .atomic)
+        do {
+            try encoder.encode(ledger).write(to: URL(fileURLWithPath: stateFilePath), options: .atomic)
+        } catch {
+            registerFailure("\(failurePrefix) — \(Self.shortError(error))")
+        }
     }
 }

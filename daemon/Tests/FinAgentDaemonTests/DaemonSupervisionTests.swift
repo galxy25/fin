@@ -257,7 +257,10 @@ final class DaemonDirectiveClientTests: XCTestCase {
     private func makeClient(
         agentName: String = "finbot",
         inboxURL: String? = nil,
+        inboxResetAtLaunch: Bool = false,
         deviceToken8: String = DaemonConfig.defaultDeviceToken8,
+        stateFilePath: String? = nil,
+        hasRunHereBefore: Bool = false,
         audit: @escaping (String) -> Void = { _ in },
         fetch: @escaping (URLRequest) async throws -> (Data, URLResponse),
         put: @escaping (URLRequest) async throws -> URLResponse = { _ in
@@ -269,10 +272,12 @@ final class DaemonDirectiveClientTests: XCTestCase {
             directiveURL: "https://bucket.example/directives.json",
             statusURL: "https://bucket.example/status.json",
             inboxURL: inboxURL,
+            inboxResetAtLaunch: inboxResetAtLaunch,
             agentName: agentName,
             pollSeconds: 30,
             deviceToken8: deviceToken8,
-            stateFilePath: stateFile,
+            stateFilePath: stateFilePath ?? stateFile,
+            hasRunHereBefore: hasRunHereBefore,
             audit: audit,
             fetch: fetch,
             put: put
@@ -280,14 +285,18 @@ final class DaemonDirectiveClientTests: XCTestCase {
     }
 
     /// A transport that answers the inbox URL and the directive URL differently, so
-    /// merge order and per-source failure isolation are observable.
+    /// merge order and per-source failure isolation are observable. `inboxResetAtLaunch`
+    /// is the cloud-worker posture (the control plane emptied the inbox at the launch
+    /// call); the default is the resident one.
     private func makeInboxClient(
+        inboxResetAtLaunch: Bool = false,
         audit: @escaping (String) -> Void = { _ in },
         directives: @escaping () async throws -> (Data, URLResponse),
         inbox: @escaping () async throws -> (Data, URLResponse)
     ) -> DaemonDirectiveClient {
         makeClient(
             inboxURL: "https://bucket.example/inbox.json",
+            inboxResetAtLaunch: inboxResetAtLaunch,
             audit: audit,
             fetch: { request in
                 request.url?.absoluteString.contains("inbox") == true
@@ -581,6 +590,13 @@ final class DaemonDirectiveClientTests: XCTestCase {
         XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
         XCTAssertTrue(client.appliedIDs.isEmpty, "seeded ids live apart from the capped applied list")
         XCTAssertEqual(try persistedLedger(), seededLedger(["d-1", "d-2", "d-3"]), "the seed is durable")
+        // The bytes, not a round trip through LedgerFile's own CodingKeys: every deployed
+        // daemon reads this file back, so a renamed key is a fleet-wide dedupe reset.
+        XCTAssertEqual(
+            try rawLedger(),
+            #"{"applied":[],"inbox_seed_pending":false,"inbox_seeded":[],"seed_pending":false,"seeded":["d-1","d-2","d-3"]}"#,
+            "the on-disk key names are a wire contract with every deployed daemon"
+        )
         XCTAssertEqual(
             lines.filter {
                 $0 == "[s3] first run: 3 historical directive(s) in the supervision doc marked applied, not replayed"
@@ -650,10 +666,10 @@ final class DaemonDirectiveClientTests: XCTestCase {
         XCTAssertEqual(try persistedLedger(), seededLedger([], applied: ["d-1", "d-2"]))
     }
 
-    /// The inbox is exempt: the control plane empties it at launch (the launch is the
-    /// conversation boundary), so anything in it by the first poll is a live message
-    /// that arrived while the worker booted, and it must apply.
-    func testFirstRunSeedLeavesInboxMessagesAlone() async throws {
+    /// The cloud-worker posture: the config says the launcher emptied the inbox (the
+    /// control plane does, at the `POST /workers` call), so anything in it by the first
+    /// read is a live message that arrived while the worker booted, and it must apply.
+    func testFirstRunSeedLeavesInboxMessagesAloneWhenTheLauncherResetTheInbox() async throws {
         startWithNoLedger()
         var lines: [String] = []
         let directives = document("""
@@ -665,6 +681,7 @@ final class DaemonDirectiveClientTests: XCTestCase {
         {"id": "m-2", "kind": "user_message", "text": "and again"}
         """)
         let client = makeInboxClient(
+            inboxResetAtLaunch: true,
             audit: { lines.append($0) },
             directives: { (directives, self.response(200)) },
             inbox: { (inbox, self.response(200)) }
@@ -674,11 +691,103 @@ final class DaemonDirectiveClientTests: XCTestCase {
 
         XCTAssertEqual(pending.map(\.id), ["m-1", "m-2"], "inbox delivers; directives are seeded")
         XCTAssertEqual(client.seededIDs, ["d-1", "d-2"], "directive ids seeded, inbox ids untouched")
+        XCTAssertTrue(client.seededInboxIDs.isEmpty)
         XCTAssertTrue(client.appliedIDs.isEmpty)
         XCTAssertEqual(try persistedLedger(), seededLedger(["d-1", "d-2"]))
         XCTAssertTrue(lines.contains(
             "[s3] first run: 2 historical directive(s) in the supervision doc marked applied, not replayed"
         ), "got: \(lines)")
+        XCTAssertFalse(lines.contains { $0.contains("inbox") }, "nothing to say about an exempt inbox: \(lines)")
+    }
+
+    /// The resident posture (config.example.json — no `inboxResetAtLaunch`): only the
+    /// control plane's launch path empties the inbox, the app only ever appends, so a
+    /// first run here would otherwise replay the phone's whole backlog — weeks of
+    /// prompts, one model turn each, before the first heartbeat. The inbox is seeded
+    /// like the directive document, under its own ledger keys, and the status
+    /// document's mark stays the directive one.
+    func testFirstRunSeedsTheInboxBacklogTooUnlessTheLauncherResetIt() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+        var inbox = document("""
+        {"id": "m-1", "kind": "user_message", "text": "three weeks ago"},
+        {"id": "m-2", "kind": "user_message", "text": "last tuesday"}
+        """)
+        let client = makeInboxClient(
+            audit: { lines.append($0) },
+            directives: { (self.history(), self.response(200)) },
+            inbox: { (inbox, self.response(200)) }
+        )
+
+        let first = await client.poll()
+
+        XCTAssertTrue(first.isEmpty, "the backlog is history, not instructions: \(first.map(\.id))")
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
+        XCTAssertEqual(client.seededInboxIDs, ["m-1", "m-2"])
+        XCTAssertTrue(client.appliedIDs.isEmpty)
+        XCTAssertEqual(try persistedLedger(),
+                       DaemonDirectiveClient.LedgerFile(seeded: ["d-1", "d-2", "d-3"], inboxSeeded: ["m-1", "m-2"]))
+        XCTAssertTrue(lines.contains("[s3] first run: 2 message(s) already in the inbox marked applied, not replayed"),
+                      "got: \(lines)")
+        XCTAssertEqual(lines.filter { $0.hasPrefix(Self.firstRunAuditPrefix) }.count, 2, "one line per source: \(lines)")
+
+        // The status mark is the DIRECTIVE high-water; an opaque inbox id would mean
+        // nothing to the supervisor reading it.
+        let status = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(client.statusBody(DaemonStatusSnapshot(state: "idle")).utf8)) as? [String: Any])
+        XCTAssertEqual(status["last_applied_id"] as? String, "d-3")
+
+        // Sent after the daemon came up: delivered, and only it.
+        inbox = document("""
+        {"id": "m-1", "kind": "user_message", "text": "three weeks ago"},
+        {"id": "m-2", "kind": "user_message", "text": "last tuesday"},
+        {"id": "m-3", "kind": "user_message", "text": "just now"}
+        """)
+        let pending746 = await client.poll()
+        XCTAssertEqual(pending746.map(\.id), ["m-3"])
+
+        // And the inbox seed is durable across a restart, like the directive one.
+        let reborn = makeInboxClient(
+            directives: { (self.history(), self.response(200)) },
+            inbox: { (inbox, self.response(200)) }
+        )
+        let pending753 = await reborn.poll()
+        XCTAssertEqual(pending753.map(\.id), ["m-3"])
+        XCTAssertEqual(reborn.seededInboxIDs, ["m-1", "m-2"])
+    }
+
+    /// The inbox seed waits for its own document and survives a restart on its own flag,
+    /// independently of the directive seed — the two sources fail independently
+    /// everywhere else too.
+    func testInboxSeedPendingSurvivesARestartOnItsOwnFlag() async throws {
+        startWithNoLedger()
+        struct Boom: Error {}
+        let inbox = document(#"{"id": "m-1", "kind": "user_message", "text": "backlog"}"#)
+        let firstLife = makeInboxClient(
+            directives: { (self.history(), self.response(200)) },
+            inbox: { throw Boom() }
+        )
+        let pending768 = await firstLife.poll()
+        XCTAssertTrue(pending768.isEmpty)
+        XCTAssertEqual(firstLife.seededIDs, ["d-1", "d-2", "d-3"], "the directive seed does not wait for the inbox")
+        XCTAssertEqual(try persistedLedger(),
+                       DaemonDirectiveClient.LedgerFile(seeded: ["d-1", "d-2", "d-3"], inboxSeedPending: true))
+
+        var lines: [String] = []
+        let secondLife = makeInboxClient(
+            audit: { lines.append($0) },
+            directives: { (self.history(), self.response(200)) },
+            inbox: { (inbox, self.response(200)) }
+        )
+        XCTAssertTrue(lines.contains("[s3] first run: resumed with the inbox seed still pending"), "got: \(lines)")
+        XCTAssertFalse(lines.contains("[s3] first run: resumed with the directive seed still pending"), "got: \(lines)")
+
+        let pending = await secondLife.poll()
+
+        XCTAssertTrue(pending.isEmpty, "the backlog is seeded when the inbox finally reads, not replayed: \(pending.map(\.id))")
+        XCTAssertEqual(secondLife.seededInboxIDs, ["m-1"])
+        XCTAssertEqual(try persistedLedger(),
+                       DaemonDirectiveClient.LedgerFile(seeded: ["d-1", "d-2", "d-3"], inboxSeeded: ["m-1"]))
     }
 
     /// A corrupt ledger is a reset, not a first run: the daemon HAS run here, so it
@@ -701,7 +810,10 @@ final class DaemonDirectiveClientTests: XCTestCase {
 
     /// A ledger that exists but can't be read (permissions, a directory at the path) is
     /// a reset like a corrupt one — the daemon has run here — never a first run that
-    /// would seed, fail to persist, and do it all again on every launch.
+    /// would seed, fail to persist, and do it all again on every launch. Every write
+    /// fails here too, so this also pins the failed-write path: audited, and the next
+    /// life replays what this one applied (noisy, nothing lost) rather than the write
+    /// silently not happening.
     func testUnreadableLedgerIsAResetNotAFirstRun() async throws {
         try FileManager.default.removeItem(atPath: stateFile)
         try FileManager.default.createDirectory(atPath: stateFile, withIntermediateDirectories: false)
@@ -714,6 +826,49 @@ final class DaemonDirectiveClientTests: XCTestCase {
         XCTAssertEqual(pending.map(\.id), ["d-1", "d-2", "d-3"], "delivered, as after any reset")
         XCTAssertTrue(client.seededIDs.isEmpty)
         XCTAssertFalse(lines.contains { $0.hasPrefix(Self.firstRunAuditPrefix) }, "got: \(lines)")
+
+        client.markApplied("d-1")
+        XCTAssertEqual(lines.filter { $0.hasPrefix("[s3] ledger write failed — ") }.count, 1,
+                       "a write that never lands must say so: \(lines)")
+        let pending830 = await client.poll()
+        XCTAssertEqual(pending830.map(\.id), ["d-2", "d-3"], "in memory, d-1 is applied")
+
+        var rebornLines: [String] = []
+        let reborn = makeClient(audit: { rebornLines.append($0) },
+                                fetch: { _ in (self.history(), self.response(200)) })
+        let pending835 = await reborn.poll()
+        XCTAssertEqual(pending835.map(\.id), ["d-1", "d-2", "d-3"],
+                       "the apply never persisted, so d-1 replays — visibly, after another reset line")
+        XCTAssertTrue(rebornLines.contains("[s3] state file unreadable — dedupe reset"), "got: \(rebornLines)")
+    }
+
+    /// The seed's own write can fail (a state directory owned by another uid, a read-only
+    /// mount, a full disk). 1.3.0 turned a lost ledger into a replay; with the seed, a
+    /// lost ledger makes the NEXT launch a first run again, which seeds — and drops —
+    /// whatever was written in between. That must be visible, and it must re-seed
+    /// rather than pretend.
+    func testFirstRunSeedThatCannotPersistAuditsAndIsAFirstRunAgainOnRestart() async throws {
+        let unwritable = NSTemporaryDirectory() + "fin-agentd-missing-dir-\(UUID().uuidString)/ledger.json"
+        var lines: [String] = []
+        let client = makeClient(stateFilePath: unwritable, audit: { lines.append($0) },
+                                fetch: { _ in (self.history(), self.response(200)) })
+
+        let pending = await client.poll()
+
+        XCTAssertTrue(pending.isEmpty, "the seed still holds in memory: \(pending.map(\.id))")
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: unwritable))
+        XCTAssertEqual(lines.filter { $0.hasPrefix("[s3] first run: could not persist the seed — ") }.count, 1,
+                       "got: \(lines)")
+
+        var rebornLines: [String] = []
+        let reborn = makeClient(stateFilePath: unwritable, audit: { rebornLines.append($0) },
+                                fetch: { _ in (self.historyPlusOne(), self.response(200)) })
+        let afterRestart = await reborn.poll()
+        XCTAssertTrue(afterRestart.isEmpty, "no ledger landed, so this is a first run again — it seeds, it does not replay: \(afterRestart.map(\.id))")
+        XCTAssertEqual(reborn.seededIDs, ["d-1", "d-2", "d-3", "d-4"], "and d-4 is what the lost ledger cost")
+        XCTAssertTrue(rebornLines.contains("[s3] first run: 4 historical directive(s) in the supervision doc marked applied, not replayed"),
+                      "got: \(rebornLines)")
     }
 
     /// The seed waits for a document it actually read: a failed first fetch leaves it
@@ -811,7 +966,8 @@ final class DaemonDirectiveClientTests: XCTestCase {
     }
 
     /// The status document's `last_applied_id` is the high-water mark after a seed —
-    /// the newest seeded id — until the daemon applies something itself.
+    /// the LAST id in the directive document — until the daemon applies something
+    /// itself.
     func testStatusReportsTheSeedAsLastAppliedUntilARealApply() async throws {
         startWithNoLedger()
         let client = makeClient(fetch: { _ in (self.history(), self.response(200)) })
@@ -828,6 +984,311 @@ final class DaemonDirectiveClientTests: XCTestCase {
         XCTAssertEqual(try lastApplied(), "m-1")
     }
 
+    /// "Last id in the document", literally — document order, never sorted, so the
+    /// field is the high-water mark exactly when the supervisor appends (the document's
+    /// contract) and the README says so rather than promising "newest".
+    func testStatusLastAppliedAfterASeedIsTheDocumentsLastElementNotTheNewestId() async throws {
+        startWithNoLedger()
+        let notAppendOrdered = document("""
+        {"id": "d-3", "kind": "user_message", "text": "newest, written first"},
+        {"id": "d-1", "kind": "user_message", "text": "oldest"},
+        {"id": "d-2", "kind": "user_message", "text": "middle"}
+        """)
+        let client = makeClient(fetch: { _ in (notAppendOrdered, self.response(200)) })
+        _ = await client.poll()
+
+        XCTAssertEqual(client.seededIDs, ["d-3", "d-1", "d-2"], "document order is kept")
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(client.statusBody(DaemonStatusSnapshot(state: "idle")).utf8)
+        ) as? [String: Any])
+        XCTAssertEqual(object["last_applied_id"] as? String, "d-2")
+    }
+
+    // MARK: First run — an absent document (1.4.1)
+
+    /// Nothing creates `fin/directives.json` until an operator writes the first directive
+    /// (the control plane only ever PUTs the per-agent inbox), so on a bucket without it
+    /// a first run's every read fails until that first directive — which would then be
+    /// the first successful read, and seeded. A 404 on the directive slot at first run
+    /// means "no history": the seed completes empty and that first directive lands.
+    func testFirstRunWithNoDirectiveDocumentSeedsNothingAndDeliversTheFirstOneWritten() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+        var exists = false
+        let client = makeClient(audit: { lines.append($0) }, fetch: { _ in
+            if exists {
+                return (self.document(#"{"id": "d-1", "kind": "user_message", "text": "the first directive ever"}"#), self.response(200))
+            }
+            return (Data(), self.response(404))
+        })
+
+        let first = await client.poll()
+
+        XCTAssertTrue(first.isEmpty)
+        XCTAssertTrue(client.seededIDs.isEmpty)
+        XCTAssertFalse(client.isFirstRun, "the seed is complete — empty")
+        XCTAssertEqual(try persistedLedger(), seededLedger([]), "seed_pending is false on disk")
+        XCTAssertEqual(lines, ["[s3] first run: no supervision directive document yet (HTTP 404) — nothing to seed"],
+                       "one line, and NOT a poll failure: \(lines)")
+
+        exists = true
+        let second = await client.poll()
+        XCTAssertEqual(second.map(\.id), ["d-1"], "the first directive written is delivered, not stamped history")
+    }
+
+    /// S3 answers 403, not 404, for a missing key when the signer may not ListBucket —
+    /// a hand-provisioned resident config's presigned GET typically sees that. Same
+    /// meaning at first run, on the directive slot.
+    func testFirstRunTreatsA403OnTheDirectiveDocumentAsAbsentToo() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+        var exists = false
+        let client = makeClient(audit: { lines.append($0) }, fetch: { _ in
+            if exists {
+                return (self.document(#"{"id": "d-1", "kind": "user_message", "text": "first"}"#), self.response(200))
+            }
+            return (Data(), self.response(403))
+        })
+
+        await client.primeFirstRunSeed()
+
+        XCTAssertFalse(client.isFirstRun)
+        XCTAssertEqual(try persistedLedger(), seededLedger([]))
+        XCTAssertEqual(lines, ["[s3] first run: no supervision directive document yet (HTTP 403) — nothing to seed"],
+                       "got: \(lines)")
+
+        exists = true
+        let pending1054 = await client.poll()
+        XCTAssertEqual(pending1054.map(\.id), ["d-1"])
+    }
+
+    /// Transient failures keep deferring: a 5xx, like a thrown transport error, says
+    /// nothing about whether the document exists.
+    func testFirstRunStillDefersTheSeedOnAServerError() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+        var status = 503
+        let client = makeClient(audit: { lines.append($0) }, fetch: { _ in
+            if status == 200 { return (self.history(), self.response(200)) }
+            return (Data(), self.response(status))
+        })
+
+        await client.primeFirstRunSeed()
+
+        XCTAssertTrue(client.isFirstRun, "a 503 is not 'no document'")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile))
+        XCTAssertTrue(lines.contains("[s3] poll failed: HTTP 503"), "got: \(lines)")
+        XCTAssertTrue(lines.contains("[s3] first run: directive document not read at launch — seed deferred to the next poll"),
+                      "got: \(lines)")
+
+        status = 200
+        let pending1076 = await client.poll()
+        XCTAssertTrue(pending1076.isEmpty)
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"], "seeded on the first document actually read")
+    }
+
+    /// After the first run a 404 is what it always was: a poll failure, audited under
+    /// the failure prefix, with the ledger untouched.
+    func testA404AfterTheFirstRunIsAPollFailureAsBefore() async throws {
+        XCTAssertEqual(try rawLedger(), "[]", "setUp's ledger: the daemon has run here")
+        var lines: [String] = []
+        let client = makeClient(audit: { lines.append($0) },
+                                fetch: { _ in (Data(), self.response(404)) })
+
+        let pending = await client.poll()
+
+        XCTAssertTrue(pending.isEmpty)
+        XCTAssertEqual(lines, ["[s3] poll failed: HTTP 404"], "got: \(lines)")
+        XCTAssertEqual(try rawLedger(), "[]", "nothing seeded, nothing written")
+    }
+
+    /// The same is true once the seed has completed inside one process: the absent
+    /// reading is a first-run rule, not a permanent reinterpretation of 404.
+    func testA404OnceTheSeedIsDrawnIsAPollFailureAgain() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+        var status = 200
+        let client = makeClient(audit: { lines.append($0) }, fetch: { _ in
+            if status == 200 { return (self.history(), self.response(200)) }
+            return (Data(), self.response(status))
+        })
+        _ = await client.poll()
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
+
+        status = 404
+        _ = await client.poll()
+
+        XCTAssertTrue(lines.contains("[s3] poll failed: HTTP 404"), "got: \(lines)")
+        XCTAssertEqual(lines.filter { $0.contains("nothing to seed") }.count, 0, "got: \(lines)")
+    }
+
+    /// An absent inbox never resolves the DIRECTIVE seed — the slots are independent —
+    /// and, exempt (the cloud posture), the inbox's 404 is an ordinary inbox failure.
+    func testAnAbsentInboxNeverResolvesTheDirectiveSeed() async throws {
+        startWithNoLedger()
+        struct Boom: Error {}
+        var lines: [String] = []
+        var directivesReachable = false
+        let client = makeInboxClient(
+            inboxResetAtLaunch: true,
+            audit: { lines.append($0) },
+            directives: {
+                guard directivesReachable else { throw Boom() }
+                return (self.history(), self.response(200))
+            },
+            inbox: { (Data(), self.response(404)) }
+        )
+
+        await client.primeFirstRunSeed()
+        XCTAssertTrue(client.isFirstRun, "the directive seed is still owed")
+        XCTAssertFalse(lines.contains { $0.hasPrefix("[s3] inbox") }, "an exempt inbox is not read by the prime at all: \(lines)")
+
+        let firstPoll = await client.poll()
+        XCTAssertTrue(firstPoll.isEmpty)
+        XCTAssertTrue(client.isFirstRun, "still owed")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile), "nothing resolved, nothing written")
+        XCTAssertTrue(lines.contains("[s3] inbox poll failed: HTTP 404"), "an exempt inbox's 404 is a plain failure: \(lines)")
+        XCTAssertFalse(lines.contains { $0.contains("nothing to seed") }, "got: \(lines)")
+
+        directivesReachable = true
+        let pending1138 = await client.poll()
+        XCTAssertTrue(pending1138.isEmpty)
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"], "seeded from the directive document, when it finally read")
+    }
+
+    /// Resident posture: an inbox object that doesn't exist yet (the phone never wrote
+    /// one) is no backlog — the inbox seed completes empty on its own, the directive
+    /// seed stays owed, and the first message the phone ever sends is delivered.
+    func testFirstRunWithNoInboxDocumentSeedsTheInboxEmptyOnItsOwn() async throws {
+        startWithNoLedger()
+        struct Boom: Error {}
+        var lines: [String] = []
+        var inboxExists = false
+        let client = makeInboxClient(
+            audit: { lines.append($0) },
+            directives: { throw Boom() },
+            inbox: {
+                if inboxExists {
+                    return (self.document(#"{"id": "m-1", "kind": "user_message", "text": "first ever"}"#), self.response(200))
+                }
+                return (Data(), self.response(404))
+            }
+        )
+
+        _ = await client.poll()
+
+        XCTAssertTrue(client.isFirstRun, "the directive seed is still owed")
+        XCTAssertEqual(try persistedLedger(), DaemonDirectiveClient.LedgerFile(seedPending: true),
+                       "the inbox's seed is done (empty); the directive's is recorded as pending")
+        XCTAssertTrue(lines.contains("[s3] first run: no inbox document yet (HTTP 404) — nothing to seed"), "got: \(lines)")
+        XCTAssertFalse(lines.contains("[s3] inbox poll failed: HTTP 404"), "not a failure at first run: \(lines)")
+
+        inboxExists = true
+        let pending1169 = await client.poll()
+        XCTAssertEqual(pending1169.map(\.id), ["m-1"], "the phone's first message lands")
+    }
+
+    // MARK: First run — evidence beyond the ledger (1.4.1)
+
+    /// 1.3.0 wrote the ledger only on its first apply, so a box that ran it for weeks
+    /// without a matching directive has no ledger at all. Upgrade it and restart with a
+    /// directive freshly written: `.missing` alone would seed that directive as history.
+    /// The daemon passes what it can observe — its audit log predates this launch — and
+    /// that makes it not a first run: delivered, as 1.3.0 would have.
+    func testMissingLedgerWithAPriorRunsAuditLogIsNotAFirstRun() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+        let client = makeClient(hasRunHereBefore: true, audit: { lines.append($0) },
+                                fetch: { _ in (self.history(), self.response(200)) })
+
+        XCTAssertEqual(lines, ["[s3] no directive ledger, but the audit log predates this launch — not a first run, nothing seeded"],
+                       "got: \(lines)")
+        XCTAssertFalse(client.isFirstRun)
+        let pending = await client.poll()
+        XCTAssertEqual(pending.map(\.id), ["d-1", "d-2", "d-3"], "every unapplied directive is delivered")
+        XCTAssertTrue(client.seededIDs.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile), "nothing applied, nothing to write yet")
+        XCTAssertFalse(lines.contains { $0.hasPrefix(Self.firstRunAuditPrefix) }, "got: \(lines)")
+    }
+
+    /// With no such evidence a missing ledger is still the first run it always was.
+    func testMissingLedgerWithoutPriorRunEvidenceIsAFirstRun() async throws {
+        startWithNoLedger()
+        let client = makeClient(hasRunHereBefore: false,
+                                fetch: { _ in (self.history(), self.response(200)) })
+        XCTAssertTrue(client.isFirstRun)
+        let pending1201 = await client.poll()
+        XCTAssertTrue(pending1201.isEmpty)
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
+    }
+
+    // MARK: Ledger file shape
+
+    /// The load side of the wire contract: a hand-written 1.4.0 object — the exact key
+    /// names — loads as what it says, with no reset, no first run, no reseed. The
+    /// counterpart to `testLegacyArrayLedgerLoadsAndUpgradesInPlace`, which pins only
+    /// the 1.3.0 shape.
+    func testHandWrittenObjectLedgerLoadsAsIs() async throws {
+        try Data(#"{"applied":["d-1"],"seeded":["d-9"],"seed_pending":false}"#.utf8)
+            .write(to: URL(fileURLWithPath: stateFile))
+        var lines: [String] = []
+        let client = makeClient(audit: { lines.append($0) },
+                                fetch: { _ in (self.history(), self.response(200)) })
+
+        XCTAssertEqual(client.appliedIDs, ["d-1"])
+        XCTAssertEqual(client.seededIDs, ["d-9"])
+        XCTAssertTrue(client.seededInboxIDs.isEmpty, "a 1.4.0 file has no inbox keys; they default")
+        XCTAssertFalse(client.isFirstRun)
+        XCTAssertTrue(lines.isEmpty, "no reset, no first run: \(lines)")
+        let pending1223 = await client.poll()
+        XCTAssertEqual(pending1223.map(\.id), ["d-2", "d-3"])
+    }
+
+    /// A partial object keeps what it carries. Missing keys default — the same forward
+    /// tolerance the directive document has — instead of the file counting as corrupt,
+    /// which would throw the applied ids away and replay them.
+    func testPartialObjectLedgerKeepsItsAppliedIDs() async throws {
+        try Data(#"{"applied":["d-1"]}"#.utf8).write(to: URL(fileURLWithPath: stateFile))
+        var lines: [String] = []
+        let client = makeClient(audit: { lines.append($0) },
+                                fetch: { _ in (self.history(), self.response(200)) })
+
+        XCTAssertEqual(client.appliedIDs, ["d-1"])
+        XCTAssertTrue(client.seededIDs.isEmpty)
+        XCTAssertFalse(client.isFirstRun, "an object ledger means the daemon ran here")
+        XCTAssertTrue(lines.isEmpty, "no 'dedupe reset', no first run: \(lines)")
+        let pending1239 = await client.poll()
+        XCTAssertEqual(pending1239.map(\.id), ["d-2", "d-3"], "d-1 stays applied")
+    }
+
+    // MARK: First run — 304 with nothing cached
+
+    /// A first run's prime sends no `If-None-Match`, but a caching proxy in front of the
+    /// bucket can still answer 304 — `isFresh` with no body. That must not end the
+    /// first run with an empty seed, or the whole document lands on the next 200.
+    func testFirstRunDoesNotSeedOnA304WithNoCachedDocument() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+        var status = 304
+        let client = makeClient(audit: { lines.append($0) }, fetch: { _ in
+            if status == 200 { return (self.history(), self.response(200)) }
+            return (Data(), self.response(304))
+        })
+
+        await client.primeFirstRunSeed()
+
+        XCTAssertTrue(client.isFirstRun, "a 304 with nothing cached says nothing about history")
+        XCTAssertTrue(client.seededIDs.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile), "no ledger was written")
+        XCTAssertTrue(lines.contains("[s3] first run: directive document not read at launch — seed deferred to the next poll"),
+                      "got: \(lines)")
+
+        status = 200
+        let pending1264 = await client.poll()
+        XCTAssertTrue(pending1264.isEmpty, "the first real body seeds")
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"])
+    }
+
     /// The one path where a ledger exists yet seeding still happens: the directive fetch
     /// keeps failing while an inbox message applies and persists. The seed must still
     /// land on the next successful directive read in this process.
@@ -838,6 +1299,7 @@ final class DaemonDirectiveClientTests: XCTestCase {
         var lines: [String] = []
         let inbox = document(#"{"id": "m-1", "kind": "user_message", "text": "from the phone"}"#)
         let client = makeInboxClient(
+            inboxResetAtLaunch: true,
             audit: { lines.append($0) },
             directives: {
                 guard directivesReachable else { throw Boom() }
@@ -872,6 +1334,7 @@ final class DaemonDirectiveClientTests: XCTestCase {
         struct Boom: Error {}
         let inbox = document(#"{"id": "m-1", "kind": "user_message", "text": "from the phone"}"#)
         let firstLife = makeInboxClient(
+            inboxResetAtLaunch: true,
             directives: { throw Boom() },
             inbox: { (inbox, self.response(200)) }
         )
@@ -881,6 +1344,7 @@ final class DaemonDirectiveClientTests: XCTestCase {
 
         var lines: [String] = []
         let secondLife = makeInboxClient(
+            inboxResetAtLaunch: true,
             audit: { lines.append($0) },
             directives: { (self.history(), self.response(200)) },
             inbox: { (inbox, self.response(200)) }

@@ -27,6 +27,8 @@
     "directiveURL": "https://your-bucket.s3.amazonaws.com/fin/directives.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-...",
     "statusURL": "https://your-bucket.s3.amazonaws.com/fin/agentd-status.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-...",
     "inboxURL": "https://your-bucket.s3.amazonaws.com/fin/agentd-inbox.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-...",
+    "_inboxResetAtLaunch_note": "true ONLY when whatever launches this daemon empties the inbox document first (the control plane's POST /workers does; launch.sh and a resident install do not). It exempts the inbox from the first-run seed; false/absent seeds the inbox backlog as history on a first run. See README: Remote supervision.",
+    "inboxResetAtLaunch": false,
     "agentName": "fin-agentd-1",
     "pollSeconds": 30
   },

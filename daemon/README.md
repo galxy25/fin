@@ -188,6 +188,7 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   "directiveURL": "https://…/directives.json",   // GET (presigned URL works)
   "statusURL": "https://…/agentd-status.json",   // PUT; optional
   "inboxURL": "https://…/agentd-inbox.json",     // GET; optional (below)
+  "inboxResetAtLaunch": false,                     // optional; default false (below)
   "agentName": "fin-agentd-1",
   "pollSeconds": 30                                // optional; default 30
 }
@@ -206,35 +207,71 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   messages via the engine **between turns only**. A directive with `"arm_monitor": true`
   (optionally `"interval_seconds"`) also takes the monitor-start path above; any fresh
   directive restarts a model-disarmed heartbeat. Applied ids are deduped in
-  `fin-agentd-directives.json` next to the audit log — since 1.4.0 an object
-  `{"applied": […], "seeded": […], "seed_pending": false}` (the 1.3.0 bare array still
-  loads); `applied` is capped at 500, oldest evicted — so a restart never replays old
-  instructions.
+  `fin-agentd-directives.json` next to the audit log — since 1.4.0 an object,
+  `{"applied": […], "seeded": […], "seed_pending": false, "inbox_seeded": […],
+  "inbox_seed_pending": false}` (the inbox pair since 1.4.1; every key is optional on
+  read, so a 1.4.0 file or a hand-edited partial one keeps what it carries, and the
+  1.3.0 bare array still loads); `applied` is capped at 500, oldest evicted — so a
+  restart never replays old instructions.
 
-  **First run (1.4.0).** A box with no ledger file at all — a fresh cloud worker, a new
-  install — treats the first directive document it successfully reads as history, not
-  instructions: every id in it (matching this agent or not, well-formed or not) is
+  **First run (1.4.0; refined in 1.4.1).** A box the daemon has never run on — a fresh
+  cloud worker, a new install: no ledger file, and (1.4.1) no audit log from an earlier
+  launch either — treats the first directive document it successfully reads as history,
+  not instructions: every id in it (matching this agent or not, well-formed or not) is
   recorded as seeded without being injected, the ledger is written, and one line audits
   `[s3] first run: N historical directive(s) in the supervision doc marked applied, not
   replayed`. That read happens **at launch** — before the SSH connect, the readiness
-  probes and the first task turn, which together can run for minutes — so the boundary
-  is the same one the control plane draws when it empties the per-agent inbox, and a
-  directive written after launch is delivered even if it lands mid-first-turn. (If the
-  launch fetch fails, `[s3] first run: directive document not read at launch — seed
-  deferred to the next poll` is audited and the poll loop seeds on the first document
-  it does read.) Seeded ids live in the ledger's own `seeded` list, uncapped: the
-  document may hold more than the 500-id applied cap, and a seeded id evicted from a
-  capped list would replay — so the audit count is what was kept. The document is
-  shared by every agent, so the control plane can't empty it at launch the way it
-  empties the per-agent inbox; before this a fresh worker replayed weeks of operator
-  directives, one model turn each. An existing ledger — even an empty `[]` — or a
-  corrupt or unreadable one is *not* a first run: the daemon has run here, and every
-  unapplied directive is delivered as before. The one exception is a ledger the first
-  run itself wrote while its seed was still owed (an inbox message applied while the
-  directive URL was failing, then a restart — systemd's `Restart=always`): the file
-  says so (`"seed_pending": true`), the next launch audits `[s3] first run: resumed
-  with the directive seed still pending`, and the seed lands when the document finally
-  arrives instead of the document replaying.
+  probes and the first task turn, which together can run for minutes — so a directive
+  written after it is delivered even if it lands mid-first-turn. The boundary is the
+  daemon's first directive read, and only that. It is *not* the one the control plane
+  draws when it empties the per-agent inbox: that falls at the `POST /workers` call,
+  minutes before the daemon's read on a cloud worker (cloud-init, downloads), and
+  further before it if the early GETs fail — anything written to the shared document
+  between the launch call and the daemon's first read is history to that daemon. The
+  inbox has no such window. (If the launch fetch fails, `[s3] first run: directive
+  document not read at launch — seed deferred to the next poll` is audited and the poll
+  loop seeds on the first document it does read; a 304 with nothing cached — a caching
+  proxy can answer that even to the unconditional first GET — defers the same way.)
+  Seeded ids live in the ledger's own `seeded` list, uncapped: the document may hold
+  more than the 500-id applied cap, and a seeded id evicted from a capped list would
+  replay — so the audit count is what was kept. The document is shared by every agent,
+  so the control plane can't empty it at launch the way it empties the per-agent inbox;
+  before this a fresh worker replayed weeks of operator directives, one model turn each.
+
+  *No document yet (1.4.1).* Nothing creates `fin/directives.json` until an operator
+  writes the first directive (the control plane only ever PUTs the per-agent inbox), so
+  on a bucket without it every first-run read fails — until that first directive, which
+  would then be the first successful read, and seeded. A read that finds no object —
+  HTTP 404, or the 403 S3 answers for a missing key when the presigned URL's signer may
+  not ListBucket (the control plane grants it, so a cloud worker sees 404; a
+  hand-provisioned resident config typically sees 403) — therefore means "no history"
+  at first run: the seed completes empty, the ledger is written with `seed_pending:
+  false`, `[s3] first run: no supervision directive document yet (HTTP 404) — nothing
+  to seed` is audited, and the first directive written afterwards is delivered. Only at
+  first run, only for the slot whose seed is owed: after it, 404 and 403 are poll
+  failures as before. Timeouts, connection errors and 5xx still defer.
+
+  *Not a first run.* An existing ledger — even an empty `[]` — or a corrupt or
+  unreadable one is *not* a first run: the daemon has run here, and every unapplied
+  directive is delivered as before. Neither (1.4.1) is a missing ledger next to an audit
+  log that already existed when the daemon started: 1.3.0 wrote the ledger only on its
+  first apply, so a box that ran it for weeks with no matching directive has no ledger
+  at all, and a 1.4.0 upgrade there would seed the next directive as history; the audit
+  log is the evidence it ran, and `[s3] no directive ledger, but the audit log predates
+  this launch — not a first run, nothing seeded` says so. The one case where a ledger
+  exists yet a seed is still owed is one the first run itself wrote while waiting (an
+  inbox message applied while the directive URL was failing, then a restart — systemd's
+  `Restart=always`): the file says so (`"seed_pending": true`), the next launch audits
+  `[s3] first run: resumed with the directive seed still pending`, and the seed lands
+  when the document finally arrives instead of the document replaying.
+
+  *If the ledger can't be written* (1.4.1) — a state directory owned by another uid, a
+  read-only mount, a full disk — the seed audits `[s3] first run: could not persist the
+  seed — <reason>` and every later write `[s3] ledger write failed — <reason>`
+  (throttled like other failures). The process keeps working from memory, and the next
+  launch is a first run again — which seeds, and drops, whatever was written in between.
+  Under 1.3.0 a lost ledger meant a replay (noisy, nothing lost); with the seed it means
+  a silent drop unless it is said out loud, so it is.
 
   ```json
   {"version": 1, "directives": [
@@ -252,26 +289,45 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   inbox message resumes a `request_input`-paused or `stayResident`-suspended agent
   exactly as a directive does. The two sources fail independently: a dead directive URL
   audits `[s3] poll failed: …` and still delivers inbox messages, a dead inbox audits
-  `[s3] inbox poll failed: …` and still delivers directives. The inbox is exempt from
-  the first-run seed: the control plane empties it at launch (the launch is the
-  conversation boundary), so a message that arrives while the worker boots still
-  applies.
+  `[s3] inbox poll failed: …` and still delivers directives.
+
+  **The inbox and the first run (1.4.1).** On a first run the inbox is seeded like the
+  directive document — every message already in it is history (`[s3] first run: N
+  message(s) already in the inbox marked applied, not replayed`; an inbox object that
+  doesn't exist yet is `[s3] first run: no inbox document yet (HTTP 404) — nothing to
+  seed`; the ids go to the ledger's `inbox_seeded`, and a restart before the inbox
+  could be read resumes with `[s3] first run: resumed with the inbox seed still
+  pending`) — **unless** the config says `"inboxResetAtLaunch": true`: whatever
+  launched this daemon emptied the inbox first, as the control plane's `POST /workers`
+  does right before the instance launch, so anything in it by the daemon's first read
+  arrived while the worker booted and must apply. Set it only when that is literally
+  true: configs the control plane provisions carry it (the Lambda sets it); a
+  hand-provisioned config launched through `POST /workers` needs it added; a resident
+  install, or a worker launched with `launch.sh` (which does not reset the inbox),
+  leaves it off. 1.4.0 exempted the inbox unconditionally on the strength of the
+  control plane's reset — which only the control plane's launch path performs, while
+  the app only ever appends — so a resident install's first run replayed the phone's
+  whole backlog, one model turn each, before the first heartbeat.
 
 - **Status** — after every poll and every finished turn the daemon PUTs:
 
   ```json
   {"schema": 1, "device": "fin-agentd", "device_id8": "cloud001",
-   "daemon_version": "1.4.0", "agent": "fin-agentd-1", "state": "idle",
+   "daemon_version": "1.4.1", "agent": "fin-agentd-1", "state": "idle",
    "last_applied_id": "d-1", "last_turn_at": "…", "last_assistant_preview": "…",
    "last_error": null, "updated_at": "…"}
   ```
 
   (`last_assistant_preview` is capped at 200 characters; `last_error` carries the most
   recent turn failure, including a directive-injected turn that failed after its id was
-  consumed. After a first-run seed, `last_applied_id` is the newest seeded id — the
-  high-water mark — until the daemon applies something itself. `daemon_version` tells a
-  supervisor which harness features exist; 1.4.0 = the always-on `LC_FIN_AGENT` session
-  marker and the first-run directive high-water.)
+  consumed. After a first-run seed, `last_applied_id` is the *last id in the directive
+  document* as seeded — document order, never sorted, so it is the high-water mark
+  exactly when the supervisor appends, which is the document's contract; an inbox seed
+  never shows here — until the daemon applies something itself. `daemon_version` tells
+  a supervisor which harness features exist; 1.4.0 = the always-on `LC_FIN_AGENT`
+  session marker and the first-run directive high-water; 1.4.1 = the absent-document
+  and prior-run first-run rules, the inbox seed with `inboxResetAtLaunch`, audited
+  ledger writes, and a tolerant ledger decode.)
 
 - **Audit** — `[s3] applied directive <id>` on application, `[s3] poll failed: <reason>`
   / `[s3] put failed: <reason>` on failure, throttled to one line per 5 minutes per
@@ -283,9 +339,16 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   supervision doc marked applied, not replayed` once, on the read that seeded it —
   normally the launch fetch (a missing ledger with an empty document audits nothing).
   The other first-run lines: `[s3] first run: directive document not read at launch —
-  seed deferred to the next poll` when the launch fetch failed, and `[s3] first run:
-  resumed with the directive seed still pending` when a restart finds a ledger the
-  previous life wrote before its seed landed.
+  seed deferred to the next poll` (and its `inbox document` twin) when the launch fetch
+  failed; `[s3] first run: resumed with the directive seed still pending` (or `inbox
+  seed`) when a restart finds a ledger the previous life wrote before its seed landed;
+  `[s3] first run: no supervision directive document yet (HTTP 404) — nothing to seed`
+  (or `no inbox document yet`) when the object doesn't exist; `[s3] first run: N
+  message(s) already in the inbox marked applied, not replayed` for a seeded inbox
+  backlog; `[s3] first run: could not persist the seed — <reason>` when the ledger
+  write failed (later writes: `[s3] ledger write failed — <reason>`, throttled). And
+  once, at startup, `[s3] no directive ledger, but the audit log predates this launch —
+  not a first run, nothing seeded` on a 1.3.0 box that never applied a directive.
 
 ## Cloud transcript
 
@@ -355,7 +418,15 @@ swift test
 Pure-logic tests always run (engine dispatch, directive and inbox polling with an
 injected transport including the first-run high-water and its launch-time prime, the
 `LC_FIN_AGENT` session marker, the transcript line format against the app reader's
-contract, the stayResident gates, classifier guards). The live integration tests (real
-sshd + tmux on 127.0.0.1, LM Studio at `localhost:1234`, and
-`DaemonSessionMarkerLiveTests` asking a real login shell whether the marker arrived)
-skip cleanly when the dev-machine prerequisites are missing.
+contract, the stayResident gates, classifier guards). `DaemonLaunchOrderTests` drives
+the real `Daemon.launch()` — the pre-connect phase `run()` executes — through the
+daemon's own seams (`supervisionFetch`, `makeSession`, `terminate`), pinning that the
+seed is on disk before any session object exists and that the session `run()` opens
+carries the marker. The live integration tests (real sshd + tmux on 127.0.0.1, LM
+Studio at `localhost:1234`, and `DaemonSessionMarkerLiveTests` asking a real login
+shell whether the marker arrived) skip cleanly when the dev-machine prerequisites are
+missing. The marker test also skips where the login shell has no tmux auto-attach to
+guard (a green run there would be vacuous), fails *without connecting* where the
+auto-attach ignores the marker (connecting would be the hijack), and — where it does
+connect — types exactly one line, after the shell has spoken and gone quiet, and
+disconnects the instant an answer shows a non-empty `$TMUX`.
