@@ -284,6 +284,7 @@ final class AgentEngineDispatchTests: XCTestCase {
     /// — a refusal is a decision, not a crash.
     func testGuardedSendInputRefusesAnotherTmuxServer() async {
         let session = RecordingStubSession()
+        session.environment["TMUX"] = "/private/tmp/tmux-501/fin,4242,0"
         var audited: [AgentAuditEvent] = []
         let engine = makeEngine(session: session, audit: { audited.append($0) })
         engine.tmuxGuard = TmuxSendGuard(
@@ -315,6 +316,7 @@ final class AgentEngineDispatchTests: XCTestCase {
     /// The trailing newline is the NORMAL shape, not an exotic one.
     func testHalfTypedSendInputIsRefusedDespiteTheTrailingNewline() async {
         let session = RecordingStubSession()
+        session.environment["TMUX"] = "/private/tmp/tmux-501/fin,4242,0"
         let engine = makeEngine(session: session)
         engine.tmuxGuard = TmuxSendGuard(
             isEnforced: true,
@@ -337,6 +339,9 @@ final class AgentEngineDispatchTests: XCTestCase {
     /// `-L fin`, which names that very server.
     func testGuardedSendInputStillDeliversAllowedTmuxCommands() async {
         let session = RecordingStubSession()
+        // The live shell reports it is inside Fin's own tmux server — which is what the
+        // engine asks it before every tmux send.
+        session.environment["TMUX"] = "/private/tmp/tmux-501/fin,4242,0"
         let engine = makeEngine(session: session)
         engine.tmuxGuard = TmuxSendGuard(
             isEnforced: true,
@@ -361,6 +366,79 @@ final class AgentEngineDispatchTests: XCTestCase {
         XCTAssertTrue(session.sentInputs[0].contains("capture-pane"))
         XCTAssertTrue(session.sentInputs[2].contains("send-keys -t fin"))
         XCTAssertTrue(session.sentInputs[4].contains("-L fin new-session"))
+    }
+
+    /// R0 IS ASKED OF THE LIVE SHELL, EVERY TIME. `shellIsOnOwnServer` defaults to true and
+    /// the daemon used to set it once, at launch — but the model may leave its own tmux
+    /// server whenever it likes (`tmux detach`, `exit`, killing its own session are all
+    /// ordinary work ON its own server), and the PTY then drops back to the login shell
+    /// that spawned the client, whose `$TMUX` is empty. From there `tmux send-keys -t main`
+    /// names no socket for R1 to catch and lands on the human's server. So the shell is
+    /// asked again before the send, and a shell that does not answer is not confined.
+    func testTmuxSendsAreCheckedAgainstTheLiveShellNotALaunchTimeSnapshot() async {
+        let session = RecordingStubSession()          // no TMUX: not inside any tmux
+        let engine = makeEngine(session: session)
+        engine.tmuxGuard = TmuxSendGuard(
+            isEnforced: true, ownSession: "fin", ownSocket: .name("fin"),
+            shellIsOnOwnServer: true                  // the stale launch-time "yes"
+        )
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
+        ))
+
+        XCTAssertTrue(session.sentInputs.isEmpty, "an unconfined shell must not type tmux")
+        XCTAssertTrue(result.contains("REFUSED"), "got: \(result)")
+        XCTAssertEqual(session.environmentProbes, ["TMUX"], "the live shell must be asked")
+    }
+
+    /// The sequence the finding described, as one test: a send that leaves the tmux server,
+    /// then the escape. The guard cannot see what `tmux detach` does — it is allowed work on
+    /// Fin's own server — so the only thing that catches the second send is asking the shell
+    /// again.
+    func testLeavingTheTmuxServerIsCaughtBeforeTheNextSend() async {
+        let session = RecordingStubSession()
+        session.environment["TMUX"] = "/private/tmp/tmux-501/fin,4242,0"
+        let engine = makeEngine(session: session)
+        engine.tmuxGuard = TmuxSendGuard(
+            isEnforced: true, ownSession: "fin", ownSocket: .name("fin")
+        )
+
+        _ = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "tmux detach", "await_output_seconds": 1}"#
+        ))
+        XCTAssertEqual(session.sentInputs.count, 2, "detaching your own client is allowed")
+
+        // …and now the PTY is back at the login shell, where $TMUX is empty.
+        session.environment["TMUX"] = ""
+        let result = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
+        ))
+        XCTAssertEqual(session.sentInputs.count, 2, "nothing more may be typed")
+        XCTAssertTrue(result.contains("REFUSED"), "got: \(result)")
+        XCTAssertEqual(session.environmentProbes, ["TMUX", "TMUX"])
+    }
+
+    /// The check is on the tmux path only: ordinary work must not pay a round trip (or put
+    /// an `echo` in the human's terminal) for a rule that cannot apply to it.
+    func testOrdinaryCommandsAreNotChargedForTheConfinementCheck() async {
+        let session = RecordingStubSession()
+        session.environment["TMUX"] = "/private/tmp/tmux-501/fin,4242,0"
+        let engine = makeEngine(session: session)
+        engine.tmuxGuard = TmuxSendGuard(
+            isEnforced: true, ownSession: "fin", ownSocket: .name("fin")
+        )
+
+        _ = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "git status", "await_output_seconds": 1}"#
+        ))
+
+        XCTAssertEqual(session.sentInputs.count, 2, "the command still goes out")
+        XCTAssertTrue(session.environmentProbes.isEmpty, "and nothing was probed for it")
     }
 
     /// A host that never set the guard behaves exactly as it did before the guard
@@ -497,7 +575,10 @@ final class AgentEngineDispatchTests: XCTestCase {
 
         XCTAssertEqual(requested, [TmuxSessionRead.maxLines])
         let body = result.components(separatedBy: "\n")
-        XCTAssertLessThanOrEqual(body.count, TmuxSessionRead.maxLines + 1, "one frame line plus the cap")
+        XCTAssertLessThanOrEqual(
+            body.count, TmuxSessionRead.maxLines + 3,
+            "the cap, plus one frame line and the two fence markers"
+        )
         XCTAssertTrue(result.contains("900"), "the trim must keep the NEWEST lines")
         XCTAssertFalse(result.contains("\n1\n"), "the oldest lines are the ones dropped")
     }

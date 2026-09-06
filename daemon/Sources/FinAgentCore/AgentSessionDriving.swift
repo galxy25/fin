@@ -15,4 +15,21 @@ public protocol AgentSessionDriving: AnyObject {
     /// Types the given text into the live terminal exactly as the agent produced it —
     /// callers normalize the tail to `\r` via `AgentTurnLogic.submittable` first.
     func sendAgentInput(_ text: String)
+
+    /// Asks the LIVE shell what one environment variable holds. Nil means it did not
+    /// answer inside `timeout` — busy in a full-screen program, mid-reconnect, gone.
+    ///
+    /// This is how `AgentTurnEngine` re-takes the tmux guard's confinement proof (R0)
+    /// before it types a tmux command: the whole private-socket design rests on the shell
+    /// being INSIDE its own tmux server, and the shell can leave (`tmux detach`, `exit`) at
+    /// any time without telling anyone. "No answer" is therefore not "probably fine", it is
+    /// "unproven", and the guard fails closed on it.
+    func probeEnvironment(_ name: String, timeout: TimeInterval) async -> String?
+}
+
+public extension AgentSessionDriving {
+    /// A driver that cannot ask the shell anything cannot prove anything either. Nil is
+    /// the fail-closed answer, and the only host that arms the tmux guard —
+    /// `HeadlessTerminalSession` — implements this for real.
+    func probeEnvironment(_ name: String, timeout: TimeInterval) async -> String? { nil }
 }

@@ -51,5 +51,42 @@ final class DaemonRoutingPromptTests: XCTestCase {
         XCTAssertTrue(prompt.contains("fin"))
         XCTAssertTrue(prompt.contains("pocketdj"))
         XCTAssertTrue(prompt.contains("OFF-LIMITS"))
+        // The app's posture is the default: one tmux server, so the shell really can read
+        // every session on it.
+        XCTAssertTrue(prompt.contains("tmux capture-pane -p -t <session>"), prompt)
+    }
+
+    /// ON A PRIVATE SOCKET THE ROUTING PROMPT MUST NOT TEACH A COMMAND THAT CANNOT WORK.
+    /// The daemon's shell talks only to its own tmux server, where the human's `main` does
+    /// not exist: a model told to read other sessions with `tmux capture-pane -p -t main`
+    /// gets `can't find session: main` and reports a live session as dead — and the "not
+    /// live means DEAD, recreate it" rule would then have it start a same-named duplicate
+    /// on its own server and route work into it. It also contradicted the guard's own
+    /// paragraph, which is appended to the very same prompt.
+    func testOnAPrivateSocketTheRoutingSectionSendsTheModelToReadSession() throws {
+        let url = try registryURL()
+        try JSONEncoder().encode(RegistryDocument(sessions: [
+            SessionRegistration(session: "fin", cwd: "~", tasks: ["fin"]),
+        ])).write(to: url)
+
+        let prompt = Daemon.composedSystemPrompt(
+            base: Daemon.defaultSystemPrompt,
+            registryFileURL: url,
+            tmuxGuard: TmuxSendGuard(
+                isEnforced: true, ownSession: "fin", ownSocket: .name("fin")
+            )
+        )
+
+        XCTAssertTrue(prompt.contains("Session routing:"))
+        XCTAssertTrue(prompt.contains("read_session"), prompt)
+        XCTAssertFalse(
+            prompt.contains("tmux capture-pane -p -t <session>"),
+            "the shell cannot read another server's sessions on this host: \(prompt)"
+        )
+        XCTAssertFalse(
+            prompt.contains("the namespace the send_input guard"),
+            "there is no fin- namespace any more: \(prompt)"
+        )
+        XCTAssertTrue(prompt.contains("OFF-LIMITS"), prompt)
     }
 }

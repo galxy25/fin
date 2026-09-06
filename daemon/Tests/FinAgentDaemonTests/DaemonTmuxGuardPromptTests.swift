@@ -133,8 +133,40 @@ final class DaemonTmuxGuardPromptTests: XCTestCase {
         XCTAssertTrue(session.sentInputs.isEmpty, "nothing may reach the PTY")
     }
 
+    /// THE SAME WIRING, ONE STEP FURTHER: the engine the daemon's factory builds asks the
+    /// LIVE shell where it is before it types a tmux command. A shell that has dropped out
+    /// of tmux (`$TMUX` empty — what `tmux detach` leaves behind) must stop every tmux
+    /// command, even one that names no socket and would otherwise be ordinary work.
+    @MainActor
+    func testTheFactorysEngineRefusesTmuxWhenTheLiveShellIsNoLongerConfined() async throws {
+        let session = GuardStubSession()
+        session.reportedTmux = ""                     // detached: back in the login shell
+        let engine = Daemon.makeTurnEngine(
+            configuration: AgentEngineConfiguration(
+                endpointURL: "http://127.0.0.1:1",
+                modelIdentifier: "stub"
+            ),
+            session: session,
+            tmuxGuard: TmuxSendGuard.forHost(
+                connectCommand: "exec tmux -L fin new-session -A -s fin \\; set status off",
+                registryFileURL: try registryURL(sessions: ["fin"])
+            ),
+            audit: { _ in }
+        )
+
+        let refused = await engine.execute(AgentToolCall(
+            id: "t1",
+            name: AgentToolSpec.sendInput.name,
+            arguments: #"{"input": "tmux send-keys -t main 'rm -rf ~/forges' Enter"}"#
+        ))
+
+        XCTAssertTrue(refused.contains("REFUSED"), "got: \(refused)")
+        XCTAssertTrue(refused.contains("not confirmed"), "got: \(refused)")
+        XCTAssertTrue(session.sentInputs.isEmpty, "nothing may reach the PTY")
+    }
+
     /// Told, not just enforced: an armed guard appends its paragraph, and it names the
-    /// read path, the allow-list, and the namespace the model may create sessions in.
+    /// read path and the read-only way to see everything outside Fin's own server.
     func testArmedGuardAppendsItsParagraphToTheSystemPrompt() throws {
         let registry = try registryURL(sessions: ["fin"])
         let guardPolicy = TmuxSendGuard.forHost(
@@ -193,9 +225,17 @@ final class GuardStubSession: AgentSessionDriving {
     let eventLog = TerminalEventLog()
     var isSessionConnected = true
     private(set) var sentInputs: [String] = []
+    /// What the "live shell" answers when the engine re-takes the tmux guard's confinement
+    /// proof. Defaults to a shell inside socket `fin`, which is what the connectCommand in
+    /// these tests would produce; a test that wants the unconfined case clears it.
+    var reportedTmux: String? = "/private/tmp/tmux-501/fin,4242,0"
 
     func sendAgentInput(_ text: String) {
         sentInputs.append(text)
         eventLog.recordInput(Array(text.utf8))
+    }
+
+    func probeEnvironment(_ name: String, timeout: TimeInterval) async -> String? {
+        name == "TMUX" ? reportedTmux : nil
     }
 }

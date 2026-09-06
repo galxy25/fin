@@ -6,6 +6,28 @@ import NIO
 import NIOSSH
 import Crypto
 
+/// What one `runFixedCommand` produced. The two streams stay apart so a caller can frame
+/// pane CONTENT and a tmux ERROR differently; `truncated` says a cap was hit, so the
+/// caller can say so rather than silently shortening someone's screen.
+public struct FixedCommandOutput: Sendable, Equatable {
+    public var output: String
+    public var diagnostics: String
+    public var truncated: Bool
+
+    public init(output: String, diagnostics: String = "", truncated: Bool = false) {
+        self.output = output
+        self.diagnostics = diagnostics
+        self.truncated = truncated
+    }
+}
+
+/// The one mutable cell `runFixedCommand`'s timeout races over. Main-actor isolated, so
+/// the two tasks touching it are serialized by the actor rather than by a lock.
+@MainActor
+private final class FixedCommandBox {
+    var value: Result<FixedCommandOutput, Error>?
+}
+
 public enum HeadlessSessionState: Equatable, Sendable {
     case disconnected
     case connecting
@@ -76,6 +98,12 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
     /// Bumped on every connect()/disconnect(); a superseded run() checks its captured
     /// generation before touching shared state.
     private var generation = 0
+    /// How long the last connection lived, so a session that dies immediately backs off
+    /// instead of spinning. With `exec tmux …` as the connect command, a shell that cannot
+    /// start tmux exits at once, and the auto-reconnect below would otherwise re-handshake
+    /// in a tight loop for as long as the daemon runs.
+    private var connectedAt: Date?
+    private var consecutiveShortLives = 0
     /// True once the configured connectCommand has been typed into the shell (or when
     /// none is configured). `waitForShellReady` gates on it so the readiness probe can
     /// never validate the pre-attach shell.
@@ -233,41 +261,118 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
     /// SSH exec request is), which is why the name that goes into it is validated to a
     /// charset with no shell meaning at all.
     ///
-    /// Non-zero exit is NOT an exception here: `tmux capture-pane -t nope` exits 1 and
-    /// prints `can't find session: nope`, and that sentence is the honest answer to give
-    /// the model. Output is capped at `maxResponseBytes`, oldest-kept, with a marker.
+    /// STDOUT AND STDERR STAY APART, and a non-zero exit is a FAILURE. Merging them meant
+    /// `tmux capture-pane -t nope` — exit 1, `can't find session: nope` on stderr — came
+    /// back as `.text`, and the model read that sentence as the CONTENT of a pane called
+    /// `nope`. A warning tmux printed during a successful capture was likewise spliced into
+    /// the middle of the terminal text. The caller decides how to frame each half; this
+    /// function only refuses to blur them.
+    ///
+    /// BOUNDED IN TIME AND IN BYTES. Every other remote wait in this file takes a timeout,
+    /// and this one is model-callable: an exec stream that never EOFs (a wedged tmux
+    /// server, a half-dead TCP connection) would otherwise hang the agent's turn forever,
+    /// because Citadel's own 15s bound covers channel creation and not the stream. Output
+    /// is capped at `maxResponseBytes` keeping the NEWEST bytes, which is what "the last N
+    /// lines of a pane" means — keeping the oldest handed the model the top of a long
+    /// capture under a label promising the bottom.
     public func runFixedCommand(
         _ commandLine: String,
-        maxResponseBytes: Int = 64 * 1024
-    ) async throws -> String {
+        maxResponseBytes: Int = 64 * 1024,
+        timeout: TimeInterval = 20
+    ) async throws -> FixedCommandOutput {
         guard let client else { throw HeadlessSessionError.notConnected }
-        var collected = ""
+        // An unstructured Task, deliberately: a task GROUP awaits its children on the way
+        // out, so a child blocked on a stream that never yields would swallow the timeout
+        // it is supposed to enforce. This one is abandoned (and cancelled) on timeout.
+        let box = FixedCommandBox()
+        let work = Task { @MainActor in
+            do {
+                box.value = .success(
+                    try await Self.collect(
+                        commandLine, on: client, maxResponseBytes: maxResponseBytes
+                    )
+                )
+            } catch {
+                box.value = .failure(error)
+            }
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while box.value == nil {
+            guard Date() < deadline else {
+                work.cancel()
+                throw HeadlessSessionError.commandTimedOut(seconds: Int(timeout))
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return try box.value!.get()
+    }
+
+    /// The streaming half, split out so the timeout above has something to abandon.
+    private static func collect(
+        _ commandLine: String,
+        on client: SSHClient,
+        maxResponseBytes: Int
+    ) async throws -> FixedCommandOutput {
+        var output = ""
+        var diagnostics = ""
         var truncated = false
+        var bytesSeen = 0
+        // A ceiling on how much we will read at all: the sliding window below bounds
+        // MEMORY, not time, and a command that prints forever would otherwise only be
+        // stopped by the caller's clock.
+        let readCeiling = maxResponseBytes * 8
         do {
             for try await chunk in try await client.executeCommandStream(commandLine) {
-                let buffer: ByteBuffer
                 switch chunk {
-                case .stdout(let value): buffer = value
-                case .stderr(let value): buffer = value
+                case .stdout(let value):
+                    output += String(buffer: value)
+                    bytesSeen += value.readableBytes
+                    if output.utf8.count > maxResponseBytes {
+                        output = keepingLastBytes(output, maxResponseBytes)
+                        truncated = true
+                    }
+                case .stderr(let value):
+                    diagnostics += String(buffer: value)
+                    bytesSeen += value.readableBytes
+                    if diagnostics.utf8.count > maxResponseBytes {
+                        diagnostics = keepingLastBytes(diagnostics, maxResponseBytes)
+                        truncated = true
+                    }
                 }
-                collected += String(buffer: buffer)
-                if collected.utf8.count > maxResponseBytes {
+                if bytesSeen > readCeiling {
                     truncated = true
                     break
                 }
             }
         } catch let failure as SSHClient.CommandFailed {
-            // The command ran and said something; the exit status only matters when it
-            // said nothing at all.
-            if collected.isEmpty {
-                throw HeadlessSessionError.commandFailed(status: failure.exitCode)
-            }
+            throw HeadlessSessionError.commandFailed(
+                status: failure.exitCode,
+                detail: firstLine(diagnostics.isEmpty ? output : diagnostics)
+            )
         }
-        if truncated {
-            collected = String(collected.prefix(maxResponseBytes))
-                + "\n[truncated at \(maxResponseBytes) bytes]"
+        return FixedCommandOutput(output: output, diagnostics: diagnostics, truncated: truncated)
+    }
+
+    /// Keeps the last `limit` BYTES (not Characters — the budget is a byte budget), cut
+    /// forward to the next newline so the result starts on a whole line and on a whole
+    /// UTF-8 scalar.
+    static func keepingLastBytes(_ text: String, _ limit: Int) -> String {
+        var bytes = Array(text.utf8)
+        guard bytes.count > limit else { return text }
+        bytes = Array(bytes.suffix(limit))
+        if let newline = bytes.firstIndex(of: 0x0A) {
+            bytes = Array(bytes[(newline + 1)...])
+        } else {
+            // No line break in the window: drop any leading UTF-8 continuation bytes so
+            // the first scalar is whole.
+            while let first = bytes.first, first & 0xC0 == 0x80 { bytes.removeFirst() }
         }
-        return collected
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func firstLine(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.split(separator: "\n").first.map(String.init) ?? trimmed
     }
 
     private func send(bytes: [UInt8]) {
@@ -319,6 +424,7 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
                 guard let self, myGeneration == self.generation else { return }
                 self.stdinWriter = outbound
                 self.state = .connected
+                self.connectedAt = Date()
                 // Written after the first MEANINGFUL inbound output (a banner or prompt —
                 // something with alphanumeric content) rather than immediately: on a
                 // loaded machine the remote shell can take seconds to spawn, and input
@@ -361,14 +467,32 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
         // A working session that dropped unexpectedly gets one silent auto-reconnect;
         // a failed handshake does not (retrying bad credentials immediately just spins).
         let shouldAutoReconnect = state == .connected
+        let lifetime = connectedAt.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        connectedAt = nil
         client = nil
         stdinWriter = nil
         if state != .disconnected {
             state = .disconnected
         }
         if shouldAutoReconnect {
+            // BACKOFF, because the connect command can now END the session. With
+            // `exec tmux …` the shell IS the tmux client: leaving tmux (or failing to
+            // start it) closes the channel immediately, and an unconditional reconnect
+            // would re-handshake in a tight loop against sshd for as long as the daemon
+            // runs. A connection that lived a while resets the counter, so an ordinary
+            // network drop still reconnects at once.
+            consecutiveShortLives = lifetime < 10 ? consecutiveShortLives + 1 : 0
+            let delay = min(30.0, pow(2.0, Double(consecutiveShortLives)) - 1)
             state = .reconnecting
-            connect()
+            if delay <= 0 {
+                connect()
+            } else {
+                Task { [weak self] in
+                    try? await Task.sleep(for: .milliseconds(Int(delay * 1000)))
+                    guard let self, myGeneration == self.generation else { return }
+                    self.connect()
+                }
+            }
         }
     }
 
@@ -402,7 +526,8 @@ public enum HeadlessSessionError: Error, LocalizedError {
     case connectFailed(String)
     case connectTimeout(seconds: Int)
     case notConnected
-    case commandFailed(status: Int)
+    case commandFailed(status: Int, detail: String)
+    case commandTimedOut(seconds: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -412,8 +537,12 @@ public enum HeadlessSessionError: Error, LocalizedError {
             return "SSH connection didn't come up within \(seconds)s."
         case .notConnected:
             return "the SSH session is not connected."
-        case .commandFailed(let status):
-            return "the command exited \(status) without printing anything."
+        case .commandFailed(let status, let detail):
+            return detail.isEmpty
+                ? "the command exited \(status) without printing anything."
+                : "\(detail) (exit \(status))"
+        case .commandTimedOut(let seconds):
+            return "the command produced no result within \(seconds)s and was abandoned."
         }
     }
 }

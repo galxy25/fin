@@ -267,9 +267,23 @@ final class RecordingStubSession: AgentSessionDriving {
     let eventLog = TerminalEventLog()
     var isSessionConnected = true
     private(set) var sentInputs: [String] = []
+    /// What the "live shell" answers when the engine asks for an environment variable.
+    /// Empty by default, which is the honest default for a stub with no shell: the tmux
+    /// guard's R0 then treats confinement as unproven, exactly as it would against a
+    /// terminal that had dropped out of tmux.
+    var environment: [String: String] = [:]
+    /// Every variable the engine asked about, in order — the tmux guard's live
+    /// confinement check is supposed to happen before each tmux send, and this is how a
+    /// test sees that it did.
+    private(set) var environmentProbes: [String] = []
 
     func sendAgentInput(_ text: String) {
         sentInputs.append(text)
         eventLog.recordInput(Array(text.utf8))
+    }
+
+    func probeEnvironment(_ name: String, timeout: TimeInterval) async -> String? {
+        environmentProbes.append(name)
+        return environment[name]
     }
 }

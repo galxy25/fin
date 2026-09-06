@@ -46,14 +46,21 @@ DOMAIN="gui/$(id -u)"
 LLM_URL="${FIN_LLM_URL:-http://127.0.0.1:1234/v1}"
 
 BIN_SRC="${FIN_AGENTD_BIN_SRC:-$REPO_ROOT/daemon/.build/release/fin-agentd}"
-# The floor, not a preference. Below 1.4.1 the first supervised run seeds only the
-# directive document, so every message sitting in fin/inbox/<slug>.json — up to 200
-# accumulated app messages, some weeks old — is injected as one model turn each on the
-# resident first run. 1.4.1 seeds the inbox as history unless the launcher emptied it
-# (daemon/README.md), and the resident config deliberately omits `inboxResetAtLaunch`;
-# that correctness is inert on an older body. `cmp -s` only ever asked "different from
-# last time", so whatever happened to sit in daemon/.build/release got installed.
-REQUIRED_DAEMON_VERSION="${FIN_REQUIRED_DAEMON_VERSION:-1.4.1}"
+# The floor, not a preference, and it tracks the daemon<->config CONTRACT.
+#
+# 1.5.0 is the private-socket contract: provision-config.sh writes (and on every refresh
+# rewrites) a connectCommand that puts the daemon's shell on its OWN tmux socket
+# (`exec tmux -L fin …`). A 1.4.x binary paired with that config is confined with no way
+# to look out of it — it has no read_session tool and no tmux guard, so Fin can neither
+# see nor drive the machine's real sessions, and nothing in the install output would say
+# so. This check is the only thing standing between an old binary in
+# daemon/.build/release and that silent half-install.
+#
+# 1.4.1 is still the floor for the older reason, kept because a floor only ever moves up:
+# below it the first supervised run seeds only the directive document, so every message
+# sitting in fin/inbox/<slug>.json — up to 200 accumulated app messages, some weeks old —
+# is injected as one model turn each on the resident first run.
+REQUIRED_DAEMON_VERSION="${FIN_REQUIRED_DAEMON_VERSION:-1.5.0}"
 # Copied next to the binary at install time; the LaunchAgents reference these, never the
 # checkout (see step 6).
 RUNTIME_SCRIPTS=(refresh.sh provision-config.sh rotate-logs.sh launch-agentd.sh)
@@ -91,7 +98,7 @@ or point at one with --binary PATH."
 
 # Ask the binary what it is. `strings` cannot answer this: `daemonVersion` is a five-byte
 # Swift string, stored as a small-string immediate in the instruction stream, so grepping
-# the Mach-O for "1.4.1" finds nothing even in a 1.4.1 body.
+# the Mach-O for "1.5.0" finds nothing even in a 1.5.0 body.
 DAEMON_VERSION="$("$BIN_SRC" --version 2>/dev/null | awk '$1 == "fin-agentd" {print $2}')"
 [ -n "$DAEMON_VERSION" ] || die "$BIN_SRC does not answer --version — it predates the version flag,
 so it is older than $REQUIRED_DAEMON_VERSION. Rebuild through the machine guard:
@@ -99,8 +106,11 @@ so it is older than $REQUIRED_DAEMON_VERSION. Rebuild through the machine guard:
 if [ "$DAEMON_VERSION" != "$REQUIRED_DAEMON_VERSION" ] \
 	&& [ "$(printf '%s\n%s\n' "$REQUIRED_DAEMON_VERSION" "$DAEMON_VERSION" | sort -V | head -1)" != "$REQUIRED_DAEMON_VERSION" ]; then
 	die "$BIN_SRC is fin-agentd $DAEMON_VERSION; this site needs >= $REQUIRED_DAEMON_VERSION.
-Below $REQUIRED_DAEMON_VERSION the resident first run replays the whole inbox backlog, one model
-turn per message. Rebuild through the machine guard:
+Below $REQUIRED_DAEMON_VERSION the daemon does not know about the private tmux socket this
+installer provisions: no read_session tool and no tmux guard, so Fin would be shut inside its
+own tmux server with no way to see the machine's real work (and below 1.4.1 the resident first
+run also replays the whole inbox backlog, one model turn per message). Rebuild through the
+machine guard:
     $REPO_ROOT/scripts/dev/one-at-a-time.sh swift build -c release --package-path $REPO_ROOT/daemon"
 fi
 echo "version: fin-agentd $DAEMON_VERSION (floor $REQUIRED_DAEMON_VERSION)"

@@ -12,18 +12,21 @@ that involves terminal work starts with a routing decision.
 **Your registry** lists each session you may act on: its name, what kind of
 process runs there (a coding agent like Claude Code, or a plain shell), its
 working directory, and the task vocabulary that belongs to it. Sessions you
-start yourself are yours to drive — name them with a `fin-` prefix
-(`tmux new-session -d -s fin-<purpose>`), the namespace the send-keys guard
-treats as yours. Nothing writes the registry file for you: a session someone
+start yourself are yours to drive; a `fin-` prefix
+(`tmux new-session -d -s fin-<purpose>`) keeps them easy to tell apart from
+everyone else's. Nothing writes the registry file for you: a session someone
 else started becomes yours only when the user registers it.
 
-<!-- Corrected 2026-09-06: the previous wording ("sessions you create yourself
-are added to the registry automatically") was never true — nothing in the
-codebase writes the registry, so a created session could not be driven at all
-once TmuxCommandGuard started enforcing the allow-list. The `fin-` namespace is
-what makes `start` work end to end. This is a factual correction, not a routing
-rule, and the offline corpus (router_baseline.py) does not read this file;
-re-score router_llm.py against it when a local endpoint is up again. -->
+<!-- Corrected 2026-09-06 (twice). First: the original wording ("sessions you
+create yourself are added to the registry automatically") was never true —
+nothing in the codebase writes the registry. Second, same day: the replacement
+called `fin-` "the namespace the send-keys guard treats as yours", which stopped
+being true when the private-socket design deleted the guard's allow-list and its
+namespace along with it (daemon/Sources/FinAgentCore/TmuxCommandGuard.swift).
+`fin-` is now a naming convention and nothing more. Both are factual
+corrections, not routing rules; the offline corpus (router_baseline.py) does not
+read this file, so no scored decision changes — re-score router_llm.py against it
+when a local endpoint is up again. -->
 
 
 ## Two independent facts — never conflate them

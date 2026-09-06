@@ -143,7 +143,17 @@ final class DaemonDirectiveClient {
     static let userMessageKind = "user_message"
     /// Reported in the status document so a supervisor can tell which harness features
     /// (stayResident, cloud transcript, inbox, push notify) this agent has.
-    static let daemonVersion = "1.4.1"
+    ///
+    /// 1.5.0 is the PRIVATE-SOCKET CONTRACT, and the bump is load-bearing rather than
+    /// ceremonial: from this version the daemon expects a `connectCommand` that puts its
+    /// shell on its own tmux socket (`exec tmux -L fin …`), ships the `read_session` tool
+    /// as the only way to see the machine's other sessions, and re-checks tmux confinement
+    /// before every send. Pair a 1.4.x binary with the new config — which
+    /// `provision-config.sh` rewrites unconditionally on every refresh — and the agent is
+    /// confined with no way to read out of it: no `read_session`, no guard, and a shell
+    /// that can neither see nor drive the human's sessions. `install.sh`'s version floor is
+    /// what stops that, and it can only stop it if this string moves.
+    static let daemonVersion = "1.5.0"
     /// The ONE status that means "no such object" on a first-run read. S3 answers 404
     /// for a missing key when the signer may `s3:ListBucket` — the control plane's and
     /// the operator's signers hold it for exactly that reason (control-plane commit

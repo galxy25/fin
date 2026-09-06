@@ -54,7 +54,7 @@ Beyond `server`, `agent`, and `task`, every field is optional:
 | `controlPlane` | — | Endpoint + bearer token of the serverless control plane; turns notify events into APNs pushes (below) |
 
 Inside `server`, `connectCommand` (typed into the shell once the PTY is up — on a resident
-site `tmux -L <socket> new-session -A -s <session> \; set status off`, which is where the
+site `exec tmux -L <socket> new-session -A -s <session> \; set status off`, which is where the
 agent's own tmux SERVER is chosen; see "The tmux boundary") and `environment` (extra SSH
 env requests) are optional too. Since 1.4.0 the environment always carries one entry the config can't remove:
 
@@ -139,13 +139,23 @@ Read once at startup, so edits take effect on the next launch.
 ### The tmux boundary: a private socket, not a parser
 
 **The agent's shell runs on its own tmux server.** The resident `connectCommand` is
-`tmux -L fin new-session -A -s fin \; set status off`. `tmux -L` names a socket *file*, so
-Fin's tmux server is a different process, with a different socket, from the one hosting
-the human's `main`. Nothing typed inside Fin's shell can reach the human's sessions — not
-because the string was classified as safe, but because the server it would have to talk to
-is not the one its `$TMUX` points at. Both facts the daemon needs (the socket name and the
-session name) are parsed out of that one config string; nothing is hardcoded to `fin`, so
-provisioning with `FIN_TMUX_SOCKET=wharf FIN_TMUX_SESSION=dockside` guards `wharf`.
+`exec tmux -L fin new-session -A -s fin \; set status off`. `tmux -L` names a socket
+*file*, so Fin's tmux server is a different process, with a different socket, from the one
+hosting the human's `main`. Nothing typed inside Fin's shell can reach the human's sessions
+— not because the string was classified as safe, but because the server it would have to
+talk to is not the one its `$TMUX` points at. Both facts the daemon needs (the socket name
+and the session name) are parsed out of that one config string; nothing is hardcoded to
+`fin`, so provisioning with `FIN_TMUX_SOCKET=wharf FIN_TMUX_SESSION=dockside` guards
+`wharf`.
+
+**`exec` is part of the boundary, not decoration.** Without it the tmux client is a child
+of the login shell, and `tmux detach` — or `exit`, or killing its own session, all ordinary
+allowed work *on its own server* — returns the PTY to that login shell, whose `$TMUX` is
+empty. A bare `tmux send-keys -t main …` typed there names no socket for R1 to catch and
+lands on the human's server. With `exec`, leaving tmux ends the SSH session instead; the
+daemon reconnects (with backoff, so a shell that cannot start tmux cannot spin) and
+re-attaches. R0's live check is the other lock on that door: a shell that answers with the
+wrong `$TMUX`, or does not answer, refuses every tmux command until it does.
 
 **Why the previous design was replaced.** Until this branch the daemon shared the human's
 socket and a 1,579-line `TmuxCommandGuard` parsed every `send_input` string, classifying
@@ -167,19 +177,22 @@ private socket costs exactly the capability a resident site exists for: `tmux ca
 exist. So the daemon exposes a tool whose parameter is a session NAME, never a command
 line, and runs a fixed argv against the DEFAULT socket on a separate SSH exec channel.
 
-**What is left of the guard** (`Sources/FinAgentCore/TmuxCommandGuard.swift`): six rules,
-no classification. The file went from 1,579 lines to 1,078 — 670 of them code, down from
-1,057 — and most of what remains is the lexer plus the explanation of why the rest is
-gone. Its own tests went from 923 lines to 431. It is a second layer behind a real
-boundary, not the boundary itself.
+**What is left of the guard** (`Sources/FinAgentCore/TmuxCommandGuard.swift`): seven rules,
+no classification. The file is 1,344 lines against the old 1,579 — but only **782 of them
+are code**, down from 1,057, and most of that is the lexer; the rest is the explanation of
+why the classification machinery is gone (the 90-command table, prefix resolution, target
+extraction, the allow-list, the registry snapshot, the `fin-` namespace and the
+ssh-locality collectors are all deleted). It is a second layer behind a real boundary, not
+the boundary itself.
 
 | Rule | What is refused | Why it is not the socket's job |
 |---|---|---|
-| R0 | EVERY tmux command, when the daemon could not confirm the shell is inside its own tmux server | The rest of the table assumes a bare `tmux …` reaches Fin's server, which is true only because `$TMUX` points there — a fact about a `connectCommand` typed into a PTY, which can fail quietly. The daemon asks the live shell for `$TMUX` after connecting (`probeEnvironment`) and treats "no answer" as "not confined". A loudly crippled agent — it still has `read_session` — beats one quietly typing into someone else's terminal. |
-| R1 | A tmux invocation naming a socket that is not the agent's own — `-L other`, `-S /path`, in every getopt-cluster and quoted spelling | Naming another socket is the only way a tmux *command line* leaves the agent's server. This is the rule; everything else is a footnote. |
+| R0 | EVERY tmux command, whenever the LIVE shell is not confirmed to be inside its own tmux server | The rest of the table assumes a bare `tmux …` reaches Fin's server, which is true only because `$TMUX` points there — and the shell can leave (`tmux detach`, `exit`, killing its own session are all ordinary work ON its own server), landing back in the login shell whose `$TMUX` is empty. So the check is **not a launch-time snapshot**: `AgentTurnEngine` re-asks the shell for `$TMUX` immediately before every send that mentions tmux, and "no answer" (busy, disconnected, inside a full-screen program) is "not confined". A loudly crippled agent — it still has `read_session` — beats one quietly typing into someone else's terminal. |
+| R1 | A tmux invocation naming a socket that is not the agent's own — `-L other`, `-S /path`, in every getopt-cluster and quoted spelling | Naming another socket is one of the two ways a tmux *command line* leaves the agent's server. Note tmux's precedence, which the parser mirrors: **`-S` wins over `-L`** however they are ordered (man tmux; verified on 3.6a), so `-S <the human's socket> -L fin` is refused. |
+| R1b | A tmux invocation with **no** socket flag that will not run in Fin's own shell — under `ssh`, `mosh`, `su`, `sudo`/`doas`, `launchctl`, `at`, `open`, `docker`, `osascript`…, or with `env -i`/`env -` | The other way out, and the premise R1 alone got wrong: with no `-L`/`-S`, tmux reads its socket from `$TMUX`, and those all start a fresh environment where `$TMUX` is gone — tmux then falls back to the label `default`, the human's server. The refusal names the one-word fix (`tmux -L fin …`), which is allowed. The wrapper list is **named, not fail-closed**: see the residual list for why, and for what that leaves open. |
 | R2 | `kill-server`, and every prefix tmux would resolve to it (`kill`, `kill-s`, `kill-serv`) | It ends the agent's own shell mid-turn; on a host that never got a private socket it ends everything. `kill-session`/`-window`/`-pane` are NOT prefixes of it and stay allowed. |
-| R3 | `pkill`/`killall` aimed at tmux | A signal is not a tmux command. It kills every tmux server on the machine, and no socket boundary stops it. |
-| R4 | A tmux invocation whose `TMUX` variable is being unset or overridden (`TMUX= tmux …`, `env -u TMUX tmux …`, `unset TMUX`, `set -e TMUX`) | **The one hole the private socket does not close** — see the residual list. |
+| R3 | A signal aimed at tmux, judged on the whole LINE: `pkill tmux`, `killall tmux`, and `kill $(pgrep tmux)` | A signal is not a tmux command. It kills every tmux server on the machine, and no socket boundary stops it. Line-level because the pid comes from somewhere else on the line — segment by segment, `kill $(pgrep tmux)` was a `kill` with no tmux in it next to a harmless `pgrep`. `pkill node` and `kill 1234` are untouched: the *word* tmux has to be on the line. |
+| R4 | Unsetting or overriding a variable tmux picks its SERVER from — `TMUX` **and `TMUX_TMPDIR`** (`TMUX= tmux …`, `env -u TMUX tmux …`, `unset TMUX`, `set -e TMUX`, `export TMUX_TMPDIR=…`) | **The one hole the private socket does not close** — see the residual list. `TMUX_TMPDIR` is the *directory* a `-L <label>` resolves in, so setting it re-points even Fin's own label at any socket file the model picks. |
 | R5 | A half-typed line (trailing `\`, or an open quote) that mentions tmux, or a trailing fragment that could still *become* `tmux` | The PTY concatenates sends, so `tmux -L \` and `default kill-server` are two individually-harmless calls the shell joins at its continuation prompt. |
 
 Everything else on the agent's own server is now ordinary work: `new-session`,
@@ -202,21 +215,41 @@ the variable, which R4 cannot tell from a write; a tmux command line quoted
 anywhere in a line that mentions tmux (`tmux ls; bash`); a half-typed line, including one
 that is only a read; **file content that happens to be a tmux command** — a here-doc body,
 a doc, a script being written (the way through is a quoted argument, which is data:
-`printf 'tmux -L other ls\n' >> notes.md`, and the refusal text says so); and any remote
-`ssh <host> tmux -L …`, since the ssh-locality collectors were deleted with everything
-else and a remote socket flag now reads the same as a local one.
+`printf 'tmux -L other ls\n' >> notes.md`, and the refusal text says so); any remote
+`ssh <host> tmux …`, flagged or not, since the ssh-locality collectors were deleted with
+everything else and a remote tmux reads the same as a local one (naming the socket —
+`ssh <host> tmux -L fin …` — is allowed); a `kill` on any line that also names tmux; and
+every tmux command at all while the shell is busy enough not to answer R0's check.
 
 **Residual risk, stated plainly.**
 
-- **`$TMUX` is a socket selector.** With neither `-L` nor `-S`, tmux takes its socket path
-  from `$TMUX`. Verified on tmux 3.6a against two private sockets (never the default one):
-  from a pane on socket A, `TMUX=<socket B path>,0,0 tmux ls` listed **B's** sessions, and
-  with `TMUX` unset tmux falls back to the label `default` — which is the human's server.
-  R4 refuses the direct spellings, including a bare `export TMUX=…` with no tmux command in
-  the same send (the guard sees one send at a time, so the assignment is its only moment to
-  act). It cannot refuse an assembled one — a value built up across sends, a helper script,
-  an argv constructed structurally inside an interpreter, or a shell function. **This is the
-  sharpest edge of the current design.**
+- **`$TMUX` is a socket selector, and so is `TMUX_TMPDIR`.** With neither `-L` nor `-S`,
+  tmux takes its socket path from `$TMUX`. Verified on tmux 3.6a against two private
+  sockets (never the default one): from a pane on socket A, `TMUX=<socket B path>,0,0 tmux
+  ls` listed **B's** sessions, and with `TMUX` unset tmux falls back to the label `default`
+  — which is the human's server. `TMUX_TMPDIR` is the same hazard one level up: it is the
+  directory `-L <label>` resolves in (`$TMUX_TMPDIR/tmux-<uid>/<label>`), verified here by
+  pointing a private label at a scratch directory. R4 refuses the direct spellings of both,
+  including a bare `export TMUX=…` with no tmux command in the same send (the guard sees one
+  send at a time, so the assignment is its only moment to act). It cannot refuse an
+  assembled one — a value built up across sends, a helper script, an argv constructed
+  structurally inside an interpreter, or a shell function. **This is the sharpest edge of
+  the current design.**
+- **R1b's wrapper list is named, so it is incomplete.** A socket-less tmux run under a
+  wrapper that starts a fresh environment reaches the *default* socket, and the guard
+  refuses that for the wrappers it can name (`ssh`, `mosh`, `su`, `sudo`, `doas`,
+  `launchctl`, `at`, `open`, `docker`, `podman`, `chroot`, `nsenter`, `osascript`,
+  `systemd-run`, `crontab`, plus `env -i`). Treating **every** unmodelled head as crossing
+  was tried and reverted in the same hour: it refuses `man tmux`, `which tmux`,
+  `brew install tmux` and `grep -e tmux config.fish`, and an unmodelled head is far more
+  often a command that mentions tmux than one that runs it. So a wrapper nobody thought of
+  — some other launcher, a script of the human's that re-execs — is an open route, and only
+  the dedicated UNIX user below closes it by construction.
+- **The agent owns the directory its own socket lives in.** `-L fin` resolves to
+  `/tmp/tmux-<uid>/fin`, a path the agent can delete and replace with a symlink to the
+  human's socket, at which point `tmux -L fin …` — a command R1 reads as "my own server" —
+  is talking to the human's. No parser can see that: the dangerous command is an `ln`, not a
+  tmux. Kernel permissions are the only real answer; see the dedicated-user upgrade.
 - **Same UNIX user.** The agent's SSH session runs as the human's own uid, so the default
   socket is *reachable* by any process that opens it deliberately; the guard is a
   heuristic standing in front of a door that is unlocked. Indirection the guard cannot
@@ -224,15 +257,36 @@ else and a remote socket flag now reads the same as a local one.
   `~/.tmux.conf` written now and read by a later tmux, a command split across two sends —
   remains open, as does plain non-tmux damage (`pkill -f mlx_lm`, `launchctl bootout`, an
   `rm` shape `DestructiveCommandHeuristic` misses).
-- **`read_session` reads, and reading is not nothing.** It pipes another user's terminal
-  into the model's context, and from there into the cloud transcript. Output is capped and
-  run through `MemoryRedactor` (the same scrub the transcript uses), which catches shapes,
-  not every secret.
+- **R0 is now live, and that moves the failure mode rather than deleting it.** The shell is
+  re-asked for `$TMUX` before every tmux-bearing send, so leaving tmux mid-run is caught —
+  but the check is an `echo` typed into the same PTY, so (a) it appears in the terminal and
+  the transcript, (b) a shell that is busy or inside a full-screen program cannot answer and
+  every tmux command is refused until it can, and (c) there is a microscopic window between
+  the answer and the command, closed in practice only because the engine is the single
+  writer and `exec tmux …` means leaving tmux ends the session instead of returning to a
+  shell.
+- **`read_session` reads, and reading is not nothing — in both directions.** *Out:* it pipes
+  another user's terminal into the model's context and from there into the cloud transcript;
+  output is capped and run through `MemoryRedactor` (the same scrub the transcript uses),
+  which catches shapes, not every secret. *In:* those panes are the untrusted ones (the
+  human's `main` hosts other coding agents and whatever was pasted into them; build and
+  `curl` output can carry attacker-authored text), and the model reading them holds
+  `send_input` on its own server and `notify` to a human. The capture is fenced and labelled
+  as data, and a pane cannot forge the fence (its copy of the marker is neutered) — but a
+  fence is a mitigation, not a proof: a small model can still be talked into something by
+  text inside one.
 - **A registry naming someone else's session is now read-only in practice.** Routing still
-  renders its prompt section, but a registered session that lives on the default socket
-  cannot be driven from Fin's shell any more — only read, through `read_session`. The
-  shipped resident registry lists only Fin's own session, so nothing regresses today; a
-  multi-session routing story needs Fin's collaborators to live on Fin's socket.
+  renders its prompt section — on a private socket it renders the variant that sends the
+  model to `read_session` and tells it NOT to recreate a session it cannot see — but a
+  registered session that lives on the default socket cannot be driven from Fin's shell any
+  more. The shipped resident registry lists only Fin's own session, so nothing regresses
+  today; a multi-session routing story needs Fin's collaborators to live on Fin's socket.
+- **`set status off` removed the traffic the idle timeout relied on.** The connection carries
+  `IdleStateHandler(readTimeout: 90s)`; with the tmux status bar off, an idle pane emits
+  nothing, so a quiet daemon reconnects roughly every 90 seconds. Each reconnect re-types the
+  connectCommand (re-attaching the same session) and re-takes R0's proof, and the reconnect
+  now backs off if the session keeps dying immediately — so this is churn in the log, not a
+  correctness problem. It is written down because it is easy to mistake for a bug.
 
 **The airtight version, and what it costs.** Run the agent's SSH session as a **dedicated
 UNIX user**. tmux creates its socket directory `0700` under `/tmp/tmux-<uid>`, so a
@@ -304,11 +358,17 @@ The engine advertises the same shared roster as the app
   `tmux capture-pane -p -J -t <name> -S -<lines>` — and runs it against the DEFAULT socket
   over a **separate SSH exec channel**, not the agent's PTY: the model supplies one word
   and the daemon supplies every other byte, so there is no command line to inject into.
-  Output is capped (`maxResponseBytes` 64 KB, `lines` clamped to 1…400, newest kept) and
-  passed through `MemoryRedactor`, the same scrub the cloud transcript applies. A runner
-  that does not wire `AgentTurnEngine.onReadSession` — the Fin app — answers "not available
-  in this runtime" rather than an empty capture or an "unknown tool", the same honesty rule
-  as `notify`.
+  Output is capped (`maxResponseBytes` 64 KB — the newest bytes, cut at a line boundary,
+  with the drop disclosed — and `lines` clamped to 1…400) and passed through
+  `MemoryRedactor`, the same scrub the cloud transcript applies. The read is also bounded in
+  TIME (20s on the exec channel), because a model-callable read that never returns would
+  hang the turn with no way back short of restarting the daemon. stdout and stderr are kept
+  apart and a non-zero exit is a FAILURE, so `can't find session: nope` reaches the model as
+  a failed read rather than as the contents of a pane. What does come back is **fenced and
+  labelled as untrusted data** — it is somebody else's screen, and a pane that prints the
+  fence marker gets that copy neutered. A runner that does not wire
+  `AgentTurnEngine.onReadSession` — the Fin app — answers "not available in this runtime"
+  rather than an empty capture or an "unknown tool", the same honesty rule as `notify`.
 - **`request_input`** — records the question in the audit log and fires the notify hook
   with `FIN_EVENT=request-input`, `FIN_MESSAGE=<question>`. The answer arrives as a
   supervision directive or an inbox message (below) — there is no local user to type

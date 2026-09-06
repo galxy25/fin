@@ -312,22 +312,35 @@ if refresh and isinstance(existing, dict):
     # kept it would run a daemon whose prompt and guard both say "your own server" while
     # its shell sits on the human's.
     #
-    # Narrow on purpose: it upgrades ONLY the legacy shape — a tmux attach with no socket
-    # flag at all — and says so out loud, with the old value. A connectCommand that
-    # already names a socket (any socket) is a deliberate choice and is left alone.
+    # TWO upgrades, both narrow, both announced with the old value:
+    #   1. no socket flag at all -> add `-L <socket>`. A connectCommand that already names
+    #      a socket (any socket) is a deliberate choice and is left alone.
+    #   2. no `exec` -> add it. Without `exec`, the tmux client is a CHILD of the login
+    #      shell, so `tmux detach` (or `exit`, or killing its own session — all ordinary
+    #      work on its own server) drops the PTY back to that login shell, where $TMUX is
+    #      empty and a socket-less `tmux send-keys -t main …` reaches the owner's server.
+    #      With `exec`, leaving tmux ends the SSH session instead; the daemon reconnects
+    #      (with backoff) and re-attaches. The guard also re-checks confinement before
+    #      every tmux command, so this is the second lock on that door, not the only one.
     socket = env.get("FIN_TMUX_SOCKET") or ""
     server_block = config.get("server") or {}
     current = (server_block.get("connectCommand") or "").strip()
-    if socket and current.startswith("tmux ") and " -L " not in current and " -S " not in current:
-        upgraded = "tmux -L %s %s" % (socket, current[len("tmux "):])
+    upgraded = current
+    if socket and upgraded.startswith("tmux ") and " -L " not in upgraded and " -S " not in upgraded:
+        upgraded = "tmux -L %s %s" % (socket, upgraded[len("tmux "):])
+    if upgraded.startswith("tmux "):
+        upgraded = "exec " + upgraded
+    if upgraded != current:
         server_block["connectCommand"] = upgraded
         config["server"] = server_block
-        print("note: connectCommand upgraded to the private tmux socket -L %s\n"
+        print("note: connectCommand upgraded\n"
               "      was: %s\n      now: %s\n"
-              "      The daemon's shell now runs on its OWN tmux server, so nothing it types can\n"
-              "      reach the owner's sessions; it reads them with the read_session tool instead."
-              % (socket, current, upgraded), file=sys.stderr)
-        mode = "refreshed (URLs + private tmux socket)"
+              "      The daemon's shell runs on its OWN tmux server, so nothing it types can\n"
+              "      reach the owner's sessions; it reads them with the read_session tool instead.\n"
+              "      `exec` means leaving that tmux ends the SSH session rather than dropping the\n"
+              "      agent into an unconfined login shell."
+              % (current, upgraded), file=sys.stderr)
+        mode = "refreshed (URLs + connectCommand)"
 else:
     if refresh:
         print("note: no existing config.json to refresh — writing a full one", file=sys.stderr)
@@ -347,8 +360,16 @@ else:
             # iMac) is never named anywhere in this file. The daemon parses this string
             # for both facts it needs — its socket and its session — so renaming either
             # here is enough; nothing downstream is hardcoded to "fin".
+            #
+            # `exec` is the second half of that boundary: it REPLACES the login shell with
+            # the tmux client, so there is no unconfined shell left behind to fall back to.
+            # Without it, `tmux detach` / `exit` / killing its own session — all ordinary,
+            # allowed work on its own server — returns the PTY to a login shell whose $TMUX
+            # is empty, and a socket-less `tmux send-keys -t main …` typed there reaches the
+            # owner's server. With it, leaving tmux ends the SSH session and the daemon
+            # reconnects into a fresh attach.
             "connectCommand": (
-                "tmux %snew-session -A -s %s \\; set status off"
+                "exec tmux %snew-session -A -s %s \\; set status off"
                 % ("-L %s " % env["FIN_TMUX_SOCKET"] if env.get("FIN_TMUX_SOCKET") else "",
                    env["FIN_TMUX_SESSION"])
             ),
@@ -412,15 +433,17 @@ write_private(config_path, json.dumps(config, indent=2, ensure_ascii=False) + "\
 
 # --- routing registry: only the daemon's own session is registered ------------------
 # Schema: evals/tmux-routing/registry.example.json (SessionRegistration in
-# FinAgentCore/SessionRouting.swift). The guardrail is registration itself: a session
-# that exists on the tmux server but is not listed here (the owner's "main") is
-# invisible to routing and forbidden to send-keys. The file is user-editable working
-# memory, so an existing one is left alone.
+# FinAgentCore/SessionRouting.swift). THIS FILE IS NOT A SECURITY BOUNDARY — it used to
+# be described as one, and since the private-socket design landed that is simply false.
+# The boundary is the socket: the daemon's shell runs on its own tmux server (`-L fin`),
+# so the owner's sessions are not "forbidden", they do not exist there. The guard never
+# reads a session name out of this file (`TmuxSendGuard.forHost` only checks whether the
+# file EXISTS, as one of three reasons to arm), and there is no "fin-" namespace any
+# more — every session on Fin's own server is Fin's to drive.
 #
-# TmuxCommandGuard reads this file ONCE, at daemon launch (it is writable by the very
-# shell the guard constrains, so a live re-read would be an escalation path). Editing it
-# therefore takes effect at the next launch — and the agent does not need it to start
-# sessions of its own: names beginning with "fin-" are its namespace.
+# What registration still does: it fills in the routing prompt, so the model knows which
+# sessions it is expected to own and what each is for. The file is user-editable working
+# memory, so an existing one is left alone, and it is read once at daemon launch.
 registry_state = "kept (already present)"
 if not os.path.exists(registry_path):
     registry = {

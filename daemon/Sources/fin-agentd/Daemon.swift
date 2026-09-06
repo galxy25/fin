@@ -358,7 +358,16 @@ final class Daemon {
     ) -> String {
         var prompt = base
         if let registry = RegistryDocument.loadIfPresent(at: registryFileURL),
-           let section = SessionRouter.promptSection(registry: registry) {
+           // WHICH ROUTING PROMPT depends on where this daemon's shell lives. On a private
+           // tmux socket the shell cannot see the machine's other sessions at all, so the
+           // section must send the model to `read_session` — the app's wording ("read any
+           // session with `tmux capture-pane -p -t <name>`") would have it run a command
+           // that answers `can't find session: main` and conclude the human's live session
+           // is dead. On a shared socket the app's wording is the true one.
+           let section = SessionRouter.promptSection(
+               registry: registry,
+               otherSessions: tmuxGuard.ownSocket == .standard ? .sameTmuxServer : .readSessionTool
+           ) {
             prompt += "\n\n" + section
         }
         // Told, not just enforced: a refusal the model understands beats a refusal it
@@ -599,9 +608,13 @@ final class Daemon {
         // `$TMUX` pointing at Fin's own socket: if the attach failed quietly — tmux not
         // installed, a startup flush that ate the line, a server that refused to start —
         // the shell is a plain login shell, a bare `tmux send-keys -t main …` names no
-        // socket for the guard to catch, and it lands on the human's server. So ask the
-        // shell, once, and let the answer decide: no proof means every tmux command is
-        // refused for this run (read_session still works, and the refusal says why).
+        // socket for the guard to catch, and it lands on the human's server.
+        //
+        // THIS PROBE IS THE LOG LINE, NOT THE GATE. It runs once, and its answer would be
+        // stale the moment the model typed `tmux detach` — so `AgentTurnEngine` re-asks the
+        // live shell before every send that mentions tmux, and that answer is what R0
+        // actually decides on. What this one buys is an operator who learns at launch, in
+        // the log and the audit trail, that the site came up unconfined.
         if tmuxGuard.isEnforced, tmuxGuard.ownSocket != .standard {
             let reported = await session.probeEnvironment("TMUX")
             tmuxGuard.shellIsOnOwnServer = TmuxSendGuard.shellReportIsOwnServer(
@@ -645,10 +658,13 @@ final class Daemon {
                     + "guard's parser misses; see daemon/README.md"
                 : "private socket (\(tmuxGuard.ownSocket.described))"
             log("tmux guard armed: session \"\(tmuxGuard.ownSession ?? "?")\" on \(posture); "
-                + "another server (-L/-S, TMUX=…) and kill-server are refused, "
-                + "read_session reads the default socket read-only")
+                + "another server (-L/-S, TMUX=/TMUX_TMPDIR=, a socket-less tmux under "
+                + "ssh/sudo/env -i), kill-server and signals aimed at tmux are refused; "
+                + "confinement is re-checked with the live shell before every tmux command, "
+                + "and read_session reads the default socket read-only")
         } else {
-            log("tmux guard not armed: no tmux session in connectCommand and no routing registry")
+            log("tmux guard not armed: connectCommand names neither a tmux session nor a tmux "
+                + "socket, and there is no routing registry")
         }
         if systemPrompt.contains("Mission ledger:") {
             log("goals ledger enabled: ledger at \(goalsLedgerPath)")
@@ -1005,7 +1021,12 @@ final class Daemon {
     ///
     /// The output is redacted with `MemoryRedactor` before it is returned, the same scrub
     /// the cloud transcript applies: this is the one tool that pipes ANOTHER user's
-    /// terminal into the model's context, and that pane may be showing a token.
+    /// terminal into the model's context, and that pane may be showing a token. What comes
+    /// back is also FENCED as untrusted data by `TmuxSessionRead.frameCapture` — the pane
+    /// belongs to somebody else, and text on it is not an instruction to this agent.
+    ///
+    /// stderr is kept separate from stdout so tmux's own `can't find session: nope` is
+    /// reported as a FAILED read rather than framed as the contents of a pane.
     private func readSession(name: String?, lines: Int) async -> AgentReadSessionOutcome {
         guard let session else {
             return .failed("the daemon has no SSH session open.")
@@ -1026,15 +1047,33 @@ final class Daemon {
         }
         let commandLine = TmuxSessionRead.commandLine(argv)
         do {
-            let output = try await session.runFixedCommand(
+            let result = try await session.runFixedCommand(
                 commandLine,
                 maxResponseBytes: TmuxSessionRead.maxResponseBytes
             )
             record(AgentAuditEvent(
                 kind: "notice",
-                text: "read_session ran: \(commandLine) (\(output.utf8.count) bytes)"
+                text: "read_session ran: \(commandLine) (\(result.output.utf8.count) bytes"
+                    + (result.diagnostics.isEmpty ? "" : ", stderr: \(result.diagnostics.prefix(200))")
+                    + (result.truncated ? ", truncated" : "") + ")"
             ))
-            return .text(MemoryRedactor.redact(output))
+            // A command that exited 0 but said nothing on stdout while complaining on
+            // stderr is a failed read, not an empty pane. (A non-zero exit never gets here
+            // — `runFixedCommand` throws, carrying tmux's own sentence.)
+            if result.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !result.diagnostics.isEmpty {
+                return .failed(MemoryRedactor.redact(result.diagnostics))
+            }
+            var text = MemoryRedactor.redact(result.output)
+            if result.truncated {
+                // APPENDED, not prepended: the engine trims this text to the last N lines
+                // before framing it, so a note at the top would be silently dropped by the
+                // very truncation it is disclosing.
+                text += "\n[read_session note: that screen was larger than the "
+                    + "\(TmuxSessionRead.maxResponseBytes / 1024) KB this tool returns; the OLDEST "
+                    + "part was dropped and the newest kept]"
+            }
+            return .text(text)
         } catch {
             let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             log("read_session failed: \(reason)")

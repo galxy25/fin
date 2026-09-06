@@ -140,6 +140,40 @@ public final class AgentTurnEngine {
     /// is then refused.
     public var tmuxGuard: TmuxSendGuard = .unenforced
 
+    /// R0, TAKEN LIVE. `tmuxGuard.shellIsOnOwnServer` is a snapshot, and a snapshot from
+    /// daemon launch is worthless by the second send: the model can leave its own tmux
+    /// server whenever it likes — `tmux detach`, `exit`, `tmux kill-session -t <its own
+    /// session>` are all ordinary, allowed commands on its own server — and the PTY then
+    /// drops back to the login shell that spawned the client, whose `$TMUX` is empty. From
+    /// there `tmux send-keys -t main …` names no socket for R1 to catch and lands on the
+    /// human's server, while a frozen flag still says "confined".
+    ///
+    /// So the shell is asked again, immediately before any send that could be a tmux
+    /// command. The cost is one `echo` round trip on those sends only (the prefilter is the
+    /// same cheap one the guard uses), and a shell that is busy or gone does not answer —
+    /// which is treated as "not confined", the safe direction. There is deliberately NO
+    /// cache: the interesting case is exactly two sends in a row, `tmux detach` then the
+    /// escape, so a proof with any shelf life at all would be a proof of the wrong shell.
+    private func guardForThisSend(_ typed: String) async -> TmuxSendGuard {
+        var policy = tmuxGuard
+        guard policy.isEnforced,
+              policy.ownSocket != .standard,
+              TmuxCommandGuard.mightMentionTmux(typed) else { return policy }
+        let reported = await session.probeEnvironment("TMUX", timeout: 5)
+        policy.shellIsOnOwnServer = TmuxSendGuard.shellReportIsOwnServer(
+            reported, socket: policy.ownSocket
+        )
+        if !policy.shellIsOnOwnServer {
+            record(
+                "notice",
+                "tmux confinement check FAILED before a tmux send ($TMUX "
+                    + (reported.map { $0.isEmpty ? "empty" : $0 } ?? "no answer")
+                    + ", expected \(policy.ownSocket.described)) — the command is refused"
+            )
+        }
+        return policy
+    }
+
     public init(
         configuration: AgentEngineConfiguration,
         session: any AgentSessionDriving,
@@ -609,7 +643,13 @@ public final class AgentTurnEngine {
         // half-typed-line refusal never fired while the terminal really was left at PS2
         // waiting for the next send. The guard normalizes the same way internally, so no
         // caller can get this wrong; passing it here keeps the invariant visible.
-        if case .refuse(let message) = tmuxGuard.evaluate(AgentTurnLogic.typedBody(input)) {
+        //
+        // AND JUDGED AGAINST THE SHELL AS IT IS NOW: `guardForThisSend` re-takes R0's
+        // confinement proof from the live shell first, because the model is allowed to
+        // leave its own tmux server (`tmux detach`) and everything else here assumes it
+        // has not.
+        let typed = AgentTurnLogic.typedBody(input)
+        if case .refuse(let message) = await guardForThisSend(typed).evaluate(typed) {
             record("error", message, toolName: toolName,
                    toolArguments: rawArguments, isFailure: true)
             return message

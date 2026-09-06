@@ -237,13 +237,17 @@ old `fin/sites/fin/<site8>/status.json` in S3 is left for the operator.
   — a config that never attaches passes too. Checking that direction means attaching Levi's
   session on purpose, which neither script will do.
 - **A PRIVATE TMUX SOCKET — the boundary that is not a parser.** The daemon's
-  `connectCommand` is `tmux -L fin new-session -A -s fin \; set status off`. `tmux -L`
+  `connectCommand` is `exec tmux -L fin new-session -A -s fin \; set status off`. `tmux -L`
   names a socket *file*, so Fin's tmux server is a different process from the one hosting
   Levi's `main`: nothing typed inside Fin's shell can reach his sessions, whatever it
   spells, because the server it would have to talk to is not the one its `$TMUX` points
-  at. That is correctness by topology. The previous posture — one shared socket, with a
-  1,580-line parser classifying every `send_input` string — is gone; eight reviews found
-  thirty-five distinct bypasses of it, and every fix round produced new ones.
+  at. That is correctness by topology. `exec` closes the way back out — without it,
+  `tmux detach` (ordinary work on Fin's own server) drops the PTY to the login shell that
+  spawned the client, where `$TMUX` is empty and a socket-less `tmux send-keys -t main …`
+  reaches Levi's server; with it, leaving tmux ends the SSH session and the daemon
+  reconnects. The previous posture — one shared socket, with a 1,580-line parser
+  classifying every `send_input` string — is gone; eight reviews found thirty-five distinct
+  bypasses of it, and every fix round produced new ones.
 - **Reading moved out of the shell, into a tool.** A private socket costs exactly the
   capability a resident site exists for: `tmux capture-pane -t main -p` typed into Fin's
   shell now talks to Fin's own server, where `main` does not exist. So the daemon exposes
@@ -254,33 +258,39 @@ old `fin/sites/fin/<site8>/status.json` in S3 is left for the operator.
   agent's PTY. The model supplies one word; every other byte is the daemon's. Output is
   capped (64 KB, ≤400 lines) and run through the transcript's redaction, because this is
   the one tool that pipes another user's terminal into the model's context.
-- **What is left of the guard: one rule, plus five small ones.** `TmuxCommandGuard` shrank
-  from 1,579 lines to 1,078 (670 of them code, down from 1,057) and stopped classifying
-  anything. It refuses (R1) a tmux
-  invocation naming a socket that is not the daemon's own, (R2) `kill-server` and every
-  prefix tmux would resolve to it, (R3) `pkill`/`killall` aimed at tmux — a signal crosses
-  every socket — (R4) any command that unsets or overrides `TMUX`, and (R5) a half-typed
-  line (trailing `\` or open quote) that mentions tmux, since the PTY joins consecutive
-  sends. Ahead of all of them, (R0) if the daemon could not CONFIRM the shell is inside its
-  own tmux server — it asks the live shell for `$TMUX` right after connecting — every tmux
-  command is refused for that run, because a bare `tmux send-keys -t main …` names no
-  socket for R1 to catch and a quietly-failed `connectCommand` would put it on the human's
-  server. Everything else on Fin's own server — create, kill, rename,
-  send keys, `run-shell` — is now ordinary work: there is no allow-list, and nothing to
-  register. The lexer survives because finding the word `tmux` through quoting, escaping,
-  wrappers and interpreters is the part that was genuinely hard (`t\mux`, `tm"u"x`,
-  `$'tmux'`, `TMUX`, `sh -c '…'`, `find -exec`, `| sh`, `xargs tmux`).
-- **The residual risk, plainly.** The agent's shell runs as the **same UNIX user** as Levi,
-  so the default socket is still *reachable* by a process that opens it on purpose — and
-  there is one spelling that does exactly that with no socket flag at all: tmux takes its
-  socket path from `$TMUX` when neither `-L` nor `-S` is given, so `TMUX= tmux …` or
-  `env -u TMUX tmux …` selects a different server (verified on tmux 3.6a against two
-  private sockets: from a pane on socket A, `TMUX=<socket B>,0,0 tmux ls` listed B's
-  sessions). R4 refuses the recognizable spellings; it cannot refuse an assembled one
-  (`export T=…; …`, a helper script, an argv built structurally inside an interpreter).
-  Also unclosed: `~/.tmux.conf` written now and read by a later tmux, and plain non-tmux
-  damage (`pkill -f mlx_lm`, `launchctl bootout`, `rm` shapes `DestructiveCommandHeuristic`
-  misses).
+- **What is left of the guard: two rules about which server, plus five small ones.**
+  `TmuxCommandGuard` stopped classifying anything — no command table, no target
+  extraction, no allow-list. It refuses (R1) a tmux invocation naming a socket that is not
+  the daemon's own (`-S` beating `-L` the way tmux itself resolves them), (R1b) a
+  socket-less tmux that will not run in Fin's own shell — under `ssh`, `sudo`, `launchctl`,
+  `env -i` and the rest of a named list — because `$TMUX` does not survive those and tmux
+  would fall back to the machine's default socket, (R2) `kill-server` and every prefix tmux
+  would resolve to it, (R3) a signal aimed at tmux anywhere on the line (`pkill tmux`,
+  `kill $(pgrep tmux)`) — a signal crosses every socket — (R4) any command that unsets or
+  overrides `TMUX` or `TMUX_TMPDIR`, and (R5) a half-typed line (trailing `\` or open
+  quote) that mentions tmux, since the PTY joins consecutive sends. Ahead of all of them,
+  (R0) unless the LIVE shell confirms it is inside Fin's own tmux server — it is asked for
+  `$TMUX` before every tmux-bearing send, not once at launch — every tmux command is
+  refused, because a bare `tmux send-keys -t main …` names no socket for R1 to catch and a
+  shell that has left tmux would put it on Levi's server. Everything else on Fin's own
+  server — create, kill, rename, send keys, `run-shell` — is ordinary work: there is no
+  allow-list, and nothing to register. The lexer survives because finding the word `tmux`
+  through quoting, escaping, wrappers and interpreters is the part that was genuinely hard
+  (`t\mux`, `tm"u"x`, `$'tmux'`, `TMUX`, `sh -c '…'`, `find -exec`, `| sh`, `xargs tmux`).
+- **The residual risk, plainly** (the full list is in `daemon/README.md`). The agent's shell
+  runs as the **same UNIX user** as Levi, so the default socket is still *reachable* by a
+  process that opens it on purpose — and there are spellings that do exactly that with no
+  socket flag at all: tmux takes its socket path from `$TMUX` when neither `-L` nor `-S` is
+  given, and resolves `-L <label>` under `$TMUX_TMPDIR` (both verified on tmux 3.6a against
+  private sockets only). R4 refuses the recognizable spellings; it cannot refuse an
+  assembled one (`export T=…; …`, a helper script, an argv built structurally inside an
+  interpreter). R1b's list of environment-crossing wrappers is named rather than
+  fail-closed, because treating every unknown head as crossing refuses `man tmux` — so a
+  launcher nobody listed is still a route. And because the agent owns `/tmp/tmux-<uid>/`,
+  it could replace its own socket file with a symlink to Levi's, which no parser can see
+  (the dangerous command is an `ln`). Also unclosed: `~/.tmux.conf` written now and read by
+  a later tmux, and plain non-tmux damage (`pkill -f mlx_lm`, `launchctl bootout`, `rm`
+  shapes `DestructiveCommandHeuristic` misses).
 - **The airtight version, and what it costs.** Run the agent's SSH session as a
   **dedicated UNIX user**. tmux's socket directory is `0700` under `/tmp/tmux-<uid>`, so a
   different uid is refused by the KERNEL, not by a heuristic — `TMUX=` and every other
@@ -310,16 +320,21 @@ old `fin/sites/fin/<site8>/status.json` in S3 is left for the operator.
 
 ## What Phase 0 leaves broken
 
-Three things this package cannot fix from inside itself. All three are Phase 1/1.5.0 work;
-they are listed here so nobody discovers them as a surprise.
+Three things this package cannot fix from inside itself — the first needs a `sudo` step
+this installer deliberately does not take, the other two are Phase 1 work. They are listed
+here so nobody discovers them as a surprise.
 
-1. **`main` is off-limits by policy, not by isolation.** See the routing-registry bullet
-   above. `TmuxCommandGuard` now refuses mutating tmux commands aimed at unregistered
-   sessions before they reach the PTY, so a prompt paragraph is no longer the only thing
-   standing there — but the daemon still shares a tmux socket with Levi's live session on
-   the box where the fine-tune runs, and a byte-level guard cannot stop indirection
-   (`$T send-keys`, `eval`, a helper script, an alias). Isolation is the dedicated-socket
-   change, and it trades away Fin's ability to read `main`.
+1. **The isolation is a socket, not a uid.** This is no longer the old "off-limits by
+   policy" problem — Fin's shell runs on its own tmux server (`-L fin`), so Levi's sessions
+   do not exist in it, and `read_session` gives back the reading that costs (see the
+   security-model bullets above). What is still missing is KERNEL enforcement: the daemon
+   runs as Levi's own uid, so the default socket remains openable by anything that
+   deliberately opens it — an assembled `TMUX=`, a symlink dropped over Fin's own socket
+   path, a wrapper R1b does not name. The remaining isolation step is the **dedicated UNIX
+   user**: a different uid cannot open a `0700` `/tmp/tmux-<uid>` directory at all. It costs
+   one `sudo` step and a decision about what that user may read, and it needs a plan for
+   `read_session` (which runs as whoever the SSH session is). **Levi's call, not a TODO the
+   code can close by itself.**
 2. **The Mac stops idle-sleeping.** This site's inbox URL is signed `get_object` only, and
    `DaemonDirectiveClient` never writes the inbox back — it dedupes in its own ledger and
    leaves the object alone. The one writer that ever emptied `fin/inbox/fin.json` was the
