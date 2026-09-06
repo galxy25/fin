@@ -13,11 +13,19 @@ It walks BOTH directions:
                   results table names the rows that cover it, no sentence the
                   ledger *rejected* appears in a piece, and no banned phrase or
                   infrastructure name does either
+  row  -> itself  a rowed score carries its qualifiers IN the sentence, or the row
+                  declares the §4.3 carve-out and does not spend it on a headline
 
 The second direction is the one that enforces THE CLAIM RULE. It was missing
 until 2026-09-06, and an injected `published/` piece asserting a fabricated
 accuracy number, a ledger-rejected interlock sentence, two banned phrases and a
 real tailnet name passed this checker with `claims: []` and exit 0.
+
+The third was missing until 2026-09-06 too, and it is a subtler hole: a number
+CAN be rowed and still be the sentence `EX-BAD-1` rejects. `RPI-12` shipped
+"still reads 36/51" — no model, no corpus, no tier split — and passed, because
+"36/51" appeared in a row's claim text and that was the whole test. Coverage is
+not qualification. See `claims-ledger.md` §8.
 
 What it still CANNOT do is open an artifact and read it — the part that matters
 most. This is a floor, not the audit. It exits non-zero on any defect.
@@ -92,6 +100,30 @@ AVAILABILITY_PHRASES = (
 )
 
 EXCUSE_WORDS = ("never", "bad:", "do not", "don't", "forbid", "rejected", "avoid", "banned", "not say")
+
+# claims-ledger.md §4 step 3. A score carries its qualifiers IN the sentence: the
+# model identifier, the corpus, and the core/hard tier split. Two declarations in
+# the row's re-check column stand in for them, and both are decisions a reviewer
+# can audit rather than omissions a writer makes silently:
+#
+#   "carve-out"      §4.3's structurally-attached number. Checked further in
+#                    check_piece_to_rows: such a sentence may not be a heading or
+#                    the piece's title, which is what stops the phrase from being
+#                    typed into re-check to get past this check.
+#   "negated number" a figure present only in order to be refused (RPI-37). It
+#                    must NOT acquire qualifiers; that would make it an assertion.
+#
+# This is a shape test, not a reading. It cannot tell whether the model named is
+# the model that was run — that half is human work and always will be.
+CARVE_OUT_RE = re.compile(r"carve[-\s]?out", re.I)
+NEGATED_RE = re.compile(r"negated number", re.I)
+CORE_TIER_RE = re.compile(r"\bcore\b", re.I)
+OTHER_TIER_RE = re.compile(r"\b(hard|adversarial)\b", re.I)
+CORPUS_RE = re.compile(r"\bcorpus\b|\bscenarios?\b", re.I)
+BACKTICKED_RE = re.compile(r"`([^`\n]+)`")
+MODEL_WORD_RE = re.compile(r"\b(model|untuned|fine-tuned|finetuned|candidate|checkpoint|adapter)\b", re.I)
+NO_MODEL_RE = re.compile(r"\bno model\b", re.I)
+MODEL_ID_RE = re.compile(r"[A-Za-z0-9][\w.+-]*/[A-Za-z0-9][\w.+-]*")
 
 
 def norm(text: str) -> str:
@@ -214,6 +246,65 @@ def check_rows(rows: list[dict], problems: list[str]) -> dict[str, dict]:
             if not row["verified_by"] or row["verified_by"] in {"-", "—"}:
                 problems.append(f"{rid}: status '{status}' with no verifier (§1)")
     return by_id
+
+
+def names_a_model(claim: str) -> bool:
+    """True when the sentence names the model the score belongs to.
+
+    A model id is a backticked `publisher/name` token — exactly one slash, no
+    file extension — in a sentence that is also *about* a model. "no model at
+    all" counts: an arm with no model has named its model as precisely as it
+    can be named.
+
+    Known residual, stated rather than papered over: a sentence that says
+    "model" AND backticks a one-segment repo path (`evals/tmux-routing`) passes
+    without naming a model. Tightening that needs a list of real model ids,
+    which would go stale silently — a worse failure than this one, because it
+    would start rejecting true sentences. The check is a floor; the verifier
+    still reads the sentence.
+    """
+    if NO_MODEL_RE.search(claim):
+        return True
+    if not MODEL_WORD_RE.search(claim):
+        return False
+    for token in (t.strip() for t in BACKTICKED_RE.findall(claim)):
+        if token.count("/") != 1 or re.search(r"\.[A-Za-z0-9]{1,5}$", token):
+            continue
+        if MODEL_ID_RE.fullmatch(token):
+            return True
+    return False
+
+
+def check_score_qualifiers(rows: list[dict], problems: list[str]) -> None:
+    """THE CLAIM RULE applied to the sentence, not just to its coverage.
+
+    Rows are checked rather than pieces because the verbatim check above already
+    proves the row's claim IS the piece's sentence — and rows reach further:
+    `STYLE.md` copy blocks and the §5 teaching examples live in no piece at all.
+    """
+    for row in rows:
+        if row["status"] in {"rejected", "retired"}:
+            continue  # a rejected row's whole purpose can be to carry the bad shape
+        claim = row["claim"]
+        if not SCORE_RE.search(claim):
+            continue
+        if CARVE_OUT_RE.search(row["recheck"]) or NEGATED_RE.search(row["recheck"]):
+            continue
+        missing = []
+        if not names_a_model(claim):
+            missing.append("a model identifier")
+        if not CORPUS_RE.search(claim):
+            missing.append("the corpus")
+        if not (CORE_TIER_RE.search(claim) and OTHER_TIER_RE.search(claim)):
+            missing.append("the tier split")
+        if missing:
+            problems.append(
+                f"{row['id']}: a sentence carrying a score is missing {' and '.join(missing)}, "
+                f"and re-check declares neither a carve-out nor a negated number "
+                f"(claims-ledger.md §4 step 3) — this is the EX-BAD-1 shape. Either put the "
+                f"qualifiers in the sentence, or use the carve-out and say so in re-check. "
+                f"Claim: {norm(claim)[:80]}"
+            )
 
 
 def check_approval(rel: str, stage: str, fm: dict, text: str, problems: list[str]) -> None:
@@ -363,6 +454,30 @@ def check_piece_to_rows(
                     f"claim needs a build number in App Store Connect (ledger §2)"
                 )
 
+    # 4b. §4 step 3's other half, which only the piece can show: a number riding
+    #     on the carve-out may "never be the piece's most quotable sentence — not
+    #     the title, not a subhead". Without this, `carve-out` typed into re-check
+    #     would buy an unqualified headline, which is EX-BAD-1 with paperwork.
+    heads = [norm(line).lstrip("#").strip() for line in lines if line.lstrip().startswith("#")]
+    title = norm(fm.get("title") or "")
+    for cid in declared:
+        row = by_id.get(cid)
+        if not row or not SCORE_RE.search(row["claim"]):
+            continue
+        if not CARVE_OUT_RE.search(row["recheck"]):
+            continue
+        claim = norm(row["claim"]).rstrip(".").strip()
+        where = "the title" if claim and title and claim in title else None
+        if not where and any(claim and claim in head for head in heads):
+            where = "a heading"
+        if where:
+            problems.append(
+                f"{rel}: {cid} declares the §4.3 carve-out but its sentence is {where} — "
+                f"a carve-out number may never be the most quotable line in the piece "
+                f"(claims-ledger.md §4 step 3). Qualify it in the sentence instead. "
+                f"Claim: {claim[:80]}"
+            )
+
     # 5. Infrastructure names. STYLE.md §2's one written exemption is the
     #    loopback endpoint and model identifier in reproduction commands, and
     #    code fences are already stripped out above.
@@ -434,6 +549,7 @@ def main() -> int:
 
     rows = parse_ledger(ledger_path)
     by_id = check_rows(rows, problems)
+    check_score_qualifiers(rows, problems)
     live_rows = [r for r in rows if r["piece"].startswith(STAGES)]
     rejected = [r for r in rows if r["status"] == "rejected"]
 

@@ -27,13 +27,14 @@ published_at: ""
 > lab-book entry for the prompt-iteration experiment must be added to the
 > front matter and cited in the body — a published result cites the book.
 >
-> **Blocking: the prompt this piece measures has since been corrected and not
-> re-scored.** Commit `7a591f4`, on the unmerged `imac-site` branch, rewrites
-> the registry paragraph of `evals/tmux-routing/prompts/router.md` and says in
-> its own inline comment to "re-score `router_llm.py` against it when a local
-> endpoint is up again." Until that re-score exists, 49/51 describes a prompt
-> revision the tree is already moving away from. See "Corrections owed
-> upstream" at the bottom.
+> **Blocking: the prompt this piece measures has since been corrected twice and
+> not re-scored.** Commits `7a591f4` and `f0ca4af`, both on the unmerged
+> `imac-site` branch, rewrite the registry paragraph of
+> `evals/tmux-routing/prompts/router.md` — the second correcting the first —
+> and the surviving inline comment still says to "re-score `router_llm.py`
+> against it when a local endpoint is up again." Until that re-score exists,
+> 49/51 describes a prompt revision the tree is already moving away from. See
+> "Corrections owed upstream" at the bottom.
 
 # Same untuned `google/gemma-4-e4b`, two router prompts: 36/51 with the original, 49/51 with round 3, on the 51-scenario tmux-routing corpus (26 core, 25 hard)
 
@@ -291,14 +292,19 @@ prompt, and neither has been run.
   the model produced the right JSON, and nothing more. It is not evidence about
   what a running Fin does with that decision, and it is not a safety property:
   the send-path allow-list that would make it one lives on an unmerged branch.
-- **The prompt has moved since.** The round-3 prompt was corrected on
-  2026-09-06 by `7a591f4` (unmerged), which is explicit that a re-score is
-  owed. 49/51 is a fact about `99ed9d9`, not about whatever ships next.
+- **The prompt has moved since — twice.** The round-3 prompt was corrected on
+  2026-09-06 by `7a591f4` and again by `f0ca4af`, both on the unmerged
+  `imac-site` branch; the second rewrites the first's correction, and its
+  inline comment (now headed "Corrected 2026-09-06 (twice)") is still explicit
+  that a re-score is owed. 49/51 is a fact about `99ed9d9`, not about whatever
+  ships next.
 - **It does not move the champion.** The champion record in
-  `scripts/model-factory/evals-champions.json` still reads 36/51, because it
-  was seeded from the pre-rework run and a prompt change does not promote a
-  champion. A candidate promotes only by passing all 26 core scenarios and
-  beating the champion on core + hard combined.
+  `scripts/model-factory/evals-champions.json` still reads 36/51 for the
+  untuned `google/gemma-4-e4b` on the 51-scenario tmux-routing corpus — core
+  21/26, hard 15/25, with the original router prompt — because it was seeded
+  from that pre-rework run and a prompt change does not promote a champion. A
+  candidate promotes only by passing all 26 core scenarios and beating the
+  champion on core + hard combined.
 - **Bigger local models were not evaluated.** Two larger local models were
   unusable under the harness's 30-second per-call contract: `gemma-4-12b-qat`
   spends about 40 seconds per call on reasoning tokens, and `gemma-4-26b-a4b`
@@ -423,7 +429,11 @@ in sync, and the ledger is the copy that gets audited.
       number at all
 - [x] Every quotable sentence carries model + prompt revision + corpus +
       tiering, in the sentence; secondary numbers name their round and tier
-      (`claims-ledger.md` §4 step 3)
+      (`claims-ledger.md` §4 step 3). **This box was ticked on 2026-09-06 while
+      the champion sentence in "What this does not show" carried none of the
+      four and claimed no carve-out (`RPI-12`). Corrected the same day, and
+      `check-claims.py` now enforces the box instead of trusting it — see
+      `claims-ledger.md` §8.**
 - [x] The losing arms and the regressions are in the results table
 - [x] Flake/timeout counts are reported and marked as non-semantic
 - [x] Run count is stated as **unrecorded**; no averaging or best-of is implied

@@ -114,6 +114,20 @@ proposed ──▶ verified ──▶ approved ──▶ published ──▶ sta
 
    Rows that use the carve-out say so in the **re-check** column, so a later
    reviewer knows the omission was a decision and not an oversight.
+
+   **`check-claims.py` enforces the shape of this.** Any row whose claim
+   sentence carries a score must do one of three things, and the checker fails
+   the row if it does none: carry a model identifier, a corpus and a core/hard
+   tier split **in the sentence**; or say **carve-out** in **re-check**, which
+   is a declaration a reviewer can then check by hand; or, for a figure that
+   appears only in order to be refused (`RPI-37`), say **negated number**. A
+   row that declares the carve-out may not have its sentence appear in a
+   heading or in the piece's `title:` — that is the "never the most quotable
+   sentence" half, and it is the reason the declaration cannot simply be typed
+   to get past the check. This is a shape test, not a reading: it cannot tell
+   whether the model named is the model that was run. It exists because
+   `RPI-12` shipped a bare `36/51` past a green checker (§8), and it would have
+   failed that row.
 4. For `performance`: confirm the number, the denominator, the tiering split,
    the model identifier, the prompt revision, and the run count all match the
    artifact. Confirm the sentence does not generalize from a configuration to a
@@ -257,19 +271,57 @@ and link to the piece that can (see `templates/social-post.md`).
 | **piece** | *example only* |
 | **claim** | "Fin's fine-tuned foreman model beats the untuned baseline on the routing gate." |
 | **kind** | performance |
-| **evidence** | `scripts/model-factory/README.md` |
+| **evidence** | `scripts/model-factory/README.md` — what the sentence cites, and it is a plan |
 | **verified by** | — |
 | **verified** | — |
 | **status** | **rejected** |
-| **re-check** | n/a |
+| **re-check** | n/a. The rejection stands; its *rationale* was rewritten on 2026-09-06 because the original one was false — see §8 |
 
-**Why it fails.** No fine-tune has been run. `scripts/model-factory/README.md`
-lists "First fine-tune run (**human go required**)" as an unchecked box, and
-`evals-champions.json` records only the untuned model. The cited artifact is a
-*plan*; the sentence is written as a *result*. Kind is also wrong: at best this
-is `roadmap` ("a fine-tuned model is next, and it only ships if it beats the
-untuned score on the same corpus"), and that version cites the promotion rule
-in the same README, which does exist.
+**Why it fails.** A fine-tune **has** been run against this target, and it is
+still running. The first line of
+`models/candidates/fin-foreman-e4b-mlx/train.log` is `=== TRAIN START
+2026-09-05 20:15:29 pid 18405 base=mlx-community/gemma-4-E4B-it-qat-4bit ===`;
+the same directory holds sixteen checkpoint adapter files, an
+`adapter_config.json` recording a 4490-iteration LoRA run, and a log that was
+still being appended to on 2026-09-06. What has **not** happened is everything
+between a training run and this sentence's claim. The runbook that sits beside
+the log — `fuse-and-gate.md`, steps 1–4: fuse, serve, re-record the champion,
+gate — has not been executed: there is no
+`models/candidates/fin-foreman-e4b-fused` directory, no `gate.json`, and no
+`models/champion.json`. `scripts/model-factory/evals-champions.json` is
+byte-unchanged since it was seeded at `a823271` and still records the untuned
+`google/gemma-4-e4b` at 36/51 — core 21/26, hard 15/25 — on the 51-scenario
+tmux-routing corpus. No candidate has been fused, no candidate has been served,
+no candidate has been scored, and nothing has been compared with a baseline.
+The cited artifact is a *plan*; the sentence is written as a *result*, and the
+result exists in no artifact. Kind is also wrong: at best this is `roadmap`
+("a fine-tuned model is next, and it only ships if it beats the untuned score
+on the same corpus"), and that version cites the promotion rule in the same
+README, which does exist.
+
+**This example was itself caught committing its own error.** Until 2026-09-06
+the paragraph above began "No fine-tune has been run. `scripts/model-factory/README.md`
+lists 'First fine-tune run (**human go required**)' as an unchecked box" — a
+negative claim about work, verified from a plan document's unchecked checkbox,
+sitting in the same file whose §4 standing hazard forbids exactly that and
+names it "`EX-BAD-2` run backwards". It was already false when it was written:
+the run had started the previous evening. The checkbox is still unchecked
+today, and the checkbox was never the artifact — the training log is.
+
+It is kept here rather than quietly replaced because of *how* it survived. The
+rationale was written in `5b95672`, the commit that created this file. Two
+commits later `0be1f62` added §4's standing hazard **and** corrected the two
+live rows that had made the identical mistake — `RPI-25` and `RPI-35`, both
+still marked "Added 2026-09-06" for that reason — and left this one standing,
+in the section whose entire job is to teach the rule. Writing a rule, applying
+it to the rows in front of you, and not re-reading the worked examples is an
+ordinary way to keep an error, and nothing in `check-claims.py` could have
+caught it. **A machine cannot open an artifact; that half of this ledger
+is human work, and this is what it costs when nobody does it.** Note also what
+the corrected rejection needs: two paths under `models/`, which is gitignored
+(`RPI-35`), so a reader who has only the repository cannot check this example
+at all — which is why the evidence quotes the log's first line instead of
+pointing at it.
 
 ---
 
@@ -298,29 +350,36 @@ lab-book entry id for the prompt-iteration experiment to every row here** — th
 published piece must cite the book, not only the repo.
 
 **Standing hazard on this whole block.** The prompt these rows describe has
-already been corrected on an unmerged branch: `7a591f4` (2026-09-06, branch
-`imac-site`, not an ancestor of `main @ 704ab09`) rewrites the registry
-paragraph of `evals/tmux-routing/prompts/router.md`, and its own inline comment
-says to "re-score `router_llm.py` against it when a local endpoint is up
-again." Every row whose re-check names the prompt goes `stale` on that merge.
-A ledger that only ever looks at `main` cannot see this coming, so it is
-written down here instead: **before this piece moves out of `review/`, diff
-`prompts/router.md` across every live branch, not just `main`.**
+already been corrected **twice** on an unmerged branch. `git log 704ab09..imac-site
+-- evals/tmux-routing/prompts/router.md` on 2026-09-06 returns two commits,
+neither an ancestor of `main @ 704ab09`: `7a591f4` (09:52) rewrites the registry
+paragraph of `evals/tmux-routing/prompts/router.md`, and `f0ca4af` (12:22)
+rewrites `7a591f4`'s own correction after the private-socket design deleted the
+`fin-` namespace it had just introduced. The surviving inline comment, now
+headed "Corrected 2026-09-06 (twice)", still says to "re-score `router_llm.py`
+against it when a local endpoint is up again." Every row whose re-check names
+the prompt goes `stale` on that merge. **This entry was itself incomplete until
+2026-09-06: it named only `7a591f4`, because it was written from one commit
+rather than from the commit range** — which is why the instruction below is a
+range diff and not a commit lookup. A ledger that only ever looks at `main`
+cannot see any of this coming, so it is written down here instead: **before this
+piece moves out of `review/`, run that range diff again across every live
+branch, not just `main`.**
 
 | id | piece | claim (exact text as published) | kind | evidence | verified by | verified | status | re-check |
 |---|---|---|---|---|---|---|---|---|
 | RPI-01 | drafts/2026-09-06-router-prompt-iteration.md | "`evals/tmux-routing/scenarios.json` — 51 labeled scenarios, **26 core** and **25 adversarial** (`h01`–`h25`)." | method | `evals/tmux-routing/RESULTS.md @ d98a031` ("51 scenarios (26 original + 25 adversarial `h01`–`h25`)"); corpus file `evals/tmux-routing/scenarios.json @ 704ab09` | Claude Opus 5 (agent) | 2026-09-06 | verified | on any change to `scenarios.json`; the counts are the qualifier. Re-filed from `capability` to `method` on 2026-09-06: it is a fact about an artifact, not something Fin can do |
 | RPI-02 | drafts/2026-09-06-router-prompt-iteration.md | "The deterministic baseline router, which uses no model at all, scores 29/51 on the same 51-scenario corpus: 26/26 on core and 3/25 on the adversarial set." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, Overall table, row "baseline (`router_baseline.py`)" | Claude Opus 5 (agent) | 2026-09-06 | verified | on any change to `router_baseline.py` or `scenarios.json`. **Carve-out (§4.3):** no model qualifier, because this arm uses no model — the sentence says so; corpus and tiering are in the sentence |
 | RPI-03 | drafts/2026-09-06-router-prompt-iteration.md | "With the original router prompt (`evals/tmux-routing/prompts/router.md @ 96ea006`), the untuned `google/gemma-4-e4b` — served through LM Studio at temperature 0 with a 30-second per-call timeout — scored 36/51 on the 51-scenario tmux-routing corpus: core 21/26, hard 15/25." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, Overall table row "model, original prompt" and the run-conditions paragraph ("LM Studio at `http://localhost:1234/v1`, model `google/gemma-4-e4b`, temperature 0, 30s/call timeout"); same figures in `scripts/model-factory/evals-champions.json`; the prompt revision is `evals/tmux-routing/prompts/router.md @ 96ea006` — the harness's initial commit, established by `git log -- evals/tmux-routing/prompts/router.md`, whose next touch is round 1 at `22005c7` | Claude Opus 5 (agent) | 2026-09-06 | verified | on any re-run, model change, or corpus change. **Note:** neither `RESULTS.md` nor `evals-champions.json` records a prompt sha for this arm — the sha above is recovered from the file's commit history, and it is the weakest link in the row. Anyone re-running this must record the prompt sha in the artifact |
-| RPI-04 | drafts/2026-09-06-router-prompt-iteration.md | "With the round-3 prompt (`evals/tmux-routing/prompts/router.md @ 99ed9d9`) — the same untuned `google/gemma-4-e4b`, the same endpoint, the same settings, the same 51-scenario corpus — the score is 49/51: core 25/26, hard 24/25." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, Overall table row "model, reworked prompt" and rounds table row 3; prompt `evals/tmux-routing/prompts/router.md @ 99ed9d9` ("Settle on the round-3 prompt"), byte-identical to `fcb10b2` where round 3 was introduced (blob `c511bab`), unchanged as of `main @ 704ab09` | Claude Opus 5 (agent) | 2026-09-06 | verified | **the moment `prompts/router.md` changes on any branch, or the model changes.** This row is a claim about a (model, prompt) pair; either half moving voids it. **Already pending:** `7a591f4` on `imac-site` changes that file and asks for a re-score — see the standing hazard above. This row goes `stale` on that merge |
+| RPI-04 | drafts/2026-09-06-router-prompt-iteration.md | "With the round-3 prompt (`evals/tmux-routing/prompts/router.md @ 99ed9d9`) — the same untuned `google/gemma-4-e4b`, the same endpoint, the same settings, the same 51-scenario corpus — the score is 49/51: core 25/26, hard 24/25." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, Overall table row "model, reworked prompt" and rounds table row 3; prompt `evals/tmux-routing/prompts/router.md @ 99ed9d9` ("Settle on the round-3 prompt"), byte-identical to `fcb10b2` where round 3 was introduced (blob `c511bab`), unchanged as of `main @ 704ab09` | Claude Opus 5 (agent) | 2026-09-06 | verified | **the moment `prompts/router.md` changes on any branch, or the model changes.** This row is a claim about a (model, prompt) pair; either half moving voids it. **Already pending:** two commits on `imac-site` change that file and ask for a re-score — `7a591f4` and `f0ca4af`, the second correcting the first; `git log 704ab09..imac-site -- evals/tmux-routing/prompts/router.md` is the search, and it returned only one commit the first time this row was written. See the standing hazard above. This row goes `stale` on that merge |
 | RPI-05 | drafts/2026-09-06-router-prompt-iteration.md | "Nothing about the model changed between those two runs — same weights, same serving stack, same settings, the untuned model in both arms — so the prompt was the whole intervention." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`: one run-conditions paragraph ("model `google/gemma-4-e4b`, temperature 0, 30s/call timeout") governs every model row in both tables, and the rounds table varies only the prompt | Claude Opus 5 (agent) | 2026-09-06 | verified | on any re-run of either arm. **Rewritten 2026-09-06.** It read "no fine-tune", evidenced on an unchecked box in `scripts/model-factory/README.md` — a plan document. A QLoRA run for this target had in fact been training since 2026-09-05 (see RPI-25). The sentence is now a statement about the two arms, evidenced on the run artifact, and carries no claim about what exists elsewhere |
 | RPI-06 | drafts/2026-09-06-router-prompt-iteration.md | "Round 1 scored 46/51 and round 2 scored 48/51 on that corpus." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, rounds table, rows 1 and 2 | Claude Opus 5 (agent) | 2026-09-06 | verified | on any re-run of those prompt revisions. **Carve-out (§4.3):** a secondary number inside the Results section, whose table row names the prompt sha and the tier split, and whose section headline carries all four qualifiers. It is not quotable alone as a claim about the product because it names a round, not Fin |
 | RPI-07 | drafts/2026-09-06-router-prompt-iteration.md | "Round 4 fixed both of round 3's remaining misses and broke three scenarios that round 3 had passed — `r06`, `h01`, `h12` — for a net 48/51, so round 3 is the prompt we kept" | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, rounds table row 4 (48/51, misses `r06 h01 h12`) and the paragraph "Round 4 fixed the last two (c01, h08) but its stronger generic-word clamp regressed three others"; the keep decision is commit `99ed9d9`; round 4 is `e7460cd` | Claude Opus 5 (agent) | 2026-09-06 | verified | if round 4 or a later round is ever re-scored. Carve-out (§4.3): names its round |
 | RPI-08 | drafts/2026-09-06-router-prompt-iteration.md | "Two scenarios still fail under the round-3 prompt: `c01` in the core set and `h08` in the hard set." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, rounds table row 3 (misses `c01 h08`) and the "Remaining misses (round-3 prompt)" table | Claude Opus 5 (agent) | 2026-09-06 | verified | on any re-run; a miss set from one recorded score is not guaranteed stable. Goes `stale` with RPI-04 when the prompt changes. Carve-out (§4.3): names its prompt revision and both tiers |
 | RPI-09 | drafts/2026-09-06-router-prompt-iteration.md | "Two of the misses recorded in rounds 1 and 2 were 30-second endpoint timeouts rather than wrong answers — one in each round — and rounds 3 and 4 recorded none." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, rounds table daggers on `h21` (round 1) and `r01` (round 2) with the footnote "= 30s endpoint timeout, not a semantic miss (`decide()` degrades to clarify). One flake each in rounds 1–2, none in rounds 3–4." | Claude Opus 5 (agent) | 2026-09-06 | verified | on any re-run — flake counts are per-run and will differ. Carve-out (§4.3): names its rounds; it is a count of flakes, not a score |
 | RPI-10 | drafts/2026-09-06-router-prompt-iteration.md | "Two larger local models were unusable under the harness's 30-second per-call contract: `gemma-4-12b-qat` spends about 40 seconds per call on reasoning tokens, and `gemma-4-26b-a4b` did not fit in the available memory on the machine we scored on." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, run-conditions paragraph ("`gemma-4-12b-qat` spends ~40s/call on reasoning tokens; `gemma-4-26b-a4b` refuses to load for lack of memory") | Claude Opus 5 (agent) | 2026-09-06 | verified | hardware- and build-specific; re-check on any change of machine, model build, or the 30s timeout. **Wording note:** `RESULTS.md` says "on the box"; `STYLE.md` §1 puts "boxes" on the never-say list for the machines Fin runs on, so the published sentence says "the machine we scored on" |
-| RPI-11 | drafts/2026-09-06-router-prompt-iteration.md | "This number describes the eval harness, not the shipped app: Fin's in-app router carries guidance that tracks the round-3 prompt, but it is assembled by different code and has not been scored end to end in the app." | method | `daemon/Sources/FinAgentCore/SessionRouting.swift @ 704ab09`, `SessionRouter.promptSection` — doc comment "derived from evals/tmux-routing/prompts/router.md" and the in-body comment "Guidance text tracks evals/tmux-routing/prompts/router.md (round-3 prompt, 49/51 on the corpus) — edit THERE first, re-score, then sync here"; no in-app scoring artifact exists anywhere under `evals/` at `704ab09` | Claude Opus 5 (agent) | 2026-09-06 | verified | when an app-level routing eval lands, this sentence must be rewritten rather than dropped. Re-filed from `capability` to `method` on 2026-09-06: it is a statement about what has **not** been measured, and a verifier applying the `capability` procedure would go looking for an implementing commit that by construction does not exist |
-| RPI-12 | drafts/2026-09-06-router-prompt-iteration.md | "The champion record in `scripts/model-factory/evals-champions.json` still reads 36/51, because it was seeded from the pre-rework run and a prompt change does not promote a champion." | performance | `scripts/model-factory/evals-champions.json @ 704ab09` (overall 36/51, `note: "untuned local model via LM Studio; the score to beat until a fine-tuned candidate promotes"`); promotion rule in `scripts/model-factory/README.md @ 704ab09` § "Eval gate" | Claude Opus 5 (agent) | 2026-09-06 | verified | on any edit to `evals-champions.json` or the first promotion |
+| RPI-11 | drafts/2026-09-06-router-prompt-iteration.md | "This number describes the eval harness, not the shipped app: Fin's in-app router carries guidance that tracks the round-3 prompt, but it is assembled by different code and has not been scored end to end in the app." | method | `daemon/Sources/FinAgentCore/SessionRouting.swift @ 704ab09`, `SessionRouter.promptSection` — doc comment "derived from evals/tmux-routing/prompts/router.md" and the in-body comment "Guidance text tracks evals/tmux-routing/prompts/router.md (round-3 prompt, 49/51 on the corpus) — edit THERE first, re-score, then sync here"; the search behind the negative half is `git ls-tree -r 704ab09 -- evals/`, which lists only `evals/goals-ledger/` and `evals/tmux-routing/` — no in-app scoring artifact anywhere. The nearest thing that exists is `daemon/Tests/FinAgentCoreTests/SessionRoutingTests.swift @ 704ab09`, and it is not a counter-example: it asserts the **deterministic** router's decision case by case (`testR01…`, `testC01…`, `testF01…`) and produces no score, no model call and no accuracy figure | Claude Opus 5 (agent) | 2026-09-06 | verified | when an app-level routing eval lands, this sentence must be rewritten rather than dropped. Re-filed from `capability` to `method` on 2026-09-06: it is a statement about what has **not** been measured, and a verifier applying the `capability` procedure would go looking for an implementing commit that by construction does not exist |
+| RPI-12 | drafts/2026-09-06-router-prompt-iteration.md | "The champion record in `scripts/model-factory/evals-champions.json` still reads 36/51 for the untuned `google/gemma-4-e4b` on the 51-scenario tmux-routing corpus — core 21/26, hard 15/25, with the original router prompt — because it was seeded from that pre-rework run and a prompt change does not promote a champion." | performance | `scripts/model-factory/evals-champions.json @ 704ab09` (`modelId: google/gemma-4-e4b`, core 21/26, hard 15/25, overall 36/51, `note: "untuned local model via LM Studio; the score to beat until a fine-tuned candidate promotes"`); the arm is the original prompt — `evals/tmux-routing/RESULTS.md @ d98a031` row "model, original prompt" carries the same 36/51 · 21/26 · 15/25, and no other recorded arm does; promotion rule in `scripts/model-factory/README.md @ 704ab09` § "Eval gate" | Claude Opus 5 (agent) | 2026-09-06 | verified | on any edit to `evals-champions.json` or the first promotion. **No carve-out (§4.3), and none is available here:** the sentence sits under the heading "What this does not show", which carries none of the four qualifiers, so it must and now does carry the model, the corpus, the tier split and the prompt arm itself. **Corrected 2026-09-06** — until this revision the sentence read "still reads 36/51, because it was seeded from the pre-rework run", a bare score with no model, no corpus and no tiering, and this column claimed no carve-out because none had been considered. That is the `EX-BAD-1` shape inside the ledger's own live rows; see §8 |
 | RPI-13 | drafts/2026-09-06-router-prompt-iteration.md | "The gain from round 0 to round 3 is concentrated in one decision type: `start` went from 4/13 to 13/13, while `route` moved 21/24 to 23/24, `clarify` 7/10 to 9/10, and `refuse` stayed 4/4." | performance | `evals/tmux-routing/RESULTS.md @ d98a031`, Overall table, per-action columns for rows "model, original prompt" and "model, reworked prompt" | Claude Opus 5 (agent) | 2026-09-06 | verified | on any re-run; the per-action split comes from the same recorded scores as the totals. Carve-out (§4.3): names both rounds, inside the Results section |
 | RPI-14 | drafts/2026-09-06-router-prompt-iteration.md | "Same untuned `google/gemma-4-e4b`, two router prompts: 36/51 with the original, 49/51 with round 3, on the 51-scenario tmux-routing corpus (26 core, 25 hard)" | performance | the title and H1; the numbers are RPI-03 and RPI-04's evidence — `evals/tmux-routing/RESULTS.md @ d98a031` Overall table, with `prompts/router.md @ 96ea006` (original) and `@ 99ed9d9` (round 3) | Claude Opus 5 (agent) | 2026-09-06 | verified | goes `stale` whenever RPI-03 or RPI-04 does. **This row exists because the title is the sentence most likely to travel alone.** It carries the model, both prompt revisions by round, the corpus and the tiering; it deliberately does not say "Fin", because a headline naming Fin and a score is the EX-BAD-1 failure |
 | RPI-15 | drafts/2026-09-06-router-prompt-iteration.md | "Fin's router emits one of four decisions for every request: `route` to an existing registered session, `start` a new one, `clarify` when the request is genuinely ambiguous, or `refuse` when the target is a live session that was never registered with Fin." | capability | `daemon/Sources/FinAgentCore/SessionRouting.swift @ 704ab09`, `enum RoutingDecision` — the four cases with their doc comments ("Deliver to an existing, registered session", "Create a new coding-agent session for this task", "Ambiguous — ask the user instead of guessing", "Target exists but is not registered/fin-created — off-limits") and `var action` returning exactly `route`/`start`/`clarify`/`refuse`; same contract in `evals/tmux-routing/prompts/router.md @ 99ed9d9` | Claude Opus 5 (agent) | 2026-09-06 | verified | on any change to `RoutingDecision`'s cases or the JSON contract |
@@ -347,7 +406,7 @@ written down here instead: **before this piece moves out of `review/`, diff
 | RPI-35 | drafts/2026-09-06-router-prompt-iteration.md | "`datasets/` and `models/` are both gitignored, so no reader can check either the rule or the caveat against an actual training split." | method | `.gitignore @ 704ab09` lines `/datasets/` and `/models/` | Claude Opus 5 (agent) | 2026-09-06 | verified | if either tree is committed. **Added 2026-09-06.** This is the blind spot that produced the two errors this revision fixed: a ledger verified against `main` cannot see a training run or a dataset that exists on disk, and it will state their absence with confidence. §4's standing hazard now says so in general |
 | RPI-36 | drafts/2026-09-06-router-prompt-iteration.md | its Status list still carries "First fine-tune run (**human go required**)" as an unchecked box, while a QLoRA run for that target has been training since 2026-09-05. | method | `scripts/model-factory/README.md @ 704ab09`, Status list: "- [ ] First fine-tune run (**human go required** — see Hard rule)"; `models/candidates/fin-foreman-e4b-mlx/train.log` and `launch-train.sh`, per RPI-25 | Claude Opus 5 (agent) | 2026-09-06 | verified | when the README's Status list is corrected. Filed under "Corrections owed upstream" in the piece: this is a defect in an artifact the piece cites, and it is the third one. The piece must not be the only place the repo's own status is stated correctly |
 
-| RPI-37 | drafts/2026-09-06-router-prompt-iteration.md | **Nobody should read this post as "Fin routes correctly 96% of the time."** That number does not exist yet. | method | `daemon/Sources/FinAgentCore/SessionRouting.swift @ 704ab09` — the app assembles its own prompt in `SessionRouter.promptSection` and no in-app routing eval exists anywhere under `evals/` at `704ab09`, so no artifact records an end-to-end app accuracy figure; the 96% that does exist is `49/51` in `evals/tmux-routing/RESULTS.md @ d98a031`, a harness number for one (model, prompt) pair on 51 scenarios | Claude Opus 5 (agent) | 2026-09-06 | verified | when an app-level routing eval lands, at which point the sentence is rewritten around the real number rather than deleted. **This is the piece's single most important sentence and it needed a row for the same reason the title did:** it is the one that names, in a reader's own words, the false inference the numbers invite. It is also the only percentage in the body, and it exists to be negated — the checker requires it to be rowed precisely so that a later edit cannot quietly drop the negation and leave the figure standing |
+| RPI-37 | drafts/2026-09-06-router-prompt-iteration.md | **Nobody should read this post as "Fin routes correctly 96% of the time."** That number does not exist yet. | method | `daemon/Sources/FinAgentCore/SessionRouting.swift @ 704ab09` — the app assembles its own prompt in `SessionRouter.promptSection` and no in-app routing eval exists anywhere under `evals/` at `704ab09`, so no artifact records an end-to-end app accuracy figure; the 96% that does exist is `49/51` in `evals/tmux-routing/RESULTS.md @ d98a031`, a harness number for one (model, prompt) pair on 51 scenarios | Claude Opus 5 (agent) | 2026-09-06 | verified | **Negated number (§4.3):** the 96% is present only in order to be refused, so it carries no model, corpus or tier split and must not acquire any — qualifying it would turn a refusal into a measurement. This is the third of §4 step 3's three declarations, and it is why `check-claims.py` does not demand qualifiers here. When an app-level routing eval lands, the sentence is rewritten around the real number rather than deleted. **This is the piece's single most important sentence and it needed a row for the same reason the title did:** it is the one that names, in a reader's own words, the false inference the numbers invite. It is also the only percentage in the body, and it exists to be negated — the checker requires it to be rowed precisely so that a later edit cannot quietly drop the negation and leave the figure standing |
 
 **Notes on the RPI rows.**
 
@@ -423,3 +482,40 @@ The `CB` rows below are the standing ones.
 | CB-8 | `STYLE.md` §3 | "Fin asks you to register it instead of typing into it" | capability | `daemon/Sources/FinAgentCore/SessionRouting.swift @ 704ab09`, `RoutingDecision.refuse` and the `decide()` guardrail branch returning "register it before Fin will send keys there"; `evals/tmux-routing/prompts/router.md @ 99ed9d9`, "Live but not registered → OFF-LIMITS … say what you found and ask the user to register it" | Claude Opus 5 (agent) | 2026-09-06 | verified | rewrite when `imac-site` merges and enforcement exists. This is `CB-2` in short form: it is in **decision voice** ("asks"), which is what makes it publishable while `CB-1` and `CB-7` are not. It describes what Fin is built to do, and the `refuse` decision is scored on 4/4 refuse scenarios in `RESULTS.md @ d98a031` — scoring the decision, not the enforcement (RPI-16) |
 | CB-9 | `STYLE.md` §3 | "When it is genuinely ambiguous, Fin asks." | capability | `daemon/Sources/FinAgentCore/SessionRouting.swift @ 704ab09`: `RoutingDecision.clarify(question:reason:)` with the doc comment "Ambiguous — ask the user instead of guessing", and the router doc comment "collisions surface as `clarify`, never a silent pick" | Claude Opus 5 (agent) | 2026-09-06 | verified | on any change to the `clarify` case. Decision voice, and the decision exists in code. Note what it does **not** say: nothing about how often the model reaches it correctly. `c01` is a scenario where it should have clarified and did not (RPI-32) |
 | CB-10 | `STYLE.md` §3 | "When Fin hits a wall it cannot pass — a login, a 2FA prompt, a missing credential — it is built to ask you instead of guessing or stalling." | capability | `daemon/Sources/FinAgentCore/AgentTools.swift @ 704ab09`, the `request_input` tool: "Ask the user a question when you are blocked without their answer — a choice only they can make, a credential, an ambiguous instruction. Notifies them and returns immediately; their next message is the answer." Also `AgentIntentClassifier.ownToolNames` and `GoalsLedgerTests` | Claude Opus 5 (agent) | 2026-09-06 | verified | on any change to the `request_input` tool. **"is built to" is doing real work in this sentence and must not be edited out.** The tool exists and the model may call it; **no eval measures whether it calls it at a login prompt**, and the tool description names a credential but neither a login nor 2FA. Written as "Fin asks you when it hits a login" this becomes a behavioural claim with no measurement behind it |
+
+---
+
+## 8. Corrections to this ledger itself
+
+This file states a rule and then applies it, in the same document — and it has
+now failed its own rules three times: twice outright, and once by searching too
+narrowly. All three are recorded here rather than quietly edited, for the
+reason `README.md` §1 gives for the internal record: a correction nobody can
+see is indistinguishable from a claim nobody checked. A ledger that logs its
+own failures is worth more than one that appears never to have had any.
+
+| date | where | the rule it broke | what it said | what the artifact shows | the fix |
+|---|---|---|---|---|---|
+| 2026-09-06 | `EX-BAD-2`'s rationale (§5) — written in `5b95672`, left standing by `0be1f62`, the commit that added the rule it breaks | §4's standing hazard — "A negative claim about work that has not happened may never be verified from a plan document's unchecked checkbox … Reading an unchecked box as evidence the work has not been done is `EX-BAD-2` run backwards" | "No fine-tune has been run. `scripts/model-factory/README.md` lists 'First fine-tune run (**human go required**)' as an unchecked box" | `models/candidates/fin-foreman-e4b-mlx/train.log` line 1: `=== TRAIN START 2026-09-05 20:15:29 pid 18405 base=mlx-community/gemma-4-E4B-it-qat-4bit ===`; sixteen checkpoint adapters beside it; the log still being appended to on 2026-09-06 | rationale rewritten onto the artifacts that actually support the verdict — no fused model, no `gate.json`, no `models/champion.json`, `evals-champions.json` unchanged. Verdict unchanged: still **rejected**, for real reasons |
+| 2026-09-06 | `RPI-12` (§6) | §4 step 3's four-qualifier rule, and the ledger's own `EX-BAD-1` | "The champion record … still reads 36/51, because it was seeded from the pre-rework run" — a score with no model, no corpus and no tier split, under a heading ("What this does not show") carrying none of them, in a row whose **re-check** column declared no carve-out | `evals-champions.json`: `modelId: google/gemma-4-e4b`, untuned, core 21/26, hard 15/25, overall 36/51, on the 51-scenario tmux-routing corpus | sentence rewritten to carry all four qualifiers; **re-check** now states that no carve-out is available here and why; `check-claims.py` grew a check that fails any rowed score whose sentence carries neither the qualifiers nor a declared carve-out |
+| 2026-09-06 | the RPI block's standing hazard (§6), and `RPI-04`'s re-check | §4 step 1, "Open the artifact named in **evidence**. Not a search result about it, not a memory of it" — an unmerged-branch hazard's artifact is a commit *range*, not a commit | "`7a591f4` (2026-09-06, branch `imac-site`, not an ancestor of `main @ 704ab09`) rewrites the registry paragraph of `evals/tmux-routing/prompts/router.md`" — one commit | `git log 704ab09..imac-site -- evals/tmux-routing/prompts/router.md` returns **two**: `7a591f4` (09:52) and `f0ca4af` (12:22), the second rewriting the first's correction after the private-socket design deleted the `fin-` namespace it had introduced | the hazard, `RPI-04`'s re-check and the piece's blocking banner now name both commits and name the range diff as the search that finds them |
+
+**What the first two have in common.** Each was a claim about the *absence* of
+something, and each was checked against a document instead of against the
+thing. `EX-BAD-2` read a checkbox where it should have read a training log.
+`RPI-12` read a number out of a file and left behind the columns beside it that
+gave the number its meaning. Neither was catchable by `check-claims.py` as it
+stood then: the first needs a filesystem the repository cannot see, and the
+second needed a rule the checker did not have. It has that rule now — §4 step 3
+is enforced for every rowed score — which is the only half of this that
+generalizes to future rows. The other half does not: a verifier still has to
+open the artifact, and a verifier in a hurry reads the document already open.
+The third is the same failure in its mildest form — the artifact *was* opened,
+but only one of them, because the search returned before it was finished.
+
+**Standing instruction that follows from both.** When a row's evidence is the
+*absence* of something, the **evidence** column names the search that would have
+found it — the directory listed, the glob run, the log opened, the commit range
+diffed — never the plan that says it has not happened yet. A row whose evidence
+for an absence is a plan document, a checkbox, or "nothing in the repo" with no
+named search is `proposed`, not `verified`.

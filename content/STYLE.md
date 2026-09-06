@@ -204,7 +204,13 @@ this paragraph must not restate it more loosely or more tightly. In its words:
 such a number "must still name its tier split **or** its round, and it must
 **never** be the piece's most quotable sentence — not the title, not a subhead,
 not a pull quote, not the lede." The test is the one in §6: if this line were
-the only thing a reader saw, would they believe something false?
+the only thing a reader saw, would they believe something false? Since
+2026-09-06 `check-claims.py` enforces the shape of this too: a rowed score
+whose sentence names no model, no corpus or no tier split fails unless its row
+*declares* the carve-out in **re-check**, and a row that declares it fails if
+that sentence turns out to be a heading or the piece's title. Being in the
+ledger is not the same as being qualified; `claims-ledger.md` §8 records the
+sentence that taught us the difference, and what it cost to notice.
 
 **Derived numbers and tables** have their own rules — a computed figure the
 artifact does not print gets its own row and says it is arithmetic; a results

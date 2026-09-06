@@ -172,6 +172,19 @@ banned phrases and a real tailnet name passed the checker green. It fails on:
   name — in reader-facing prose. Fenced code blocks are skipped, which is
   exactly the width of `STYLE.md` §2's written exemption.
 
+**Row → itself** — added 2026-09-06, after `RPI-12` shipped "still reads 36/51"
+with no model, no corpus and no tier split *and* passed green, because the
+number did appear in a row's claim text and that was the whole test. **Coverage
+is not qualification** (`claims-ledger.md` §8). It fails on:
+
+- **a rowed score whose sentence names no model, no corpus, or no core/hard
+  tier split** — unless the row's **re-check** column declares the §4 step 3
+  carve-out, or marks the figure a *negated number*: one present only in order
+  to be refused, which must not acquire qualifiers;
+- **a row that declares the carve-out and then spends it on a heading or the
+  piece's `title:`**, which §4 step 3 forbids outright. The carve-out exists for
+  a number that cannot travel alone; a headline is the line that travels.
+
 **Stage and approval.** It fails on a `status` that disagrees with its
 directory; `approved_by` filled on anything in `drafts/`; any piece at
 `approved` or `published` with an empty `approved_by` or one carrying no quote
