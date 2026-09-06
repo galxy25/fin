@@ -148,12 +148,32 @@ and recover from — plus an `isFailure` line in the audit log. Nothing crashes;
 continues.
 
 The allow-list is **the daemon's own tmux session** (parsed out of `connectCommand`, so it
-survives a missing registry) **∪ every session in `routing-registry.json`**. The registry
-file is re-read on every send, so a session registered mid-run becomes writable without a
-restart and a deleted registry shrinks the list back to the daemon's own session. **No
-registry means the allow-list is exactly the daemon's own session** — fail closed, and the
-refusal text says so, because a model that thinks the registry merely failed to load will
-keep trying.
+survives a missing registry) **∪ every session in `routing-registry.json`, read once at
+launch ∪ every session whose name starts with `fin-`**. **No registry means the allow-list
+is exactly the daemon's own session** — fail closed, and the refusal text says so, because
+a model that thinks the registry merely failed to load will keep trying.
+
+Two deliberate properties of that sentence:
+
+- **The registry is a snapshot, not a live read.** `routing-registry.json` sits in the same
+  home directory as the shell the guard constrains, so re-reading it per send would make
+  the allow-list writable *by the thing it constrains*: a `python3 -c` that appends
+  `{"session": "main"}` — a command with no tmux in it, which neither this guard nor
+  `DestructiveCommandHeuristic` looks at — followed by `tmux send-keys -t main …` on the
+  very next call. Widening now takes the user, on the host, and applies at the next launch.
+  The refusal text deliberately does **not** name the file, for the same reason.
+- **`fin-` is the daemon's own namespace**, and it is what pays for that snapshot. The
+  router's `start` action has to keep working: create a session, then drive it. Nothing in
+  this codebase has ever written a created session into the registry
+  (`SessionRegistryStore.register` has no caller), so before this the prompt's promise that
+  "sessions you create yourself are added to the registry automatically" was simply false —
+  and once the guard started enforcing, every start-then-drive flow was a dead end.
+  `tmux new-session -d -s fin-build` followed by `tmux send-keys -t fin-build …` now works
+  end to end with no path from the terminal to the allow-list. The price: a session a
+  *human* names `fin-…` is inside Fin's namespace. Auto-registering created names was
+  rejected as the alternative, because `tmux new-session -d -s main` fails when `main`
+  already exists and the guard cannot tell that failure from a success — learning the name
+  either way would hand over the human's session.
 
 | Class | Commands | Rule |
 | --- | --- | --- |
@@ -161,25 +181,54 @@ keep trying.
 | Never | `kill-server`, `run-shell`, `if-shell`, `source-file`, `bind-key`, `unbind-key`, `set-hook`, `command-prompt`, `confirm-before`, `display-menu`/`-popup`/`-panes`, `choose-*`, `customize-mode`, `attach-session`, `switch-client`, `detach-client`, `suspend-client`, `refresh-client`, `lock-*`, `server-access`, `wait-for`, `clear-prompt-history`, plus `tmux -c` and `tmux -f` | Refused whatever they target: they execute commands, reach the whole server, or move the human's client. |
 | Registered targets only | everything else that mutates — `send-keys`, `paste-buffer`, `kill-session`/`-window`/`-pane`, `new-window`, `split-window`, `respawn-*`, `swap`/`move`/`join`/`break`/`link`/`unlink`, `rename-*`, `select-*`, `resize-*`, `clear-history`, `pipe-pane`, `set-option`/`set-window-option`/`set-environment` | Allowed only when every session it names is on the allow-list. `set-*` with `-g`/`-s` is refused outright (global/server scope escapes the session). |
 | Creation | `new-session` | Creating a session stays legal — it is the router's `start` action. `-t <unregistered>` (grouping shares the target's windows) and `-A -s <unregistered>` (attach-or-create) are not. |
+| Flags that make `-t` lie | `kill-session -a`, `send-keys -c <client>` / `-K` | Refused before the target check. `-a` inverts the target — `kill-session -a -t fin` kills every session *except* `fin` (verified on 3.6a: fin/main/bystander in, only `fin` left), i.e. `kill-server`'s blast radius wearing an allowed name. `-c` addresses a *client*, so the keys land wherever that client is attached — on the shared socket, the human's terminal — and there is no `-t` to check. (`tmux list-clients`, an allowed read, prints the ttys.) |
+| Not one command | `xargs tmux …`, a line ending in `\` or an open quote | Refused. `xargs` builds tmux's argv out of stdin, which the guard cannot see (verified: `echo "rename-session -t victim OWNED" \| xargs tmux` renames while the guard sees an argument-less `tmux`). A half-typed line is worse: the PTY concatenates sends, so `tmux \` and then `send-keys -t main …` are two individually-harmless calls the shell joins at its continuation prompt. A trailing fragment in command position that could still *become* `tmux` (`t\`, `tm\`) counts. |
 
 Parsing details that matter, all covered by `TmuxCommandGuardTests`: multiple commands per
 line (`;`, `&&`, `||`, `|`, newline, `$( )`, backticks); leading env assignments and
-`sudo`/`env`/`command`/`exec`/`nohup` prefixes; a full path (`/opt/homebrew/bin/tmux`);
-quoting around the target; the target forms `main`, `main:0`, `main:0.1`, `=main`, `-tmain`;
-tmux's own `\;` chaining; **abbreviations** (tmux accepts any unambiguous prefix, so `send`,
-`send-key`, `kill-ses` all resolve, and an ambiguous prefix resolves to the *most
-restrictive* match); the `-L`/`-S` socket flags (a different server means the allow-list
-does not apply, so mutations there are refused and reads are not); and **no `-t` at all**,
-which means the daemon's own current session and is allowed only because that session is
-itself on the list. Anything the parser cannot confidently prove is read-only — an unknown
-verb, a `$0`/`%3`/`@2`/bare-index target — is refused. The command table was diffed against
-`tmux 3.6a`'s `list-commands`: all 90 real commands are present with matching aliases, and
-no prefix of a real command resolves to a read-only entry here that real tmux would resolve
-elsewhere.
+`sudo`/`env`/`command`/`exec`/`nohup` prefixes; a full path (`/opt/homebrew/bin/tmux`); the
+target forms `main`, `main:0`, `main:0.1`, `=main`, `-tmain`; **abbreviations** (tmux
+accepts any unambiguous prefix of a name *or an alias*, so `send`, `send-key`, `kill-ses`,
+`showe` all resolve, and an ambiguous prefix resolves to the *most restrictive* match); the
+`-L`/`-S` socket flags (a different server means the allow-list does not apply, so mutations
+there are refused and reads are not); and **no `-t` at all**, which means the daemon's own
+current session and is allowed only because that session is itself on the list. Anything the
+parser cannot confidently prove is read-only — an unknown verb at the top level, a
+`$0`/`%3`/`@2`/bare-index target — is refused.
 
-Quoted shell text is unwrapped one level (up to three), so `sh -c 'tmux send-keys -t main …'`
-and the two-hop `tmux send-keys -t fin 'tmux send-keys -t main …'` are both caught. As a
-bonus, `pkill`/`killall` aimed at tmux is refused — it ends the same way `kill-server` does.
+**Shell quoting is not evidence about anything**, which is where the first version was
+wrong in three places. The shell strips quotes before tmux ever sees `argv`, so the guard
+must reason about the bytes tmux gets, not the bytes the model typed. Three shapes were
+verified against real tmux 3.6a on a private socket and are now handled:
+
+- `tmux ls ';' send-keys -t main …` — a quoted `;` is a real tmux command separator
+  (`\;`, `';'` and `";"` are the same argument). tmux's own rule is that any argument
+  *ending* in `;` ends the command unless the `;` is backslash-escaped, and this parser now
+  implements exactly that — including the consequence that `send-keys -t fin 'echo hi;'
+  Enter` really is two commands to tmux too ("unknown command: Enter").
+- `tmux send-keys -lt main …` — tmux uses getopt, which packs short options, so the target
+  hides in the middle of a cluster. `-lt`, `-at`, `-dt`, `-As` are all parsed now.
+- `tmux send-keys "-t" main …` — quoting the *flag* used to make it invisible; quoting says
+  nothing, so `wasQuoted` is no longer consulted when finding flags.
+
+The same lesson applies to the command word: `TMUX`, `t\mux` and `tm"u"x` all run tmux on
+this case-insensitive volume, so the word is looked for in **lexed, case-folded** words, not
+as a substring of the raw string.
+
+The command table was diffed against `tmux 3.6a`'s `list-commands`, names *and* aliases, over
+every prefix of every command: no prefix this guard calls read-only resolves to something
+else in real tmux, and no prefix real tmux resolves is unknown here.
+
+Quoted shell text is unwrapped one level (up to three) **when the head is something that
+runs it** — `sh -c 'tmux send-keys -t main …'`, `eval "…"`, and the two-hop
+`tmux send-keys -t fin 'tmux send-keys -t main …'` are all caught. Text that merely mentions
+tmux is data: `git commit -m "tmux guard: …"`, `grep "tmux kill-server" daemon/` and
+`echo "tmux …" >> notes.md` are untouched, which matters in a repo whose current work *is*
+tmux. Inside a payload, an unrecognized verb is prose rather than a refusal — real tmux would
+answer "unknown command" and do nothing. A **remote** `ssh <host> tmux …` is deliberately out
+of scope (another machine's session names mean nothing to this allow-list, and driving Fin's
+own cloud box over ssh is a product behavior); `ssh localhost tmux …` is local and is checked.
+As a bonus, `pkill`/`killall` aimed at tmux is refused — it ends the same way `kill-server` does.
 
 **Honest limits.** This is defense in depth over a natural-language channel, not a sandbox.
 It closes the direct path — the one a local model actually takes when it decides to be
@@ -188,15 +237,28 @@ guard can reach:
 
 - variable or alias indirection (`T=tmux; $T send-keys …`, `alias t=tmux` in a rc file);
 - encoding (`eval $(echo dG11eA== | base64 -d) …`), or any construction that assembles the
-  word `tmux` at runtime;
+  word `tmux` at runtime — including `sh -c "$CMD"`, where the payload is a variable;
 - a helper script, Makefile target, or shell function that runs tmux on the model's behalf;
-- writing `~/.tmux.conf` (or any file) with one command and having tmux read it later;
-- `ssh <other host> tmux …` — the remote server is out of this guard's world (a *local*
-  `ssh localhost tmux …` is caught);
+- writing `~/.tmux.conf` (or any file) with one command and having tmux read it later (the
+  direct `source-file` is refused; the write is not);
+- `ssh <other host> tmux …` — a remote server is out of this guard's world **by policy**,
+  not by oversight: its session names are not in this registry's namespace. A *local*
+  `ssh localhost tmux …` is caught;
+- **a command split across two `send_input` calls whose halves say nothing about tmux.**
+  The obvious shapes are closed — a line ending in `\` or an open quote is refused when it
+  mentions tmux, and so is a trailing fragment in command position that could still become
+  the word (`t\`, `tm\`) — but a fragment that is *not* in command position (`FOO=bar t\`)
+  still gets through. Same family as variable indirection: the guard sees one send at a time;
 - entirely non-tmux damage: `pkill -f mlx_lm`, `launchctl bootout`, `rm` shapes
-  `DestructiveCommandHeuristic` misses;
+  `DestructiveCommandHeuristic` misses (`pkill tmux` specifically *is* caught);
+- a human session named `fin-…`, which is inside the namespace the guard treats as Fin's;
 - and everything downstream of a send to a session that IS registered — the guard checks
   the target, not what the agent in that session then does.
+
+False refusals it *does* make, all in the safe direction: `-t 0`, `-t %3`, `-t @2` (a bare
+index or a pane/window id can point into any session, so it cannot be proven); a quoted
+`send-keys` payload whose first characters look like a flag (`'-tail -f log'`); `tmux -f
+<conf> <mutation>` (a read under `-f` is fine); and a half-typed line that mentions tmux.
 
 **The structural fix is a dedicated socket.** Set
 `"connectCommand": "tmux -L fin new-session -A -s fin"` and the human's sessions stop

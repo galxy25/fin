@@ -14,10 +14,21 @@ import Foundation
 // defense in depth, not a sandbox. It closes the direct path — the one a local model
 // actually takes when it decides to be helpful — and it cannot close indirection
 // (`$T send-keys` after `T=tmux`, base64/eval, a helper script that runs tmux, a
-// background job, `ssh host` to a machine we can't reason about). The structural fix is
+// background job, a command split across two sends whose halves never spell the word).
+// A remote `ssh host tmux …` is out of scope by policy, not by oversight: another
+// machine's session names are not in this registry's namespace. The structural fix is
 // a dedicated socket (`tmux -L fin new-session -A -s fin`), which removes the human's
 // sessions from the agent's namespace entirely at the cost of being able to READ them.
 // See daemon/README.md § "The tmux send-keys guard" for the full residual list.
+//
+// TWO RULES THIS FILE LEARNED THE HARD WAY, both from real tmux 3.6a on a private
+// socket, both places where the first version was wrong:
+//   1. SHELL QUOTING IS NOT EVIDENCE. The shell removes quotes before tmux sees argv, so
+//      `';'` is a command separator, `"-t"` is a flag, and `t\mux` is tmux. Decide on
+//      lexed words, never on the raw string or on `wasQuoted`.
+//   2. A TARGET IS NOT ALWAYS A TARGET. `kill-session -a -t fin` kills everything EXCEPT
+//      `fin`; `send-keys -c <client>` has no session target at all. Flags that invert or
+//      redirect the target are refused before the allow-list is consulted.
 //
 // THE POLICY, in one line: read anything, write only what is registered.
 
@@ -70,28 +81,32 @@ public struct TmuxSendGuard: Sendable, Equatable {
     /// A mutating tmux command with no `-t` targets THIS session.
     public var ownSession: String?
     public var ownSocket: TmuxSocket
-    /// Snapshot of the registry's session names, used when no file URL is set.
+    /// The registry's session names, READ ONCE at launch.
+    ///
+    /// Deliberately a snapshot, not a live file read. `routing-registry.json` is an
+    /// ordinary file owned by the same uid as the guarded shell, so re-reading it on
+    /// every send would make the allow-list writable BY THE THING IT CONSTRAINS: two
+    /// commands the guard never even inspects (a `python3 -c` that appends `{"session":
+    /// "main"}`, then `tmux send-keys -t main …`) would be enough. A snapshot means
+    /// widening the list needs the user, on the host, and takes effect at the next
+    /// launch. The cost — a session registered mid-run is not writable until restart —
+    /// is paid by `ownedSessionPrefix`, which lets the agent start and drive sessions in
+    /// its own namespace without any file at all.
     public var registrySessions: Set<String>
     public var hasRegistry: Bool
-    /// Re-read on every evaluation when set, so a session the model registers mid-run
-    /// becomes writable without a daemon restart — and so a registry that is DELETED
-    /// mid-run shrinks the allow-list back to the agent's own session.
-    public var registryFileURL: URL?
 
     public init(
         isEnforced: Bool,
         ownSession: String?,
         ownSocket: TmuxSocket = .standard,
         registrySessions: Set<String> = [],
-        hasRegistry: Bool = false,
-        registryFileURL: URL? = nil
+        hasRegistry: Bool = false
     ) {
         self.isEnforced = isEnforced
         self.ownSession = ownSession
         self.ownSocket = ownSocket
         self.registrySessions = registrySessions
         self.hasRegistry = hasRegistry
-        self.registryFileURL = registryFileURL
     }
 
     /// The explicit opt-out: a host with no tmux namespace of its own to protect.
@@ -111,32 +126,25 @@ public struct TmuxSendGuard: Sendable, Equatable {
             ownSession: own,
             ownSocket: socket,
             registrySessions: Set(registry?.sessions.map(\.session) ?? []),
-            hasRegistry: registry != nil,
-            registryFileURL: registryFileURL
+            hasRegistry: registry != nil
         )
     }
 
-    /// The live allow-list: the agent's own session plus every registered session.
-    /// When a file URL is set it is the authority — a missing or unreadable file means
-    /// an EMPTY registry, not a retained snapshot, so deleting the file cannot widen it.
+    /// The allow-list: the agent's own session plus every session registered at launch.
+    /// (Sessions in Fin's own `fin-` namespace are allowed too, but by rule rather than
+    /// by name — see `TmuxCommandGuard.ownedSessionPrefix`.)
     public func resolved() -> (allowed: Set<String>, hasRegistry: Bool) {
         var sessions = registrySessions
-        var present = hasRegistry
-        if let registryFileURL {
-            if let document = RegistryDocument.loadIfPresent(at: registryFileURL) {
-                sessions = Set(document.sessions.map(\.session))
-                present = true
-            } else {
-                sessions = []
-                present = false
-            }
-        }
         if let ownSession { sessions.insert(ownSession) }
-        return (sessions, present)
+        return (sessions, hasRegistry)
     }
 
     public func evaluate(_ input: String) -> TmuxGuardVerdict {
         guard isEnforced else { return .allow }
+        // Ahead of `resolved()`: `AgentTurnEngine` is main-actor, and every `git status`
+        // the agent types goes through here. A command that cannot possibly be about tmux
+        // must not pay for building an allow-list.
+        guard TmuxCommandGuard.mightMentionTmux(input) else { return .allow }
         let (allowed, present) = resolved()
         return TmuxCommandGuard.evaluate(
             input,
@@ -174,13 +182,39 @@ public enum TmuxCommandGuard {
         // Fast path AND blast-radius bound: a command that never mentions tmux (or a
         // process-killer aimed at it) is not this guard's business, and must behave
         // byte-for-byte as it did before. Everything else pays the parser.
-        guard input.contains("tmux") else { return .allow }
+        //
+        // The cheap test is on the RAW string, so it must not be the only test: the shell
+        // assembles the word out of quoting and escaping (`t\mux`, `tm"u"x`, and on this
+        // case-insensitive volume `TMUX`, all verified to run tmux), and none of those
+        // contain the substring. So anything carrying a quote or a backslash falls
+        // through to the lexer, which normalizes exactly those forms, and the real
+        // decision is made on lexed words.
+        guard mightMentionTmux(input) else { return .allow }
         let context = Context(
             allowed: allowedSessions,
             ownSession: ownSession,
             ownSocket: ownSocket,
             hasRegistry: hasRegistry
         )
+        let mentions = mentionsTmux(input)
+
+        // HALF A COMMAND IS NOT A COMMAND. The guard sees one `send_input` at a time, but
+        // the PTY concatenates them: `tmux \` (allowed on its own) followed by
+        // `send-keys -t main 'rm -rf ~'` (no tmux in it at all) is joined by the shell at
+        // its continuation prompt into one forbidden command. Same for a line that leaves
+        // a quote open. A fragment that could still BECOME `tmux` (`t\`, `tm\`) counts.
+        if endsInLineContinuation(input) || hasUnterminatedQuote(input),
+           mentions || trailingWordCouldBecomeTmux(input) {
+            return refusal(
+                "that line is only half a command — it ends in a shell continuation or an "
+                    + "unterminated quote, so what it finally runs depends on the next thing typed, "
+                    + "and Fin's guard judges one send at a time. Send the whole tmux command in a "
+                    + "single line.",
+                session: nil,
+                context: context
+            )
+        }
+        guard mentions else { return .allow }
         return evaluate(line: input, depth: 0, context: context)
     }
 
@@ -224,7 +258,11 @@ public enum TmuxCommandGuard {
             : "There is no routing registry on this host, so the allow-list is fail-closed to your own session: \(list)."
         return """
             tmux guard (enforced in code, not just here): read anything, write only what is \
-            registered. \(scope)
+            registered. \(scope) You may also start and drive any session whose name begins with \
+            `\(ownedSessionPrefix)` — that prefix is your own namespace, so when you need a session \
+            of your own, `tmux new-session -d -s \(ownedSessionPrefix)<purpose>` and drive that. \
+            You cannot widen the list any other way from inside the terminal: adding a session the \
+            user already owns takes the user, on this host.
 
             You MAY inspect ANY tmux session on this machine, registered or not, and you should — \
             that is how you answer "what is running", "what is the status of X", or "what did that \
@@ -242,6 +280,14 @@ public enum TmuxCommandGuard {
             user to register it (e.g. `\(example)` is registered; anything else is not).
             """
     }
+
+    /// Fin's own session namespace. A session named `fin-…` is one the agent started for
+    /// itself, so it is writable without appearing in any file — which is what keeps the
+    /// router's `start` action alive now that the registry is a launch-time snapshot:
+    /// `tmux new-session -d -s fin-build` then `send-keys -t fin-build …` works end to
+    /// end, with no path from the terminal to the allow-list. The trade is stated plainly
+    /// in daemon/README.md: a human session named `fin-…` would be inside Fin's namespace.
+    public static let ownedSessionPrefix = "fin-"
 
     // MARK: - Policy table
 
@@ -429,23 +475,9 @@ public enum TmuxCommandGuard {
     private static func evaluate(segment words: [Word], depth: Int, context: Context) -> TmuxGuardVerdict {
         guard !words.isEmpty else { return .allow }
 
-        // A quoted argument is its own little command line: `sh -c 'tmux …'`,
-        // `eval "tmux …"`, and the two-hop `tmux send-keys -t fin 'tmux … -t main'`
-        // all land here. Only quoted words that actually mention tmux pay the recursion.
-        for word in words where word.wasQuoted && word.text.contains("tmux") {
-            guard depth < maxNestingDepth else {
-                return refusal(
-                    "that command nests tmux inside quoted shell text more deeply than Fin's guard "
-                        + "will unwrap, so it cannot be proven read-only.",
-                    session: nil,
-                    context: context
-                )
-            }
-            let verdict = evaluate(line: word.text, depth: depth + 1, context: context)
-            if verdict.isRefusal { return verdict }
-        }
-
-        // Strip `sudo`/`env FOO=1`/`exec`… to find the real head.
+        // Strip `sudo`/`env FOO=1`/`exec`… to find the real head FIRST: every decision
+        // below (does this head execute its quoted arguments? is it an ssh hop?) is about
+        // the command that will actually run, not the wrapper.
         var index = 0
         var strippedPrefix = false
         while index < words.count {
@@ -459,7 +491,7 @@ public enum TmuxCommandGuard {
                 index += 1
                 continue
             }
-            if benignPrefixes.contains(basename(token)) {
+            if benignPrefixes.contains(normalized(basename(token))) {
                 index += 1
                 strippedPrefix = true
                 continue
@@ -468,14 +500,59 @@ public enum TmuxCommandGuard {
         }
         guard index < words.count else { return .allow }
 
-        let head = basename(words[index].text)
+        let head = normalized(basename(words[index].text))
         let tail = Array(words[(index + 1)...])
 
-        if head == "tmux" {
-            return evaluate(invocation: tail, depth: depth, context: context)
+        // A REMOTE hop leaves this guard's world. `worker` on the cloud box is not
+        // `worker` here, and this registry says nothing about that machine — checking it
+        // against a local allow-list refuses legitimate work (driving Fin's own cloud box
+        // over ssh is a documented product behavior) without protecting anything local.
+        // Exactly the reasoning `-L`/`-S` already gets. `ssh localhost …` IS local.
+        if head == "ssh", !sshRunsOnThisMachine(tail) { return .allow }
+
+        // `xargs` builds tmux's argv out of stdin, which this guard cannot see:
+        // `echo "rename-session -t main OWNED" | xargs tmux` renamed a session on a probe
+        // socket while the guard saw an argument-less `tmux`. Refuse the combination.
+        if head == "xargs", tail.contains(where: { isTmuxToken($0.text) }) {
+            return refusal(
+                "`xargs tmux` builds tmux's arguments out of stdin, which Fin's guard cannot see, "
+                    + "so the target check cannot be applied at all. Write the tmux command out in "
+                    + "full on one line instead.",
+                session: nil,
+                context: context
+            )
         }
 
-        if processKillers.contains(head), tail.contains(where: { $0.text.contains("tmux") }) {
+        // A quoted argument can be its own little command line — but ONLY when the head is
+        // something that RUNS it: `sh -c '…'`, `eval "…"`, or tmux itself relaying a
+        // payload into another session (the two-hop
+        // `tmux send-keys -t fin 'tmux … -t main'`). Text that merely mentions tmux —
+        // `git commit -m "tmux guard: …"`, `grep "tmux kill-server" daemon/`,
+        // `echo "tmux …" >> notes.md` — is data, and refusing it cost real work.
+        if head == "tmux" || commandCarriers.contains(head) {
+            for word in tail where word.wasQuoted && mentionsTmux(word.text, depth: depth + 1) {
+                guard depth < maxNestingDepth else {
+                    return refusal(
+                        "that command nests tmux inside quoted shell text more deeply than Fin's "
+                            + "guard will unwrap, so it cannot be proven read-only.",
+                        session: nil,
+                        context: context
+                    )
+                }
+                let verdict = evaluate(line: word.text, depth: depth + 1, context: context)
+                if verdict.isRefusal { return verdict }
+            }
+        }
+
+        if head == "tmux" {
+            // `strict` — an unrecognized verb is a refusal — only at the top level, where
+            // the word `tmux` really is the command. Deeper down (quoted payloads, a verb
+            // fished out of a carrier's arguments) an unknown verb is prose or an
+            // argument: real tmux would answer "unknown command" and do nothing.
+            return evaluate(invocation: tail, depth: depth, context: context, strict: depth == 0)
+        }
+
+        if processKillers.contains(head), tail.contains(where: { normalized($0.text).contains("tmux") }) {
             return refusal(
                 "`\(head)` aimed at tmux would kill the tmux server and every session on it, "
                     + "including sessions that are not Fin's.",
@@ -484,11 +561,16 @@ public enum TmuxCommandGuard {
             )
         }
 
-        // `ssh box tmux …`, `xargs tmux …`, `sudo -u someone tmux …`: the command word
-        // is at an offset we can't compute, so scan for it.
+        // `ssh localhost tmux …`, `sudo -u someone tmux …`, `timeout 60 tmux …`: the
+        // command word is at an offset we can't compute, so scan for it.
         if commandCarriers.contains(head) || strippedPrefix {
-            if let hit = tail.firstIndex(where: { basename($0.text) == "tmux" }) {
-                return evaluate(invocation: Array(tail[(hit + 1)...]), depth: depth, context: context)
+            if let hit = tail.firstIndex(where: { isTmuxToken($0.text) }) {
+                return evaluate(
+                    invocation: Array(tail[(hit + 1)...]),
+                    depth: depth,
+                    context: context,
+                    strict: false
+                )
             }
         }
 
@@ -496,7 +578,12 @@ public enum TmuxCommandGuard {
     }
 
     /// One `tmux …` invocation: global flags, then one or more `;`-separated commands.
-    private static func evaluate(invocation args: [Word], depth: Int, context: Context) -> TmuxGuardVerdict {
+    private static func evaluate(
+        invocation args: [Word],
+        depth: Int,
+        context: Context,
+        strict: Bool
+    ) -> TmuxGuardVerdict {
         let parsed = parseGlobalFlags(args)
         if let refusalText = parsed.refusal {
             return refusal(refusalText, session: nil, context: context)
@@ -511,8 +598,10 @@ public enum TmuxCommandGuard {
                 command: sub,
                 socket: parsed.socket,
                 socketMismatch: socketMismatch,
+                deferredRefusal: parsed.deferredRefusal,
                 depth: depth,
-                context: context
+                context: context,
+                strict: strict
             )
             if verdict.isRefusal { return verdict }
         }
@@ -523,8 +612,10 @@ public enum TmuxCommandGuard {
         command words: [Word],
         socket: TmuxSocket?,
         socketMismatch: Bool,
+        deferredRefusal: String?,
         depth: Int,
-        context: Context
+        context: Context,
+        strict: Bool
     ) -> TmuxGuardVerdict {
         // Bare `tmux` (or a trailing `;`): new-session with a generated name. It touches
         // nothing that already exists.
@@ -533,6 +624,7 @@ public enum TmuxCommandGuard {
 
         let resolution = resolve(verb)
         guard let command = resolution.command else {
+            guard strict else { return .allow }
             return refusal(
                 "Fin's guard does not recognize the tmux command `\(verb)`, so it cannot prove the "
                     + "command only reads. Unrecognized tmux commands are refused, not guessed at.",
@@ -541,8 +633,13 @@ public enum TmuxCommandGuard {
             )
         }
 
-        // Inspection first: reading is allowed on any session and any server.
+        // Inspection first: reading is allowed on any session and any server — including
+        // under a global flag that would otherwise be refused, so `tmux -f /dev/null ls`
+        // still reads.
         if case .readOnly = command.kind { return .allow }
+        if let deferredRefusal {
+            return refusal(deferredRefusal, session: nil, context: context)
+        }
         if socketMismatch, let socket {
             return refusal(
                 "`\(command.name)` names an explicit tmux server (\(socket.described)), which is "
@@ -572,6 +669,9 @@ public enum TmuxCommandGuard {
             return check(targets: flagValues("t", in: arguments), command: command.name, context: context)
 
         case .targetChecked:
+            if let why = targetIsNotWhatItSays(command: command.name, arguments: arguments) {
+                return refusal(why, session: nil, context: context)
+            }
             let targets = flagValues("t", in: arguments) + flagValues("s", in: arguments)
             return check(targets: targets, command: command.name, context: context)
 
@@ -588,6 +688,37 @@ public enum TmuxCommandGuard {
         }
     }
 
+    /// Flags that make `-t` mean something OTHER than "this one session", which is the
+    /// only thing `check(targets:)` knows how to reason about. Both were verified on
+    /// tmux 3.6a against a private socket:
+    ///
+    /// - `kill-session -a -t fin` kills every session EXCEPT `fin` (sessions fin/main/
+    ///   bystander before, only `fin` after). An allow-listed target is exactly what makes
+    ///   it dangerous: its blast radius is `kill-server`'s, which the table refuses.
+    /// - `send-keys -c <client-tty>` (and `-K`) types into whatever session a CLIENT is
+    ///   attached to — `tmux list-clients` is an allowed read that prints those ttys, and
+    ///   on this host the attached client is the human's. There is no `-t` to check.
+    static func targetIsNotWhatItSays(command: String, arguments: [Word]) -> String? {
+        if command == "kill-session", hasFlag("a", in: arguments) {
+            return "`kill-session -a` kills every session on this server EXCEPT the one it names, "
+                + "so naming an allowed session is what makes it dangerous — it has `kill-server`'s "
+                + "blast radius. Kill one session at a time, by name, with no `-a`."
+        }
+        if command == "send-keys" || command == "send-prefix",
+           hasFlag("c", in: arguments) || hasFlag("K", in: arguments) {
+            return "`\(command) -c`/`-K` sends keys to a CLIENT rather than to a named session, so "
+                + "they land in whatever session that client is attached to — which on this machine "
+                + "is the human's terminal. Address a session with `-t <session>` instead."
+        }
+        return nil
+    }
+
+    /// The allow-list test. A name is Fin's if it was registered at launch, if it is the
+    /// agent's own session, or if it lives in Fin's own `fin-` namespace.
+    static func isAllowed(_ name: String, in context: Context) -> Bool {
+        context.allowed.contains(name) || name.hasPrefix(ownedSessionPrefix)
+    }
+
     private static func check(targets: [String], command: String, context: Context) -> TmuxGuardVerdict {
         guard !targets.isEmpty else {
             // No `-t`: tmux acts on the CURRENT session, which is the agent's own.
@@ -600,7 +731,7 @@ public enum TmuxCommandGuard {
                     context: context
                 )
             }
-            guard context.allowed.contains(own) else {
+            guard isAllowed(own, in: context) else {
                 return refusal(
                     "`\(command)` with no `-t` acts on Fin's own session \"\(own)\", which is not in "
                         + "the allow-list.",
@@ -614,7 +745,7 @@ public enum TmuxCommandGuard {
         for target in targets {
             switch sessionReference(target) {
             case .current:
-                guard let own = context.ownSession, context.allowed.contains(own) else {
+                guard let own = context.ownSession, isAllowed(own, in: context) else {
                     return refusal(
                         "`\(command)` targets the current session, which Fin cannot resolve to an "
                             + "allowed session name on this host.",
@@ -623,7 +754,7 @@ public enum TmuxCommandGuard {
                     )
                 }
             case .named(let name):
-                guard context.allowed.contains(name) else {
+                guard isAllowed(name, in: context) else {
                     return refusal(
                         "`\(command)` would act on tmux session \"\(name)\", which is not a session "
                             + "Fin is registered to drive.",
@@ -679,10 +810,18 @@ public enum TmuxCommandGuard {
                     + "Fin's own session: \(list)."
             )
         }
+        // Deliberately does NOT name the registry file. The allow-list is a launch-time
+        // snapshot precisely so the guarded shell cannot widen it; printing the path here
+        // would hand the model the one lever the snapshot exists to remove.
+        parts.append(
+            "You cannot widen this list from the terminal. If you need a session of your own, start "
+                + "one in Fin's namespace — `tmux new-session -d -s \(ownedSessionPrefix)work` — and "
+                + "drive that; those are always yours."
+        )
         if let session {
             parts.append(
-                "If the user wants Fin to drive \"\(session)\", it has to be registered in "
-                    + "routing-registry.json first — tell them that, and offer to read the session "
+                "Driving \"\(session)\" takes the user registering it on this host, which applies the "
+                    + "next time the agent starts — tell them that, and offer to read the session "
                     + "instead."
             )
         }
@@ -700,12 +839,19 @@ public enum TmuxCommandGuard {
     /// Exact name or alias wins; otherwise every prefix match votes and the MOST
     /// RESTRICTIVE class wins, so a short prefix can never be laundered into a
     /// read-only classification by a table that happens to be incomplete.
+    ///
+    /// tmux prefix-matches ALIASES as well as names (cmd_find in cmd.c compares both), so
+    /// this does too — otherwise `showe` and `showms`, which are real ways to spell
+    /// `show-environment` and `show-messages`, come back as unknown verbs and read-only
+    /// inspection gets refused for no reason.
     static func resolve(_ verb: String) -> Resolution {
         guard !verb.isEmpty else { return Resolution(command: nil, ambiguous: false) }
         if let exact = commands.first(where: { $0.name == verb || $0.aliases.contains(verb) }) {
             return Resolution(command: exact, ambiguous: false)
         }
-        let matches = commands.filter { $0.name.hasPrefix(verb) }
+        let matches = commands.filter { command in
+            command.name.hasPrefix(verb) || command.aliases.contains { $0.hasPrefix(verb) }
+        }
         guard !matches.isEmpty else { return Resolution(command: nil, ambiguous: false) }
         if matches.count == 1 { return Resolution(command: matches[0], ambiguous: false) }
         if let refused = matches.first(where: { if case .alwaysRefuse = $0.kind { return true }; return false }) {
@@ -728,10 +874,14 @@ public enum TmuxCommandGuard {
         var socket: TmuxSocket?
         var arguments: [Word]
         var refusal: String?
+        /// Applied only to commands that are not read-only, the same way a socket
+        /// mismatch is: `tmux -f /dev/null list-sessions` is still just a read.
+        var deferredRefusal: String?
     }
 
     static func parseGlobalFlags(_ args: [Word]) -> ParsedInvocation {
         var socket: TmuxSocket?
+        var deferred: String?
         var index = 0
         while index < args.count {
             let token = args[index].text
@@ -755,10 +905,7 @@ public enum TmuxCommandGuard {
                         refusal: "`tmux -c` runs a shell command through the tmux server, outside any target check."
                     )
                 case "f":
-                    return ParsedInvocation(
-                        socket: socket, arguments: [],
-                        refusal: "`tmux -f` loads an alternate config file, which can bind keys that execute commands."
-                    )
+                    deferred = "`tmux -f` loads an alternate config file, which can bind keys that execute commands."
                 default: break
                 }
             default:
@@ -766,45 +913,62 @@ public enum TmuxCommandGuard {
             }
             index += 1
         }
-        return ParsedInvocation(socket: socket, arguments: Array(args[index...]), refusal: nil)
+        return ParsedInvocation(
+            socket: socket,
+            arguments: Array(args[index...]),
+            refusal: nil,
+            deferredRefusal: deferred
+        )
     }
 
-    /// tmux's own multi-command form: `tmux a \; b`. The shell hands us `;` as a plain
-    /// word (from `\;`, `';'` or `";"`), so an UNQUOTED word that is or ends with `;`
-    /// starts a new tmux command. A quoted `;` inside a send-keys payload does not.
+    /// tmux's own multi-command form: `tmux a \; b`.
+    ///
+    /// SHELL QUOTING CANNOT BE CONSULTED HERE. The shell removes quotes before tmux sees
+    /// argv, so `\;`, `';'` and `";"` are byte-identical arguments and tmux separates on
+    /// all three. tmux's actual rule (`cmd_parse_from_arguments`) is: an argument that
+    /// ends in `;` ends the command, unless that `;` is itself backslash-escaped, in which
+    /// case it is a literal. Verified on tmux 3.6a, private socket:
+    /// `tmux ls ';' rename-session -t other x` renamed `other`, and
+    /// `tmux send-keys -t fin 'echo hi;' Enter` answered "unknown command: Enter" — i.e.
+    /// real tmux splits the quoted payload too, so mirroring it is not a false refusal.
     static func subcommands(of args: [Word]) -> [[Word]] {
         var result: [[Word]] = []
         var current: [Word] = []
         for word in args {
-            if !word.wasQuoted, word.text == ";" {
-                result.append(current)
-                current = []
+            guard word.text.hasSuffix(";"), !word.text.hasSuffix("\\;") else {
+                current.append(word)
                 continue
             }
-            if !word.wasQuoted, word.text.hasSuffix(";"), word.text.count > 1 {
-                current.append(Word(text: String(word.text.dropLast()), wasQuoted: false))
-                result.append(current)
-                current = []
-                continue
-            }
-            current.append(word)
+            let stem = String(word.text.dropLast())
+            if !stem.isEmpty { current.append(Word(text: stem, wasQuoted: word.wasQuoted)) }
+            result.append(current)
+            current = []
         }
         result.append(current)
         return result.filter { !$0.isEmpty }
     }
 
-    /// Every value given to `-<flag>`, in both the separated (`-t main`) and attached
-    /// (`-tmain`) forms. ALL of them are checked: a literal argument that merely looks
-    /// like `-t` costs a false refusal, which is the safe direction.
+    /// Every value given to `-<flag>`, in the separated (`-t main`), attached (`-tmain`)
+    /// and CLUSTERED (`-lt main`, `-dt main`, `-As main`) forms. ALL of them are checked:
+    /// a literal argument that merely looks like `-t` costs a false refusal, which is the
+    /// safe direction.
+    ///
+    /// Two rules learned the hard way, both verified against tmux 3.6a on a private
+    /// socket. (1) tmux uses getopt, which packs short options: `send-keys -lt victim x`
+    /// really does deliver to `victim`, and `kill-session -at fin` really does kill every
+    /// other session — so the flag letter must be looked for anywhere in the cluster, not
+    /// just first. (2) Shell quoting says nothing about what is a flag: the shell strips
+    /// quotes before tmux sees argv, and `send-keys '-t' victim x` delivers exactly like
+    /// `send-keys -t victim x`. So `wasQuoted` is NOT consulted.
     static func flagValues(_ flag: Character, in args: [Word]) -> [String] {
         var values: [String] = []
         var index = 0
         while index < args.count {
             let token = args[index].text
-            if token.hasPrefix("-"), !token.hasPrefix("--"), token.count > 1, !args[index].wasQuoted {
+            if token.hasPrefix("-"), !token.hasPrefix("--"), token.count > 1 {
                 let letters = Array(token.dropFirst())
-                if letters[0] == flag {
-                    let attached = String(letters.dropFirst())
+                if let position = letters.firstIndex(of: flag) {
+                    let attached = String(letters[(position + 1)...])
                     if attached.isEmpty {
                         index += 1
                         // A dangling flag has no value we can resolve — the sentinel
@@ -820,9 +984,11 @@ public enum TmuxCommandGuard {
         return values
     }
 
+    /// Same two rules as `flagValues`: scan the whole cluster, ignore shell quoting.
+    /// `set-option "-g" default-command …` is a server-wide option however it was quoted.
     static func hasFlag(_ letter: Character, in args: [Word]) -> Bool {
         args.contains { word in
-            guard !word.wasQuoted, word.text.hasPrefix("-"), !word.text.hasPrefix("--") else { return false }
+            guard word.text.hasPrefix("-"), !word.text.hasPrefix("--") else { return false }
             return word.text.dropFirst().contains(letter)
         }
     }
@@ -984,6 +1150,122 @@ public enum TmuxCommandGuard {
         }
         flush()
         return result
+    }
+
+    // MARK: - Finding the word `tmux`
+
+    /// Case-folded, because the volume this ships on is case-insensitive: `TMUX -V` and
+    /// `TmUx -V` both print a tmux version in bash, zsh and fish on this Mac.
+    static func normalized(_ token: String) -> String { token.lowercased() }
+
+    static func isTmuxToken(_ token: String) -> Bool { normalized(basename(token)) == "tmux" }
+
+    /// The cheap prefilter. It must be a SUPERSET of what the lexer can find, so it
+    /// cannot just look for the substring: a quote or a backslash anywhere means the
+    /// shell may assemble the word out of pieces (`t\mux`, `tm"u"x`), and those forms run.
+    static func mightMentionTmux(_ input: String) -> Bool {
+        let lowered = normalized(input)
+        if lowered.contains("tmux") || lowered.contains("pkill") || lowered.contains("killall") {
+            return true
+        }
+        return input.contains("\\") || input.contains("'") || input.contains("\"")
+    }
+
+    /// The real test, on LEXED words: quoting and escaping are already undone here, so
+    /// `t\mux`, `tm"u"x`, `TMUX` and `/opt/homebrew/bin/tmux` all answer true.
+    static func mentionsTmux(_ line: String, depth: Int = 0) -> Bool {
+        for segment in segments(in: line) {
+            for word in segment {
+                if isTmuxToken(word.text) { return true }
+                if processKillers.contains(normalized(basename(word.text))) { return true }
+                if word.wasQuoted, depth < maxNestingDepth, mentionsTmux(word.text, depth: depth + 1) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    // MARK: - Half-typed lines
+
+    /// An odd number of trailing backslashes is a shell line continuation: the next
+    /// `send_input` is appended to this one at the PS2 prompt (verified:
+    /// `printf 'tmux \\\n-V\n'` prints a tmux version in bash, zsh and fish).
+    static func endsInLineContinuation(_ input: String) -> Bool {
+        var backslashes = 0
+        for character in input.reversed() {
+            if character == "\\" { backslashes += 1 } else { break }
+        }
+        return backslashes % 2 == 1
+    }
+
+    /// A line that ends inside a quote is also waiting for the next send.
+    static func hasUnterminatedQuote(_ input: String) -> Bool {
+        let characters = Array(input)
+        var index = 0
+        while index < characters.count {
+            switch characters[index] {
+            case "\\":
+                index += 2
+            case "'":
+                index += 1
+                while index < characters.count, characters[index] != "'" { index += 1 }
+                if index >= characters.count { return true }
+                index += 1
+            case "\"":
+                index += 1
+                while index < characters.count, characters[index] != "\"" {
+                    if characters[index] == "\\" { index += 1 }
+                    index += 1
+                }
+                if index >= characters.count { return true }
+                index += 1
+            default:
+                index += 1
+            }
+        }
+        return false
+    }
+
+    /// `t\` + `mux send-keys -t main …`: neither half contains the word, but the shell
+    /// joins them. A trailing fragment alone in command position that is a prefix of
+    /// `tmux` is treated as the first half of one.
+    static func trailingWordCouldBecomeTmux(_ input: String) -> Bool {
+        guard let segment = segments(in: input).last, segment.count == 1, let word = segment.first else {
+            return false
+        }
+        let fragment = normalized(word.text)
+        return !fragment.isEmpty && "tmux".hasPrefix(fragment)
+    }
+
+    // MARK: - ssh
+
+    /// Hosts that mean "this machine", where a tmux command really does land on the
+    /// server this guard is protecting. Anything else is another machine's namespace.
+    static let localHostNames: Set<String> = ["localhost", "127.0.0.1", "::1", "0.0.0.0", "0"]
+
+    /// ssh options that take a value, so the word after them is not the destination.
+    private static let sshValueFlags: Set<Character> = [
+        "b", "c", "D", "E", "e", "F", "I", "i", "J", "L", "l", "m", "O", "o",
+        "p", "Q", "R", "S", "W", "w",
+    ]
+
+    static func sshRunsOnThisMachine(_ args: [Word]) -> Bool {
+        var index = 0
+        while index < args.count {
+            let token = args[index].text
+            guard token.hasPrefix("-"), token.count > 1 else { break }
+            let letters = Array(token.dropFirst())
+            if let last = letters.last, sshValueFlags.contains(last), letters.count == 1 {
+                index += 2
+            } else {
+                index += 1
+            }
+        }
+        guard index < args.count else { return false }
+        var host = normalized(args[index].text)
+        if let at = host.lastIndex(of: "@") { host = String(host[host.index(after: at)...]) }
+        return localHostNames.contains(host)
     }
 
     // MARK: - Small helpers

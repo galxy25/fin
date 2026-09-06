@@ -371,6 +371,11 @@ write_private(config_path, json.dumps(config, indent=2, ensure_ascii=False) + "\
 # that exists on the tmux server but is not listed here (the owner's "main") is
 # invisible to routing and forbidden to send-keys. The file is user-editable working
 # memory, so an existing one is left alone.
+#
+# TmuxCommandGuard reads this file ONCE, at daemon launch (it is writable by the very
+# shell the guard constrains, so a live re-read would be an escalation path). Editing it
+# therefore takes effect at the next launch — and the agent does not need it to start
+# sessions of its own: names beginning with "fin-" are its namespace.
 registry_state = "kept (already present)"
 if not os.path.exists(registry_path):
     registry = {

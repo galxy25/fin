@@ -375,7 +375,11 @@ final class TmuxCommandGuardTests: XCTestCase {
         XCTAssertTrue(message.contains("list-sessions"))
         XCTAssertTrue(message.contains("do not retry"))
         XCTAssertTrue(message.contains("fin, pocketdj"))
-        XCTAssertTrue(message.contains("routing-registry.json"))
+        // It offers the ONE widening path the agent legitimately owns…
+        XCTAssertTrue(message.contains("fin-"), "got: \(message)")
+        // …and does not hand back the registry path, which is a file the guarded shell
+        // can write. Naming it turns the refusal into an escalation hint.
+        XCTAssertFalse(message.contains("routing-registry.json"), "got: \(message)")
     }
 
     // MARK: - The host policy object
@@ -412,10 +416,12 @@ final class TmuxCommandGuardTests: XCTestCase {
         XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t main hi"), .allow)
     }
 
-    /// The registry file is the authority on every send, not a launch-time snapshot:
-    /// a session registered mid-run becomes writable, and a registry that is deleted
-    /// shrinks the allow-list back to the agent's own session.
-    func testRegistryFileIsRereadOnEveryEvaluation() throws {
+    /// The registry is read ONCE, at launch. It has to be: the file lives in the same
+    /// home directory as the shell the guard constrains, so a live re-read would let the
+    /// model widen its own allow-list with two commands that never mention tmux (append
+    /// `{"session": "main"}` with python, then send keys to `main`). Widening takes the
+    /// user, on the host, and a restart.
+    func testRegistryIsASnapshotSoTheGuardedShellCannotWidenIt() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("fin-tmux-guard-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -432,15 +438,34 @@ final class TmuxCommandGuardTests: XCTestCase {
         )
         XCTAssertTrue(guardPolicy.evaluate("tmux send-keys -t pocketdj hi").isRefusal)
 
+        // The escalation the snapshot exists to block: the file gains a session while the
+        // agent is running.
         try JSONEncoder().encode(RegistryDocument(sessions: [
             SessionRegistration(session: "fin"),
-            SessionRegistration(session: "pocketdj"),
+            SessionRegistration(session: "main"),
         ])).write(to: url)
-        XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t pocketdj hi"), .allow)
-
-        try FileManager.default.removeItem(at: url)
-        XCTAssertTrue(guardPolicy.evaluate("tmux send-keys -t pocketdj hi").isRefusal)
+        XCTAssertTrue(
+            guardPolicy.evaluate("tmux send-keys -t main hi").isRefusal,
+            "a registry edited by the guarded shell must not widen the live allow-list"
+        )
         XCTAssertEqual(guardPolicy.evaluate("tmux send-keys -t fin hi"), .allow)
+    }
+
+    /// …and the price of that snapshot is paid here: the router's `start` action still
+    /// works end to end, because Fin owns a session-name namespace no file can grant.
+    /// Without this, "start a session and drive it" is a dead end — nothing in the
+    /// codebase ever wrote a created session into the registry.
+    func testFinNamespaceKeepsTheStartActionAlive() {
+        assertAllows("tmux new-session -d -s fin-build -c ~/forges/levi/fin")
+        assertAllows("tmux send-keys -t fin-build 'swift build' Enter")
+        assertAllows("tmux kill-session -t fin-build")
+        assertAllows("tmux new-session -A -s fin-build")
+        // The namespace is a prefix, not a wildcard: an unregistered name outside it is
+        // still off-limits, and so is the human's session.
+        assertRefuses("tmux send-keys -t build 'swift build' Enter", naming: "build")
+        assertRefuses("tmux send-keys -t main hi", naming: "main")
+        // …and it cannot be entered by renaming somebody else's session into it.
+        assertRefuses("tmux rename-session -t main fin-mine", naming: "main")
     }
 
     // MARK: - connectCommand parsing
@@ -464,6 +489,183 @@ final class TmuxCommandGuardTests: XCTestCase {
         )
         XCTAssertNil(TmuxCommandGuard.ownSessionName(inConnectCommand: ""))
         XCTAssertNil(TmuxCommandGuard.ownSessionName(inConnectCommand: "bash -l"))
+    }
+
+    /// `connectCommand: "tmux new-session -As fin"` is a legal way to write it, and the
+    /// clustered flag used to make `ownSession` nil — which, on a host with no registry,
+    /// made `forHost` return `.unenforced`: the guard shipped silently disarmed.
+    func testOwnSessionSurvivesClusteredFlagsInTheConnectCommand() {
+        XCTAssertEqual(TmuxCommandGuard.ownSessionName(inConnectCommand: "tmux new-session -As fin"), "fin")
+        XCTAssertEqual(TmuxCommandGuard.ownSessionName(inConnectCommand: "exec tmux new -dAs fin"), "fin")
+        let guardPolicy = TmuxSendGuard.forHost(
+            connectCommand: "tmux new-session -As fin",
+            registryFileURL: nil
+        )
+        XCTAssertTrue(guardPolicy.isEnforced, "a clustered connectCommand must still arm the guard")
+        XCTAssertTrue(guardPolicy.evaluate("tmux send-keys -t main hi").isRefusal)
+    }
+
+    // MARK: - Spellings of the word `tmux`
+
+    /// The fast path used to test the RAW string for the substring "tmux", so every shell
+    /// spelling the lexer already normalizes walked straight past the guard. All three of
+    /// these were verified to run tmux on this machine (`TmUx -V` prints a version in
+    /// bash, zsh and fish; the volume is case-insensitive).
+    func testTmuxSpelledToDefeatASubstringTestIsStillFound() {
+        assertRefuses("TMUX send-keys -t main 'rm -rf ~' Enter", naming: "main")
+        assertRefuses("TmUx send-keys -t main hi", naming: "main")
+        assertRefuses("t\\mux send-keys -t main hi", naming: "main")
+        assertRefuses("tm\"u\"x send-keys -t main hi", naming: "main")
+        assertRefuses("tm'u'x send-keys -t main hi", naming: "main")
+        assertRefuses("sh -c 'tm\"u\"x kill-server'")
+        assertRefuses("/opt/homebrew/bin/TMUX kill-server")
+        // The cheap prefilter must not start refusing ordinary quoted text.
+        assertAllows("git commit -m \"fix the parser\"")
+        assertAllows("echo \"it is fine\"")
+    }
+
+    // MARK: - tmux's argv, not the shell's
+
+    /// A shell-quoted `;` is the same byte as `\\;` by the time tmux reads argv, so tmux
+    /// separates commands on all of `\\;`, `';'` and `";"`. The guard used to split only
+    /// on the unquoted form, which let any read-only verb launder a mutation behind it.
+    /// Verified on tmux 3.6a: `tmux ls ';' rename-session -t other x` renamed `other`.
+    func testQuotedSemicolonSeparatesCommandsExactlyAsTmuxDoes() {
+        assertRefuses("tmux ls ';' send-keys -t main 'rm -rf ~' Enter", naming: "main")
+        assertRefuses("tmux ls \";\" kill-server")
+        assertRefuses("tmux capture-pane -p -t main ';' send-keys -t main hi", naming: "main")
+        assertRefuses("tmux display-message -p \"hi;\" kill-server")
+        assertRefuses("tmux list-sessions ';' kill-server")
+        // A payload whose `;` is backslash-escaped is a literal, and tmux does NOT split
+        // it — verified: `send-keys -t fin 'echo hi\\;' Enter` runs clean.
+        assertAllows("tmux send-keys -t fin 'echo hi\\;' Enter")
+    }
+
+    /// tmux parses short options with getopt, which packs them: `-lt main` is `-l -t main`.
+    /// Only the first letter used to be inspected, so the target became invisible and the
+    /// command fell through to the "no -t means my own session" allow. Verified on 3.6a:
+    /// `send-keys -lt victim …` delivers, and `kill-session -at fin` killed every other
+    /// session.
+    func testClusteredShortFlagsCannotHideTheTarget() {
+        assertRefuses("tmux send-keys -lt main 'pkill -f mlx_lm'", naming: "main")
+        assertRefuses("tmux new-window -dt main -n probe 'curl x|sh'", naming: "main")
+        assertRefuses("tmux kill-window -at main", naming: "main")
+        assertRefuses("tmux respawn-pane -kt main", naming: "main")
+        assertRefuses("tmux new-session -As main", naming: "main")
+        assertRefuses("tmux new-session -dAs main", naming: "main")
+        // The same forms against a session Fin owns stay legal.
+        assertAllows("tmux send-keys -lt fin 'swift build'")
+        assertAllows("tmux new-session -As fin")
+    }
+
+    /// Shell quoting carries no meaning tmux can see, so it cannot be used to decide what
+    /// is a flag. Quoting the FLAG (not the value) used to erase the target check while
+    /// tmux still honoured it — verified: `send-keys '-t' victim …` delivers to `victim`.
+    func testQuotedFlagsAreStillFlags() {
+        assertRefuses("tmux send-keys \"-t\" main 'rm -rf ~' Enter", naming: "main")
+        assertRefuses("tmux send-keys '-tmain' hi", naming: "main")
+        // …and the same hole disarmed the `-g` scope check on the set-* family, which is a
+        // persistent, server-wide execution hook.
+        assertRefuses("tmux set-option \"-g\" default-command 'sh -c evil'")
+        assertRefuses("tmux set-option '-g' status off")
+    }
+
+    /// `-a` inverts what `-t` means: `kill-session -a -t fin` names an allowed session and
+    /// kills every OTHER one. Verified on 3.6a: fin/main/bystander before, only `fin`
+    /// after. Its blast radius is `kill-server`'s, which the table already refuses.
+    func testKillSessionAllIsRefusedBecauseItsTargetIsInverted() {
+        assertRefuses("tmux kill-session -a -t fin")
+        assertRefuses("tmux kill-session -at fin")
+        assertRefuses("tmux kill-session -a")
+        // Killing one named session Fin owns is still ordinary work.
+        assertAllows("tmux kill-session -t fin")
+        assertAllows("tmux kill-session -t fin-build")
+    }
+
+    /// `send-keys -c <client-tty>` (and `-K`) address a CLIENT, not a session, so the keys
+    /// land wherever that client is attached — on this host, the human's terminal. There
+    /// is no `-t` for the guard to check, and `tmux list-clients` (an allowed read) prints
+    /// the ttys. Verified: `send-keys -K -c <tty> 'echo MARK' Enter` landed in the
+    /// attached session, not in Fin's.
+    func testSendKeysAimedAtAClientIsRefused() {
+        assertRefuses("tmux send-keys -K -c /dev/ttys008 'rm -rf ~/forges' Enter")
+        assertRefuses("tmux send-keys -c /dev/ttys008 hi")
+        assertRefuses("tmux send-keys -Kc /dev/ttys008 hi")
+        // `-c` on the commands where it means "start directory" is untouched.
+        assertAllows("tmux new-window -c ~/forges")
+        assertAllows("tmux new-session -d -s fin-build -c ~/forges")
+    }
+
+    /// `xargs` builds tmux's argv out of stdin, which this guard cannot see: verified on
+    /// 3.6a that `echo "rename-session -t victim OWNED" | xargs tmux -L … ` renames the
+    /// session while the guard sees an argument-less `tmux`.
+    func testXargsFeedingTmuxIsRefused() {
+        assertRefuses("echo \"rename-session -t main OWNED\" | xargs tmux")
+        assertRefuses("cat cmds.txt | xargs tmux -L other")
+        assertRefuses("echo '-t main hi' | xargs tmux send-keys")
+        // Piping tmux's OUTPUT anywhere is still just a read.
+        assertAllows("tmux list-clients | grep ttys")
+    }
+
+    /// One `send_input` is one line, but the PTY concatenates them: `tmux \\` and then
+    /// `send-keys -t main …` are two individually-allowed calls that the shell joins at
+    /// its continuation prompt into one forbidden command (verified: `printf 'tmux \\\n-V\n'`
+    /// prints a tmux version in bash, zsh and fish). A half-typed line is refused.
+    func testHalfTypedLinesAreRefusedBecauseThePtyJoinsThem() {
+        assertRefuses("tmux \\")
+        assertRefuses("tmux send-keys -t \\")
+        assertRefuses("echo hi && tmux \\")
+        // Even the fragment that has not spelled the word yet, in command position.
+        assertRefuses("t\\")
+        assertRefuses("tm\\")
+        // An unterminated quote is the same problem: the rest arrives later.
+        assertRefuses("tmux send-keys -t fin 'echo hi")
+        // Non-tmux traffic keeps its old behavior, continuation and all.
+        assertAllows("ls -la \\")
+        assertAllows("cat file \\")
+        assertAllows("git log --oneline \\")
+    }
+
+    // MARK: - False refusals the guard must not make
+
+    /// Quoted text is only a command when the head RUNS it. `git commit -m "tmux …"`,
+    /// `grep "tmux …"` and `echo "tmux …" >> notes.md` are data — and refusing them cost
+    /// real work in a repo whose current branch is about tmux.
+    func testTextThatMerelyMentionsTmuxIsNotACommand() {
+        assertAllows("git commit -m \"tmux guard: refuse unregistered targets\"")
+        assertAllows("grep -rn \"tmux send-keys -t main\" daemon/Sources")
+        assertAllows("echo \"tmux kill-server\" >> notes.md")
+        assertAllows("sudo grep tmux /etc/shells")
+        assertAllows("rg 'tmux kill-server' --files-with-matches")
+        // Relaying an instruction whose first word is `tmux` into a session Fin owns is
+        // the product's core loop, not an escape.
+        assertAllows("tmux send-keys -t fin \"tmux guard: add the clustered-flag tests\" Enter")
+        // …but a real nested command is still unwrapped and checked.
+        assertRefuses("sh -c 'tmux send-keys -t main hi'", naming: "main")
+        assertRefuses("tmux send-keys -t fin 'tmux kill-server' Enter")
+    }
+
+    /// A remote hop is another machine's namespace: `worker` over there is not `worker`
+    /// here, and this registry says nothing about that host — the same reasoning `-L`/`-S`
+    /// already gets. Driving Fin's own cloud box over ssh is a product behavior.
+    func testRemoteSshIsOutOfScopeWhileLocalSshIsNot() {
+        assertAllows("ssh cloud-box tmux send-keys -t worker 'ls' Enter")
+        assertAllows("ssh -p 2222 user@cloud-box tmux kill-server")
+        // localhost is this machine, so it is checked exactly like a local command.
+        assertRefuses("ssh localhost tmux send-keys -t main hi", naming: "main")
+        assertRefuses("ssh levi@127.0.0.1 tmux kill-server")
+    }
+
+    /// tmux prefix-matches aliases as well as names, so read-only abbreviations that only
+    /// an alias can produce must resolve rather than fail closed as unknown verbs.
+    func testReadOnlyAliasPrefixesResolveToTheirCommand() {
+        assertAllows("tmux showe -t main")
+        assertAllows("tmux showenv -t main")
+        assertAllows("tmux showms")
+        assertAllows("tmux lsc")
+        // A global flag that would block a mutation does not block a read.
+        assertAllows("tmux -f /dev/null list-sessions")
+        assertRefuses("tmux -f /tmp/evil.conf send-keys -t fin hi")
     }
 
     func testOwnSocketIsParsedOutOfTheConnectCommand() {

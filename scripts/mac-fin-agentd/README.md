@@ -230,15 +230,33 @@ old `fin/sites/fin/<site8>/status.json` in S3 is left for the operator.
   command — `send-keys`, `paste-buffer`, `kill-session`/`-window`/`-pane`, `kill-server`,
   `new-window`, `split-window`, `respawn-*`, `rename-*`, `set-option`, `attach`,
   `switch-client`, `run-shell`, `if-shell`, `source-file`, `bind-key`, a `-L`/`-S` pointed
-  at another server — whose target is not the daemon's own session or a registered one. It
-  handles `;`/`&&`/`||`/newline chaining, `sudo`/`env`/full-path prefixes, quoting, tmux's
-  own `\;` form, abbreviations (`send`, `kill-ses`), `$(…)`/backticks, and one level of
-  `sh -c '…'` nesting. **Reading is deliberately unrestricted** — `capture-pane`,
+  at another server — whose target is not the daemon's own session, a registered one, or a
+  session in Fin's own `fin-` namespace. It handles `;`/`&&`/`||`/newline chaining,
+  `sudo`/`env`/full-path prefixes, tmux's own `\;` form **and its quoted twins `';'`/`";"`**
+  (the shell removes quotes before tmux sees argv, so all three separate commands),
+  getopt-clustered flags (`-lt main`, `-at fin`, `-As main`), a quoted flag (`"-t" main`),
+  spellings the shell assembles (`TMUX`, `t\mux`, `tm"u"x`), abbreviations of names *and*
+  aliases (`send`, `kill-ses`, `showe`), `$(…)`/backticks, and one level of `sh -c '…'`
+  nesting. Three flags get refused before any target check because they make the target
+  lie: `kill-session -a` (kills every session *except* the one named), and `send-keys -c`/
+  `-K` (address a client, so the keys land in whatever session the human is attached to).
+  `xargs tmux …` is refused whole — its argv comes from stdin — and so is a line ending in
+  `\` or an open quote, because the PTY concatenates sends and the shell would join it with
+  the next one. **Reading is deliberately unrestricted** — `capture-pane`,
   `list-sessions`, `list-windows`, `has-session`, `display-message -p` work against `main`
   and every other session, because seeing the iMac's real work is the whole point of a
   resident site. Refusals are honest tool results (they name the session and hand back the
   read commands) and land in the audit log as failures. Coverage:
   `daemon/Tests/FinAgentCoreTests/TmuxCommandGuardTests.swift`.
+
+  **The allow-list is read once, at launch.** `routing-registry.json` lives in the same home
+  directory as the shell the guard constrains, so a per-send re-read would let the model
+  widen its own allow-list with two commands the guard never inspects (append a session with
+  `python3 -c …`, then send keys to it). Registering a session is therefore a *user* action
+  on this Mac that applies at the next launch — and the refusal text deliberately does not
+  name the file. What keeps the router's `start` action working is a namespace instead of a
+  file: sessions named `fin-…` are Fin's own, so `tmux new-session -d -s fin-build` then
+  `tmux send-keys -t fin-build …` works end to end. Don't name your own sessions `fin-`.
 
   **This is defense in depth, not a sandbox — say so out loud.** The daemon's shell still
   runs inside `tmux new-session -A -s fin` on the user's **default tmux socket**, the same
@@ -246,7 +264,9 @@ old `fin/sites/fin/<site8>/status.json` in S3 is left for the operator.
   natural-language channel cannot close indirection: `T=tmux; $T send-keys …`, a
   base64/`eval` reconstruction, a helper script or Makefile target that runs tmux, an alias
   or shell function, writing `~/.tmux.conf` and having tmux read it later, `ssh <remote>
-  tmux …`, or plain non-tmux damage (`pkill -f mlx_lm`, `launchctl bootout`, an `rm` shape
+  tmux …` (out of scope by policy — a remote box's session names are not in this registry's
+  namespace), a command split across two sends whose halves never spell the word, or plain
+  non-tmux damage (`pkill -f mlx_lm`, `launchctl bootout`, an `rm` shape
   `DestructiveCommandHeuristic` misses — its patterns still match **nothing** in a tmux
   verb). The guard closes the direct path a model actually takes; treat `main` as protected
   against the obvious, not isolated. The structural fix is a dedicated socket

@@ -44,6 +44,14 @@ HERE = Path(__file__).resolve().parent
 # the model wrote, so the port is mostly a pessimistic shell/tmux parser in front
 # of the same allow-list. Same policy on both sides — read anything, write only
 # what is registered — so the refuse-scenarios below stay the spec.
+#
+# Production's allow-list is wider in one deliberate way: sessions named "fin-*"
+# are Fin's own namespace, writable without appearing in any registry. That is
+# what keeps the router's `start` action working there (nothing ever wrote a
+# created session into routing-registry.json, and production reads that file only
+# at launch, because the guarded shell can write it). This harness hands the
+# executor a name from the registry, so it has no `start`-then-drive path to
+# protect and stays registry-only.
 # ---------------------------------------------------------------------------
 class GuardedTmuxExecutor:
     def __init__(self, socket_name: str, registry: dict):

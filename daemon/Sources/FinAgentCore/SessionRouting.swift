@@ -343,6 +343,13 @@ extension SessionRouter {
         // here. The "Session routing:" and "OFF-LIMITS" markers are load-bearing:
         // the prompt-gating tests key on them.
         //
+        // The "sessions you start yourself" sentence below was corrected in both
+        // places on 2026-09-06: the old wording claimed created sessions were
+        // registered automatically, which nothing in this codebase has ever done
+        // (SessionRegistryStore.register has no caller), so once TmuxCommandGuard
+        // began enforcing the allow-list a created session could not be driven at
+        // all. `fin-` is the namespace that makes `start` work end to end.
+        //
         // ONE DELIBERATE EXCEPTION: the "OFF-LIMITS means writing, not looking"
         // paragraph is production-only and is NOT mirrored into router.md. It
         // describes a mechanism the eval harness implements separately (its
@@ -358,7 +365,10 @@ extension SessionRouter {
         Your registry lists each session you may act on:
         \(entries.joined(separator: "\n"))
 
-        Sessions you create yourself are added to the registry automatically.
+        Sessions you start yourself are yours to drive — name them with a `fin-` prefix \
+        (`tmux new-session -d -s fin-<purpose>`), which is the namespace the send_input \
+        guard recognizes as Fin's own. Nothing writes the registry file for you: a session \
+        someone else started becomes yours only when the user registers it.
 
         Two independent facts — never conflate them. For any session name check both: \
         REGISTERED (in the registry) decides trust — whether the session is yours to act \

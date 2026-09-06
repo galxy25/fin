@@ -577,7 +577,8 @@ final class Daemon {
         }
         if tmuxGuard.isEnforced {
             let allowed = tmuxGuard.resolved().allowed.sorted().joined(separator: ", ")
-            log("tmux guard armed: mutating tmux commands limited to [\(allowed)]; "
+            log("tmux guard armed: mutating tmux commands limited to [\(allowed)] plus "
+                + "\(TmuxCommandGuard.ownedSessionPrefix)* (Fin's own namespace); "
                 + "reads (capture-pane, list-*, has-session) are unrestricted")
         } else {
             log("tmux guard not armed: no tmux session in connectCommand and no routing registry")
@@ -601,8 +602,11 @@ final class Daemon {
             audit: { [weak self] event in self?.record(event) }
         )
         // Set, always — even when unarmed, so the assignment (not an omission) is what
-        // decides. The guard re-reads the registry per send, so a session the model
-        // registers mid-run becomes writable without a restart.
+        // decides. The allow-list is the snapshot taken just above: the registry is NOT
+        // re-read per send, because the file sits in the same home directory the guarded
+        // shell can write, and a live read would let the thing being constrained edit its
+        // own allow-list. Sessions the agent starts for itself stay drivable through
+        // TmuxCommandGuard.ownedSessionPrefix, which needs no file at all.
         engine.tmuxGuard = tmuxGuard
 
         // The model's request_input tool: record + notify — the engine already wrote the
