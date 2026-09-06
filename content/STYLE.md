@@ -15,14 +15,28 @@ checkable, not by being enthusiastic.
 | thing | say | never say |
 |---|---|---|
 | the product | **Fin** | "the Fin app" when you mean the agent; "the assistant"; "the AI" |
-| what Fin is | **a terminal agent with a voice interface and resilient distributed decentralized consensus cloud brain** — the standing directive's own words (`README.md` §6). Required verbatim in app-submission materials. In running prose the sanctioned short form is **"a terminal agent with a voice interface and a cloud brain"**: a deliberate compression for readability, never a replacement, and never the version that goes to App Store review | "an AI assistant", "a chatbot", "an LLM wrapper"; any form that drops the cloud brain entirely |
+| what Fin is | Levi's framing, quoted and attributed: **"a terminal agent with a voice interface and resilient distributed decentralized consensus cloud brain"** (`CLAUDE.md`, 2026-09-05; ledger row `CB-4`). Every piece **reinforces** that framing and never dilutes it — which is what the directive asks for, and is not the same as pasting the sentence. In running prose the sanctioned short form is **"a terminal agent with a voice interface and a cloud brain"** (`CB-5`), a deliberate compression for readability | "an AI assistant", "a chatbot", "an LLM wrapper"; any form that drops the cloud brain entirely. And never assert *resilient*, *distributed*, *decentralized* or *consensus* as description in Fin's own voice — see the warning under this table |
 | the apps | **the Fin app on iPhone, iPad, Mac** (Apple TV and Vision Pro ride along) | platform code names, "our iOS client" |
 | the machines Fin runs on | **Fin's computers**; individually "a cloud computer", "the Mac in your study", "this iPhone" | sites, workers, instances, nodes, daemons, hosts, boxes |
-| the distributed brain | **Fin's cloud brain** — "Fin keeps working when a computer goes away" | "our distributed system", "the control plane", "the orchestrator" |
-| a terminal Fin works in | **a session**, or plainly "the terminal where your build runs" | tmux pane/window/socket in user-facing copy (fine internally) |
+| the distributed brain | **Fin's cloud brain** — the name only | "our distributed system", "the control plane", "the orchestrator"; and **never** "Fin keeps working when a computer goes away", which is `CB-6`, **rejected**: the failover it promises is a design document, not code on `main` |
+| a terminal Fin works in | **a session**, or plainly the terminal where your build runs | tmux pane/window/socket in user-facing copy (fine internally) |
 | letting Fin onto a machine | **give Fin a key to this computer** (Fin's Key) | "provisioning SSH credentials", "key material" |
 | speaking to Fin | **just talk to Fin** / "ask Fin" | "voice-enabled", "hands-free experience", "utterances" |
 | the small local model | **the model Fin runs on your own machine** | "our proprietary model", "SLM", "edge AI" |
+
+> **The framing is a direction, not a mechanism claim.** `CLAUDE.md` asks that
+> copy, screenshots, review notes and feature priorities *reinforce* the frame
+> and not dilute it. It does not ask that the sentence be pasted, and four of
+> its words — *resilient*, *distributed*, *decentralized*, *consensus* — describe
+> machinery that has no capability row and cannot get one from `main`:
+> `docs/SITES.md` §1 makes the control plane the **only** orchestrator and
+> settles exclusion with one linearizable authority, which is centralized by
+> design. So the sentence is quoted as Levi's framing, with attribution, and
+> those four words never appear as description in Fin's own voice — least of
+> all in App Store review notes, where a technical claim is read as a
+> representation about the product. Reinforce the frame the way the rest of
+> this file does: by saying what Fin actually does. See `claims-ledger.md` §7,
+> rows `CB-4` and `CB-5`, and §2 of the ledger on the `framing` kind.
 
 The user talks to **one Fin**. Copy never implies the user is managing several
 agents, choosing which one to talk to, or thinking about where a message lands.
@@ -41,6 +55,20 @@ Two words that need care because they are internal jargon that leaks easily:
 SQS, instance/worker/site ids, hostnames, tailnet names, bucket names, ARNs,
 region names. Not because they are secret — because naming them breaks the one
 thing the product is doing for the user. See `README.md` §6.
+
+**The one written exemption.** A reproduction block in a developer-audience
+result post may print the endpoint, port and model identifier a reader needs to
+re-run the measurement — `http://localhost:1234/v1`, `google/gemma-4-e4b`. A
+loopback address in a command the reader types on their own machine is not a
+name of a machine Fin runs on, and withholding it would make the result
+unreproducible, which costs more than it protects. **Nothing else is exempt:**
+no tailnet name, no bucket, no account id, no ARN, no instance or site id, in
+any piece, in prose or in a code block. `check-claims.py` fails a piece whose
+prose carries an account id, an access key id, an ARN, an S3 URI, a tailnet
+hostname, a bucket name, an instance id, or a cloud product name; it skips
+fenced code blocks, which is exactly the width of this exemption and no wider.
+A piece that needs a real hostname to be reproducible is a piece whose
+reproduction instructions are not ready to publish.
 
 **"AI-powered", "AI-driven", "powered by AI".** It says nothing; every product
 in the category says it; and it points at the machinery instead of at what the
@@ -90,7 +118,10 @@ cannot keep:
   asks which one instead of guessing. (This is `clarify`, and it is worth
   saying out loud that asking is the designed behavior, not a failure.)
 - **When Fin hits a wall it cannot pass — a login, a 2FA prompt, a missing
-  credential — it asks you instead of guessing or stalling.**
+  credential — it is built to ask you instead of guessing or stalling.** (This
+  is the `request_input` tool; "is built to" is load-bearing and stays. The
+  tool exists on `main`; no eval measures how reliably the model reaches for
+  it. See `CB-10`.)
 - **Fin can be wrong.** Say it plainly where it matters, and say what the wrong
   case looks like: a message goes to the wrong session. Describe a recovery —
   seeing where a message went, moving it — only after opening the app and using
@@ -98,17 +129,20 @@ cannot keep:
   and no move-or-reassign control in the app, so a sentence promising one is
   false today.
 
-> **These sentences are copy, and copy is claims.** This section exists to be
-> lifted verbatim into posts, App Store descriptions, and review notes, which
-> makes it simultaneously the most-copied and the easiest-to-miss text in the
-> scaffold. Nothing here may be lifted without a row in `claims-ledger.md`
+> **These sentences are copy, and copy is claims.** This section — and §1's
+> **say** column — exist to be lifted verbatim into posts, App Store
+> descriptions, and review notes, which makes them simultaneously the
+> most-copied and the easiest-to-miss text in the scaffold. Nothing prescribed
+> anywhere in this file may be lifted without a row in `claims-ledger.md`
 > (§7, "Copy blocks outside a piece"), **re-verified against `main` on the day
 > it is used.** A guardrail sentence that was true when this file was written
 > and false in the build a reader downloads is the worst copy we can produce.
-> The first bullet's history is the reason for the rule: it read "Fin only
+> Two histories are the reason for the rule. The first bullet read "Fin only
 > touches sessions you registered" until 2026-09-06, and the send-path
 > enforcement that sentence implied is not on `main` — it is on an unmerged
-> branch.
+> branch (`CB-1`). And §1's say column carried a failover promise until the
+> same day (`CB-6`), which survived a whole audit because the ledger's scope
+> said "§3" and a table did not look like copy.
 
 Never write copy that implies Fin does not make mistakes, that it "always"
 routes correctly, or that a guardrail makes an outcome impossible. Where an
@@ -165,10 +199,18 @@ link preview without the paragraph that qualified it.
 **Secondary numbers inside a piece.** A number in a results table, or one that
 names its round inside a section whose headline sentence already carries the
 four qualifiers, does not have to repeat all four — that would be unreadable.
-It must still name the tier split it refers to and the configuration it belongs
-to, and it must not be the piece's quotable sentence. The test is the one in §6:
-if this line were the only thing a reader saw, would they believe something
-false? See `claims-ledger.md` §4 step 3, which states the carve-out precisely.
+`claims-ledger.md` §4 step 3 is the governing statement of that carve-out, and
+this paragraph must not restate it more loosely or more tightly. In its words:
+such a number "must still name its tier split **or** its round, and it must
+**never** be the piece's most quotable sentence — not the title, not a subhead,
+not a pull quote, not the lede." The test is the one in §6: if this line were
+the only thing a reader saw, would they believe something false?
+
+**Derived numbers and tables** have their own rules — a computed figure the
+artifact does not print gets its own row and says it is arithmetic; a results
+table takes one `<!-- table-claims: … -->` declaration rather than a row per
+cell. Both are `claims-ledger.md` §4 step 5, and `check-claims.py` enforces the
+table half.
 
 Other rules for numbers:
 
@@ -177,7 +219,16 @@ Other rules for numbers:
   should see it.
 - **One run is one run.** If the number came from a single scored run, say so.
   Do not average silently, do not report a best-of, and do not imply a
-  confidence interval that was never computed.
+  confidence interval that was never computed. **That prohibition includes
+  saying which comparisons are safe.** "A 1–2 point difference is within noise,
+  but the larger gap survives it" is a variance estimate wearing a caveat's
+  clothes, and it is most tempting in the limits section, where it reads as
+  candour while licensing the headline. With no repeats, the honest statement
+  is that no ordering is established — including the one you like.
+- **A number an artifact does not print is a derived number.** Say it is
+  arithmetic on the figures you cited, and give it a row. An *interpretation*
+  of a number is not a measurement: attribute it to us in the sentence, or cut
+  it.
 - **Report the flakes.** If some misses were timeouts or infrastructure
   failures rather than wrong answers, that belongs in the same table, marked.
 - **Report the regressions.** If an intervention fixed two things and broke

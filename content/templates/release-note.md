@@ -4,11 +4,19 @@ kind: release-note
 status: draft            # draft | review | approved | published
 audience: "TestFlight testers | App Store users"
 claims: []               # every line in the note that asserts something
-labbook: []
+labbook: []              # lab-book entry ids this cites. If writing one of these
+                         # pieces makes you want a number the book does not have,
+                         # README.md §1's four conditions govern the entry you
+                         # write: from the run's own outputs, dated today, marked
+                         # retrospective, and saying that a draft prompted it.
+                         # The book never gets written to suit a post.
 channel: app-store-release-notes   # or testflight-whats-new
 date: YYYY-MM-DD
 author: "<who wrote it>"
-build: ""                # REQUIRED: the App Store Connect build number
+build: ""                # REQUIRED once this reaches review/: the App Store Connect
+                         # build number. check-claims.py fails a release note in
+                         # review/ or published/ whose build: carries no digit.
+shipped_text: ""         # REQUIRED before published/: see "Text as shipped" below
 platforms: []            # [ios, macos, tvos, visionos] — exactly what this build covers
 approved_by: ""
 published_at: ""
@@ -91,6 +99,39 @@ do instead if there is a workaround.
 
 ---
 
+## Text as shipped
+
+<!--
+REQUIRED before this piece may be moved to published/. Paste here, verbatim, the
+"What's New" / "What to Test" text that was actually typed into App Store
+Connect, with the build number and the date it was submitted.
+
+Why this section exists. The pipeline ends at content/published/, but App Store
+metadata is not tracked anywhere in this repository — `git ls-tree -r main` has
+no fastlane directory, no metadata directory, no App Store folder; the text is
+typed into App Store Connect by hand. So a release note's ledger rows have
+nothing to be reconciled against unless the shipped words come back here. A note
+that says one thing while the store says another is an availability claim with
+no evidence, and nobody would ever find out.
+
+If the shipped text differs from the draft above — an editor trimmed it, review
+asked for a change — the difference goes here as shipped and the draft above
+stays as drafted. Do not retro-edit the draft to match; the gap between what we
+wrote and what went out is information.
+
+The `apple-publish` skill owns the submission mechanics. It does not own these
+words, and copying them back is a human step, like the submission itself.
+-->
+
+build: <NN>
+submitted: YYYY-MM-DD
+
+```
+<the exact text in App Store Connect>
+```
+
+---
+
 ## Claims in this note
 
 | id | sentence | kind | evidence |
@@ -100,6 +141,10 @@ do instead if there is a workaround.
 ## Pre-flight
 
 - [ ] Every line is true of **this build**, verified against the build number
+- [ ] `build:` in the front matter carries the App Store Connect build number
+      (the checker fails this note in `review/` without it)
+- [ ] **"Text as shipped" carries the words actually submitted** — required
+      before `published/`, because nothing else in this repo records them
 - [ ] Platform coverage stated where it is not all platforms
 - [ ] No infrastructure names, no internal component names, no code identifiers
 - [ ] No numbers unless they carry their qualifiers (they rarely fit — omit)

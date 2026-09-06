@@ -4,7 +4,12 @@ kind: feature-announcement
 status: draft            # draft | review | approved | published
 audience: "<who this is for: Fin users on iPhone; developers evaluating Fin; TestFlight testers>"
 claims: []               # e.g. [FK-01, FK-02] — ids in content/claims-ledger.md
-labbook: []              # lab-book entry ids this cites; [] is fine for a pure feature post
+labbook: []              # lab-book entry ids this cites. If writing one of these
+                         # pieces makes you want a number the book does not have,
+                         # README.md §1's four conditions govern the entry you
+                         # write: from the run's own outputs, dated today, marked
+                         # retrospective, and saying that a draft prompted it.
+                         # The book never gets written to suit a post.
 channel: blog            # blog | app-store-release-notes | testflight-whats-new | social
 date: YYYY-MM-DD
 author: "<who wrote it>"
@@ -43,12 +48,20 @@ have to do instead, and what did it cost them?
 Do NOT invent a user or quote one who does not exist (STYLE.md §2). Describe
 the situation, not a persona.
 
-Connect to the frame (README.md §6): a terminal agent with a voice interface
-and resilient distributed decentralized consensus cloud brain — the standing
-directive's own words, and the ones app-submission materials use verbatim
-(STYLE.md §1 covers when the short form is allowed). A feature post should make
-one of those pillars more true, and the reader should be able to feel which
-one.
+Connect to the frame (README.md §6). Levi's framing for Fin is "a terminal
+agent with a voice interface and resilient distributed decentralized consensus
+cloud brain" — ledger row CB-4, kind `framing`.
+
+REINFORCE it; do not paste it. The directive asks that copy reinforce the frame
+and not dilute it, which is a direction, not a sentence to copy — and four of
+its words (resilient, distributed, decentralized, consensus) describe machinery
+with no capability row behind it, so they are never asserted as description in
+Fin's own voice. Quote the sentence only with attribution to Levi. The short
+form for running prose is CB-5.
+
+A feature post should make one of those pillars more true, and the reader
+should be able to feel which one. The way to reinforce the frame is to say what
+Fin actually does.
 -->
 
 ## How it works

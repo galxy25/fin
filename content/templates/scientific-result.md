@@ -75,7 +75,10 @@ State the decision this was meant to inform.
 Everything a reader needs to judge the number. Be exhaustive; this section is
 allowed to be boring.
 
-  - Model: exact identifier, tuned or untuned, quantization if it matters
+  - Model: exact identifier, tuned or untuned, quantization if it matters. If
+    the run artifact does not record the quantization or the serving build, SAY
+    SO — a bare model identifier does not pin the weights a reader would load,
+    and the gap is a fact about the artifact, not a detail to fill in.
   - Serving stack: what served it, on what hardware, with what settings
     (temperature, timeouts, context window)
   - Prompt: which revision, cited to a path @ sha
@@ -83,7 +86,24 @@ allowed to be boring.
     any of it was seen in training (the leakage rule)
   - Tiering: the split, and what makes the hard tier hard
   - Scoring: what counts as correct, what the exit-code gate is
-  - Runs: HOW MANY. One run is one run. Say so.
+  - Runs: HOW MANY. One run is one run. Say so. And if the artifact records no
+    run count, the piece may not infer one — "one score recorded" is not "one
+    run performed" (claims-ledger.md §4 step 4).
+
+  ** THE QUESTION THIS SECTION MOST OFTEN DUCKS **
+
+  WHAT WAS THE INTERVENTION WRITTEN AGAINST? If the thing you changed — a
+  prompt, a heuristic, a threshold — was authored by reading the miss list this
+  same corpus produced, then the number you are publishing is a FIT to this
+  corpus and is not evidence of generalization. There is no held-out split, and
+  the leakage rule above does not cover you: it is about training data, and a
+  prompt-only result has no training data.
+
+  Say it in "What this does not show", in plain words, and say what would be
+  needed instead (scenarios written after the intervention, by someone who had
+  not seen it). A post whose every individual number is true but which is silent
+  on this reads as a generalization claim. That is the most dangerous shape a
+  result post can have, because nothing in it is false.
 -->
 
 ## Corpus
@@ -103,7 +123,23 @@ marketing chart.
 
 Mark flakes, timeouts, and infrastructure failures distinctly from wrong
 answers, with a footnote, and give their counts.
+
+A CAPTION SENTENCE ABOVE THE TABLE names the artifact the scores come from,
+at a sha — and names it HONESTLY. If a column is not in that artifact (a prompt
+sha you recovered from `git log`, a percentage you computed), say where that
+column came from. "Reproduced from RESULTS.md" is false of a table that has a
+column RESULTS.md does not contain, and a reviewer who opens the file to check
+finds they cannot.
+
+A TABLE TAKES ONE DECLARATION, NOT A ROW PER CELL (claims-ledger.md §4 step 5).
+Put a `<!-- table-claims: XX-01, XX-02 -->` marker on the line above it naming
+every ledger row that covers its cells. check-claims.py fails a scored table
+with no marker, and fails a marker naming an id the piece does not declare.
+Numbers in PROSE get no such shelter: each one must appear in some declared
+row's own claim text.
 -->
+
+<!-- table-claims: XX-01, XX-02 -->
 
 | configuration | overall | <tier A> | <tier B> | notes |
 |---|---|---|---|---|
@@ -135,6 +171,10 @@ model-capacity limit, or a corpus problem — and say which of those is a guess.
 <!--
 REQUIRED, and written first. Be specific, in a list. Typical entries:
 
+  - NO HELD-OUT SPLIT: the intervention was authored against this corpus's own
+    miss lists, so the number measures fit to it, not generalization (see
+    Method). Write this one whenever it is true; it is the limit most often
+    left out, and the only one that changes what the headline means.
   - single run per arm; no variance measured, no repeats, no confidence interval
   - one model, one corpus, one registry shape
   - the intervention was X only — no fine-tune, no retraining, no data change
@@ -145,6 +185,22 @@ REQUIRED, and written first. Be specific, in a list. Typical entries:
 
 The last one matters most. Write down the inference a motivated reader would
 make, and cut it off explicitly.
+
+** THE TRAP IN THIS SECTION. ** A limits section is where an unmeasured claim
+is most likely to slip through, because everything around it sounds like
+candour. The specific move to watch for is a sentence that gives back with one
+hand what it took with the other:
+
+  Bad:  "No variance was measured, so a 1-2 point difference between rounds is
+         within what a re-run could move. The larger gap is big enough to
+         survive that caveat."
+
+The second sentence is a variance estimate. If no repeats were run, nothing
+here supports it, and it exists to protect the headline — which is why it is
+always the headline's gap that survives. With no repeats, the honest statement
+is that NO ordering is established, including the one you like. Every sentence
+in this section is a claim and needs a ledger row like any other; a limit is
+not exempt from the rule because it sounds modest.
 -->
 
 ## Reproduce it
@@ -154,6 +210,16 @@ The exact command, with the environment variables, against a stated endpoint.
 Plus what a reader needs that they may not have (a served model, the corpus at
 a sha). If it cannot be reproduced outside our machines, SAY SO here rather
 than implying otherwise.
+
+AND: can the reader actually open what you cited? (README.md §2, the reader
+check.) This repository is private. A reproduction block that names paths the
+reader cannot fetch is a claim of reproducibility, not reproducibility. For
+each cited artifact, either confirm the reader can open it or put a quoted
+excerpt in the piece, marked as coming from an internal repository.
+
+Endpoints and model identifiers ARE allowed here — STYLE.md §2's one written
+exemption covers reproduction commands. Nothing else is: no hostname, no
+bucket, no account id.
 -->
 
 ```sh
@@ -186,10 +252,26 @@ only, and it gets its own ledger row (claims-ledger.md §2).
       records none, the piece says that instead of inferring one
 - [ ] The losing arms and the regressions are in the results table
 - [ ] Flake/timeout counts are reported and marked as non-semantic
-- [ ] No averaging, best-of, or implied confidence interval
+- [ ] No averaging, best-of, or implied confidence interval — **including in
+      the limits section**, where "the big gap survives the caveat" is the
+      usual form
+- [ ] **Held-out split: either there is one, or "What this does not show" says
+      there is not** and says what the intervention was written against
+- [ ] Derived numbers say they are arithmetic on the cited figures, and
+      interpretations of a number are attributed to us, not to the artifact
+- [ ] Each results table carries a `<!-- table-claims: … -->` marker, and its
+      caption names the artifact honestly, including any column that came from
+      somewhere else
 - [ ] No guardrail is described as an interlock (STYLE.md §3)
 - [ ] "What this does not show" names the inference a reader would wrongly make
 - [ ] Reproduction command was actually run as written
-- [ ] Lab-book entry ids are in the front matter and cited in the body
+- [ ] **Reader check done** (README.md §2): for each artifact the piece cites to
+      the reader, either they can open it or the piece says what stands in
+- [ ] Lab-book entry ids are in the front matter and cited in the body — and if
+      any entry was backfilled for this piece, it meets README.md §1's four
+      conditions
 - [ ] No claim generalizes a configuration into a product capability
+- [ ] Negative claims about work that has not happened were checked against the
+      thing itself — a log, a run artifact, a directory — **never against an
+      unchecked box in a plan document** (claims-ledger.md §4, standing hazard)
 - [ ] **Levi has approved this piece, in his own words** — no agent publishes

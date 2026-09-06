@@ -4,7 +4,12 @@ kind: social-post
 status: draft            # draft | review | approved | published
 audience: "<who scrolls past this>"
 claims: []               # yes, short posts need ledger rows too
-labbook: []
+labbook: []              # lab-book entry ids this cites. If writing one of these
+                         # pieces makes you want a number the book does not have,
+                         # README.md §1's four conditions govern the entry you
+                         # write: from the run's own outputs, dated today, marked
+                         # retrospective, and saying that a draft prompted it.
+                         # The book never gets written to suit a post.
 channel: social
 date: YYYY-MM-DD
 author: "<who wrote it>"
