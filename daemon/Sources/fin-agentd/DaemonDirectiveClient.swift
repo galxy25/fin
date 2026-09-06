@@ -106,11 +106,11 @@ private struct PolledDocument {
     /// False after a hard failure, so a source that just failed contributes nothing this
     /// pass instead of replaying a stale cache. The other source is unaffected.
     var isFresh = false
-    /// First run only: the HTTP status of a read that found NO object at the URL — 404,
-    /// or the 403 S3 answers for a missing key when the signer lacks ListBucket. Reset by
-    /// every read, and only ever set while `seedPending`: after the seed those statuses
-    /// are poll failures again, exactly as before.
-    var absentStatus: Int?
+    /// First run only: true after a read that found NO object at the URL — HTTP 404,
+    /// and only that (`DaemonDirectiveClient.absentStatus`). Reset by every read, and
+    /// only ever set while `seedPending`: after the seed a 404 is a poll failure again,
+    /// exactly as before.
+    var absent = false
     /// True while this source's first-run high-water hasn't been drawn yet — see
     /// `seedLedgerIfFirstRun`. Each slot draws its own, independently.
     var seedPending = false
@@ -144,11 +144,25 @@ final class DaemonDirectiveClient {
     /// Reported in the status document so a supervisor can tell which harness features
     /// (stayResident, cloud transcript, inbox, push notify) this agent has.
     static let daemonVersion = "1.4.1"
-    /// The statuses that mean "no such object" on a first-run read: S3 answers 404 for a
-    /// missing key when the signer may ListBucket (the control plane grants it for
-    /// exactly that reason) and 403 when it may not — a hand-provisioned resident
-    /// config's presigned GET typically sees the latter.
-    static let absentStatuses: Set<Int> = [404, 403]
+    /// The ONE status that means "no such object" on a first-run read. S3 answers 404
+    /// for a missing key when the signer may `s3:ListBucket` — the control plane's and
+    /// the operator's signers hold it for exactly that reason (control-plane commit
+    /// 59222fa, `SeeMissingAgentObjects`).
+    ///
+    /// 403 is deliberately NOT absent, at first run or ever. S3 answers 403 for a
+    /// missing key when the signer lacks ListBucket — but also for an expired presigned
+    /// URL, a signature mismatch, an expired token, a revoked or wrong access key, and
+    /// a denied bucket policy; and the body's `<Code>` can't split them, because
+    /// `AccessDenied` is what both a missing key without ListBucket and a denied read
+    /// say, so no parse is attempted. Reading 403 as absent would let a resident install
+    /// that starts with stale URLs complete its seed EMPTY and persist a ledger; the
+    /// operator re-mints the URLs, restarts in the same state directory, and — no
+    /// longer a first run — every unapplied directive and the whole inbox backlog
+    /// replay, one model turn each. So a 403 is always a poll failure that leaves the
+    /// seed pending, exactly as under 1.4.0. The cost: a signer without ListBucket sees
+    /// its seed deferred until the document exists, which is the safe direction —
+    /// nothing is stamped history on the strength of a status that may mean "denied".
+    static let absentStatus = 404
 
     #if !canImport(Darwin)
     /// Linux only: the default fetch's buffered read runs through this session, whose
@@ -216,7 +230,9 @@ final class DaemonDirectiveClient {
     ///     this box — the daemon passes whether its audit log already existed at launch.
     ///     A 1.3.0 daemon wrote the ledger only on its first apply, so a missing ledger
     ///     alone can't tell a fresh box from a 1.3.0 box that never applied anything;
-    ///     seeding the latter would swallow the next directive as history.
+    ///     seeding the latter would swallow the next directive as history. The verdict
+    ///     is written as an empty, non-pending ledger, so the next launch reads it back
+    ///     instead of re-deriving it from the audit log's existence.
     ///   - fetch: The transport; nil (the default) is the real one — streaming and
     ///     body-capped on Darwin, buffered under a total-time timeout on Linux.
     init(
@@ -314,11 +330,15 @@ final class DaemonDirectiveClient {
             // No ledger, but the box has run this daemon: a 1.3.0 daemon that never
             // applied a directive left no ledger behind, only its audit log. Not a
             // first run — every unapplied directive is delivered, as 1.3.0 would have.
+            // The verdict is written down as an empty, non-pending ledger, so the next
+            // launch reads "has run here" from the file instead of re-deriving it from
+            // the audit log's existence every time.
             self.appliedIDs = []
             self.seededIDs = []
             self.seededInboxIDs = []
             self.seededLookup = []
             audit("[s3] no directive ledger, but the audit log predates this launch — not a first run, nothing seeded")
+            persistLedger()
         case .missing:
             // A box this daemon has never run on: the shared supervision document is
             // history to it, not instructions — and so is the inbox's backlog, unless
@@ -407,12 +427,14 @@ final class DaemonDirectiveClient {
     /// which exempts the inbox here) but cannot empty the directive document, which
     /// every agent shares — so the daemon draws that line itself.
     ///
-    /// A slot whose object does not exist yet (`absentStatus`) has no history: its seed
-    /// completes empty, so the first entry written afterwards is delivered rather than
-    /// becoming the "first successful read" and getting seeded. A failed or unparseable
-    /// read leaves the seed pending for the next poll, and in that window
-    /// `matching(in:)` returns nothing for the slot anyway. Persisting even an empty
-    /// seed creates the ledger file, so an in-place restart is no longer a first run.
+    /// A slot whose object does not exist yet (`absent` — HTTP 404, nothing else) has no
+    /// history: its seed completes empty, so the first entry written afterwards is
+    /// delivered rather than becoming the "first successful read" and getting seeded. A
+    /// failed or unparseable read — a 403 included, whatever S3 meant by it — leaves the
+    /// seed pending for the next poll, and in that window `matching(in:)` returns
+    /// nothing for the slot anyway. Persisting even an empty seed creates the ledger
+    /// file, so an in-place restart is no longer a first run — which is exactly why a
+    /// status that may mean "denied" must never complete a seed.
     private func seedLedgerIfFirstRun() {
         var persist = false
         if directiveDocument.seedPending,
@@ -420,8 +442,8 @@ final class DaemonDirectiveClient {
             directiveDocument.seedPending = false
             persist = true
             switch resolution {
-            case .absent(let status):
-                audit("[s3] first run: \(directiveDocument.seedNoun.absent) (HTTP \(status)) — nothing to seed")
+            case .absent:
+                audit("[s3] first run: \(directiveDocument.seedNoun.absent) (HTTP \(Self.absentStatus)) — nothing to seed")
             case .document(let ids):
                 seededIDs = ids
                 if !ids.isEmpty { audit("[s3] first run: \(directiveDocument.seedNoun.seeded(ids.count))") }
@@ -432,8 +454,8 @@ final class DaemonDirectiveClient {
             inboxDocument?.seedPending = false
             persist = true
             switch resolution {
-            case .absent(let status):
-                audit("[s3] first run: \(inbox.seedNoun.absent) (HTTP \(status)) — nothing to seed")
+            case .absent:
+                audit("[s3] first run: \(inbox.seedNoun.absent) (HTTP \(Self.absentStatus)) — nothing to seed")
             case .document(let ids):
                 seededInboxIDs = ids
                 if !ids.isEmpty { audit("[s3] first run: \(inbox.seedNoun.seeded(ids.count))") }
@@ -445,7 +467,8 @@ final class DaemonDirectiveClient {
     }
 
     private enum SeedResolution {
-        case absent(status: Int)
+        /// HTTP 404 at first run: no object, no history.
+        case absent
         case document([String])
     }
 
@@ -453,7 +476,7 @@ final class DaemonDirectiveClient {
     /// (failed, unparseable, or a 304 with no cached body — a caching proxy can answer
     /// that even to an unconditional first GET).
     private static func seedResolution(of slot: PolledDocument) -> SeedResolution? {
-        if let status = slot.absentStatus { return .absent(status: status) }
+        if slot.absent { return .absent }
         guard slot.isFresh, let cached = slot.cached else { return nil }
         var seen = Set<String>()
         return .document(cached.directives.map(\.id).filter { seen.insert($0).inserted })
@@ -463,7 +486,7 @@ final class DaemonDirectiveClient {
     private func refreshed(_ slot: PolledDocument) async -> PolledDocument {
         var document = slot
         document.isFresh = false
-        document.absentStatus = nil
+        document.absent = false
         guard let url = URL(string: document.url), !document.url.isEmpty else {
             registerFailure("\(document.failurePrefix): invalid URL")
             return document
@@ -482,11 +505,14 @@ final class DaemonDirectiveClient {
                 return document
             }
             guard (200..<300).contains(status) else {
-                if document.seedPending, Self.absentStatuses.contains(status) {
+                if document.seedPending, status == Self.absentStatus {
                     // First run, and no object at this URL: not a failure — there is
                     // no history here. `seedLedgerIfFirstRun` completes the seed
                     // empty. After the seed the same status is a poll failure again.
-                    document.absentStatus = status
+                    // 404 ONLY: a 403 falls through to the failure below and keeps
+                    // the seed pending, because it may mean "denied" — see
+                    // `absentStatus`.
+                    document.absent = true
                     return document
                 }
                 registerFailure("\(document.failurePrefix): HTTP \(status)")
@@ -683,11 +709,12 @@ final class DaemonDirectiveClient {
 
     /// The three ways the ledger file can come back at init, kept distinct on purpose:
     /// `missing` is a first run and seeds (`seedLedgerIfFirstRun`) — unless the daemon
-    /// has other evidence it ran here (`hasRunHereBefore`); `loaded` — even an empty
-    /// `[]` — means the daemon has run here before and every unapplied directive is
-    /// delivered (unless the file itself says a seed is still pending); `corrupt` is a
-    /// reset worth one audit line (the init writes it), because it can replay
-    /// directives the previous run already applied.
+    /// has other evidence it ran here (`hasRunHereBefore`), in which case the init
+    /// writes an empty ledger so that verdict is on disk from then on; `loaded` — even
+    /// an empty `[]` — means the daemon has run here before and every unapplied
+    /// directive is delivered (unless the file itself says a seed is still pending);
+    /// `corrupt` is a reset worth one audit line (the init writes it), because it can
+    /// replay directives the previous run already applied.
     private enum LedgerLoad {
         case missing
         case corrupt

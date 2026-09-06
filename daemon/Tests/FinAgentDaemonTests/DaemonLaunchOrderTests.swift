@@ -142,7 +142,10 @@ final class DaemonLaunchOrderTests: XCTestCase {
 
         XCTAssertNotNil(session)
         XCTAssertEqual(fetches, 0, "not a first run — nothing to prime, nothing fetched")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: ledgerPath), "nothing seeded, nothing written")
+        XCTAssertEqual(try JSONDecoder().decode(DaemonDirectiveClient.LedgerFile.self,
+                                                from: Data(contentsOf: URL(fileURLWithPath: ledgerPath))),
+                       DaemonDirectiveClient.LedgerFile(),
+                       "nothing seeded — and the verdict is persisted as an empty, non-pending ledger")
         let audit = try auditLog()
         XCTAssertTrue(audit.contains("no directive ledger, but the audit log predates this launch — not a first run, nothing seeded"),
                       "got: \(audit)")

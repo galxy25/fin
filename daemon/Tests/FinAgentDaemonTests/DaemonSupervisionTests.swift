@@ -1036,30 +1036,95 @@ final class DaemonDirectiveClientTests: XCTestCase {
         XCTAssertEqual(second.map(\.id), ["d-1"], "the first directive written is delivered, not stamped history")
     }
 
-    /// S3 answers 403, not 404, for a missing key when the signer may not ListBucket —
-    /// a hand-provisioned resident config's presigned GET typically sees that. Same
-    /// meaning at first run, on the directive slot.
-    func testFirstRunTreatsA403OnTheDirectiveDocumentAsAbsentToo() async throws {
+    /// A 403 is NOT "no document", at first run or ever. S3 answers it for a missing key
+    /// when the signer lacks ListBucket — but also for an expired presigned URL, a
+    /// signature mismatch, a revoked key, a denied policy — and the control plane's and
+    /// the operator's signers hold ListBucket, so a missing key reads 404 to them.
+    /// Reading 403 as absent would complete the seed EMPTY on a denied read and write a
+    /// ledger; the next launch, URLs re-minted, would then replay the whole document. So
+    /// at first run a 403 is the plain poll failure it was under 1.4.0: the seed stays
+    /// pending, nothing is written, and the first document actually read is what seeds.
+    func testA403AtFirstRunIsAFailureThatLeavesTheSeedPending() async throws {
         startWithNoLedger()
         var lines: [String] = []
-        var exists = false
+        var status = 403
         let client = makeClient(audit: { lines.append($0) }, fetch: { _ in
-            if exists {
-                return (self.document(#"{"id": "d-1", "kind": "user_message", "text": "first"}"#), self.response(200))
-            }
-            return (Data(), self.response(403))
+            if status == 200 { return (self.history(), self.response(200)) }
+            return (Data(), self.response(status))
         })
 
         await client.primeFirstRunSeed()
 
-        XCTAssertFalse(client.isFirstRun)
-        XCTAssertEqual(try persistedLedger(), seededLedger([]))
-        XCTAssertEqual(lines, ["[s3] first run: no supervision directive document yet (HTTP 403) — nothing to seed"],
-                       "got: \(lines)")
+        XCTAssertTrue(client.isFirstRun, "a 403 may mean 'denied' — the seed is still owed")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile), "nothing resolved, nothing written")
+        XCTAssertTrue(lines.contains("[s3] poll failed: HTTP 403"), "got: \(lines)")
+        XCTAssertTrue(lines.contains("[s3] first run: directive document not read at launch — seed deferred to the next poll"),
+                      "got: \(lines)")
+        XCTAssertFalse(lines.contains { $0.contains("nothing to seed") }, "403 is never 'absent': \(lines)")
 
-        exists = true
-        let pending1054 = await client.poll()
-        XCTAssertEqual(pending1054.map(\.id), ["d-1"])
+        let stillDenied = await client.poll()
+        XCTAssertTrue(stillDenied.isEmpty)
+        XCTAssertTrue(client.isFirstRun, "still owed after a poll's 403 too")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile))
+
+        status = 200
+        let firstRead = await client.poll()
+        XCTAssertTrue(firstRead.isEmpty, "the first document read is history, not delivered")
+        XCTAssertEqual(client.seededIDs, ["d-1", "d-2", "d-3"], "seeded on the first document actually read: 3, not 0")
+        XCTAssertFalse(client.isFirstRun)
+        XCTAssertEqual(try persistedLedger(), seededLedger(["d-1", "d-2", "d-3"]))
+    }
+
+    /// The refuted scenario, end to end: a resident install starts with stale presigned
+    /// URLs (403 on both slots), the operator re-mints them and restarts in the same
+    /// state directory. Because the 403s wrote no ledger, the restart is still a first
+    /// run, and the first successful read seeds the directive document's N ids and the
+    /// inbox's M — replaying none of them. (Had 403 counted as absent, the first life
+    /// would have persisted an empty seed and the second replayed all N + M.)
+    func testA403AtFirstRunThenReMintedURLsOnRestartSeedTheWholeBacklogNotZero() async throws {
+        startWithNoLedger()
+        var lines: [String] = []
+        let directives = history()
+        let inbox = document("""
+        {"id": "m-1", "kind": "user_message", "text": "old"},
+        {"id": "m-2", "kind": "user_message", "text": "older"}
+        """)
+        let stale = makeInboxClient(
+            audit: { lines.append($0) },
+            directives: { (Data(), self.response(403)) },
+            inbox: { (Data(), self.response(403)) }
+        )
+
+        await stale.primeFirstRunSeed()
+        let firstLifePending = await stale.poll()
+
+        XCTAssertTrue(firstLifePending.isEmpty)
+        XCTAssertTrue(stale.isFirstRun, "both seeds are still owed")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile), "no ledger: the restart must still be a first run")
+        XCTAssertTrue(lines.contains("[s3] poll failed: HTTP 403"), "got: \(lines)")
+        XCTAssertTrue(lines.contains("[s3] inbox poll failed: HTTP 403"), "got: \(lines)")
+        XCTAssertFalse(lines.contains { $0.contains("nothing to seed") }, "got: \(lines)")
+
+        lines = []
+        let reMinted = makeInboxClient(
+            audit: { lines.append($0) },
+            directives: { (directives, self.response(200)) },
+            inbox: { (inbox, self.response(200)) }
+        )
+
+        await reMinted.primeFirstRunSeed()
+        let secondLifePending = await reMinted.poll()
+
+        XCTAssertTrue(secondLifePending.isEmpty, "nothing replays: \(secondLifePending.map(\.id))")
+        XCTAssertEqual(reMinted.seededIDs, ["d-1", "d-2", "d-3"], "N = 3 directive ids seeded, not 0")
+        XCTAssertEqual(reMinted.seededInboxIDs, ["m-1", "m-2"], "M = 2 inbox ids seeded, not 0")
+        XCTAssertFalse(reMinted.isFirstRun)
+        XCTAssertEqual(try persistedLedger(),
+                       DaemonDirectiveClient.LedgerFile(seeded: ["d-1", "d-2", "d-3"], inboxSeeded: ["m-1", "m-2"]))
+        XCTAssertTrue(lines.contains("[s3] first run: 3 historical directive(s) in the supervision doc marked applied, not replayed"),
+                      "got: \(lines)")
+        XCTAssertTrue(lines.contains("[s3] first run: 2 message(s) already in the inbox marked applied, not replayed"),
+                      "got: \(lines)")
     }
 
     /// Transient failures keep deferring: a 5xx, like a thrown transport error, says
@@ -1207,8 +1272,18 @@ final class DaemonDirectiveClientTests: XCTestCase {
         let pending = await client.poll()
         XCTAssertEqual(pending.map(\.id), ["d-1", "d-2", "d-3"], "every unapplied directive is delivered")
         XCTAssertTrue(client.seededIDs.isEmpty)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: stateFile), "nothing applied, nothing to write yet")
+        XCTAssertEqual(try persistedLedger(), DaemonDirectiveClient.LedgerFile(),
+                       "the verdict is written down: an empty, non-pending ledger, not re-derived from the audit log next launch")
         XCTAssertFalse(lines.contains { $0.hasPrefix(Self.firstRunAuditPrefix) }, "got: \(lines)")
+
+        // The next launch reads that ledger and needs no audit-log evidence at all.
+        var rebornLines: [String] = []
+        let reborn = makeClient(hasRunHereBefore: false, audit: { rebornLines.append($0) },
+                                fetch: { _ in (self.historyPlusOne(), self.response(200)) })
+        XCTAssertFalse(reborn.isFirstRun, "the ledger says it ran here")
+        XCTAssertTrue(rebornLines.isEmpty, "no verdict to re-derive, nothing to say: \(rebornLines)")
+        let rebornPending = await reborn.poll()
+        XCTAssertEqual(rebornPending.map(\.id), ["d-1", "d-2", "d-3", "d-4"], "still delivered, still nothing seeded")
     }
 
     /// With no such evidence a missing ledger is still the first run it always was.
