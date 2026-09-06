@@ -48,7 +48,42 @@ struct DaemonConfig: Decodable {
         var privateKeyPath: String
         var passphrase: String?
         var connectCommand: String?
+        /// Extra SSH env requests for the PTY channel. Merged OVER the always-on
+        /// `LC_FIN_AGENT` marker — see `sessionEnvironment`.
         var environment: [String: String]?
+
+        /// The SSH environment variable that marks a session as fin-agentd's own. A login
+        /// shell that execs every interactive remote login into the human's real tmux
+        /// session does so BEFORE the daemon types its `connectCommand`, so without a way
+        /// to tell the daemon apart its `FIN_READY_*` probes and keystrokes land in the
+        /// user's live session (the 2026-09-05 iMac shakedown). Shell profiles gate their
+        /// auto-attach on this name — it is a contract, don't rename it. `LC_`-prefixed
+        /// because the sshd configs that forward anything by default forward `LC_*`
+        /// (macOS, Debian/Ubuntu: `AcceptEnv LANG LC_*`); the RHEL family — Amazon Linux
+        /// included — enumerates locale names and needs `AcceptEnv LC_FIN_AGENT` added.
+        /// README: "The session marker".
+        static let agentMarkerName = "LC_FIN_AGENT"
+        static let agentMarkerDefaultValue = "1"
+
+        /// What the daemon actually requests on the PTY channel: the marker, always, with
+        /// the operator's `environment` merged on top. An operator may change the
+        /// marker's value (any non-blank string) but can never remove or blank it — a
+        /// blank value reads as unset to `[ -z "$LC_FIN_AGENT" ]` guards, which is the
+        /// hijack the marker exists to prevent.
+        var sessionEnvironment: [String: String] {
+            Self.sessionEnvironment(merging: environment)
+        }
+
+        /// Pure form of `sessionEnvironment`, for the config-free tests.
+        static func sessionEnvironment(merging configured: [String: String]?) -> [String: String] {
+            var merged = configured ?? [:]
+            let marker = merged[agentMarkerName]?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if marker.isEmpty {
+                merged[agentMarkerName] = agentMarkerDefaultValue
+            }
+            return merged
+        }
     }
 
     struct AgentConfig: Decodable {
@@ -341,6 +376,25 @@ final class Daemon {
             .path
     }
 
+    /// The SSH session the daemon opens, derived from the `server` block. Nonisolated
+    /// and pure so tests can prove what reaches the PTY channel — in particular that the
+    /// `LC_FIN_AGENT` marker rides along whether or not the operator configured an
+    /// `environment` (`DaemonSessionEnvironmentTests`).
+    nonisolated static func sessionConfiguration(
+        server: DaemonConfig.ServerConfig,
+        privateKeyPEM: String
+    ) -> HeadlessSessionConfiguration {
+        HeadlessSessionConfiguration(
+            host: server.host,
+            port: server.port ?? 22,
+            username: server.username,
+            privateKeyPEM: privateKeyPEM,
+            passphrase: server.passphrase,
+            connectCommand: server.connectCommand ?? "",
+            environment: server.sessionEnvironment
+        )
+    }
+
     func run() async {
         log("fin-agentd starting: \(config.server.username)@\(config.server.host) → \(config.agent.modelIdentifier)")
 
@@ -352,15 +406,35 @@ final class Daemon {
             await fail("cannot read private key at \(config.server.privateKeyPath): \(error)")
         }
 
-        let session = HeadlessTerminalSession(configuration: HeadlessSessionConfiguration(
-            host: config.server.host,
-            port: config.server.port ?? 22,
-            username: config.server.username,
-            privateKeyPEM: keyPEM,
-            passphrase: config.server.passphrase,
-            connectCommand: config.server.connectCommand ?? "",
-            environment: config.server.environment ?? [:]
-        ))
+        if let block = config.supervision {
+            let client = DaemonDirectiveClient(
+                directiveURL: block.directiveURL,
+                statusURL: block.statusURL,
+                inboxURL: block.inboxURL,
+                agentName: block.agentName,
+                pollSeconds: block.pollSeconds ?? 30,
+                deviceToken8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
+                stateFilePath: directiveStatePath,
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                }
+            )
+            supervision = client
+            let sources = client.inboxURL == nil ? "directives" : "directives + inbox"
+            log("supervision enabled: polling \(sources) every \(client.pollSeconds)s as \"\(block.agentName)\"")
+            // Launch is the conversation boundary. The control plane empties the
+            // per-agent inbox at launch; the daemon draws its first-run directive
+            // high-water at the same moment — before the SSH connect, the readiness
+            // probes and the first task turn, which together can run for minutes — so
+            // a directive an operator writes from here on is delivered, not stamped as
+            // history. No-op on a box the daemon has run on before.
+            await client.primeFirstRunSeed()
+        }
+
+        let session = HeadlessTerminalSession(
+            configuration: Self.sessionConfiguration(server: config.server, privateKeyPEM: keyPEM)
+        )
         self.session = session
         session.connect()
         do {
@@ -439,24 +513,6 @@ final class Daemon {
             self?.notifyFromTool(title: title, body: body) ?? false
         }
 
-        if let block = config.supervision {
-            let client = DaemonDirectiveClient(
-                directiveURL: block.directiveURL,
-                statusURL: block.statusURL,
-                inboxURL: block.inboxURL,
-                agentName: block.agentName,
-                pollSeconds: block.pollSeconds ?? 30,
-                deviceToken8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
-                stateFilePath: directiveStatePath,
-                audit: { [weak self] line in
-                    self?.log(line)
-                    self?.record(AgentAuditEvent(kind: "notice", text: line))
-                }
-            )
-            supervision = client
-            let sources = client.inboxURL == nil ? "directives" : "directives + inbox"
-            log("supervision enabled: polling \(sources) every \(client.pollSeconds)s as \"\(block.agentName)\"")
-        }
         if let uplink = transcript {
             log("cloud transcript enabled: last \(uplink.maxLines) lines, "
                 + "flushed at most every \(uplink.flushSeconds)s")
