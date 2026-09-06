@@ -43,9 +43,12 @@ have to do instead, and what did it cost them?
 Do NOT invent a user or quote one who does not exist (STYLE.md §2). Describe
 the situation, not a persona.
 
-Connect to the frame (README.md §6): this is a terminal agent with a voice
-interface and a cloud brain. A feature post should make one of those pillars
-more true, and the reader should be able to feel which one.
+Connect to the frame (README.md §6): a terminal agent with a voice interface
+and resilient distributed decentralized consensus cloud brain — the standing
+directive's own words, and the ones app-submission materials use verbatim
+(STYLE.md §1 covers when the short form is allowed). A feature post should make
+one of those pillars more true, and the reader should be able to feel which
+one.
 -->
 
 ## How it works
@@ -105,7 +108,11 @@ Delete the example row.
 ## Pre-flight
 
 - [ ] Every factual sentence has a ledger row, and every row is `verified`
+- [ ] The title has a ledger row like any other sentence
 - [ ] Every number carries model + prompt revision + corpus + tiering (STYLE.md §4)
+- [ ] Guardrails are written as decisions Fin makes, never as interlocks
+      ("Fin asks you to register it" — never "Fin only touches…", never
+      "Fin cannot…"). STYLE.md §3, and claims-ledger.md §7 `CB-1`
 - [ ] No infrastructure names anywhere in the reader-facing text
 - [ ] "What it does when it is wrong" is written and specific
 - [ ] No invented quotes, no competitor mentions, no unfalsifiable superlatives

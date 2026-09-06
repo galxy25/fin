@@ -59,7 +59,7 @@ idea  ──▶  drafts/  ──▶  claims audit  ──▶  review/  ──▶
 | **claims audit** | `content/claims-ledger.md` | every external claim in the piece has a ledger row naming its evidence, and each row has been checked against the artifact by a human or an agent who opened the artifact |
 | **review** | move to `content/review/`, `status: review` | audit complete; ledger rows are `verified`; the piece reads in Fin's voice (`STYLE.md`) |
 | **approved** | stays in `review/`, `status: approved` | **Levi said yes, in his own words** |
-| **published** | move to `content/published/`, `status: published`, with `published_at` and the channel/URL | it went out; the ledger rows become `published` and carry their re-check dates |
+| **published** | move to `content/published/`, `status: published`, with `published_at` and the channel/URL — **a human makes this move; see §4** | it went out; the ledger rows become `published` and carry their re-check dates |
 
 Moving a file between stage directories is the state change. Front matter
 `status` must agree with the directory; if they disagree, the directory wins
@@ -91,9 +91,41 @@ Evidence is an **artifact**, not a memory and not a conversation:
 the artifact does not exist yet, the claim is not ready and the sentence comes
 out of the draft.
 
-The rule is mechanical on purpose. A reviewer should be able to sit with the
-ledger and the repo and check the piece line by line without asking anyone
-anything. Anything that cannot be checked that way does not go out.
+The rule is mechanical on purpose, and **there is a machine**:
+
+```sh
+python3 content/check-claims.py          # exits non-zero on any defect
+```
+
+`check-claims.py` is pure Python, no dependencies, and it does not read the
+network or the repo's history — it reads this directory. It fails on:
+
+- a `claims:` id with no ledger row, and a ledger row naming a piece that does
+  not list it;
+- **a ledger row whose exact claim sentence does not appear verbatim in the
+  piece it names** — the check that stops a row from auditing a well-qualified
+  sentence while the piece ships a bare one;
+- a piece in `review/` with a row that is not `verified` or better;
+- a `performance` row with an empty or `n/a` re-check; an `availability` row
+  whose evidence names no build number; a row marked `verified` with no
+  verifier or no ISO date; an unknown `kind` or `status`; a duplicate id;
+- a `status` that disagrees with the directory the file is in;
+- anything in `published/` with an empty `approved_by`, an `approved_by` that
+  carries no quote and no date, an empty `published_at`, or — for a scientific
+  result — no lab-book entry;
+- **a ticked pre-flight box whose own text says `NOT DONE` or `PENDING`** — the
+  seed draft shipped two ticked boxes that were false, and a pre-flight ticked
+  without being true is worse than none, because the next reviewer trusts it;
+- a `CB` copy block (§7 of the ledger) that has drifted from the words
+  `STYLE.md` actually prescribes, or a **rejected** copy block still sitting in
+  `STYLE.md` with nothing marking it as forbidden.
+
+What the checker cannot do is open an artifact and read it, which is the part
+that matters most — so it is a floor, not the audit. A reviewer should still be
+able to sit with the ledger and the repo and check the piece line by line
+without asking anyone anything. Anything that cannot be checked that way does
+not go out. The checker exists so that the *checkable* failures are caught by
+something other than an agent's own honesty about its own work.
 
 ---
 
@@ -102,11 +134,35 @@ anything. Anything that cannot be checked that way does not go out.
 **Nothing in this directory is ever posted, published, submitted, uploaded, or
 sent anywhere by an agent on its own initiative.** Not a blog post, not a
 tweet, not a release note, not a screenshot, not a "small" correction. Agents
-draft, audit, and move files between stage directories. Publishing is a human
-act.
+draft, audit, and move files between `drafts/` and `review/`. Publishing is a
+human act.
+
+**`published/` is not an agent-writable directory.** The move into
+`content/published/` *is the record that something went out*, so an agent never
+creates, moves, edits, or deletes anything there — not as housekeeping, not to
+"file" a finished piece, not even to fix a typo. A piece an agent believes is
+finished stays in `review/` at `status: approved` until a human moves it. The
+stage-move permission in the paragraph above stops at `review/`.
 
 Publishing requires **Levi's explicit word for that specific piece.** A
-standing "yes, ship content" does not exist and cannot be created here. This
+standing "yes, ship content" does not exist and cannot be created here.
+
+**What counts as approval, and what goes in `approved_by`.** Approval is the
+highest-stakes fact in this pipeline, so it carries the same evidence standard
+as a number (`claims-ledger.md` §3, "'Levi told me' is not evidence"). The
+`approved_by` field takes three things or it is empty:
+
+1. **the words**, quoted verbatim — what Levi actually said, not a paraphrase
+   and not an interpretation of assent;
+2. **the date**, ISO;
+3. **where he said it** — the transcript, the message, the channel.
+
+An agent **never fills this field**, not even by transcribing something it read
+in its own context. An agent that believes it has been approved writes what it
+saw into a `notes:` field and leaves `approved_by` empty; a human puts their
+own words in. An empty `approved_by` on anything in `published/` is a defect
+the checker fails on, and a filled one that carries no quote and no date is
+treated as empty. This
 mirrors how App Store and TestFlight submissions already work in this repo —
 builds are prepared continuously, submissions wait for Levi — and the signing,
 keychain, and upload mechanics for those live in the **`apple-publish` skill**,
@@ -191,6 +247,7 @@ content/
   README.md              this file — the pipeline and its rules
   STYLE.md               Fin's voice for external writing
   claims-ledger.md       the audit surface: every external claim, with evidence
+  check-claims.py        the mechanical floor: run it before moving anything
   templates/
     feature-announcement.md
     scientific-result.md

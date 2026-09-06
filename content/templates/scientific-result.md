@@ -1,5 +1,5 @@
 ---
-title: "<The finding, stated plainly — not the topic>"
+title: "<The finding, stated plainly — not the topic. THE TITLE IS A CLAIM and gets its own ledger row: it either carries model + prompt revision + corpus + tiering, or it carries no number at all. It is the sentence most likely to be screenshotted alone.>"
 kind: scientific-result
 status: draft            # draft | review | approved | published
 audience: "<developers evaluating Fin; people who care how the model was measured>"
@@ -23,7 +23,17 @@ BEFORE you write the headline. If the limits section makes the headline
 embarrassing, the headline is wrong, not the limits.
 
 A result post cites the lab book. If a run is not in the book, it is not
-publishable — write the entry first (README.md §1).
+publishable.
+
+If the run happened before anyone wrote it up, the entry still has to exist —
+but a backfilled entry is NOT the same artifact as a contemporaneous one, and
+it must never be written from the draft. Write it from the run's own outputs,
+date it the day you write it, mark it retrospective, and say in the entry that
+a draft prompted it. Then the book records the one thing that matters here:
+that this entry was written by someone who already knew the headline. An
+append-only record whose framing was chosen by a marketing piece has had its
+direction of travel reversed, which is the single failure this whole structure
+exists to prevent (README.md §1).
 -->
 
 # <Title: the finding>
@@ -34,8 +44,20 @@ paragraph. A reader who stops here should have a true belief, not an
 approximate one.
 
 Bad:  "We dramatically improved Fin's routing."
-Good: "Rewriting the router prompt took the same untuned model from 36/51 to
-       49/51 on our 51-scenario corpus. Nothing about the model changed."
+Bad:  "Rewriting the router prompt took the same untuned model from 36/51 to
+       49/51 on our 51-scenario corpus."   <- no model id, no prompt revision,
+                                              no tiering: fails the pre-flight
+                                              box at the bottom of this file
+Good: "With the original router prompt (`evals/tmux-routing/prompts/router.md
+       @ 96ea006`), the untuned `google/gemma-4-e4b` — served through LM Studio
+       at temperature 0 with a 30-second per-call timeout — scored 36/51 on the
+       51-scenario tmux-routing corpus: core 21/26, hard 15/25. With the
+       round-3 prompt (`… @ 99ed9d9`) — the same model, endpoint, settings and
+       corpus — the score is 49/51: core 25/26, hard 24/25."
+
+Yes, the good one is longer. It is also the only one a reader can check, and
+it is the shape STYLE.md §4 spells out. Copy that shape, not a paraphrase of
+it: the paraphrase is how the qualifiers get lost on the first use.
 -->
 
 ## The question
@@ -156,10 +178,16 @@ only, and it gets its own ledger row (claims-ledger.md §2).
 ## Pre-flight
 
 - [ ] Every number has a ledger row citing a run artifact, and every row is `verified`
-- [ ] Every number carries model + prompt revision + corpus + tiering, **in the sentence**
+- [ ] **The title has a row**, and carries all four qualifiers or no number
+- [ ] Every quotable sentence carries model + prompt revision + corpus +
+      tiering, **in the sentence**; secondary numbers use the carve-out in
+      claims-ledger.md §4 step 3 and their rows say so
+- [ ] The run count is stated as the artifact records it — and if the artifact
+      records none, the piece says that instead of inferring one
 - [ ] The losing arms and the regressions are in the results table
 - [ ] Flake/timeout counts are reported and marked as non-semantic
-- [ ] Run count is stated; no averaging or best-of is implied
+- [ ] No averaging, best-of, or implied confidence interval
+- [ ] No guardrail is described as an interlock (STYLE.md §3)
 - [ ] "What this does not show" names the inference a reader would wrongly make
 - [ ] Reproduction command was actually run as written
 - [ ] Lab-book entry ids are in the front matter and cited in the body

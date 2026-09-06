@@ -41,11 +41,18 @@ or screenshots it will ever see the correction.
 When the qualifiers do not fit, the working move is to post the SHAPE of the
 finding and link the long form:
 
-  "Same model, same corpus, rewritten prompt: 13 more of 51 scenarios right.
-   The rounds, the regressions and the two it still gets wrong: <link>"
+  "Same model, same corpus, a rewritten prompt closed most of the gap — and
+   the next round broke three things it had already fixed. The rounds, the
+   regressions and the two it still gets wrong: <link>"
 
-That sentence has no unqualified number in it, it is true, and it is more
+That post has no number in it at all, it is true, and the see-saw is more
 interesting than the score.
+
+The near-miss to watch for: "13 more of 51 scenarios right" reads like a
+shape and is a number — two of them. A bare delta is exactly what gets
+screenshotted without its link, and "51" without the 26/25 split is the
+tiering deleted. If a digit is in the post, the four qualifiers are in the
+post. There is no shape-shaped exemption.
 
 Also: a claim is a claim at any length. Every assertion below gets a ledger
 row, exactly as it would in a 900-word post. Short does not mean unaudited.

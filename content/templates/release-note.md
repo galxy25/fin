@@ -103,6 +103,8 @@ do instead if there is a workaround.
 - [ ] Platform coverage stated where it is not all platforms
 - [ ] No infrastructure names, no internal component names, no code identifiers
 - [ ] No numbers unless they carry their qualifiers (they rarely fit — omit)
+- [ ] No guardrail written as an interlock (STYLE.md §3); a note line saying
+      what Fin will not touch describes a decision, not a mechanism
 - [ ] Fixed-lines describe symptoms, not defects
 - [ ] Reads as one Fin across the user's computers
 - [ ] Under the character limit for the channel

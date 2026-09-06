@@ -1,9 +1,9 @@
 ---
-title: "Same model, rewritten prompt: 36/51 to 49/51 on Fin's routing corpus"
+title: "Same untuned `google/gemma-4-e4b`, two router prompts: 36/51 with the original, 49/51 with round 3, on the 51-scenario tmux-routing corpus (26 core, 25 hard)"
 kind: scientific-result
 status: draft
 audience: "Developers evaluating Fin, and anyone who wants to know how we measure the model that decides where your words go"
-claims: [RPI-01, RPI-02, RPI-03, RPI-04, RPI-05, RPI-06, RPI-07, RPI-08, RPI-09, RPI-10, RPI-11, RPI-12, RPI-13]
+claims: [RPI-01, RPI-02, RPI-03, RPI-04, RPI-05, RPI-06, RPI-07, RPI-08, RPI-09, RPI-10, RPI-11, RPI-12, RPI-13, RPI-14, RPI-15, RPI-16, RPI-17, RPI-18, RPI-19, RPI-20, RPI-21, RPI-22, RPI-23, RPI-24]
 labbook: []              # PENDING — see "Lab-book link" below. Must be filled before this leaves review/.
 channel: blog
 date: 2026-09-06
@@ -26,39 +26,57 @@ published_at: ""
 > primary artifact directly. Before this piece moves to `review/`, the
 > lab-book entry for the prompt-iteration experiment must be added to the
 > front matter and cited in the body — a published result cites the book.
+>
+> **Blocking: the prompt this piece measures has since been corrected and not
+> re-scored.** Commit `7a591f4`, on the unmerged `imac-site` branch, rewrites
+> the registry paragraph of `evals/tmux-routing/prompts/router.md` and says in
+> its own inline comment to "re-score `router_llm.py` against it when a local
+> endpoint is up again." Until that re-score exists, 49/51 describes a prompt
+> revision the tree is already moving away from. See "Corrections owed
+> upstream" at the bottom.
 
-# Same model, rewritten prompt: 36/51 to 49/51 on Fin's routing corpus
+# Same untuned `google/gemma-4-e4b`, two router prompts: 36/51 with the original, 49/51 with round 3, on the 51-scenario tmux-routing corpus (26 core, 25 hard)
 
 Fin has to decide, before it does anything else, *where your words should go*.
 You have several terminals open with long-running work in them. You say "fix
 the widget build." That is a routing decision, and getting it wrong means
 typing into somebody's live session.
 
-We rewrote the prompt that makes that decision and re-scored it on our
-51-scenario corpus. The untuned `google/gemma-4-e4b`, served locally through LM
-Studio at temperature 0, went from **36/51** with the original prompt to
-**49/51** with the prompt we kept. Nothing about the model changed — same
-weights, same serving stack, same settings, no fine-tune. The prompt was the
-whole intervention.
+We rewrote the prompt that makes that decision and re-scored it. With the
+original router prompt (`evals/tmux-routing/prompts/router.md @ 96ea006`), the
+untuned `google/gemma-4-e4b` — served through LM Studio at temperature 0 with a
+30-second per-call timeout — scored 36/51 on the 51-scenario tmux-routing
+corpus: core 21/26, hard 15/25. With the round-3 prompt
+(`evals/tmux-routing/prompts/router.md @ 99ed9d9`) — the same untuned
+`google/gemma-4-e4b`, the same endpoint, the same settings, the same
+51-scenario corpus — the score is 49/51: core 25/26, hard 24/25. Nothing about
+the model changed between those two runs — same weights, same serving stack,
+same settings, no fine-tune — so the prompt was the whole intervention.
 
-The interesting part is not the 13-point gain. It is that the next round of
-prompt work fixed both remaining failures and broke three things that were
-already working, which is what most of this post is about.
+The interesting part is not the gap. It is that the next round of prompt work
+fixed both remaining failures and broke three things that were already working,
+which is what most of this post is about.
 
 ## The question
 
-Fin's router emits one of four decisions for every request: `route` it to an
-existing registered session, `start` a new one, `clarify` when it is genuinely
-ambiguous, or `refuse` when the target exists on the machine but was never
-registered with Fin. Registration is the guardrail: a terminal that merely
-exists is invisible to Fin and off-limits to type into.
+Fin's router emits one of four decisions for every request: `route` to an
+existing registered session, `start` a new one, `clarify` when the request is
+genuinely ambiguous, or `refuse` when the target is a live session that was
+never registered with Fin.
 
-A first model run scored 36/51 and failed in ways that looked like *missing
-rules* rather than missing capability. The question was whether that was true —
-whether the gap was prompt-fixable at all, and how far prompt work could go
-before it ran into the model itself. The decision it informed was concrete: if
-prompt work could not clear the corpus, the next move is a fine-tune; if it
-could, the fine-tune budget goes elsewhere first.
+That last one deserves care, because it is easy to write up as a safety
+interlock and it is not one. `refuse` is a decision, not an interlock: on
+`main` the router's answer to a live-but-unregistered target is to say what it
+found and ask you to register it, and nothing in the daemon's send path
+enforces that answer. What this eval scores is whether the model *reaches* that
+decision on 51 labeled cases — not what the running system does with it.
+
+`evals/tmux-routing/` is both the spec and the gate for the model factory's
+first fine-tune target, so the question was how far prompt work could go
+against that gate before it ran into the model itself. Routing remains the
+model factory's first fine-tune target: prompt work moved this score, and the
+first fine-tune run is still an unchecked, human-gated item in
+`scripts/model-factory/README.md`.
 
 ## Method
 
@@ -70,19 +88,24 @@ could, the fine-tune budget goes elsewhere first.
   degrades to `clarify` and is scored as a miss, so timeouts show up in the
   numbers and are marked separately (see Results).
 - **Prompt:** `evals/tmux-routing/prompts/router.md`. Five revisions, rounds 0
-  through 4; the kept one is round 3, committed at `99ed9d9`.
+  through 4: round 0 is the harness's original prompt at `96ea006`, round 3 is
+  the one we kept (introduced at `fcb10b2`, restored as the current file at
+  `99ed9d9` — byte-identical at both), and round 4 is `e7460cd`.
 - **Corpus:** `evals/tmux-routing/scenarios.json` — 51 labeled scenarios,
   **26 core** and **25 adversarial** (`h01`–`h25`). It is hand-written and
   hermetic: every scenario is a `(query, registry, live_sessions)` triple
   scored offline against an expected decision, with no tmux involved.
-- **Held out:** the corpus is the gate, so it is held out of any training data
-  by rule. This result involves no training at all, but the rule is why the
-  number means something later.
-- **Scoring:** `evals/tmux-routing/run_evals.py`, exact match on the decision
-  (and on the session name for `route`). All 26 core scenarios passing is the
-  exit-code gate.
-- **Runs:** **one scored run per prompt revision.** No repeats, no averaging,
-  no best-of. Everything below inherits that.
+- **Held out:** the corpus is the gate, so its literal scenarios are held out
+  of training data by rule — and the only dataset built so far derives from
+  that corpus, which is why `scripts/model-factory/README.md` blocks the first
+  fine-tune on synthetic variants replacing it.
+- **Scoring:** exact match on the decision (and on the session name for
+  `route`), and the harness's exit code gates on the core tier alone:
+  `run_evals.py` returns 0 only when all 26 core scenarios pass.
+- **Runs:** `RESULTS.md` records one score per prompt revision and no repeats;
+  the number of times each configuration was actually scored is not recorded in
+  any artifact in the repo, so nothing here should be read as an average, a
+  best-of, or a variance estimate.
 
 ### The corpus
 
@@ -96,42 +119,50 @@ right answer is to recreate them rather than refuse.
 That last class is the one worth understanding, because it is where the
 original prompt collapsed. A registered session that is not currently running
 is **dead**, not **unregistered**. Dead means `start`. Unregistered means
-`refuse`. The original prompt conflated them.
+`refuse`. `RESULTS.md` names *dead ≠ unregistered* as the first of the three
+prompt-fixable failure classes the original run exposed, and the rewrite was
+built around it.
 
 ## Results
 
 Both tables are reproduced from `evals/tmux-routing/RESULTS.md` at commit
-`d98a031`.
+`d98a031`. Every row is the same untuned `google/gemma-4-e4b` on the same
+51-scenario corpus except the first, which uses no model at all; the `core` and
+`hard` columns are the 26/25 split.
 
 | router | overall | route | start | clarify | refuse | core | hard |
 |---|---|---|---|---|---|---|---|
 | deterministic baseline (no model) | 29/51 (57%) | 12/24 | 6/13 | 7/10 | 4/4 | 26/26 | 3/25 |
-| model, original prompt | 36/51 (71%) | 21/24 | 4/13 | 7/10 | 4/4 | 21/26 | 15/25 |
-| model, round-3 prompt (kept) | **49/51 (96%)** | 23/24 | 13/13 | 9/10 | 4/4 | **25/26** | **24/25** |
+| model, original prompt (`96ea006`) | 36/51 (71%) | 21/24 | 4/13 | 7/10 | 4/4 | 21/26 | 15/25 |
+| model, round-3 prompt (`99ed9d9`, kept) | **49/51 (96%)** | 23/24 | 13/13 | 9/10 | 4/4 | **25/26** | **24/25** |
 
-The deterministic baseline is worth keeping in view: it passes all 26 core
-scenarios and 3 of 25 adversarial ones. That shape — perfect on the easy tier,
-near-zero on the hard one — is exactly what a keyword matcher looks like, and
-it is why the corpus has two tiers at all. A single 51-scenario headline would
-have hidden it.
+The deterministic baseline router, which uses no model at all, scores 29/51 on
+the same 51-scenario corpus: 26/26 on core and 3/25 on the adversarial set.
+That shape — perfect on the easy tier, near-zero on the hard one — is exactly
+what a keyword matcher looks like, and it is why the corpus has two tiers at
+all. A single 51-scenario headline would have hidden it.
 
-Round by round:
+Round by round, all on the same corpus and the same untuned model, varying only
+the prompt revision:
 
-| round | prompt change | overall | core | hard | misses |
-|---|---|---|---|---|---|
-| 0 | original | 36/51 | 21/26 | 15/25 | s01 s03 s05 s06 c01 h03 h10 h11 h13 h15 h16 h17 h18 h20 h23 |
-| 1 | three-classes rewrite | 46/51 | 25/26 | 21/25 | c01 h01 h07 h08 h21† |
-| 2 | imperative-first, honest vocab, start = lifecycle | 48/51 | 24/26 | 24/25 | r01† f01 h08 |
-| 3 | route ⊆ registry, start-object test — **kept** | **49/51** | **25/26** | **24/25** | c01 h08 |
-| 4 | generic-phrase clamp, anti-contrast rule — **reverted** | 48/51 | 25/26 | 23/25 | r06 h01 h12 |
+| round | prompt | prompt change | overall | core | hard | misses |
+|---|---|---|---|---|---|---|
+| 0 | `96ea006` | original | 36/51 | 21/26 | 15/25 | s01 s03 s05 s06 c01 h03 h10 h11 h13 h15 h16 h17 h18 h20 h23 |
+| 1 | `22005c7` | three-classes rewrite | 46/51 | 25/26 | 21/25 | c01 h01 h07 h08 h21† |
+| 2 | `f0040f5` | imperative-first, honest vocab, start = lifecycle | 48/51 | 24/26 | 24/25 | r01† f01 h08 |
+| 3 | `99ed9d9` | route ⊆ registry, start-object test — **kept** | **49/51** | **25/26** | **24/25** | c01 h08 |
+| 4 | `e7460cd` | generic-phrase clamp, anti-contrast rule — **reverted** | 48/51 | 25/26 | 23/25 | r06 h01 h12 |
 
 † `h21` (round 1) and `r01` (round 2) were 30-second endpoint timeouts, not
 wrong answers: the harness degrades a timed-out call to `clarify` and scores it
-as a miss. One in each of rounds 1 and 2; none in rounds 3 or 4.
+as a miss. Two of the misses recorded in rounds 1 and 2 were 30-second endpoint
+timeouts rather than wrong answers — one in each round — and rounds 3 and 4
+recorded none.
 
-The gain is concentrated in one decision type. `start` went from 4/13 to 13/13,
-while `route` moved 21/24 to 23/24, `clarify` 7/10 to 9/10, and `refuse` stayed
-4/4 throughout. The rewrite did not make the model broadly smarter about
+Round 1 scored 46/51 and round 2 scored 48/51 on that corpus. The gain from
+round 0 to round 3 is concentrated in one decision type: `start` went from 4/13
+to 13/13, while `route` moved 21/24 to 23/24, `clarify` 7/10 to 9/10, and
+`refuse` stayed 4/4. The rewrite did not make the model broadly smarter about
 routing; it fixed one confusion that happened to account for nine scenarios.
 
 ## What we changed and what it cost
@@ -141,10 +172,17 @@ routing; it fixed one confusion that happened to account for nine scenarios.
 recreate, never refuse), *explicit-new synonym coverage* (recognize a
 new-session request by meaning rather than from a list of verbs), and
 *mention ≠ target* (analogies, asides and physical-world words neither route
-nor refuse). It fixed all fifteen round-0 misses in those classes — and
-introduced four new ones: over-clarifying on a domain paraphrase (`h01`), a
-false "two targets" reading (`h07`), reading "set that up" as `start` (`h08`),
-and hallucinating vocabulary that was not in the registry (`c01`).
+nor refuse).
+
+Round 1 fixed fourteen of the fifteen round-0 misses and introduced four new
+ones — `h01`, `h07`, `h08` and `h21`, the last a 30-second endpoint timeout
+rather than a wrong answer — while `c01` failed in round 0 and failed again in
+round 1. Reading the miss sets across the table is worth doing slowly: `c01` is
+not a casualty of the rewrite, it is the one round-0 failure the rewrite never
+touched, and it is still failing under the prompt we kept. (`RESULTS.md`'s
+prose says round 1 "fixed all fifteen round-0 misses" and lists `c01` among the
+new over-corrections; that contradicts its own rounds table two lines above it.
+The table is right. See "Corrections owed upstream".)
 
 **Rounds 2 and 3** clamped the over-corrections with two structural rules
 rather than more prose: `route` may only name a session that is actually in the
@@ -153,11 +191,11 @@ a session or agent as its object, not a feature or a plan. Multi-clause
 requests target the main imperative.
 
 **Round 4** went after the last two misses with a stronger generic-phrase clamp
-and an explicit anti-contrast rule. It fixed both. It also broke three
-scenarios that rounds 2 and 3 had passed: `r06`'s direct session-name mention
-got second-guessed as a generic phrase, `h01`'s domain paraphrase got
-re-labeled generic, and `h12` refused on an adjectival "main". Net 48/51 —
-worse than the round it was trying to improve.
+and an explicit anti-contrast rule. Round 4 fixed both of round 3's remaining
+misses and broke three scenarios that round 3 had passed — `r06`, `h01`, `h12`
+— for a net 48/51, so round 3 is the prompt we kept: `r06`'s direct
+session-name mention got second-guessed as a generic phrase, `h01`'s domain
+paraphrase got re-labeled generic, and `h12` refused on an adjectival "main".
 
 So round 3 stands. Not because it is complete, but because it is the best point
 on this model's curve, and rounds 2 and 4 both demonstrated the same see-saw:
@@ -166,7 +204,8 @@ neighbors.
 
 ## Where it still fails
 
-Two scenarios, one in each tier.
+Two scenarios still fail under the round-3 prompt: `c01` in the core set and
+`h08` in the hard set.
 
 **`c01` (core).** "run the tests" routes to `fin`, rationalizing bare "tests"
 as belonging to fin's "testing and app development" domain. The right answer is
@@ -176,12 +215,14 @@ no-generic-words rule sit on a knife edge. Round 4's harder clamp fixed `c01`
 and cost `r06`, `h01` and `h12`.
 
 **`h08` (hard).** "unlike the newsletter rollout, the widget release needs a
-phased rollout — set that up" routes to `africanintellect`. The noun in the
-contrast clause still outweighs the imperative's "widget", which is literally
-in the other session's registered vocabulary. The explicit anti-contrast rule
-that fixed this in round 4 was the one that broke three others.
+phased rollout — set that up" routes to the wrong registered session: the one
+whose task vocabulary contains "newsletter". The noun in the contrast clause
+still outweighs the imperative's "widget", which is literally in the other
+session's registered vocabulary. The explicit anti-contrast rule that fixed
+this in round 4 was the one that broke three others.
 
-`c01` is the gate blocker: core stands at 25/26, and the gate requires 26/26.
+`c01` is the gate blocker: core stands at 25/26 under the round-3 prompt, and
+the harness's exit-code gate requires 26/26.
 
 Both look like model-capacity limits at this prompt length rather than missing
 rules — each has a rule in the prompt that the model applies inconsistently,
@@ -192,12 +233,14 @@ prompt, and neither has been run.
 
 ## What this does not show
 
-- **Single run per arm.** Every number in this post comes from one scored run.
-  No repeats, no variance, no confidence interval. A 1–2 scenario difference
-  between adjacent rounds is within the range a re-run could plausibly move, so
-  round 3 at 49 and rounds 2 and 4 at 48 should not be read as a firm ordering.
-  The 36 → 49 gap is large enough to survive that caveat; the 48-vs-49
-  comparisons are not.
+- **No run count is recorded.** `RESULTS.md` gives one score per prompt
+  revision and records no repeats, and there are no run logs in the repo, so
+  the number of scored runs behind each row is unknown. Treat every figure here
+  as a single observation: no variance, no confidence interval, nothing that
+  supports "consistently". A 1–2 scenario difference between adjacent rounds is
+  within the range a re-run could plausibly move, so round 3 at 49 and rounds 2
+  and 4 at 48 should not be read as a firm ordering. The 36 → 49 gap is large
+  enough to survive that caveat; the 48-vs-49 comparisons are not.
 - **The harness had flakes.** One 30-second endpoint timeout in round 1 and one
   in round 2 were scored as misses. Rounds 3 and 4 had none — which is luck as
   much as anything, and it means round 3's headline is compared against two
@@ -209,21 +252,29 @@ prompt, and neither has been run.
 - **Prompt-only.** No fine-tune, no training data, no model change. This is not
   a result about the model factory; it is a result about prompts, and it is
   partly a result about *this* model's sensitivity to them.
-- **This is the eval harness, not the app.** The 49/51 was measured through
-  `router_llm.py`, which assembles the prompt its own way. Fin's in-app router
-  (`SessionRouter.promptSection` in `FinAgentCore`) carries guidance that tracks
-  the round-3 prompt, but it is different code and has not been scored end to
-  end in the app. **Nobody should read this post as "Fin routes correctly 96%
-  of the time."** That number does not exist yet.
-- **It does not move the champion.** `scripts/model-factory/evals-champions.json`
-  still reads 36/51, because the champion record tracks *models*, and a prompt
-  change does not promote a model. A candidate promotes only by passing all 26
-  core scenarios and beating the champion on core + hard combined.
-- **Bigger local models were not evaluated.** Two were tried and excluded on
-  operational grounds, not on quality: `gemma-4-12b-qat` spends around 40
-  seconds per call on reasoning tokens, over the harness's contract, and
-  `gemma-4-26b-a4b` would not load on the box for lack of memory. We do not
-  know how either would score.
+- **This is the eval harness, not the app.** This number describes the eval
+  harness, not the shipped app: Fin's in-app router carries guidance that
+  tracks the round-3 prompt, but it is assembled by different code and has not
+  been scored end to end in the app. **Nobody should read this post as "Fin
+  routes correctly 96% of the time."** That number does not exist yet.
+- **It scores a decision, not an enforcement.** A `refuse` in this corpus means
+  the model produced the right JSON, and nothing more. It is not evidence about
+  what a running Fin does with that decision, and it is not a safety property:
+  the send-path allow-list that would make it one lives on an unmerged branch.
+- **The prompt has moved since.** The round-3 prompt was corrected on
+  2026-09-06 by `7a591f4` (unmerged), which is explicit that a re-score is
+  owed. 49/51 is a fact about `99ed9d9`, not about whatever ships next.
+- **It does not move the champion.** The champion record in
+  `scripts/model-factory/evals-champions.json` still reads 36/51, because it
+  was seeded from the pre-rework run and a prompt change does not promote a
+  champion. A candidate promotes only by passing all 26 core scenarios and
+  beating the champion on core + hard combined.
+- **Bigger local models were not evaluated.** Two larger local models were
+  unusable under the harness's 30-second per-call contract: `gemma-4-12b-qat`
+  spends about 40 seconds per call on reasoning tokens, and `gemma-4-26b-a4b`
+  did not fit in the available memory on the machine we scored on. They were
+  excluded on operational grounds, not on quality; we do not know how either
+  would score.
 
 ## Reproduce it
 
@@ -239,53 +290,107 @@ FIN_ROUTER_MODEL=google/gemma-4-e4b \
   python3 evals/tmux-routing/run_evals.py --router evals/tmux-routing/router_llm.py
 ```
 
-The harness prints every miss with expected-vs-actual JSON and the scenario
-note, and exits non-zero if any scenario fails. To reproduce an earlier round,
-check out `evals/tmux-routing/prompts/router.md` at that round's commit — round
-4 is `e7460cd`, and round 3 is `99ed9d9`, the current file.
+The harness prints every miss with expected-vs-actual JSON, and exits non-zero
+unless all 26 core scenarios pass. To reproduce a particular round, check out
+`evals/tmux-routing/prompts/router.md` at that round's commit: round 0 is
+`96ea006`, round 1 `22005c7`, round 2 `f0040f5`, round 3 `99ed9d9`, round 4
+`e7460cd`. Round 3 is the file as of `main @ 704ab09`; it is **not** the newest
+revision in the repository — see the note about `7a591f4` above.
 
 Expect your numbers to differ. Different LM Studio builds, different hardware
 and a different 30-second timeout margin all move single-run results.
 
 ---
 
+## Corrections owed upstream
+
+This piece found two defects in the artifacts it cites. Per `README.md` §1 the
+correction belongs in the internal record first; neither is fixed by this
+draft, and both should be before it publishes.
+
+1. **`evals/tmux-routing/RESULTS.md`** — the prose under the rounds table says
+   round 1 "fixed all fifteen round-0 misses" and lists `c01` among the
+   over-corrections round 1 introduced. Its own rounds table has `c01` failing
+   in round 0. The correct count is fourteen fixed, `c01` persisting, and four
+   new misses (`h01`, `h07`, `h08`, `h21†`).
+2. **`evals/tmux-routing/run_evals.py`** — the module docstring says "Exit
+   status: 0 if every scenario passes, 1 otherwise", but `main()` returns
+   `0 if core_passed == core_total else 1`: the gate is the core tier, not the
+   whole corpus. The code is the intended behavior and the docstring is stale.
+   A reader who follows "Reproduce it" will open that file.
+
 ## Claims in this piece
 
 Full rows, with evidence and re-check conditions, in
-`content/claims-ledger.md` § "RPI".
+`content/claims-ledger.md` § "RPI". Every sentence below appears verbatim in
+the body above; `content/check-claims.py` fails if one does not.
 
 | id | sentence | kind | evidence |
 |---|---|---|---|
-| RPI-01 | "The corpus is 51 labeled scenarios in `evals/tmux-routing/scenarios.json`: 26 core scenarios and 25 adversarial ones written to break a router that pattern-matches on vocabulary." | capability | `evals/tmux-routing/RESULTS.md @ d98a031`; `scenarios.json @ 704ab09` |
-| RPI-02 | "The deterministic baseline router, which uses no model at all, scores 29/51: 26/26 on core and 3/25 on the adversarial set." | performance | `RESULTS.md @ d98a031`, Overall table |
-| RPI-03 | "With the original prompt, `google/gemma-4-e4b` — untuned, served through LM Studio at temperature 0 with a 30-second per-call timeout — scored 36/51: core 21/26, hard 15/25." | performance | `RESULTS.md @ d98a031`, Overall table + run conditions; `evals-champions.json` |
-| RPI-04 | "With the round-3 prompt — the same model, the same endpoint, the same corpus, the same settings — the score is 49/51: core 25/26, hard 24/25." | performance | `RESULTS.md @ d98a031`; `prompts/router.md @ 99ed9d9` |
-| RPI-05 | "Nothing about the model changed between those two runs: same weights, same serving stack, same settings, no fine-tune. The prompt was the whole intervention." | performance | `RESULTS.md @ d98a031` run conditions; `scripts/model-factory/README.md @ 704ab09` Status |
-| RPI-06 | "Round 1 scored 46/51 and round 2 scored 48/51." | performance | `RESULTS.md @ d98a031`, rounds table |
-| RPI-07 | "Round 4 fixed both of round 3's remaining misses and broke three scenarios that round 3 had passed — `r06`, `h01`, `h12` — for a net 48/51, so round 3 is the prompt we kept." | performance | `RESULTS.md @ d98a031`, rounds table row 4 + analysis; commit `99ed9d9` |
-| RPI-08 | "Two scenarios still fail under the round-3 prompt: `c01` in the core set and `h08` in the hard set." | performance | `RESULTS.md @ d98a031`, rounds table row 3 + residual-misses table |
-| RPI-09 | "Two of the misses recorded in rounds 1 and 2 were 30-second endpoint timeouts rather than wrong answers — one in each round — and rounds 3 and 4 recorded none." | performance | `RESULTS.md @ d98a031`, dagger footnote |
-| RPI-10 | "Two larger local models were unusable under the harness's 30-second per-call contract: `gemma-4-12b-qat` spends about 40 seconds per call on reasoning tokens, and `gemma-4-26b-a4b` would not load on the box for lack of memory." | performance | `RESULTS.md @ d98a031`, run conditions |
-| RPI-11 | "This number describes the eval harness, not the shipped app: Fin's in-app router carries guidance that tracks the round-3 prompt, but it is assembled by different code and has not been scored end to end in the app." | capability | `daemon/Sources/FinAgentCore/SessionRouting.swift @ 704ab09`, `promptSection` |
-| RPI-12 | "The champion record in `scripts/model-factory/evals-champions.json` still reads 36/51, because it was seeded from the pre-rework run and a prompt change does not promote a champion." | performance | `evals-champions.json @ 704ab09`; promotion rule in `scripts/model-factory/README.md @ 704ab09` |
-| RPI-13 | "The gain is concentrated in one decision type: `start` went from 4/13 to 13/13, while `route` moved 21/24 to 23/24, `clarify` 7/10 to 9/10, and `refuse` stayed 4/4." | performance | `RESULTS.md @ d98a031`, Overall table per-action columns |
+| RPI-01 | see the ledger | method | `RESULTS.md @ d98a031`; `scenarios.json @ 704ab09` |
+| RPI-02 | see the ledger | performance | `RESULTS.md @ d98a031`, Overall table |
+| RPI-03 | see the ledger | performance | `RESULTS.md @ d98a031`; `prompts/router.md @ 96ea006`; `evals-champions.json` |
+| RPI-04 | see the ledger | performance | `RESULTS.md @ d98a031`; `prompts/router.md @ 99ed9d9` |
+| RPI-05 | see the ledger | performance | `RESULTS.md @ d98a031`; `scripts/model-factory/README.md @ 704ab09` |
+| RPI-06 | see the ledger | performance | `RESULTS.md @ d98a031`, rounds table |
+| RPI-07 | see the ledger | performance | `RESULTS.md @ d98a031`, rounds table row 4; commit `99ed9d9` |
+| RPI-08 | see the ledger | performance | `RESULTS.md @ d98a031`, rounds table row 3 |
+| RPI-09 | see the ledger | performance | `RESULTS.md @ d98a031`, dagger footnote |
+| RPI-10 | see the ledger | performance | `RESULTS.md @ d98a031`, run conditions |
+| RPI-11 | see the ledger | method | `SessionRouting.swift @ 704ab09` |
+| RPI-12 | see the ledger | performance | `evals-champions.json @ 704ab09` |
+| RPI-13 | see the ledger | performance | `RESULTS.md @ d98a031`, per-action columns |
+| RPI-14 | the title | performance | `RESULTS.md @ d98a031`; both prompt shas |
+| RPI-15 | see the ledger | capability | `SessionRouting.swift @ 704ab09` |
+| RPI-16 | see the ledger | capability | `SessionRouting.swift`, `AgentTurnEngine.swift @ 704ab09` |
+| RPI-17 | see the ledger | method | `run_evals.py @ 704ab09` |
+| RPI-18 | see the ledger | method | `scripts/model-factory/README.md @ 704ab09` |
+| RPI-19 | see the ledger | performance | `RESULTS.md @ d98a031`; `run_evals.py @ 704ab09` |
+| RPI-20 | see the ledger | performance | `RESULTS.md @ d98a031`, rounds table rows 0–1 |
+| RPI-21 | see the ledger | method | `scripts/model-factory/README.md @ 704ab09` |
+| RPI-22 | see the ledger | roadmap | `scripts/model-factory/README.md @ 704ab09` Status |
+| RPI-23 | see the ledger | method | `RESULTS.md @ d98a031`; absence of run logs |
+| RPI-24 | see the ledger | method | `RESULTS.md @ d98a031` rework paragraph |
+
+The sentences are not duplicated here: a second copy is a second thing to keep
+in sync, and the ledger is the copy that gets audited.
 
 ## Pre-flight
 
-- [x] Every number has a ledger row citing a run artifact
-- [x] Every number carries model + prompt revision + corpus + tiering, in the sentence
+- [x] Every number has a ledger row citing a run artifact, and every row is
+      `verified`
+- [x] The title carries all four qualifiers (it is `RPI-14`), or would carry no
+      number at all
+- [x] Every quotable sentence carries model + prompt revision + corpus +
+      tiering, in the sentence; secondary numbers name their round and tier
+      (`claims-ledger.md` §4 step 3)
 - [x] The losing arms and the regressions are in the results table
 - [x] Flake/timeout counts are reported and marked as non-semantic
-- [x] Run count is stated; no averaging or best-of is implied
+- [x] Run count is stated as **unrecorded**; no averaging or best-of is implied
 - [x] "What this does not show" names the inference a reader would wrongly make
       (the "Fin routes 96% of the time" reading, cut off explicitly)
+- [x] No claim generalizes a configuration into a product capability
+- [x] No guardrail is described as an interlock (`STYLE.md` §3)
+- [x] No infrastructure names in reader-facing text
 - [ ] **Reproduction command was actually run as written** — NOT DONE. The
       commands are transcribed from `RESULTS.md` and `scripts/model-factory/README.md`;
       nobody re-ran them while drafting this. Somebody must, against a live
       endpoint, before this leaves `review/`.
 - [ ] **Lab-book entry ids are in the front matter and cited in the body** —
       NOT DONE; the book did not exist when this was drafted.
-- [x] No claim generalizes a configuration into a product capability
-- [x] No infrastructure names in reader-facing text
+- [ ] **The measured prompt is the current one, or the piece says which one it
+      is not** — PARTIAL. The body says it; the re-score `7a591f4` asks for has
+      not happened. `RPI-03`, `RPI-04`, `RPI-08`, `RPI-13`, `RPI-14` and
+      `RPI-19` all go `stale` the moment that branch merges.
+- [ ] **The upstream corrections are filed** — NOT DONE. See "Corrections owed
+      upstream"; a post should not be the only place a repo's own numbers are
+      stated correctly.
+- [ ] **Levi has decided that his own project names may appear** — NOT DONE.
+      `c01`'s analysis names the `fin` session, and the corpus registry
+      (`evals/tmux-routing/registry.example.json`) contains two more of his
+      real projects with their task vocabularies. This draft names only `fin`
+      and describes the other session by its vocabulary, but naming scenario
+      content at all is a disclosure decision and it is his to make, not a
+      side effect of quoting the corpus.
 - [ ] **Levi has approved this piece, in his own words** — NOT DONE. Nothing
       here is published.

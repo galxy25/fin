@@ -15,7 +15,7 @@ checkable, not by being enthusiastic.
 | thing | say | never say |
 |---|---|---|
 | the product | **Fin** | "the Fin app" when you mean the agent; "the assistant"; "the AI" |
-| what Fin is | **a terminal agent with a voice interface and a cloud brain** | "an AI assistant", "a chatbot", "an LLM wrapper" |
+| what Fin is | **a terminal agent with a voice interface and resilient distributed decentralized consensus cloud brain** — the standing directive's own words (`README.md` §6). Required verbatim in app-submission materials. In running prose the sanctioned short form is **"a terminal agent with a voice interface and a cloud brain"**: a deliberate compression for readability, never a replacement, and never the version that goes to App Store review | "an AI assistant", "a chatbot", "an LLM wrapper"; any form that drops the cloud brain entirely |
 | the apps | **the Fin app on iPhone, iPad, Mac** (Apple TV and Vision Pro ride along) | platform code names, "our iOS client" |
 | the machines Fin runs on | **Fin's computers**; individually "a cloud computer", "the Mac in your study", "this iPhone" | sites, workers, instances, nodes, daemons, hosts, boxes |
 | the distributed brain | **Fin's cloud brain** — "Fin keeps working when a computer goes away" | "our distributed system", "the control plane", "the orchestrator" |
@@ -73,19 +73,42 @@ Fin acts on real terminals on machines people care about. The copy has to leave
 a reader with an accurate mental model of what happens when Fin is unsure or
 wrong, because that is where trust actually lives.
 
-Write the guardrails as **features, in the user's terms**:
+Write the guardrails as **features, in the user's terms** — and write them as
+*decisions Fin makes*, never as mechanisms that make an outcome impossible.
+That distinction is the whole difference between honest copy and a promise we
+cannot keep:
 
-- **Fin only touches sessions you registered.** A terminal that merely exists on
-  the machine is invisible to Fin — it will surface it and ask you to register
-  it rather than type into it. (This is the `refuse` decision.)
+- **Fin is built to leave unregistered terminals alone.** When a request names a
+  terminal that is running on the machine but was never registered with Fin,
+  the designed answer is to say what it found and ask you to register it,
+  rather than type into it. (This is the `refuse` decision.) Write it as a
+  decision — *"Fin asks you to register it instead of typing into it"* — not as
+  an interlock: **never** "Fin only touches sessions you registered", "Fin
+  cannot type into an unregistered session", or any sentence a reader would
+  take as a mechanical guarantee.
 - **When it is genuinely ambiguous, Fin asks.** Two sessions could match; Fin
   asks which one instead of guessing. (This is `clarify`, and it is worth
   saying out loud that asking is the designed behavior, not a failure.)
 - **When Fin hits a wall it cannot pass — a login, a 2FA prompt, a missing
   credential — it asks you instead of guessing or stalling.**
 - **Fin can be wrong.** Say it plainly where it matters, and say what the wrong
-  case looks like: a message lands in the wrong session, and you can see which
-  session every message went to and move it.
+  case looks like: a message goes to the wrong session. Describe a recovery —
+  seeing where a message went, moving it — only after opening the app and using
+  it. As of `main @ 704ab09` there is no per-message session attribution view
+  and no move-or-reassign control in the app, so a sentence promising one is
+  false today.
+
+> **These sentences are copy, and copy is claims.** This section exists to be
+> lifted verbatim into posts, App Store descriptions, and review notes, which
+> makes it simultaneously the most-copied and the easiest-to-miss text in the
+> scaffold. Nothing here may be lifted without a row in `claims-ledger.md`
+> (§7, "Copy blocks outside a piece"), **re-verified against `main` on the day
+> it is used.** A guardrail sentence that was true when this file was written
+> and false in the build a reader downloads is the worst copy we can produce.
+> The first bullet's history is the reason for the rule: it read "Fin only
+> touches sessions you registered" until 2026-09-06, and the send-path
+> enforcement that sentence implied is not on `main` — it is on an unmerged
+> branch.
 
 Never write copy that implies Fin does not make mistakes, that it "always"
 routes correctly, or that a guardrail makes an outcome impossible. Where an
@@ -131,6 +154,21 @@ Write it like this:
 Not like this:
 
 > Fin's local model routes with 96% accuracy.
+
+**A title is a sentence, and it is the one that travels alone.** Titles,
+subheads, pull quotes and image captions get ledger rows exactly like body
+text. A title either carries all four qualifiers or **carries no number at
+all** — the same hard rule social posts live under (`templates/social-post.md`),
+for the same reason: a headline gets screenshotted, quoted, and turned into a
+link preview without the paragraph that qualified it.
+
+**Secondary numbers inside a piece.** A number in a results table, or one that
+names its round inside a section whose headline sentence already carries the
+four qualifiers, does not have to repeat all four — that would be unreadable.
+It must still name the tier split it refers to and the configuration it belongs
+to, and it must not be the piece's quotable sentence. The test is the one in §6:
+if this line were the only thing a reader saw, would they believe something
+false? See `claims-ledger.md` §4 step 3, which states the carve-out precisely.
 
 Other rules for numbers:
 
