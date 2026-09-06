@@ -66,11 +66,16 @@ coincidence of arithmetic — 16 flavors × 10 templates — not by selection.
 
 The refuse class is the extreme: 16 domains × 10 unregistered names × 8
 templates = 1,280 candidates for 200 slots. Since the cap keeps
-`sorted(grp, key=line)[:cap]` (`gen_training_data.py:1069-1074`), the 200
-kept refuse rows are the *lexicographically first* 200 serialized examples,
-not a sample across the space. Whether that biases the surviving refuse
-vocabulary toward particular session names is unmeasured — the artifact that
-would settle it is a per-`{unreg}` histogram of the kept 200.
+`sorted(grp, key=lambda r: r["line"])[:cap]` (`gen_training_data.py:1053-1056`
+— 1069-1074 in an earlier draft of this entry is the leakage assertion and the
+final shuffle, not the cap), the 200 kept refuse rows are the *lexicographically
+first* 200 serialized examples, not a sample across the space.
+
+The bias that slicing introduces **is** measurable elsewhere in the same table,
+and it is large: all 16 invented domains appear in the `route` and `start`
+candidate pools, but only 8 survive into the kept `route` rows and only 4 into
+the kept `start` rows. For `refuse` specifically the equivalent check — a
+per-`{unreg}` histogram of the kept 200 — is still unmeasured.
 
 The balance the caps produce is real at the decision level (route 230 / start
 230 / clarify 230+160 / refuse 200 / …), but it is a balance struck over an

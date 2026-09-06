@@ -10,7 +10,7 @@ sources:
   - a823271 — "Model factory scaffold: dataset builder, QLoRA recipe, eval gate" (2026-09-05 12:59)
   - scripts/model-factory/eval_gate.py:44-45, :75-80, :110-112, :152
   - scripts/model-factory/evals-champions.json
-  - scripts/model-factory/README.md:240-262
+  - main:scripts/model-factory/README.md:240-262 (on branch labbook this is 262-284 — see the line-anchor note in O005)
   - evals/tmux-routing/run_evals.py:195
 related: [P002, P004, O002, O005, O006]
 corrects: []
@@ -101,7 +101,11 @@ parse broke and the run tells you nothing.
 
 **Before running the gate, confirm the champion number was measured with the
 prompt the candidate is being scored under.** It currently was not — see O002,
-which is the standing cautionary case for this whole protocol. `recordedAt` is
+which is the standing cautionary case for this whole protocol. O002 also records
+a second thing about this record: the `core` / `hard` split quoted above was
+**not printed by the harness** that produced the 36/51, because the corpus had
+no tiers when that run happened. It is a legitimate post-hoc re-partition, and
+nothing in the file says so. `recordedAt` is
 a string the gate never reads (`eval_gate.py` contains no reference to it);
 nothing in code prevents scoring against a stale number.
 

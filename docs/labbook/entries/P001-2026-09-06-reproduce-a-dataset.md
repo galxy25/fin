@@ -75,8 +75,11 @@ the output of.
 ## The standing gap this protocol works around
 
 Steps 5 and 6 are manual because the generator writes no manifest. The factory
-README specifies one (lines 173-175) and `build_dataset.py`'s docstring
-promises it; neither `gen_training_data.py` nor `datasets/mlx/` produces one.
+README specifies one (`main`, lines 173-175) — and *only* the README does;
+`grep -in manifest scripts/model-factory/build_dataset.py` returns zero matches,
+so an earlier draft of this entry crediting that file's docstring with the same
+promise was wrong. Neither `gen_training_data.py` nor `datasets/mlx/` produces
+one.
 Until a build emits `manifest.json` carrying the corpus sha256, the input
 shas, and the corpus commit, provenance is reconstructed by hand every time.
 That is the single highest-leverage fix in the data pipeline, and it is

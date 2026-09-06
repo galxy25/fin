@@ -9,8 +9,8 @@ tags: [curriculum, information, bits, data]
 sources:
   - "memory note training-bits-per-example — Levi's directive 2026-09-06, quoted verbatim below"
   - "local-artifact: train.log:9 — 'Iter 1: Val loss 2.463' measured before any gradient step (trainer.py:284-286)"
-  - "sibling-worktree, UNCOMMITTED: /Users/deepspacenine/forges/levi/fin-wt-bits/scripts/model-factory/{score_bits.py,select_curriculum.py,run_bits_experiment.sh} on branch bits-curriculum (704ab09), untracked as of 2026-09-06 11:30"
-  - "corpus compression measurements by a sibling survey on sha256 9552ac13… (xz -9e, gzip -9, generator source size)"
+  - "d4901d4 on branch bits-curriculum (2026-09-06 11:25:38) — 'Bits per example: measure what each training example actually teaches': score_bits.py, select_curriculum.py, run_bits_experiment.sh, tests/test_bits_curriculum.py, README.md, 2,640 insertions"
+  - "corpus measurements re-derived here on sha256 9552ac13… (2,363 lines, 16,142,664 B): xz -9e | wc -c → 58020; per-role character sums and label entropies by parsing the jsonl; generating-program size by git cat-file -s at main"
 related: [H002, O001, O004, O007, E004]
 corrects: []
 superseded-by: null
@@ -54,28 +54,62 @@ measurement free in its first log line.
 
 ## Why this corpus in particular
 
-Four independent estimators agree that this corpus is very small in
-information terms, all computed on `sha256 9552ac13…` (2,363 examples,
-16,142,664 bytes):
+Several estimators, of two different kinds — entropy of the label distribution,
+and description length — all put this corpus's information content in the tens
+of kilobytes. All computed on `sha256 9552ac13…` (2,363 examples, 16,142,664
+bytes; the fourteen class counts below sum to 2,363, which is the check that the
+partition is complete):
 
 | estimator | value |
 | --- | --- |
 | distinct assistant strings | 991 of 2,363 |
 | label entropy H(Y) | **8.585 bits/example** (ceiling log₂991 = 9.953) |
-| decision-class entropy | 3.351 bits over 11 classes (ceiling 3.459) |
+| decision-class entropy | **3.669 bits over 14 classes** (ceiling log₂14 = 3.807) |
 | **H(label \| input)** | **0 exactly** — all 2,363 (system, user) pairs are distinct |
 | `gzip -9` | 1,074,174 B = 3,637 bits/example |
 | **`xz -9e`** | **58,020 B = 196 bits/example** |
-| **the generator's own source** | **50,743 B = 172 bits/example** |
+| **the generating program's source** | **85,536 B = 290 bits/example** |
 
-`xz` and the generator source agree within 14% — two estimators on different
-principles converging on the same answer: **the whole 16 MB corpus is roughly
-50 KB of information.** Total label entropy is 2,363 × 8.585 = 20,286 bits ≈
-2.5 KB.
+Two of those rows were stated differently in this entry's first draft and are
+corrected here, with the definitions spelled out so they can be re-derived.
 
-And of that 16 MB, the optimizer only ever differentiates the labels: system
-messages are 13,510,803 characters (**83.7%**, entirely masked) and assistant
-labels are 272,847 characters (**1.69%**).
+**Decision-class entropy.** The 14 classes are the distinct values of the
+label's `action` / `decision` / `tool` field across all 2,363 rows: `route`
+(230), `start` (230), `clarify` (390), `refuse` (200), `ingest` (176), `drive`
+(176), `report` (144), `idle` (113), `ask` (160), `proceed` (160),
+`request_input` (128), `notify` (96), `send_input` (96), `read_terminal` (64).
+H = **3.6691** bits against a ceiling of log₂14 = 3.8074. The first draft printed
+3.351 over 11 classes, which reproduces exactly — but only under an unstated
+grouping that collapses the four tool-use classes into one. The definition, not
+the arithmetic, was the problem: a number nobody can re-derive from the entry is
+the thing rule 2 exists to stop.
+
+**The generating program.** `gen_training_data.py` is 50,743 bytes, but it is not
+the program that writes the corpus. It loads `router_baseline.decide` and
+`policy_baseline.decide` to label every routing and ledger row (O007) and
+`router_llm._system_prompt`, which reads `prompts/router.md` at generation time.
+Sizes at `main`: `router_baseline.py` 5,693 + `policy_baseline.py` 9,139 +
+`router_llm.py` 7,008 + `prompts/router.md` 9,272 + `prompts/tick.md` 3,681 =
+34,793 bytes beyond the generator itself. The real program is **85,536 bytes**,
+which is **47% above** `xz -9e`, not 14% below it.
+
+So the "two estimators converging" claim is withdrawn. They were never
+independent — both are compression-flavoured upper bounds on the same program's
+description length, and the apparent agreement came from leaving five of the six
+files out of one of them. What survives, and is enough:
+
+> **The whole 16 MB corpus is tens of kilobytes of information**, by every
+> measure available — `xz -9e` at 58 KB, the generating source at 86 KB, total
+> label entropy at 2,363 × 8.585 = 20,286 bits ≈ 2.5 KB, and H(label | input) =
+> 0 exactly. Three orders of magnitude between the file size and the
+> information, from three different directions.
+
+And of that 16 MB, the optimizer only ever differentiates the labels. Of the
+15,070,991 characters of message content, system messages are 13,510,803
+(**89.6%**, entirely masked) and assistant labels are 272,847 (**1.81%**). (As
+shares of the file's 16,142,664 bytes the same counts are 83.7% and 1.69%; that
+denominator includes JSON syntax and escaping, so it understates both. The first
+draft quoted the byte shares while calling them character shares.)
 
 Zero conditional entropy is the signature of label-by-construction and explains
 O001 directly: with no ambiguity anywhere in 2,363 rows, a training loss of
@@ -97,6 +131,35 @@ If bits are the right currency:
 4. **High-`residual_bits` examples will, on inspection, be mislabeled more
    often than they are hard** — the synthesized-corpus prediction.
 
+## What would refute it
+
+The README requires this section and the first draft of this entry did not have
+one, which made the claim a value judgement rather than a hypothesis. Stated so
+it can lose:
+
+- **`bits_base` is not concentrated.** If the `learned_bits` distribution over
+  the 2,245 training rows is close to uniform — say the top decile carries less
+  than 25% of the total, against the ~50%+ that "concentrated" implies — then
+  ranking by bits gives no useful ordering and there is nothing to select on.
+  This is the primary refutation and it is measurable from a single scoring pass,
+  before any training run.
+- **Bits do not predict what removal costs.** If dropping the *lowest*-
+  `learned_bits` decile changes the gate score by more than 1 scenario, while
+  dropping a random decile of the same size does not, the measure is not
+  tracking what training uses.
+- **H002's control comes out flat.** If a bits-selected subset and a
+  random subset of the same size reach the same gate score at the same iteration
+  count (H002's arm B ≈ arm C), then bits are not "the right currency for a
+  curriculum" whatever else they are — they are just a description of the
+  corpus.
+- **The measure is unstable.** If re-scoring the same corpus under a different
+  quantization of the same base model reorders the top decile substantially,
+  then a bits score is too fragile to select on, and the (corpus, base,
+  tokenizer, code) provenance rule below is not a safeguard but an admission.
+
+Predictions 1, 2 and 4 above are expectations; these four are the outcomes that
+would make this entry `refuted`.
+
 ## The experiment that would settle it
 
 1. Score every row of `datasets/mlx/train.jsonl` under the untuned base →
@@ -108,13 +171,28 @@ If bits are the right currency:
 4. Inspect the top `residual_bits` decile by hand for label errors.
 5. Then H002 tests whether selection actually saves iterations.
 
-**Tooling status — in flight, not yet committed.** `score_bits.py` (29,767 B),
-`select_curriculum.py` (30,454 B), `run_bits_experiment.sh` and a `tests/`
-directory exist in a sibling worktree at
-`/Users/deepspacenine/forges/levi/fin-wt-bits/scripts/model-factory/` on branch
-`bits-curriculum`, and are **untracked** there as of 2026-09-06 11:30 —
-`git status --short` lists all four as `??`. They are on no branch yet and this
-entry cannot cite a sha for them. `score_bits.py`'s docstring records the
+**Tooling status — committed, and citable.** This entry's first draft said the
+opposite: that the four files were untracked, on no branch, and that "this entry
+cannot cite a sha for them". That was a recollection about a working tree, and it
+was already false when it was written. The commit is **`d4901d4`** on branch
+`bits-curriculum`, *"Bits per example: measure what each training example
+actually teaches"*, authored and committed **2026-09-06 11:25:38** — five minutes
+before the stated observation and twelve before this book's own first commit. Its
+`--stat` lists `score_bits.py`, `select_curriculum.py`, `run_bits_experiment.sh`,
+`tests/test_bits_curriculum.py` and a 150-line `README.md`, 2,640 insertions.
+
+Blob sizes at `d4901d4` (`git cat-file -s`): `score_bits.py` **29,756 B**,
+`select_curriculum.py` **32,444 B**, `run_bits_experiment.sh` 10,586 B,
+`tests/test_bits_curriculum.py` 34,028 B. The first draft quoted 29,767 and
+30,454, which match neither the commit nor the working tree — sizes read off a
+tree that was being edited while they were read. The worktree has since moved on
+to `b67129f` ("Bits curriculum: fix the confounded control, rank on what the gate
+reads", 12:01) and `git status --short` there now reports ` M`, not `??`.
+
+Recorded at length because this is the exact failure the book's rule 2 exists to
+prevent, and it happened in the one entry that declared no artifact existed.
+
+`score_bits.py`'s docstring records the
 fidelity requirements that make its numbers comparable to a training loss:
 tokenize through mlx-lm's `TokenizerWrapper` rather than the raw HF tokenizer,
 compute the prompt offset the way `ChatDataset.process` does under

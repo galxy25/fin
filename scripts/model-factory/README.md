@@ -41,6 +41,15 @@ Read first if you are new to the factory:
 | `year-1/E001-…-router-prompt-rounds.md` | how the current 49/51 prompt was arrived at, and the round that was reverted |
 | `year-1/O002-…-stale-champion.md` | the recorded champion is stale; do not promote against it |
 
+**A second, independently-numbered lab book exists** at
+[`../../docs/labbook/`](../../docs/labbook/) — 13 entries written the same
+morning from an overlapping set of facts, committed in `4705b67`. It is not a
+subset of this one and it is not superseded by it; thirteen of its ids collide
+with ids here while meaning different things. Which of the two becomes canonical
+is an open decision (see `labbook/README.md`, "Provenance of this directory").
+**Until it is made, cite entries by path, never by bare id**, and read both when
+a question matters.
+
 ## Status
 
 - [x] Architecture + frozen `POST /feedback` ingest contract (this doc)

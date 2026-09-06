@@ -23,7 +23,7 @@ Two more, smaller:
 - The training recipe still names the wrong base. `train/qlora_config.yaml:7`
   reads `base_model: google/gemma-3-4b-it` and `train/README-local.md` names
   gemma-3, while the run in flight uses
-  `mlx-community/gemma-4-E4B-it-qat-4bit` (`launch-train.sh:11`). This is
+  `mlx-community/gemma-4-E4B-it-qat-4bit` (`launch-train.sh:12`). This is
   already on the fix list — `fuse-and-gate.md` step 6 — but unfixed.
 - `evals/goals-ledger` is merged, yet `eval_gate.py` has no reference to it
   (`grep -n 'goals-ledger' scripts/model-factory/eval_gate.py` → nothing). The

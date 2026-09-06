@@ -16,7 +16,7 @@ for the two baseline-labeled targets (lines 27-35):
 > over.
 
 The implementing code is the `keep()` closure at
-`gen_training_data.py:277-286`: it calls `router_baseline.decide`, returns
+`gen_training_data.py:276-285`: it calls `router_baseline.decide`, returns
 early on any mismatch of action or session, and only then appends.
 
 **The filter never rejected anything.** Counting invocations against
@@ -77,6 +77,11 @@ ledger label against anything other than the baseline that produced it.
 Also recorded for the file: `8aa690c`'s message describes the tool-use track as
 "request_input / notify / proceed". The code emits four classes and no class
 named `proceed`: `request_input` (128), `notify` (96), `send_input` (96),
-`read_terminal` (64) — `gen_training_data.py:912-937` and the generator's own
-stdout. "Proceed" is the name of the *construction rule* comment
-(`gen_training_data.py:830-833`), not of an emitted label.
+`read_terminal` (64) — `gen_tooluse`, `gen_training_data.py:912-935`, and the
+generator's own stdout. `proceed` is a *construction label*, at
+`gen_training_data.py:22` (module docstring, "request_input / notify / proceed
+(construction label)"), `:819-821` (the section comment) and `:888`
+(`TOOL_PROCEED`). An earlier draft pointed at `:830-833`, which is inside the
+`TOOLUSE_SYSTEM` prompt literal and contains no occurrence of the word. In
+fairness to the commit: its phrasing echoes the generator's own docstring
+verbatim, "(construction label)" and all.

@@ -7,11 +7,12 @@ title: Every routing and ledger label in the corpus is deterministic-baseline ou
 status: standing
 tags: [data, labels, distillation, baseline]
 sources:
-  - scripts/model-factory/gen_training_data.py:276-283 (routing keep()), :540 (ledger keep())
+  - scripts/model-factory/gen_training_data.py:276-285 (routing keep()), :540-552 (the ledger path)
   - 8aa690c — commit message claiming "an independent baseline re-derivation"
   - evals/tmux-routing/RESULTS.md:25-27 — baseline 3/25 hard vs model 24/25 hard
   - "measured today (E005): router_baseline 29/51 core 26/26 hard 3/25; policy_baseline 24/35 core 21/21 hard 3/14"
-  - "generator instrumentation by a sibling survey, 2026-09-06: routing 3,054 baseline calls / 3,054 kept / 0 rejected; ledger 769 / 769 / 0"
+  - "generator instrumentation by a sibling survey, 2026-09-06: routing 3,054 baseline calls / 3,054 passed the filter / 0 rejected; ledger 769 / 769 / 0"
+  - "re-derived here 2026-09-06: import gen_training_data, run gen_routing(), group by (target, decision), apply CAPS (gen_training_data.py:985-1001, sliced at :1053-1056) → 3,054 candidates, 890 kept"
 related: [E005, H004, P002, O001]
 corrects: []
 superseded-by: null
@@ -23,7 +24,7 @@ The routing and ledger halves of the training corpus — **1,659 of 2,363
 examples (70%)** — are labeled by running the deterministic baselines and
 recording their answers.
 
-`gen_training_data.py:276-283`, the routing path:
+`gen_training_data.py:276-285`, the routing path:
 
 ```python
 def keep(query, registry, live, intended_action, intended_session=None):
@@ -39,7 +40,7 @@ def keep(query, registry, live, intended_action, intended_session=None):
 ```
 
 The assistant message is `decision` — the baseline's output object, serialized.
-The ledger path (`:540`) is the same shape against `policy_baseline.decide`.
+The ledger path (`:540-552`) is the same shape against `policy_baseline.decide`.
 
 The generator's docstring calls this being "correct twice over": the template
 knows the intended class, and the baseline is asked to agree before the row is
@@ -50,12 +51,47 @@ kept.
 Instrumenting the generator (counting `decide` invocations against appends, run
 2026-09-06 from a clean checkout at `704ab09`):
 
-| track | baseline consulted | kept | rejected |
+| track | baseline consulted | passed the filter | rejected |
 | --- | --- | --- | --- |
 | routing | 3,054 | 3,054 | **0** |
 | ledger | 769 | 769 | **0** |
 
-It is a tripwire, not a validator. It eliminated nothing the templates did not
+**"Passed the filter" is not "kept".** The 3,054 routing rows that survive
+`keep()` are then cut down to **890** by the balancing caps, and nothing else in
+this book had recorded that. Re-derived here by importing the generator and
+grouping before the cap:
+
+| (target, decision) | candidates | cap | kept | discarded |
+| --- | ---: | ---: | ---: | ---: |
+| routing / refuse | 1,280 | 200 | 200 | **84%** |
+| routing / start | 992 | 230 | 230 | 77% |
+| routing / route | 512 | 230 | 230 | 55% |
+| routing / clarify | 270 | 230 | 230 | 15% |
+| **routing total** | **3,054** | | **890** | **71%** |
+
+And the cut is **not a sample**. `gen_training_data.py:1053-1056` keeps
+`sorted(grp, key=lambda r: r["line"])[:cap]` — a deterministic *alphabetical*
+slice of the serialized examples. That removes vocabulary wholesale: all 16
+invented domains (`DOMAINS`, `gen_training_data.py:138-153`) appear in the
+`route` and `start` candidate pools, but only **8 of 16** survive into the kept
+`route` rows (atlas, beacon, brewlog, cadence, harbor, kettle, ledgerbook,
+lumen) and only **4 of 16** into the kept `start` rows (atlas, beacon, brewlog,
+cadence). `clarify` keeps all 16; `refuse` uses none of them.
+
+Three consequences worth carrying:
+
+- **P002's disjointness argument counts the candidate pool, not the corpus.**
+  Its "16 invented domains" is true of what the generator can produce; the
+  corpus that trained run 1 contains 4 of them in its `start` class. The
+  leakage conclusion is unaffected (fewer domains cannot create overlap with the
+  eval registry) but the vocabulary breadth claim is weaker than it reads.
+- **H001 and H002 propose selecting a curriculum over a corpus that is already
+  the output of an unrecorded, non-random selection.** Any bits-ranked subset is
+  a selection on top of an alphabetical one.
+- **H004 reasons about what inputs the model was "pushed" on.** It was pushed on
+  a quarter of the `start` vocabulary the generator can write.
+
+The baseline filter itself is a tripwire, not a validator. It eliminated nothing the templates did not
 already guarantee — which is the expected outcome when the templates are
 written to produce exactly the inputs the baseline handles well, but it means
 the "correct twice over" claim carries no independent evidence.
@@ -67,8 +103,20 @@ Two corrections to `8aa690c`'s commit message, filed here:
    not independent verification.
 2. It describes the tool-use classes as "request_input / notify / **proceed**".
    The code emits four classes and none is named `proceed`: `request_input`,
-   `notify`, `send_input`, `read_terminal` (`gen_training_data.py:912-937`).
-   "Proceed" is the name of a construction-rule comment at line 830-833.
+   `notify`, `send_input`, `read_terminal` (`gen_tooluse`,
+   `gen_training_data.py:912-935`). `proceed` is a *construction label*, not an
+   emitted class: it appears in the module docstring at `:22` ("app tool-use —
+   request_input / notify / proceed (construction label)"), in the section
+   comment at `:819-821`, and as the list name `TOOL_PROCEED` at `:888`. An
+   earlier draft of this entry pointed at `:830-833`, which is inside the
+   `TOOLUSE_SYSTEM` prompt literal describing `send_input` and `request_input`
+   to the model and contains no occurrence of the word.
+
+   In fairness to `8aa690c`: its phrasing is a verbatim echo of the generator's
+   own docstring, tagged "(construction label)" in both places. The commit
+   message repeats the source's own shorthand rather than inventing one. The
+   correction is that the shorthand names no class a reader will find in the
+   data.
 
 ## Why this is the corpus's defining property
 

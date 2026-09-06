@@ -52,13 +52,17 @@ not a trend. Training loss, by 25-iteration report, mean per window:
 
 Both curves are consistent with [E004](E004-2026-09-06-bits-per-example.md):
 a corpus with zero conditional entropy has an attainable loss of zero, and 6.9M
-LoRA parameters over ~50 KB of generator description length is a wide margin.
+LoRA parameters over ~86 KB of generator description length is a wide margin.
 
 ## Two things worth flagging
 
 **A late-run rise.** The last eight reports break the pattern: iteration 3,550
-= 0.061, then 3,625 = 0.193, 3,650 = 0.183, 3,675 = 0.322, 3,700 = 0.078 —
-after 1,500 iterations spent below 0.02. The run is at 82% of 4,490 iterations
+= 0.061, then 3,625 = 0.193, 3,650 = 0.183, 3,675 = 0.322, 3,700 = 0.078. The
+per-500-iteration *means* in the table above sit below 0.02 from 2,001 onward,
+but the individual reports do not: nine reports between 2,000 and 3,525 are at
+or above 0.02 (2,100 = 0.029 … 3,000 = 0.028), so the genuinely unbroken
+sub-0.02 stretch before the rise is iterations **3,025-3,525 — about 500
+iterations**, not 1,500. The run is at 82% of 4,490 iterations
 and epoch 2 of 2 (E004 establishes one example per iteration, so the second
 epoch began at iteration 2,246; the rise is not an epoch boundary). Cause
 **UNSOURCED**. Candidates: a run of long tool-use examples, a data-order

@@ -3,7 +3,7 @@ id: O002
 date: 2026-09-06
 occurred: 2026-09-05 / 2026-09-06
 kind: OBSERVATION
-title: The recorded champion is a round-0 number — the gate would promote a candidate 13 points worse than the base model
+title: The recorded champion is a round-0 number — the gate would promote a candidate 12 points worse than the base model
 status: standing
 tags: [gate, champion, promotion, risk]
 sources:
@@ -33,6 +33,25 @@ commit `6b1c95f` at 2026-09-05 **12:17**; the first edit to `router.md` after
 its creation is `22005c7` at **12:38**. No revision of the prompt exists
 between `96ea006` (11:54) and the run.
 
+### The tier split in that record was not printed by the harness
+
+Worth stating plainly, because a reader who re-derives from `6b1c95f` will
+otherwise be stranded. `git show 6b1c95f:evals/tmux-routing/scenarios.json`
+parses to **51 scenarios, none of them flagged `hard`**. Tiering arrives one
+minute later in `2234284` ("Tier the routing corpus: core gates, hard
+benchmarks", 12:18), a child of `6b1c95f`, which rewrites `scenarios.json`
+(+509/−56) and `run_evals.py` (+16/−2). So the `core: 21/26` / `hard: 15/25`
+fields stored in `evals-champions.json` **cannot have been printed by the
+harness at the time of that run** — they are a post-hoc re-partition of the same
+51 results.
+
+The re-partition is legitimate, and that is checkable: diffing the two revisions
+of `scenarios.json` shows identical scenario ids, queries, `expected` objects and
+registry/live context, with only `hard` flags and `note` fields added; and
+E001's round-0 miss list splits 5-core / 10-hard, exactly as recorded. The
+overall 36/51 is untouched by any of this. The record is a re-partition, not a
+re-measurement, and nothing in the file says so.
+
 ## Why it matters
 
 `eval_gate.py` serves a candidate through `router_llm.py`, whose
@@ -46,12 +65,19 @@ is scored under round 3 and compared against a number produced under round 0.
 | what the champion side *should* be | round 3, 166 lines | 49/51 |
 
 **The false-promotion window:** any candidate that passes core 26/26 and scores
-**37-49 overall** promotes, while being no better than — and up to 13 points
+**37-49 overall** promotes, while being no better than — and up to **12** points
 worse than — the untuned base model measured on the same prompt. Under a
 correctly re-recorded champion the same candidate would need ≥50/51.
 
-13 points is the base model's own prompt engineering (E001) being credited to
-the fine-tune.
+12, not 13, because `beats()` is *strict* (`eval_gate.py:75-80`, quoted in
+P001): against a stored 36/51 the worst candidate that still promotes scores
+**37**, and 49 − 37 = 12. 13 is the separate and also-true number — the gap
+between the stored champion record and what the base actually scores under the
+shipped prompt (49 − 36). The record is 13 points too low; the candidate can be
+12 points worse.
+
+Either way the quantity is the base model's own prompt engineering (E001) being
+credited to the fine-tune.
 
 ## Status: diagnosed, not fixed
 

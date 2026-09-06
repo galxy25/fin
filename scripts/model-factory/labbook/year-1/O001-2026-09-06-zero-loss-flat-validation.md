@@ -20,7 +20,9 @@ superseded-by: null
 ## What was observed
 
 By iteration **2675** of run 1 (E004), the training loss printed **0.000**.
-Validation loss had already been at its floor for 1,600 iterations before that.
+Validation loss had already been at its floor for **1,675** iterations before
+that — the floor is reached at iteration 1000 (0.013 nats) and 2675 − 1000 =
+1,675.
 
 | iter | 1 | 500 | 1000 | 1500 | 2000 | 2500 | 3000 | 3500 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -32,13 +34,14 @@ did nothing for the next 2,500. Its range from iteration 1000 onward is
 0.005-0.028 nats — 0.007 to 0.040 bits per answer token — which is noise
 around "the model is not surprised at all".
 
-Train loss reached exactly 0.000 in **2 of 152 reports** (iterations 2675 and
-2925); 59 reports are ≤0.010.
+Train loss reached exactly 0.000 in **2 of the 151 reports** through iteration
+3775 (the snapshot E004 records); 59 of those are ≤0.010. The log was still
+growing — the count is only meaningful with the offset (E004).
 
 ## What it implies
 
-**The model has memorized the corpus's templates.** That is a statement about
-the corpus, not a criticism of the run:
+**The model fits this corpus's distribution completely.** That is a statement
+about the corpus, not a criticism of the run:
 
 1. The corpus is programmatically synthesized. All 2,363 rows come from
    `gen_training_data.py` — 65 routing templates over 16 invented domains, plus
@@ -56,6 +59,17 @@ the corpus, not a criticism of the run:
    validation is out of distribution.
 4. Each validation pass covers 25 of the 118 rows (21%), redrawn per pass, so
    the val numbers are also a small sample of an in-distribution set.
+
+**What it does not license is the stronger, contrastive claim** — that the model
+memorized the templates *rather than* learning the decision rules. Loss cannot
+separate those two (see "The load-bearing consequence" below), so an entry that
+asserts one of them is stating an inference, not an observation. The validation
+figures are in fact mild evidence *against* row-level memorization: 0.005-0.028
+nats on 118 rows the model never trained on. "Memorized rather than learned" is
+a hypothesis; it is stated as one, with the measurement that would refute it, in
+**H003** — an intermediate checkpoint outscoring the final one on the hard tier
+is what would support it, and a flat hard tier across checkpoints is what would
+not.
 
 ## What it does not imply
 
@@ -87,9 +101,11 @@ and is the repo's own statement of it.
 
 `d9100b6`'s header and commit message say the run "reached train loss 0.000 by
 iteration ~2900". The log's first `0.000` report is iteration **2675**
-(`train.log:136`), 225 iterations earlier, and only 2 of 152 reports are
-exactly 0.000. The paraphrase overstates the frequency and understates the
-timing. The argument built on it is unaffected.
+(`train.log:136`, verbatim: `Iter 2675: Train loss 0.000, Learning Rate
+1.000e-04, It/sec 0.064, Tokens/sec 2.206, Trained Tokens 92738, Peak mem 14.978
+GB`), 225 iterations earlier, and only 2 of the 151 reports through iteration
+3775 are exactly 0.000. The paraphrase overstates the frequency and understates
+the timing. The argument built on it is unaffected.
 
 ## Also worth carrying forward
 

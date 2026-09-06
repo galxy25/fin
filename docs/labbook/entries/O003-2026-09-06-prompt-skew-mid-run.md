@@ -27,8 +27,10 @@ A commit has since changed that file:
 | training still running | last report `Iter 3700` of 4,490 |
 
 `7a591f4` ("Close the tmux guard's parser holes: tmux's argv, not the
-shell's") replaces one sentence and adds an eleven-line HTML correction
-comment: +13/-1 lines, 9,172 → 9,936 characters. The substance is right —
+shell's") replaces one sentence and adds a **seven**-line HTML correction
+comment: +13/-1 lines overall (4 lines of replacement prose, a blank, the
+7-line `<!-- Corrected 2026-09-06: … -->` block, a trailing blank), 9,172 →
+9,936 characters. The substance is right —
 the old text ("Sessions you create yourself are added to the registry
 automatically") was never true of the codebase, and `TmuxCommandGuard`'s
 allow-list made it actively harmful. The comment in the file says so plainly
@@ -56,9 +58,8 @@ resulting score change is indistinguishable from a real capability change.
 
 ## What would prevent a recurrence
 
-The corpus should record the prompt it was built from. `build_dataset.py`'s
-docstring already promises a per-build manifest, and the factory README
-(lines 173-175) specifies its contents — "source list, example counts per
+The corpus should record the prompt it was built from. The factory README
+(`main`, lines 173-175) specifies a per-build manifest and its contents — "source list, example counts per
 track, per-split sha256, corpus git commit, build date" — but
 `gen_training_data.py` writes no manifest, and neither
 `datasets/sft-train-2026-09-05.jsonl` nor `datasets/mlx/` has one. A manifest

@@ -9,7 +9,7 @@ tags: [curriculum, bits, cost, training]
 sources:
   - "H001's corpus measurements: xz -9e = 196 bits/example; generator source = 172 bits/example; H(Y) = 8.585 bits/example"
   - "local-artifact: train.log — val loss 0.013 nats at iteration 1000, never meaningfully lower through 3500"
-  - "local-artifact: checkpoint mtimes — 60.4 min per 250 iterations, mean over 14 intervals"
+  - "local-artifact: checkpoint mtimes (15 files, 0000250 at 2026-09-05 21:16:46 … 0003750 at 2026-09-06 11:21:20) — 60.3 min per 250 iterations over the 14 checkpoint-to-checkpoint intervals; 60.4 over the 15 spans that also count train start (20:15:29 → 0000250)"
   - "memory note training-bits-per-example — 'Standing goal: fewest iterations for equal gate score'"
 related: [H001, H003, O001, E004, P004]
 corrects: []
@@ -33,9 +33,11 @@ judged on cost as well as quality.
 Three separate lines of evidence, all already measured:
 
 1. **The corpus's information is bounded by its generator.** `xz -9e` puts the
-   whole 16 MB corpus at ~58 KB, and `gen_training_data.py`'s own source is
-   50,743 bytes — two estimators agreeing within 14% (H001). More rows from
-   the same generator add approximately zero bits.
+   whole 16 MB corpus at 58,020 bytes, and the program that generates it — not
+   `gen_training_data.py` alone but the five files it loads with it — is 85,536
+   bytes of source (H001). Both are upper bounds of the same kind and they are
+   the same order of magnitude: **tens of kilobytes, against 16 MB of corpus.**
+   More rows from the same generator add approximately zero bits.
 2. **Validation stopped improving at iteration 1000 of 4,490.** 0.013 nats at
    1000, and nothing meaningfully lower through 3500 (O001). Whatever the run
    was going to learn from this distribution, it had learned by then.
@@ -44,8 +46,11 @@ Three separate lines of evidence, all already measured:
 
 ## What it would buy, in this run's units
 
-At the measured pace of **60.4 minutes per 250 iterations** (mean over 14
-checkpoint intervals):
+At the measured pace of **60.3 minutes per 250 iterations** — the mean over the
+14 checkpoint-to-checkpoint intervals (844.6 min ÷ 14). Counting the 15th span,
+from train start 20:15:29 to the first checkpoint at 21:16:46, gives 60.4; E004
+quotes that 15-span figure, and its 55.4-68.5 spread is the spread of those 15.
+Both are stated so the denominator is never ambiguous:
 
 | iterations | wall clock | fraction of run 1 |
 | --- | --- | --- |

@@ -7,7 +7,7 @@ title: Both deterministic baselines reproduce their recorded scores exactly, a d
 status: closed
 tags: [evals, reproducibility, baseline]
 sources:
-  - "measured 2026-09-06 ~11:26 PDT in the labbook worktree at branch labbook (704ab09) — commands and full output below"
+  - "measured 2026-09-06 ~11:26 PDT in the labbook worktree on branch labbook, then at 4705b67 — commands and full output below"
   - evals/tmux-routing/RESULTS.md:25 (the recorded 29/51 row)
   - evals/goals-ledger/RESULTS.md (the recorded 24/35 block)
   - evals/tmux-routing/run_evals.py:195 · evals/goals-ledger/run_evals.py:131 (the exit rule)
@@ -29,8 +29,13 @@ label distribution.
 
 ## Method
 
-Pure python, offline, no model, no GPU, from a clean checkout of branch
-`labbook` at `704ab09`:
+Pure python, offline, no model, no GPU, from the labbook worktree on branch
+`labbook`. The branch was created from `704ab09` at 11:07 and the measurement
+was taken at ~11:26, by which time the branch had already advanced to `4705b67`
+("Open the model factory lab book", 11:21:40) — so **`4705b67` is the checkout
+these numbers were produced from**, not `704ab09`. It makes no difference to the
+measurement: `4705b67` adds files under `docs/labbook/` only, and `evals/` is
+byte-identical between the two.
 
 ```sh
 python3 evals/tmux-routing/run_evals.py

@@ -7,10 +7,10 @@ title: The leakage rule — the eval corpus is held out, and how that is checked
 status: active
 tags: [data, leakage, gate, evals]
 sources:
-  - a823271 — dataset scaffold; scripts/model-factory/build_dataset.py:32-38 (its own stopgap warning)
+  - a823271 — dataset scaffold; scripts/model-factory/build_dataset.py:29-33 (its own capitalised LEAKAGE WARNING)
   - 8aa690c — "Model factory: synthesize held-out SFT data for the foreman fine-tune" (2026-09-05 19:26)
-  - scripts/model-factory/gen_training_data.py:86 (JACCARD_NEAR), :946-958 (_load_eval_inputs), :960-979 (_leak_verdict), :1058-1068 (the assertion)
-  - scripts/model-factory/README.md:167-171
+  - scripts/model-factory/gen_training_data.py:86 (JACCARD_NEAR), :946-958 (_load_eval_inputs), :960-979 (_leak_verdict), :1068-1071 (the assertion)
+  - main:scripts/model-factory/README.md:167-171 (on branch labbook this is 189-193 — see the line-anchor note in O005)
   - "local-artifact: datasets/sft-2026-09-05.jsonl (51 lines) — the seed build that violates the rule"
 related: [P001, O007, H004]
 corrects: []
@@ -24,7 +24,7 @@ Its literal scenarios are therefore **held out**: they never appear in
 `train.jsonl` or `valid.jsonl`. Train on generated variants and on telemetry;
 score on the untouched corpus.
 
-`scripts/model-factory/README.md:167-171` states it in one line worth keeping:
+`scripts/model-factory/README.md:167-171` (on `main`) states it in one line worth keeping:
 *"A gate that measures memorization measures nothing."*
 
 The adversarial hard tier is held out for a second reason on top of the first:
@@ -51,9 +51,10 @@ The check lives in the generator and runs on every build
    | token Jaccard ≥ `JACCARD_NEAR` = **0.70** (line 86) | paraphrase by reshuffling |
 
 3. **Drop every hit**, and record the counts in the build's stdout.
-4. **Re-test the kept set and assert zero** (lines 1058-1068). A leaky dataset
-   crashes the build rather than writing a file. This is the important design
-   choice: the check is not advisory.
+4. **Re-test the kept set and assert zero** (lines **1068-1071**, immediately
+   after the caps are applied at 1053-1056). A leaky dataset crashes the build
+   rather than writing a file. This is the important design choice: the check is
+   not advisory.
 
 Recorded result for the corpus now in training (`8aa690c`; reproduced by a
 sibling survey on 2026-09-06 from a clean checkout at `704ab09`):
@@ -73,17 +74,27 @@ missed on uppercased, punctuation-stripped and `" !!"`-suffixed variants. Re-run
 that check whenever `_normalize` or `JACCARD_NEAR` changes.
 
 Zero drops in the real build is explainable, not suspicious: the generator's
-vocabulary is disjoint from the eval registry by construction — 16 invented
-domains (orchard, ledgerbook, trailhead, …) and 10 invented unregistered names
-(sandbox, staging, playground, …) against the eval registry's `fin` /
-`pocketdj` / `africanintellect` and its live-but-unregistered `main` /
-`scratch` / `deploy` / `demo`.
+vocabulary is disjoint from the eval registry by construction — **16 invented
+domains** (`DOMAINS`, `gen_training_data.py:138-153`: orchard, ledgerbook,
+trailhead, …) and 10 invented unregistered names (`UNREG_NAMES`: sandbox,
+staging, playground, …) against the eval registry's `fin` / `pocketdj` /
+`africanintellect` and its live-but-unregistered `main` / `scratch` / `deploy` /
+`demo`.
+
+One qualification, because it is easy to over-read: **those 16 are the
+generator's vocabulary, not the corpus's.** The balancing caps keep a
+lexicographic slice, so only 8 of the 16 reach the kept `route` rows and 4 of 16
+the kept `start` rows (O007). Disjointness is unaffected — a smaller vocabulary
+cannot collide with the eval registry — but the *breadth* the sentence implies
+is not what the corpus contains.
 
 ## Four things the gate does not check
 
 1. **It reads only the user message.** System messages are never tested. They
-   are 83.7% of the corpus by characters and they are where an eval registry
-   would leak if one were ever reused verbatim.
+   are **89.6% of the corpus's message characters** (13,510,803 of 15,070,991;
+   83.7% of the file's 16,142,664 bytes, a denominator that also counts JSON
+   syntax) and they are where an eval registry would leak if one were ever
+   reused verbatim.
 2. **It checks inputs, never labels.** A training row could carry a wrong
    answer to a fresh question and pass cleanly. Label quality is a separate
    problem (O007).
@@ -102,7 +113,8 @@ domains (orchard, ledgerbook, trailhead, …) and 10 invented unregistered names
 gate reformatted as training data: one row per eval scenario, user = the
 scenario query, assistant = the scenario's `expected` object. It is the output
 of `build_dataset.py`, whose own docstring flags it in capitals
-(`build_dataset.py:32-38`) as a stopgap that must never reach a real run.
+(`build_dataset.py:29-33`, the LEAKAGE WARNING block) as a stopgap that must
+never reach a real run.
 
 It is not in `datasets/mlx/` and no training run has used it. It is left here
 as the worked example of what the rule forbids. If it is ever deleted, this

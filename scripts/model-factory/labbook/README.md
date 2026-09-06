@@ -84,7 +84,13 @@ downloaded, smoke-trained and deleted) are here because they failed.
 Numbering is **per kind**, monotonic, never reused: `E001, E002, …` and
 `O001, O002, …` run independently. Numbering does not restart at a new year;
 `year-2/` continues from wherever year 1 stopped, so an id identifies exactly
-one entry for the life of the book.
+one entry for the life of **this** book.
+
+**That guarantee does not hold across the branch as it currently stands**, and
+the qualifier is not pedantry — see "Provenance of this directory" at the end of
+this file. A second, independently-numbered lab book sits at `docs/labbook/` on
+the same branch, and **thirteen ids collide with different subjects**. Until the
+two are reconciled, a bare `O002` is ambiguous on branch `labbook`.
 
 ### Status values
 
@@ -197,9 +203,50 @@ alongside a separate publishing pipeline under `content/`.
 
 A parallel draft of the same book exists on this branch at `docs/labbook/`,
 committed the same morning (`4705b67`, 2026-09-06 11:21) by a sibling agent
-working from an overlapping set of facts. Its entries are numbered in their
-own sequence and **its ids do not correspond to the ids here** — its `E001`
-is a corpus-reproduction entry, this book's `E001` is the router prompt
-sweep. Reconciling the two into one canonical location is Levi's call and has
-not been made. Until it is, treat `docs/labbook/` as an independent draft and
-cite entries by path, not by bare id.
+working from an overlapping set of facts. Its 13 entries are numbered in their
+own sequence and **its ids do not correspond to the ids here**.
+
+### The collision, stated exactly
+
+Branch `labbook` carries both books: `4705b67` (`docs/labbook/`, 13 entries) and
+`a02cec3` (`scripts/model-factory/labbook/`, 20 entries). **Thirteen ids appear
+in both with different subjects** — every id the smaller book uses:
+
+| id | `docs/labbook/` | `scripts/model-factory/labbook/` |
+| --- | --- | --- |
+| E001 | corpus bit-exact reproduction | router prompt rounds 0-4 |
+| E002 | corpus census | base-model selection |
+| E003 | mlx split recovery | memory ceiling / grad-checkpoint |
+| E004 | bits per example | run 1, the E4B LoRA |
+| O001 | baseline filter never fires | zero loss, flat validation |
+| O002 | validation split in distribution | stale champion |
+| O003 | prompt skew mid-run | three prompts, no parity |
+| O004 | stale champion record | late-run loss excursion |
+| O005 | factory docs drift | no provenance in verdicts |
+| H001 | hard-tier regression | bits per example |
+| H002 | best checkpoint is not last | high-information subset |
+| P001 | reproduce a dataset | the promotion protocol |
+| P002 | the leakage gate | the leakage rule |
+
+Note the crossings, which are what make bare ids actively dangerous rather than
+merely ambiguous: the stale champion is `O004` in one book and `O002` in the
+other; bits per example is `E004` in one and `H001` in the other; "the best
+checkpoint is not the last" is `H002` there and `H003` here.
+
+### The rule until it is reconciled
+
+1. **Cite entries across books by path, never by bare id.** Inside one book, a
+   bare id means an entry of that same book — that is how the cross-references
+   in all 20 entries here should be read, and it is the only reading under which
+   they are correct.
+2. **Neither book renumbers.** Ids are never reused and never renumbered (rule
+   1); a merge that renumbered one of them would break every cross-reference in
+   it and every external citation of it.
+3. **`scripts/model-factory/README.md`'s reading list points at both**, so
+   neither is orphaned while the question is open.
+
+**Reconciling the two into one canonical location is Levi's call and has not
+been made.** It wants making before this branch merges, not after: the longer
+both live on `main`, the more outside references accumulate against ambiguous
+ids. The location `scripts/model-factory/labbook/` follows the memory note
+`labbook-and-publishing`; that is a reason, not a decision.

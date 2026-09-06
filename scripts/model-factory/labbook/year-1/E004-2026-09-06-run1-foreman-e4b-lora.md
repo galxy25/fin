@@ -67,12 +67,19 @@ exec caffeinate -i scripts/model-factory/.venv/bin/python -m mlx_lm lora \
   divides the summed gradient by 2 (`trainer.py:247-262`). The run therefore
   performs **2,245 optimizer steps at an effective batch of 2** — not 4,490
   steps, and not 4 epochs.
-- **Batch order is deterministic.** `iterate_batches` sorts the dataset by
-  length, cuts fixed batches, then permutes per pass with
-  `np.random.permutation`. It is called without `seed=`, so it draws on the
-  global numpy RNG, which `lora.py:320` seeds from `--seed 17`. The exact
-  sequence of examples is reproducible without retraining — the fact that makes
-  O004 testable.
+- **Batch order is deterministic, but replaying it is not one line.**
+  `iterate_batches` sorts the dataset by length, cuts fixed batches, then
+  permutes per pass with `np.random.permutation`. It is called without `seed=`,
+  so it draws on the **global** numpy RNG, which `lora.py:320` seeds from
+  `--seed 17`. The run is therefore reproducible — but *only if the replay
+  consumes the same draws in the same order*. `evaluate()` calls the same
+  `iterate_batches` with no `seed=` (`trainer.py:195-200`), so **every
+  validation pass consumes a permutation draw from that same global RNG**. Eight
+  validations have run by iteration 3500, five of them before the training
+  generator's second pass begins at iteration 2246. A replay that seeds
+  `np.random.seed(17)` and draws only the training permutations produces a
+  *different* example order for anything in epoch 2 — which is exactly the
+  window O004 wants. The correct replay interleaves the validation draws.
 - **`Trained Tokens` counts unmasked answer tokens only.** 129,814 tokens over
   3,750 iterations = **34.6 answer tokens per example**, consistent with the
   measured assistant labels (median 117 characters) and inconsistent with two
@@ -90,9 +97,15 @@ Training loss, sampled every 10th report from `train.log`:
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | train loss | 0.012 | 0.049 | 0.004 | 0.028 | 0.007 | 0.006 | 0.101 |
 
-Across all 152 reports so far: min **0.000**, max 0.970, median ≈0.016; exactly
-**two** reports at 0.000 (iterations 2675 and 2925); first report ≤0.010 at
+Across the **151** reports at that snapshot — one every 25 iterations, 25
+through 3775 — min **0.000**, max 0.970, median **0.017**; exactly **two**
+reports at 0.000 (iterations 2675 and 2925); **59** reports ≤0.010, the first at
 iteration 1050.
+
+The count is part of the number. `train.log` was still being written: at
+`wc -l` = 194 it held 156 reports through iteration 3900 and the median is still
+0.017, while at 148 reports (iteration 3700) it is 0.016. Any figure quoted off
+this file carries the offset it was read at, here and in E003 and O001.
 
 Validation — every `Val loss` line in the log, with the nats→bits conversion
 (bits = nats × 1.4427):

@@ -48,17 +48,34 @@ day.
 | chip | Apple M4 | `sysctl -n machdep.cpu.brand_string` |
 | model | `Mac16,3` (iMac) | `sysctl -n hw.model` |
 | unified memory | 34,359,738,368 B = **32 GB** | `sysctl -n hw.memsize` |
-| cores | 10 (4 efficiency + 6 performance) | `hw.ncpu`, `hw.perflevel{0,1}.logicalcpu` |
-| **Metal max recommended working set** | **24 GB** | device probe, below |
-| max Metal buffer length | 18 GB | same probe |
-| GPU architecture | `applegpu_g16g` | same probe |
+| cores | 10 (**4 performance + 6 efficiency**) | `hw.ncpu`, `hw.perflevel{0,1}.name`, `hw.perflevel{0,1}.logicalcpu` |
+| **Metal max recommended working set** | **24 GB** | `machine-safety-serialized-builds.md:15` |
+| max Metal buffer length | 18 GB | **UNSOURCED** — recollection of a device probe |
+| GPU architecture | `applegpu_g16g` | **UNSOURCED** — same |
 
-The probe, captured 2026-09-05 19:50:52 PDT (units GB):
+The first four rows re-derive from the cited `sysctl` calls today. The core
+split in particular is worth checking rather than remembering: `sysctl
+hw.perflevel0.name` returns `Performance` with `logicalcpu` 4, and
+`hw.perflevel1.name` returns `Efficiency` with `logicalcpu` 6 — an earlier draft
+of this entry read those two backwards while citing them.
 
+**The 24 GB has one artifact and it is a memory note**, not a probe output:
+`machine-safety-serialized-builds.md:15`, *"Metal's max recommended working set
+is only 24 GB of the 32."* The command that would re-derive it is one line —
+
+```python
+import mlx.core as mx; mx.metal.device_info()["max_recommended_working_set_size"]
 ```
-{'device_name': 'Apple M4', 'max_recommended_working_set_size': 24, 'memory_size': 32,
- 'architecture': 'applegpu_g16g', 'max_buffer_length': 18, 'resource_limit': 499000}
-```
+
+— and it is **not run here**, because it initializes Metal and P003's own rule
+is that nothing touches the GPU while a fine-tune holds it (E004). Run it the
+next time the device is free and record the output verbatim in a new entry.
+
+The remaining two figures (18 GB max buffer length, `applegpu_g16g`) come from
+the same remembered probe and have no artifact at all: they are marked UNSOURCED
+above and nothing in this protocol depends on them. Only the 24 GB is
+load-bearing, and it is load-bearing for E003 as well, which is why it gets a
+named source rather than an undated "device probe".
 
 **24 GB, not 32, is the ceiling.** Everything else in this entry follows from
 that: the OS, the window server, LM Studio's resident weights and every Xcode

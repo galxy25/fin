@@ -9,9 +9,8 @@ tags: [provenance, gate, data, reproducibility]
 sources:
   - "grep -n 'prompt|commit|sha' scripts/model-factory/eval_gate.py → no matches"
   - scripts/model-factory/eval_gate.py:113-140 (the verdict fields)
-  - scripts/model-factory/README.md:173-175 (the manifest that is specified but never written)
-  - scripts/model-factory/build_dataset.py:32-38 (docstring promising a manifest)
-  - "ls datasets/ — no manifest.json anywhere; grep -rn 'datasets/mlx' over *.py *.sh *.md *.yaml *.json → nothing outside datasets/ itself"
+  - main:scripts/model-factory/README.md:173-175 (the manifest that is specified but never written) — see the line-anchor note at the end of this entry
+  - "ls datasets/ — no manifest.json anywhere; git grep 'datasets/mlx' → no tracked hit (exit 1)"
   - scripts/model-factory/train/qlora_config.yaml:7 — base_model: google/gemma-3-4b-it
 related: [O002, O003, E002, E004, P001]
 corrects: []
@@ -48,10 +47,15 @@ Nothing emits it.
 
 ### There is no dataset manifest either
 
-`README.md:173-175` specifies one: *"Every build writes
+`README.md:173-175` (on `main`) specifies one: *"Every build writes
 `datasets/<dataset-id>/manifest.json`: source list, example counts per track,
-per-split sha256, corpus git commit, build date."* `build_dataset.py`'s
-docstring promises the same.
+per-split sha256, corpus git commit, build date."* That README is the **only**
+place the manifest is promised. An earlier draft of this entry also cited
+`build_dataset.py:32-38` as a docstring promising it; that is wrong — `grep -in
+manifest scripts/model-factory/build_dataset.py` returns **zero** matches, and
+lines 29-33 there are the LEAKAGE WARNING while 35-39 are the Usage block and
+the default output path. The citation is withdrawn rather than re-targeted,
+because there is nothing in that file to re-target it to.
 
 Neither `gen_training_data.py` nor whatever produced `datasets/mlx/` writes one.
 No `manifest.json` exists anywhere under `datasets/`.
@@ -64,11 +68,21 @@ of archaeology.
 
 ### And no record of how `datasets/mlx/` was made
 
-`grep -rn 'datasets/mlx'` across `*.py *.sh *.md *.yaml *.json` returns nothing
-outside `datasets/` itself. The split's *behaviour* is fully recovered — a
-`random.Random(17)` shuffle of the 2,363-row corpus, first 118 rows to
-validation, reproduces both files byte-for-byte including line order — but no
-committed script performs it. It is a command someone ran once.
+**No *tracked* file references it.** `git grep 'datasets/mlx'` exits 1 with no
+output. The word "tracked" is load-bearing and an earlier draft of this entry
+omitted it: a plain `grep -rn` over the working tree returns two hits, both
+inside gitignored `models/` —
+`models/candidates/fin-foreman-e4b-mlx/launch-train.sh:13` (`--train --data
+datasets/mlx \`, reproduced in full in E004) and
+`models/candidates/fin-foreman-e4b-mlx/adapter_config.json:6` (`"data":
+"datasets/mlx"`). Those are the *run's* record of the path, written by mlx-lm,
+not a script that builds it.
+
+The conclusion is unchanged and is the one that matters: the split's *behaviour*
+is fully recovered — a `random.Random(17)` shuffle of the 2,363-row corpus,
+first 118 rows to validation, reproduces both files byte-for-byte including line
+order — but **no committed script performs it**. It is a command someone ran
+once.
 
 ### Committed docs contradict the running system
 
@@ -99,3 +113,16 @@ future assertions into checks instead of archaeology. Neither has been done.
   exempts local mlx runs from the GPU-spend approval rule; run 1 needed no
   purchase approval. The stale checkbox is a documentation failure, not a
   process violation.
+
+## Line-anchor note for every `scripts/model-factory/README.md:N` citation
+
+**Every `scripts/model-factory/README.md:N` line number in this book is against
+`main` at `704ab09`.** The lab-book commit itself inserts a 22-line "## Lab
+book" section at line 22 of that file, so on branch `labbook` every anchor below
+line 22 shifts by **+22**: `## Status` 22→44, the three checkboxes 40/42/44→
+62/64/66, the manifest spec 173-175→195-197, `**Leakage rule:**` 167→189,
+`### Hard rule` 231→253, `## Eval gate` 240→262. A reader following
+`README.md:44` on this branch lands on `## Status`, not on the goals-ledger
+checkbox quoted above. The same shift applies to the citations in P001 and P002.
+This is a small, live example of exactly what the entry is about: a line number
+is a provenance claim, and it is only true of a stated revision.

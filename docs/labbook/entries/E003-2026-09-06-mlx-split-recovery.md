@@ -8,12 +8,15 @@
 ## Question
 
 The live fine-tune reads `--data datasets/mlx`
-(`models/candidates/fin-foreman-e4b-mlx/launch-train.sh:14`), a directory
+(`models/candidates/fin-foreman-e4b-mlx/launch-train.sh:13`), a directory
 containing `train.jsonl` and `valid.jsonl`. **No committed script produces
-it.** `grep -rn 'datasets/mlx' --include='*.py' --include='*.sh'
---include='*.md' --include='*.yaml' --include='*.json'` over the repo returns
-nothing outside `datasets/` itself. Can the split be recovered from the
-artifacts alone, so the run is reproducible?
+it**: `git grep 'datasets/mlx'` exits 1 with no output. (A plain `grep -rn` over
+the working tree does return two hits, both inside gitignored `models/` — that
+same `launch-train.sh:13` and `adapter_config.json:6` — which are the run's own
+record of the path, not a script that builds it. An earlier draft of this entry
+said the grep returned nothing outside `datasets/`, three lines after quoting
+one of the two hits.) Can the split be recovered from the artifacts alone, so
+the run is reproducible?
 
 ## Method
 
@@ -40,7 +43,7 @@ splits.
 
 **The construction is recovered.** The valid index set equals the first 118
 entries of a seeded shuffle of `range(2363)`, and the seed is 17 — the same
-`--seed 17` the training command uses (`launch-train.sh:16`):
+`--seed 17` the training command uses (`launch-train.sh:17`):
 
 ```python
 import random

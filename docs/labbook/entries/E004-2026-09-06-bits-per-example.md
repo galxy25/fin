@@ -36,7 +36,7 @@ Four independent estimators, each cheap, each reproducible on
 | examples | 2,363 | `wc -l` |
 | distinct assistant strings | 991 | Counter over field `messages[2].content` |
 | label entropy H(Y) | **8.585 bits/example** | empirical, max possible log2(991) = 9.953 |
-| decision-class entropy | 3.351 bits/example over 11 classes | max log2(11) = 3.459 |
+| decision-class entropy | **3.669 bits/example over 14 classes** | max log2(14) = 3.807; classes are the distinct `action`/`decision`/`tool` values: route 230, start 230, clarify 390, refuse 200, ingest 176, drive 176, report 144, idle 113, ask 160, proceed 160, request_input 128, notify 96, send_input 96, read_terminal 64 |
 | most repeated single label | 113× — `{"decision": "idle", "reason": "no message, nothing drivable…"}` | Counter |
 
 Total label information in the corpus: 2,363 × 8.585 = **20,286 bits ≈ 2.5
@@ -55,9 +55,9 @@ H(label) = 8.585 bits/example.
 This is not a compliment to the data. It is the signature of
 label-by-construction: for the routing and ledger tracks the label *is* the
 deterministic baseline's output on that input
-(`gen_training_data.py:277-286`, `router_baseline.decide`); for the elicit
+(`gen_training_data.py:276-285`, `router_baseline.decide`); for the elicit
 and tool-use tracks the label is fixed by the template family that emitted the
-input (`gen_training_data.py:798-817, 912-937`). There is no noise, no
+input (`gen_training_data.py:798-815, 912-935`). There is no noise, no
 disagreement, no ambiguity anywhere in 2,363 rows. The model is not being
 taught a distribution; it is being shown a function it can, in principle,
 memorize exactly.
@@ -69,17 +69,28 @@ memorize exactly.
 | raw corpus | 16,142,664 B | 54,647 |
 | `gzip -9` | 1,074,174 B | 3,637 |
 | `xz -9e` | 58,020 B | **196** |
-| `gen_training_data.py` source | 50,743 B | **172** |
+| the generating program's source | 85,536 B | **290** |
 
-`xz -9e` and the generator's own source code agree to within 14%. Two
-estimators built on completely different principles converge on the same
-answer: **the corpus contains on the order of 180 bits per example of
-description-length information**, and the honest total for the whole thing is
-about 50 kilobytes — the size of one Python file.
+The second row is the whole program, not one file. `gen_training_data.py` is
+50,743 B, but it loads `router_baseline.decide` and `policy_baseline.decide` to
+label every routing and ledger row and `router_llm._system_prompt`, which reads
+`prompts/router.md` at generation time. At `main`: router_baseline.py 5,693 +
+policy_baseline.py 9,139 + router_llm.py 7,008 + prompts/router.md 9,272 +
+prompts/tick.md 3,681 = 34,793 B beyond the generator. Counting only the one
+file makes it look like `xz` and the source "agree to within 14%"; counting the
+program that actually runs puts the source **47% above** `xz`, and the two were
+never independent estimators in the first place — both are compression-flavoured
+upper bounds on the same description length.
+
+The conclusion does not need the coincidence: **the corpus contains a few
+hundred bits per example of description-length information**, and the honest
+total for the whole 16 MB thing is tens of kilobytes — the size of a handful of
+Python files. Section 2's H(label | input) = 0 says the same thing from a
+different direction, and it needs no compressor at all.
 
 ### 4. What the optimizer actually sees
 
-The run trains with `--mask-prompt` (`launch-train.sh:14`), so only assistant
+The run trains with `--mask-prompt` (`launch-train.sh:15`), so only assistant
 tokens carry gradient. From `train.log`, `Trained Tokens 121200` at iteration
 3,500 → **34.6 gradient-bearing tokens per iteration**. Assistant strings
 average 115.5 characters (median 117, min 53, max 177), ≈29 tokens by a
