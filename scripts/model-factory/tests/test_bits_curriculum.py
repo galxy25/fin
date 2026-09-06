@@ -64,6 +64,76 @@ def fake_adapter(path: Path, weights: bytes = b"lora-weights-v1", rank: int = 8)
     return path
 
 
+def parity_rows(
+    values: dict,
+    tokens=35,
+    *,
+    full_forward: bool = False,
+    chunk: int | None = 512,
+    model: str = "m",
+    adapter: str | None = None,
+    adapter_digest: str | None = None,
+    max_seq_length: int = 3072,
+    match_trainer: bool = True,
+    column: str = "bits",
+    token_field: str = "answer_tokens",
+) -> list[dict]:
+    """Score-file rows shaped the way ``score_bits.py`` writes them.
+
+    parity_check.py reads three things off a row and refuses without any of
+    them: the column, the TOKEN COUNT that column is a sum over (the bound's
+    small end is per token), and the run fingerprint (a pair of files scored
+    under different models/adapters/windows is not a parity pair). ``tokens`` is
+    either one count for every row or a per-hash dict -- 35 by default, the
+    corpus's 34.6 unmasked tokens per example rounded.
+    """
+    rows = []
+    for h, v in values.items():
+        row = sb.run_fingerprint(
+            model, adapter, max_seq_length, match_trainer, full_forward, chunk, adapter_digest
+        )
+        row.update({"hash": h, column: v, "skipped": v is None})
+        row[token_field] = tokens[h] if isinstance(tokens, dict) else tokens
+        rows.append(row)
+    return rows
+
+
+def write_rows(path: Path, rows) -> Path:
+    path.write_text(
+        "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows), encoding="utf-8"
+    )
+    return path
+
+
+def run_parity_cli(chunked_rows, full_rows, extra=()) -> tuple[int, str]:
+    """parity_check.py's positional mode, end to end, on two real files."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        write_rows(d / "chunked.jsonl", chunked_rows)
+        write_rows(d / "full.jsonl", full_rows)
+        err = io.StringIO()
+        stderr, sys.stderr = sys.stderr, err
+        try:
+            rc = pc.main([str(d / "chunked.jsonl"), str(d / "full.jsonl"), *extra])
+        finally:
+            sys.stderr = stderr
+        return rc, err.getvalue()
+
+
+def score_file(values: dict, tokens=35, *, name: str = "scores.jsonl", **kw) -> pc.ScoreFile:
+    """A loaded parity_check.ScoreFile, without going through a temp file."""
+    rows = parity_rows(values, tokens, **kw)
+    fps: list[dict] = []
+    for r in rows:
+        fp = {k: r[k] for k in pc.FINGERPRINT_KEYS if k in r}
+        if fp and fp not in fps:
+            fps.append(fp)
+    field = kw.get("token_field", "answer_tokens")
+    return pc.ScoreFile(
+        Path(name), dict(values), {r["hash"]: r.get(field) for r in rows}, fps
+    )
+
+
 def uniform_scorer(vocab: int) -> sb.StubScorer:
     """Every token equally likely => exactly log2(vocab) bits per token."""
     return sb.StubScorer(vocab, lambda row, v: 0.0)
@@ -1360,12 +1430,14 @@ class TestParityCheck(unittest.TestCase):
     failing -- including in the case where it compares nothing at all."""
 
     def test_matching_files_pass_and_report_the_count(self):
-        ok, msg = pc.compare({"a": 1.0, "b": 2.0, "c": 9.0}, {"a": 1.0, "b": 2.0005}, 1e-2)
+        ok, msg = pc.compare(
+            {"a": 1.0, "b": 2.0, "c": 9.0}, {"a": 1.0, "b": 2.0005}, {"a": 1, "b": 1}, 1e-2
+        )
         self.assertTrue(ok)
         self.assertIn("over 2 examples", msg)
 
     def test_a_real_divergence_fails(self):
-        ok, msg = pc.compare({"a": 1.0}, {"a": 1.5}, 1e-2)
+        ok, msg = pc.compare({"a": 1.0}, {"a": 1.5}, {"a": 1}, 1e-2)
         self.assertFalse(ok)
         self.assertIn("0.500000", msg)
 
@@ -1373,34 +1445,38 @@ class TestParityCheck(unittest.TestCase):
         """max(..., default=0.0) over an empty generator is 0.0, which reads as
         a perfect match. Every example being skipped, or the two files coming
         from different runs, would then 'validate' the whole pipeline."""
-        ok, msg = pc.compare({"aaa": 1.0}, {"zzz": 1.0}, 1e-2)
+        ok, msg = pc.compare({"aaa": 1.0}, {"zzz": 1.0}, {"zzz": 1}, 1e-2)
         self.assertFalse(ok)
         self.assertIn("absent from the chunked file", msg)
 
     def test_no_full_forward_rows_at_all_fails(self):
-        ok, msg = pc.compare({"a": 1.0}, {}, 1e-2)
+        ok, msg = pc.compare({"a": 1.0}, {}, {}, 1e-2)
         self.assertFalse(ok)
         self.assertIn("no scored rows", msg)
 
     def test_a_partial_overlap_fails_rather_than_comparing_the_half_it_has(self):
-        ok, _ = pc.compare({"a": 1.0}, {"a": 1.0, "b": 1.0}, 1e-2)
+        ok, _ = pc.compare({"a": 1.0}, {"a": 1.0, "b": 1.0}, {"a": 1, "b": 1}, 1e-2)
         self.assertFalse(ok)
 
     def test_the_cli_skips_null_bits_and_exits_nonzero_on_an_empty_comparison(self):
+        rc, err = run_parity_cli(
+            parity_rows({"a": None}),
+            parity_rows({"a": 1.0}, full_forward=True),
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("FAILED", err)
+
+    def test_a_null_column_row_still_carries_its_run_fingerprint(self):
+        """A skipped row is still evidence of WHICH run wrote the file. Dropping
+        it from the fingerprint scan would let an all-skipped chunked file look
+        like a file with no fingerprint at all, and be refused for the wrong
+        reason -- or, waived, be compared to anything."""
         with tempfile.TemporaryDirectory() as tmp:
-            d = Path(tmp)
-            (d / "chunked.jsonl").write_text(
-                json.dumps({"hash": "a", "bits": None}) + "\n", encoding="utf-8")
-            (d / "full.jsonl").write_text(
-                json.dumps({"hash": "a", "bits": 1.0}) + "\n", encoding="utf-8")
-            err = io.StringIO()
-            stderr, sys.stderr = sys.stderr, err
-            try:
-                rc = pc.main([str(d / "chunked.jsonl"), str(d / "full.jsonl")])
-            finally:
-                sys.stderr = stderr
-            self.assertEqual(rc, 1)
-            self.assertIn("FAILED", err.getvalue())
+            f = pc.load(
+                write_rows(Path(tmp) / "s.jsonl", parity_rows({"a": None})), "bits"
+            )
+        self.assertEqual(f.values, {})
+        self.assertEqual(f.fingerprint["chunk"], 512)
 
 
 class TestExperimentConfiguration(unittest.TestCase):
@@ -1412,11 +1488,14 @@ class TestExperimentConfiguration(unittest.TestCase):
     def setUp(self):
         self.src = EXPERIMENT_SH.read_text()
 
-    def _select_invocations(self) -> list[str]:
+    def _invocations(self, script: str) -> list[str]:
         out, buf, depth = [], "", 0
         for line in self.src.splitlines():
-            if "select_curriculum.py" in line and not line.strip().startswith("#"):
-                depth, buf = 1, line
+            if script in line and not line.strip().startswith("#"):
+                depth, buf = 1, line.strip()
+                if not line.rstrip().endswith("\\"):
+                    out.append(buf)
+                    depth = 0
                 continue
             if depth:
                 buf += " " + line.strip()
@@ -1425,8 +1504,42 @@ class TestExperimentConfiguration(unittest.TestCase):
                     depth = 0
         return out
 
+    def _select_invocations(self) -> list[str]:
+        return self._invocations("select_curriculum.py")
+
     def test_both_arms_are_selected_and_found(self):
         self.assertEqual(len(self._select_invocations()), 2)
+
+    def test_every_parity_pair_in_the_script_differs_ONLY_in_the_forward_path(self):
+        """parity_check now refuses a pair scored under different models,
+        adapters, windows or masks (exit 2). The pipeline's own invocations have
+        to satisfy the rule they enforce: the --full-forward spot-check must
+        repeat the chunked run's flags exactly and change only the forward path.
+        Leaving --max-seq-length off the spot-check is fine because its default
+        IS the 3072 the chunked stage passes -- but that is a coincidence worth a
+        test, not a thing to rediscover when a stage fails at 2am."""
+        produced = {
+            self._flags(inv).get("--out"): self._flags(inv)
+            for inv in self._invocations("score_bits.py")
+        }
+        pairs = 0
+        for inv in self._invocations("parity_check.py"):
+            if "--anchor" in inv:
+                continue
+            files = [t for t in inv.split() if t.endswith('.jsonl"')]
+            self.assertEqual(len(files), 2, inv)
+            a, b = (produced.get(f) for f in files)
+            self.assertIsNotNone(a, files[0])
+            self.assertIsNotNone(b, files[1])
+            for flag, default in (("--model", None), ("--adapter", None),
+                                  ("--max-seq-length", "3072")):
+                self.assertEqual(a.get(flag, default), b.get(flag, default),
+                                 f"{flag} differs across the parity pair {files}")
+            self.assertEqual(("--no-match-trainer" in a), ("--no-match-trainer" in b))
+            self.assertNotEqual(("--full-forward" in a), ("--full-forward" in b),
+                                f"{files} describe the same forward path")
+            pairs += 1
+        self.assertEqual(pairs, 2, "stage 1c and stage 2b")
 
     # Flags that are ALLOWED to differ between the arms, with the reason. Adding
     # to this list is how you declare a second difference on purpose; anything
@@ -2375,6 +2488,62 @@ class TestAdapterContentDigest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 sb.adapter_content_digest(Path(tmp) / "nope")
 
+    def test_an_adapter_FILE_is_refused_because_the_loader_needs_a_DIRECTORY(self):
+        """The digest used to accept a plain file as 'unambiguous -- a single
+        weights file, named'. But MLXScorer loads the adapter with
+        mlx_lm.load(..., adapter_path=...), which reads adapter_config.json out
+        of a directory: that branch fingerprinted a configuration that could
+        never run, and the fingerprint would have described something no row was
+        ever scored under."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = fake_adapter(Path(tmp) / "adapter")
+            with self.assertRaises(SystemExit) as cm:
+                sb.adapter_content_digest(p / sb.ADAPTER_WEIGHTS_NAME)
+            self.assertIn("is a file", str(cm.exception))
+            self.assertIn("DIRECTORY", str(cm.exception))
+
+    def test_the_refusal_names_the_directory_to_pass_instead(self):
+        """The operator pointed at the weights inside a perfectly good adapter
+        directory. Say which path to use rather than making them guess."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = fake_adapter(Path(tmp) / "adapter")
+            with self.assertRaises(SystemExit) as cm:
+                sb.adapter_content_digest(p / sb.ADAPTER_WEIGHTS_NAME)
+            self.assertIn(f"--adapter {p}", str(cm.exception))
+
+    def test_a_loose_file_that_is_not_in_an_adapter_dir_is_refused_too(self):
+        """No directory to suggest, so it says what an adapter directory is
+        instead of resolving to a parent the operator never named."""
+        with tempfile.TemporaryDirectory() as tmp:
+            loose = Path(tmp) / "0003000_adapters.safetensors"
+            loose.write_bytes(b"checkpoint-3000")
+            with self.assertRaises(SystemExit) as cm:
+                sb.adapter_content_digest(loose)
+            self.assertIn("adapter DIRECTORY", str(cm.exception))
+
+    def test_the_scorer_refuses_an_adapter_file_before_it_loads_anything(self):
+        """End to end: the digest runs before the machine guard and before any
+        weights load, so this costs no GPU seconds -- the point of hashing
+        early."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            adapter = fake_adapter(d / "adapter")
+            corpus = d / "c.jsonl"
+            corpus.write_text(
+                json.dumps({"messages": example(
+                    ROUTING_SYS, "route it", {"action": "route", "session": "s"})}) + "\n",
+                encoding="utf-8")
+            err = io.StringIO()
+            stderr, sys.stderr = sys.stderr, err
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    sb.main(["--model", "m", "--data", str(corpus),
+                             "--out", str(d / "out.jsonl"),
+                             "--adapter", str(adapter / sb.ADAPTER_WEIGHTS_NAME)])
+            finally:
+                sys.stderr = stderr
+            self.assertIn("is a file", str(cm.exception))
+
     def test_the_digest_is_in_the_row_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = fake_adapter(Path(tmp) / "a")
@@ -2642,69 +2811,73 @@ class TestParityToleranceIsRelative(unittest.TestCase):
     fail on float noise than to catch a bug."""
 
     CORPUS_SCALE = 123.0  # bits/example, derived from train.log; see parity_check.py
+    TOKENS = 35           # 127129/3675 = 34.6 unmasked tokens per example, rounded
 
-    def _cli(self, chunked, full, extra=()):
-        with tempfile.TemporaryDirectory() as tmp:
-            d = Path(tmp)
-            for name, rows in (("chunked.jsonl", chunked), ("full.jsonl", full)):
-                (d / name).write_text(
-                    "".join(json.dumps({"hash": h, "bits": v}) + "\n"
-                            for h, v in rows.items()),
-                    encoding="utf-8")
-            err = io.StringIO()
-            stderr, sys.stderr = sys.stderr, err
-            try:
-                rc = pc.main([str(d / "chunked.jsonl"), str(d / "full.jsonl"), *extra])
-            finally:
-                sys.stderr = stderr
-            return rc, err.getvalue()
+    def _cli(self, chunked, full, extra=(), tokens=TOKENS):
+        return run_parity_cli(
+            parity_rows(chunked, tokens),
+            parity_rows(full, tokens, full_forward=True),
+            extra,
+        )
 
     def test_float_noise_at_corpus_scale_no_longer_fails_the_pipeline(self):
         """0.05 bits on a 123-bit example is 4e-4 relative -- what a 1e-3
         nats/token disagreement over ~35 answer tokens comes to. The old
         absolute 1e-2 bound failed it fivefold."""
-        ok, msg = pc.compare({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE})
+        ok, msg = pc.compare(
+            {"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE}, {"a": self.TOKENS}
+        )
         self.assertTrue(ok, msg)
         self.assertIn("4.065e-04", msg)
 
     def test_the_same_absolute_gap_is_judged_differently_at_different_scales(self):
         """The definition of relative. An absolute rule cannot tell these apart,
         and one of the two answers it gives is wrong."""
-        big, _ = pc.compare({"a": 123.5}, {"a": 123.0})   # 0.4% -- noise
-        small, _ = pc.compare({"a": 10.5}, {"a": 10.0})   # 5%   -- not noise
+        n = {"a": self.TOKENS}
+        big, _ = pc.compare({"a": 123.5}, {"a": 123.0}, n)   # 0.4% -- noise
+        small, _ = pc.compare({"a": 10.5}, {"a": 10.0}, n)   # 5%   -- not noise
         self.assertTrue(big)
         self.assertFalse(small)
-
-    def test_a_near_zero_example_is_judged_against_the_absolute_floor(self):
-        """A memorized tuned example is ~0.05 bits. A raw ratio there turns a
-        0.006-bit wobble into a 12% 'error' and fails the run on the last digits
-        of a number that is zero -- so below the floor the comparison is
-        absolute, against the floor."""
-        ok, msg = pc.compare({"a": 0.056}, {"a": 0.050})
-        self.assertTrue(ok, msg)
-        self.assertIn(f"absolute floor {pc.ABS_FLOOR_BITS:g}", msg)
-        self.assertAlmostEqual(0.006 / pc.ABS_FLOOR_BITS,
-                               float(msg.split("max relative divergence ")[1].split()[0]),
-                               places=9)
 
     def test_a_divergence_that_cannot_be_float_noise_still_fails(self):
         """The bound must not have been loosened into one that passes
         everything: a mis-assembled row is a different token's logprob."""
-        ok, msg = pc.compare({"a": 200.0}, {"a": self.CORPUS_SCALE})
+        ok, msg = pc.compare(
+            {"a": 200.0}, {"a": self.CORPUS_SCALE}, {"a": self.TOKENS}
+        )
         self.assertFalse(ok, msg)
         rc, err = self._cli({"a": 200.0}, {"a": self.CORPUS_SCALE})
         self.assertEqual(rc, 1)
         self.assertIn("FAILED", err)
 
     def test_an_explicit_tolerance_is_enforced_strictly(self):
-        """Once an operator has a real number, --tolerance is the gate and the
-        coarse ceiling is out of the way."""
-        ok, _ = pc.compare({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE}, 1e-5)
+        """Once an operator has real numbers, they are the gate and the coarse
+        ceilings are out of the way. BOTH halves have to be given: the bound is
+        the larger of the two, so a tight --tolerance alone changes nothing."""
+        ok, _ = pc.compare(
+            {"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE}, {"a": self.TOKENS},
+            1e-5, 1e-6,
+        )
         self.assertFalse(ok)
         rc, err = self._cli({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE},
-                            ["--tolerance", "1e-5"])
+                            ["--tolerance", "1e-5", "--per-token-bits", "1e-6"])
         self.assertEqual(rc, 1)
         self.assertIn("(--tolerance)", err)
+        self.assertIn("(--per-token-bits)", err)
+
+    def test_setting_only_one_half_cannot_tighten_past_the_other(self):
+        """The bound is max(relative, per-token), so the looser half rules. An
+        operator who calibrates one and forgets the other has NOT tightened the
+        gate -- which is why the banner names the half still at its default."""
+        args = ({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE}, {"a": self.TOKENS})
+        self.assertTrue(pc.compare(*args, 1e-9, None)[0])   # per-token half still 5e-3
+        self.assertTrue(pc.compare(*args, None, 1e-9)[0])   # relative half still 5e-2
+        self.assertFalse(pc.compare(*args, 1e-9, 1e-9)[0])
+        rc, err = self._cli(*args[:2], ["--tolerance", "1e-9"])
+        self.assertEqual(rc, 0)
+        self.assertIn("NOT CALIBRATED", err)
+        self.assertIn(f"--per-token-bits ({pc.UNCALIBRATED_PER_TOKEN_BITS:g}", err)
+        self.assertNotIn(f"--tolerance ({pc.UNCALIBRATED_REL_CEILING:g}", err)
 
     def test_the_uncalibrated_default_says_so_loudly_ON_A_PASS(self):
         """An uncalibrated pass is the one that gets mistaken for a validated
@@ -2713,43 +2886,453 @@ class TestParityToleranceIsRelative(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("NOT CALIBRATED", err)
         self.assertIn("max relative divergence", err)
+        self.assertIn("max per-token divergence", err)
         self.assertIn("--tolerance", err)
 
-    def test_an_explicit_tolerance_retires_the_uncalibrated_banner(self):
+    def test_explicit_bounds_for_BOTH_halves_retire_the_uncalibrated_banner(self):
         rc, err = self._cli({"a": self.CORPUS_SCALE + 0.05}, {"a": self.CORPUS_SCALE},
-                            ["--tolerance", "1e-2"])
+                            ["--tolerance", "1e-2", "--per-token-bits", "1e-2"])
         self.assertEqual(rc, 0)
         self.assertNotIn("NOT CALIBRATED", err)
 
-    def test_the_observed_maximum_is_reported_whatever_the_verdict(self):
-        """Reporting the number is the point: it is how the tolerance gets
+    def test_the_observed_maxima_are_reported_whatever_the_verdict(self):
+        """Reporting the numbers is the point: it is how the two halves get
         calibrated at all."""
-        for extra in ((), ("--tolerance", "1e-9")):
+        for extra in ((), ("--tolerance", "1e-9", "--per-token-bits", "1e-12")):
             with self.subTest(extra=extra):
                 _, err = self._cli({"a": 123.05, "b": 60.0}, {"a": 123.0, "b": 60.0}, extra)
                 self.assertIn("max relative divergence", err)
+                self.assertIn("max per-token divergence", err)
                 self.assertIn("over 2 examples", err)
-
-    def test_the_absolute_floor_is_configurable_and_load_bearing(self):
-        """Same two numbers, two floors, two verdicts: 0.006 bits against the
-        1-bit floor is 0.6%, and against a 0.001-bit floor it is judged on the
-        example's own 0.05 bits -- 12%, over the ceiling. The floor is not
-        decoration."""
-        rc, err = self._cli({"a": 0.056}, {"a": 0.050})
-        self.assertEqual(rc, 0, err)
-        rc, err = self._cli({"a": 0.056}, {"a": 0.050}, ["--abs-floor", "0.001"])
-        self.assertEqual(rc, 1)
-        self.assertIn("absolute floor 0.001", err)
 
     def test_the_file_records_that_the_bound_is_awaiting_calibration(self):
         """No GPU parity run has ever been made against this code. The default
-        must not pretend otherwise, and the old absolute hard gate must not come
-        back under the same name."""
+        must not pretend otherwise; the old absolute hard gate must not come
+        back under the same name; and neither must the fixed per-example floor
+        that replaced it, whose allowance ignored an example's length."""
         src = Path(pc.__file__).read_text(encoding="utf-8")
         self.assertIn("AWAITING CALIBRATION", src)
         self.assertFalse(hasattr(pc, "TOLERANCE"),
                          "the absolute, uncalibrated hard gate is back")
-        self.assertIsNone(inspect.signature(pc.compare).parameters["tolerance"].default)
+        self.assertFalse(hasattr(pc, "ABS_FLOOR_BITS"),
+                         "the fixed per-example floor is back; the small end is per TOKEN")
+        for half in ("tolerance", "per_token_bits"):
+            self.assertIsNone(inspect.signature(pc.compare).parameters[half].default)
+
+
+# ---------------------------------------------------------------------------
+# 20. the small end of the parity bound is PER TOKEN, not a fixed floor
+# ---------------------------------------------------------------------------
+
+
+class TestParityBoundIsPerToken(unittest.TestCase):
+    """The relative rule with a fixed 1-bit floor collapsed, for every example at
+    or below 1 bit, to an allowance of 5e-2 x 1.0 = 0.05 bits -- the same number
+    whatever the example scored and however many tokens it summed over. That is
+    the wrong quantity twice over:
+
+      * a memorized tuned example is ~0.05 bits, so the allowance WAS the whole
+        example and the check stopped discriminating exactly where the numbers
+        get small;
+      * 0.05 bits over this corpus's 34.6 answer tokens is 1.44e-3 bits/token =
+        1.0e-3 nats/token, the expected float disagreement itself, with no
+        margin -- and on a 350-token example the same fixed 0.05 bits demands
+        10x BETTER per-token agreement, while on a 3-token example it is 10x
+        looser than the noise.
+
+    The disagreement accumulates per TOKEN, so the bound's small end is per
+    token.
+    """
+
+    TOKENS = 35
+    TUNED_BITS = 0.05        # a memorized example, ~1.4e-3 bits/token
+    NOISE_BITS_PER_TOKEN = 1e-3 / math.log(2)   # 1e-3 nats/token
+
+    def test_the_same_per_token_error_is_judged_the_same_at_every_length(self):
+        """THE property the fixed floor lacked. 0.05 bits over 35 tokens and
+        0.5 bits over 350 tokens are the SAME arithmetic disagreement; the old
+        rule passed the first (barely -- it sat exactly on the bound) and failed
+        the second tenfold."""
+        short_ok, short_msg = pc.compare({"a": 0.10}, {"a": 0.05}, {"a": 35})
+        long_ok, long_msg = pc.compare({"a": 1.0}, {"a": 0.5}, {"a": 350})
+        self.assertTrue(short_ok, short_msg)
+        self.assertTrue(long_ok, long_msg)
+        ratio = lambda m: float(m.split("worst example uses ")[1].split()[0])  # noqa: E731
+        self.assertAlmostEqual(ratio(short_msg), ratio(long_msg), places=6)
+        # ... and a ten-times-worse per-token error fails at BOTH lengths.
+        self.assertFalse(pc.compare({"a": 0.55}, {"a": 0.05}, {"a": 35})[0])
+        self.assertFalse(pc.compare({"a": 5.5}, {"a": 0.5}, {"a": 350})[0])
+
+    def test_a_long_example_is_not_failed_for_being_long(self):
+        """The old fixed 0.05-bit allowance, on a 350-token example carrying
+        honest 1e-3 nats/token noise (0.505 bits), was a tenfold false alarm --
+        and a check that cries wolf gets loosened by whoever is holding the
+        pipeline at 2am."""
+        delta = self.NOISE_BITS_PER_TOKEN * 350
+        self.assertGreater(delta, 0.05, "this is the gap the old floor rejected")
+        ok, msg = pc.compare({"a": 200.0 + delta}, {"a": 200.0}, {"a": 350})
+        self.assertTrue(ok, msg)
+
+    def test_a_short_example_no_longer_gets_length_blind_slack(self):
+        """The other end of the same defect. On a 3-token example the fixed
+        0.05-bit allowance was ~12x the expected noise there (3 x 1.44e-3 =
+        0.0043 bits), so a 0.04-bit gap -- 0.013 bits/token, nine times the
+        noise floor, which no arithmetic explains -- passed, purely because
+        0.04 < 0.05."""
+        delta = 0.04
+        self.assertLess(delta, 0.05, "the old fixed floor passed exactly this")
+        ok, msg = pc.compare({"a": 0.05 + delta}, {"a": 0.05}, {"a": 3})
+        self.assertFalse(ok, msg)          # 0.04 > 5e-3 x 3 = 0.015
+        self.assertIn("set by the per-token half", msg)
+
+    def test_a_mis_assembled_row_at_the_TUNED_scale_still_fails(self):
+        """What the check must keep resolving at the small end: one wrong row is
+        a different token's logprob, ~3.55 bits at the base model's own rate,
+        against a 0.175-bit allowance for a 35-token example."""
+        ok, msg = pc.compare(
+            {"a": self.TUNED_BITS + 3.55}, {"a": self.TUNED_BITS}, {"a": self.TOKENS}
+        )
+        self.assertFalse(ok, msg)
+        self.assertGreater(float(msg.split("worst example uses ")[1].split()[0]), 15.0)
+
+    def test_honest_float_noise_at_the_TUNED_scale_passes_with_margin(self):
+        """The same bound, from the other side: under the old fixed floor this
+        wobble sat exactly ON the bound (0.05 bits allowed, 0.0505 observed), a
+        coin flip on every honest run."""
+        delta = self.NOISE_BITS_PER_TOKEN * self.TOKENS
+        self.assertAlmostEqual(delta, 0.0505, places=4)
+        ok, msg = pc.compare(
+            {"a": self.TUNED_BITS + delta}, {"a": self.TUNED_BITS}, {"a": self.TOKENS}
+        )
+        self.assertTrue(ok, msg)
+        self.assertLess(float(msg.split("worst example uses ")[1].split()[0]), 0.35)
+
+    def test_at_the_tuned_scale_the_report_says_what_it_can_still_resolve(self):
+        """Vacuity at ~0.05 bits is physical, not a choice of constant: the
+        arithmetic noise floor IS the signal there. The fix is to say so per
+        run, rather than to keep quoting a ratio against a picked floor."""
+        ok, msg = pc.compare(
+            {"a": self.TUNED_BITS + 0.01}, {"a": self.TUNED_BITS}, {"a": self.TOKENS}
+        )
+        self.assertTrue(ok, msg)
+        self.assertIn("judged by the per-token half", msg)
+        self.assertIn("wrong in KIND", msg)
+
+    def test_a_base_scale_example_is_judged_by_the_RELATIVE_half(self):
+        """Two-sided: the per-token half must not take over the large end, where
+        a proportional bound is the right one and is far tighter (6.15 bits of
+        room at 123 bits, against 0.175 per-token)."""
+        ok, msg = pc.compare({"a": 123.05}, {"a": 123.0}, {"a": 35})
+        self.assertTrue(ok, msg)
+        self.assertIn("set by the relative half", msg)
+        self.assertNotIn("judged by the per-token half", msg)
+
+    def test_the_per_token_divergence_is_reported_for_calibration(self):
+        """The number an operator needs to set --per-token-bits from, in the
+        units the flag takes."""
+        _, msg = pc.compare({"a": 0.05 + 0.035}, {"a": 0.05}, {"a": 35})
+        self.assertIn("max per-token divergence 1.000e-03 bits/token", msg)
+
+    def test_a_row_with_no_token_count_is_refused_not_floored(self):
+        """A row that does not say how many tokens its sum is over cannot be
+        judged per token. Falling back to a length-blind bound is precisely the
+        rule this replaces, so it refuses instead."""
+        ok, msg = pc.compare({"a": 1.0}, {"a": 1.0}, {"a": None})
+        self.assertFalse(ok)
+        self.assertIn("record no token count", msg)
+        self.assertFalse(pc.compare({"a": 1.0}, {"a": 1.0}, {"a": 0})[0])
+
+    def test_the_column_decides_which_token_count_is_used(self):
+        """`bits` sums the answer, `trainer_bits` adds the trainer's pad step,
+        `decision_bits` covers only the decision fields' tokens. Dividing one
+        column by another column's token count is a different number."""
+        self.assertEqual(pc.COLUMN_TOKEN_FIELD["bits"], "answer_tokens")
+        self.assertEqual(pc.COLUMN_TOKEN_FIELD["trainer_bits"], "trainer_tokens")
+        self.assertEqual(pc.COLUMN_TOKEN_FIELD["decision_bits"], "decision_tokens")
+        with tempfile.TemporaryDirectory() as tmp:
+            p = write_rows(
+                Path(tmp) / "s.jsonl",
+                parity_rows({"a": 2.0}, 7, column="decision_bits",
+                            token_field="decision_tokens"),
+            )
+            self.assertEqual(pc.load(p, "decision_bits").tokens, {"a": 7})
+
+    def test_a_column_that_is_not_a_sum_over_tokens_is_rejected_by_the_parser(self):
+        """bits_per_token is already per token; there is nothing for the rule to
+        divide by, so --column will not take it."""
+        err = io.StringIO()
+        stderr, sys.stderr = sys.stderr, err
+        try:
+            with self.assertRaises(SystemExit):
+                pc.main(["a.jsonl", "b.jsonl", "--column", "bits_per_token"])
+        finally:
+            sys.stderr = stderr
+
+    def test_the_two_files_must_agree_on_the_token_count(self):
+        """Same example, same window, different token count = the two runs
+        masked it differently. Their sums are not comparable quantities, and the
+        per-token bound has no single denominator."""
+        chunked = score_file({"a": 1.0}, {"a": 34})
+        full = score_file({"a": 1.0}, {"a": 35}, full_forward=True)
+        ok, msg = pc.check_token_counts(chunked, full, "bits")
+        self.assertFalse(ok)
+        self.assertIn("answer_tokens", msg)
+        rc, err = run_parity_cli(
+            parity_rows({"a": 1.0}, {"a": 34}),
+            parity_rows({"a": 1.0}, {"a": 35}, full_forward=True),
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("REFUSED", err)
+
+    def test_the_per_token_argument_is_written_down_in_the_file(self):
+        """The allowance is an argument, not a number someone liked: 5e-3
+        bits/token is ~3.5x the 1e-3 nats/token these two float paths are
+        expected to disagree by."""
+        self.assertAlmostEqual(
+            pc.UNCALIBRATED_PER_TOKEN_BITS / (pc.NOISE_NATS_PER_TOKEN / math.log(2)),
+            3.466, places=3,
+        )
+        src = Path(pc.__file__).read_text(encoding="utf-8")
+        self.assertIn("nats/token", src)
+        self.assertIn("WHAT THIS STILL CANNOT DO", src)
+
+
+# ---------------------------------------------------------------------------
+# 21. a parity pair is two runs that differ in ONE thing
+# ---------------------------------------------------------------------------
+
+
+class TestParityPairFingerprint(unittest.TestCase):
+    """parity_check paired two score files by content hash and checked nothing
+    about the runs behind them -- not the model, not the window, not the mask,
+    not the adapter, not the adapter_digest the previous commit added one file
+    over. So it would happily 'prove parity' between two runs that differ in
+    ways that guarantee different numbers, or condemn a chunked path that was
+    fine. Same class of bug as the pair check in select_curriculum.py, arriving
+    from the other direction."""
+
+    def _pair(self, **full_kw):
+        return (
+            score_file({"a": 1.0}, name="chunked.jsonl"),
+            score_file({"a": 1.0}, name="full.jsonl", **{"full_forward": True, **full_kw}),
+        )
+
+    def test_a_valid_pair_passes_and_names_what_it_checked(self):
+        ok, msg = pc.check_parity_fingerprints(*self._pair())
+        self.assertTrue(ok, msg)
+        self.assertIn("model='m'", msg)
+        self.assertIn("full_forward=True", msg)
+
+    def test_two_runs_under_different_models_are_refused(self):
+        ok, msg = pc.check_parity_fingerprints(*self._pair(model="other-model"))
+        self.assertFalse(ok)
+        self.assertIn("model", msg)
+        self.assertIn("different settings", msg)
+
+    def test_two_runs_under_different_windows_or_masks_are_refused(self):
+        for kw in ({"max_seq_length": 2048}, {"match_trainer": False}):
+            with self.subTest(kw=kw):
+                ok, msg = pc.check_parity_fingerprints(*self._pair(**kw))
+                self.assertFalse(ok, msg)
+                self.assertIn(next(iter(kw)), msg)
+
+    def test_two_runs_under_different_adapters_are_refused(self):
+        """One side tuned, the other not, is the difference the CURRICULUM is
+        built on -- and it is exactly what must NOT differ here. A base file and
+        a tuned file compared for parity would report the whole learned_bits
+        column as a divergence of the chunked path."""
+        ok, msg = pc.check_parity_fingerprints(
+            *self._pair(adapter="/models/tuned", adapter_digest="sha256:" + "ab" * 32)
+        )
+        self.assertFalse(ok)
+        self.assertIn("adapter", msg)
+
+    def test_two_runs_under_different_adapter_CONTENTS_are_refused(self):
+        """The case a PATH cannot see, which is why the digest exists: one
+        staging directory, two checkpoints, identical `adapter` strings."""
+        chunked = score_file({"a": 1.0}, adapter="/staging",
+                             adapter_digest="sha256:" + "11" * 32, name="chunked.jsonl")
+        full = score_file({"a": 1.0}, adapter="/staging",
+                          adapter_digest="sha256:" + "22" * 32,
+                          full_forward=True, name="full.jsonl")
+        ok, msg = pc.check_parity_fingerprints(chunked, full)
+        self.assertFalse(ok)
+        self.assertIn("adapter_digest", msg)
+
+    def test_the_SAME_forward_path_twice_is_refused_as_vacuous(self):
+        """The empty comparison wearing a full set of rows: given one forward
+        path twice, the check agrees perfectly and validates nothing."""
+        ok, msg = pc.check_parity_fingerprints(*self._pair(full_forward=False))
+        self.assertFalse(ok)
+        self.assertIn("SAME forward path", msg)
+
+    def test_two_different_CHUNK_sizes_are_a_valid_pair(self):
+        """The one thing they are SUPPOSED to differ in. Different prefill
+        boundaries are different matmul shapes and different cache evictions --
+        a real parity comparison, even with neither side --full-forward."""
+        chunked = score_file({"a": 1.0}, chunk=512, name="c512.jsonl")
+        other = score_file({"a": 1.0}, chunk=2048, name="c2048.jsonl")
+        ok, msg = pc.check_parity_fingerprints(chunked, other)
+        self.assertTrue(ok, msg)
+
+    def test_a_file_with_no_fingerprint_at_all_is_refused(self):
+        """Rows that predate the fingerprint carry no evidence of what produced
+        them. Refused, not assumed -- the same call select_curriculum makes."""
+        bare = pc.ScoreFile(Path("old.jsonl"), {"a": 1.0}, {"a": 35}, [])
+        ok, msg = pc.check_parity_fingerprints(bare, score_file({"a": 1.0}, full_forward=True))
+        self.assertFalse(ok)
+        self.assertIn("records no run fingerprint", msg)
+
+    def test_a_file_holding_two_spliced_runs_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = write_rows(
+                Path(tmp) / "spliced.jsonl",
+                parity_rows({"a": 1.0}, chunk=512) + parity_rows({"b": 1.0}, chunk=2048),
+            )
+            spliced = pc.load(p, "bits")
+        self.assertEqual(len(spliced.fingerprints), 2)
+        ok, msg = pc.check_parity_fingerprints(
+            spliced, score_file({"a": 1.0, "b": 1.0}, full_forward=True)
+        )
+        self.assertFalse(ok)
+        self.assertIn("spliced together", msg)
+
+    def test_the_refusal_can_be_waived_loudly(self):
+        ok, msg = pc.check_parity_fingerprints(*self._pair(model="other"), allow=True)
+        self.assertTrue(ok)
+        self.assertIn("WARNING", msg)
+        self.assertIn("--allow-fingerprint-mismatch", msg)
+
+    def test_the_cli_refuses_a_mismatched_pair_with_its_own_exit_code(self):
+        """Exit 2, distinct from 1: these files are not a parity pair at all, so
+        neither 'agreed' nor 'diverged' is the honest answer."""
+        rc, err = run_parity_cli(
+            parity_rows({"a": 1.0}, max_seq_length=3072),
+            parity_rows({"a": 1.0}, max_seq_length=2048, full_forward=True),
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("not a parity pair", err)
+        self.assertIn("max_seq_length", err)
+        rc, err = run_parity_cli(
+            parity_rows({"a": 1.0}, max_seq_length=3072),
+            parity_rows({"a": 1.0}, max_seq_length=2048, full_forward=True),
+            ["--allow-fingerprint-mismatch"],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("WARNING", err)
+
+    def test_the_fingerprint_is_read_off_the_rows_score_bits_writes(self):
+        """The two modules have to agree about what a fingerprint IS. A field
+        score_bits stamps that parity_check does not classify is a field nothing
+        checks across the pair -- how the adapter came to be unchecked here in
+        the first place."""
+        self.assertEqual(
+            set(pc.PARITY_MUST_AGREE) | set(pc.PARITY_FORWARD_KEYS),
+            set(sb.run_fingerprint("m", None, 3072, True, False, 512)),
+        )
+        self.assertEqual(
+            set(pc.PARITY_MUST_AGREE),
+            (set(sb.PAIR_FINGERPRINT_KEYS) | set(sb.ADAPTER_FINGERPRINT_KEYS))
+            - set(pc.PARITY_FORWARD_KEYS),
+            "a parity pair must agree on everything a base/tuned pair does, plus the "
+            "adapter -- and differ only in the forward path",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 22. a non-finite bits value is a broken forward pass, not a small divergence
+# ---------------------------------------------------------------------------
+
+
+class TestParityRefusesNonFinite(unittest.TestCase):
+    """Every comparison against NaN is False, so a NaN never displaced the
+    worst-so-far sentinel: the check reported 'max relative divergence
+    -1.000e+00' -- a divergence that cannot exist -- and exited 0."""
+
+    def test_a_NaN_is_refused_instead_of_passing_with_a_negative_divergence(self):
+        ok, msg = pc.compare({"a": float("nan")}, {"a": 1.0}, {"a": 35})
+        self.assertFalse(ok)
+        self.assertIn("NON-FINITE", msg)
+        self.assertNotIn("-1.000e+00", msg)
+
+    def test_a_NaN_on_either_side_is_caught(self):
+        for chunked, full in (
+            ({"a": float("nan")}, {"a": 1.0}),
+            ({"a": 1.0}, {"a": float("nan")}),
+        ):
+            with self.subTest(chunked=chunked):
+                self.assertFalse(pc.compare(chunked, full, {"a": 35})[0])
+
+    def test_an_infinity_is_refused_too(self):
+        ok, msg = pc.compare({"a": float("inf")}, {"a": 1.0}, {"a": 35})
+        self.assertFalse(ok)
+        self.assertIn("NON-FINITE", msg)
+
+    def test_the_refusal_names_the_rows_and_counts_them(self):
+        chunked = {"a": float("nan"), "b": 1.0, "c": float("inf")}
+        full = {"a": 1.0, "b": 1.0, "c": 1.0}
+        ok, msg = pc.compare(chunked, full, {h: 35 for h in full})
+        self.assertFalse(ok)
+        self.assertIn("2 of 3 examples", msg)
+        self.assertIn("a:", msg)
+        self.assertIn("c:", msg)
+
+    def test_the_cli_exits_nonzero_on_a_NaN(self):
+        """json.dumps writes bare NaN and json.loads reads it back, so this is
+        what an actual broken scoring run leaves on disk."""
+        rc, err = run_parity_cli(
+            parity_rows({"a": float("nan")}),
+            parity_rows({"a": 1.0}, full_forward=True),
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("NON-FINITE", err)
+        self.assertIn("FAILED", err)
+
+
+# ---------------------------------------------------------------------------
+# 23. a zero allowance is a demand for exactness, not a crash
+# ---------------------------------------------------------------------------
+
+
+class TestParityZeroAllowance(unittest.TestCase):
+    """`--abs-floor 0` used to divide by max(|full|, 0) and raise an uncaught
+    ZeroDivisionError the moment any full-forward example scored exactly 0.0
+    bits -- which is what a memorized tuned example rounds to. The floor is gone,
+    but the hazard is the same shape: zero both halves of the bound and the
+    allowance is zero."""
+
+    def test_a_zero_per_token_half_against_a_zero_bit_example_does_not_crash(self):
+        ok, msg = pc.compare({"a": 0.0}, {"a": 0.0}, {"a": 35}, per_token_bits=0.0)
+        self.assertTrue(ok, msg)
+
+    def test_both_halves_zero_demands_exactness_rather_than_raising(self):
+        self.assertTrue(pc.compare({"a": 5.0}, {"a": 5.0}, {"a": 35}, 0.0, 0.0)[0])
+        ok, msg = pc.compare({"a": 5.0 + 1e-12}, {"a": 5.0}, {"a": 35}, 0.0, 0.0)
+        self.assertFalse(ok)
+        self.assertIn("inf", msg)
+
+    def test_a_zero_bit_example_with_a_real_gap_still_fails(self):
+        ok, msg = pc.compare({"a": 3.5}, {"a": 0.0}, {"a": 35}, per_token_bits=0.0)
+        self.assertFalse(ok)
+        self.assertIn("relative n/a", msg)
+
+    def test_a_negative_bound_is_refused_rather_than_inverted(self):
+        for tol, per_token in ((-1e-3, None), (None, -1e-3)):
+            with self.subTest(tol=tol, per_token=per_token):
+                ok, msg = pc.compare({"a": 1.0}, {"a": 1.0}, {"a": 35}, tol, per_token)
+                self.assertFalse(ok)
+                self.assertIn("negative bound", msg)
+
+    def test_the_cli_survives_a_zero_bound_on_a_zero_bit_example(self):
+        """The exact operator gesture that used to raise: bound the check at
+        zero, over a corpus the adapter has memorized to 0.0 bits."""
+        rc, err = run_parity_cli(
+            parity_rows({"a": 0.0, "b": 0.0}),
+            parity_rows({"a": 0.0, "b": 0.0}, full_forward=True),
+            ["--tolerance", "0", "--per-token-bits", "0"],
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("over 2 examples", err)
 
 
 if __name__ == "__main__":

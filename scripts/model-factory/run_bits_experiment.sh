@@ -150,8 +150,10 @@ if [[ " $STAGES " == *" 1 "* ]]; then
 
   # The base ranking IS the whole curriculum in base-only mode, so the chunked
   # KV-cache path has to be validated here too, not only in stage 2. Same
-  # uncalibrated-tolerance caveat as stage 2b: this prints the divergence it
-  # observed and enforces only a coarse ceiling until someone sets --tolerance.
+  # uncalibrated-bound caveat as stage 2b: this prints the two divergences it
+  # observed and enforces only coarse ceilings until someone sets --tolerance
+  # AND --per-token-bits (the bound is the larger of the two halves, so setting
+  # one alone tightens nothing).
   say "stage 1c: parity spot-check on the BASE scores (chunked vs full forward)"
   "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$TRAIN" --limit 20 \
@@ -194,11 +196,17 @@ if [[ " $STAGES " == *" 2 "* ]]; then
   # validate nothing.
   #
   # TOLERANCE: NOT CALIBRATED YET. No parity run has been made on a GPU, so no
-  # --tolerance is passed here and the check enforces only its coarse
-  # wrong-in-KIND ceiling. It will PRINT "max relative divergence <x>". Write
-  # that number down, and add `--tolerance <a small multiple of x>` to BOTH
-  # parity_check invocations in this file (stage 1c and here). Until that is
-  # done, a pass from this stage means "not wrong in kind", not "validated".
+  # bound is passed here and the check enforces only its coarse wrong-in-KIND
+  # ceilings. It will PRINT "max relative divergence <x>" and "max per-token
+  # divergence <y> bits/token". Write BOTH down, and add
+  #   --tolerance <a small multiple of x> --per-token-bits <a small multiple of y>
+  # to BOTH parity_check invocations in this file (stage 1c and here). The bound
+  # is max(relative, per-token), so calibrating one half alone tightens nothing.
+  # Until that is done, a pass from this stage means "not wrong in kind", not
+  # "validated". The two score files must also come from runs that differ ONLY
+  # in the forward path -- parity_check refuses the pair (exit 2) otherwise,
+  # which is why the --full-forward run below repeats the same --model/--adapter
+  # and leaves --max-seq-length at its default 3072.
   say "stage 2b: parity spot-check (chunked vs full forward, 20 examples)"
   "$PY" "$SCRIPTS/score_bits.py" \
     --model "$BASE" --data "$TRAIN" --adapter "$ADAPTERS" --limit 20 \

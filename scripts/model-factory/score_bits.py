@@ -912,8 +912,27 @@ def adapter_content_digest(adapter_path: str | Path | None) -> str | None:
                 )
             parts.append((name, f.stat().st_size, file_sha256(f)))
     elif p.is_file():
-        # Tolerated because it is unambiguous: a single weights file, named.
-        parts = [(p.name, p.stat().st_size, file_sha256(p))]
+        # REFUSED, not tolerated. It reads as unambiguous -- one named weights
+        # file -- but the loader cannot take it: MLXScorer calls
+        # mlx_lm.load(model, adapter_path=...), which reads adapter_config.json
+        # out of a DIRECTORY. Digesting the file would fingerprint a
+        # configuration that cannot run, and the fingerprint would then describe
+        # something no row was ever scored under. Resolving it to its parent
+        # silently is worse: the operator named a file, and the parent may hold a
+        # config they never looked at. So: name the directory.
+        hint = (
+            f" Pass the directory instead: --adapter {p.parent}"
+            if p.name in ADAPTER_DIGEST_FILES
+            and all((p.parent / n).is_file() for n in ADAPTER_DIGEST_FILES)
+            else " Pass the adapter DIRECTORY -- the one holding "
+            f"{list(ADAPTER_DIGEST_FILES)}."
+        )
+        raise SystemExit(
+            f"[score_bits] --adapter {p} is a file. mlx_lm's load(..., adapter_path=...) "
+            f"loads {list(ADAPTER_DIGEST_FILES)} out of a DIRECTORY and would fail on "
+            "this path, so fingerprinting it would record an adapter that can never be "
+            "applied." + hint
+        )
     else:
         raise SystemExit(f"[score_bits] --adapter {p} does not exist")
     h = hashlib.sha256()

@@ -658,6 +658,14 @@ one score file held two models under one name.
   `cp -p` changes weights without changing mtime, and consecutive LoRA
   checkpoints are byte-identical in size — size+mtime is precisely the
   discriminator this hazard defeats.)
+* **`--adapter` must be a DIRECTORY.** The digest used to accept a plain file as
+  "unambiguous — a single weights file, named". But `MLXScorer` loads the adapter
+  with `mlx_lm.load(..., adapter_path=…)`, which reads `adapter_config.json` out
+  of a *directory*: that branch fingerprinted a configuration that could never
+  run, so the digest would have described something no row was ever scored under.
+  A file is now **refused**, with the directory to pass instead named in the
+  message when there is one — rather than silently resolved to a parent holding a
+  config the operator never looked at.
 * **Operator-visible consequences.** Re-running with the same command against a
   path whose weights have changed is now **refused** (exit 2) instead of resumed;
   point `--out` at a new file per checkpoint, which is what the staging recipe
@@ -679,48 +687,113 @@ one score file held two models under one name.
   `select_curriculum.py` also refuses a single file holding two different
   digests, however it came to (a hand-concatenation, a restored backup).
 
-**The parity tolerance is RELATIVE, and its default is not yet a gate.** The
-internal check (`parity_check.py CHUNKED.jsonl FULLFWD.jsonl`, stages 1c and 2b)
-compares an un-cached single forward against a chunked prefill through a rotating
-KV cache on a 4-bit-quantised model — two different sequences of floating-point
-operations over the same mathematics, which `score_bits.py`'s own comments concede
-disagree numerically. Some divergence is *expected*; the check's job is to
-separate it from a chunked path assembling the wrong rows.
+**The parity bound is per TOKEN at the small end, and its default is not yet a
+gate.** The internal check (`parity_check.py CHUNKED.jsonl FULLFWD.jsonl`, stages
+1c and 2b) compares an un-cached single forward against a chunked prefill through
+a rotating KV cache on a 4-bit-quantised model — two different sequences of
+floating-point operations over the same mathematics, which `score_bits.py`'s own
+comments concede disagree numerically. Some divergence is *expected*; the check's
+job is to separate it from a chunked path assembling the wrong rows.
 
-It used to enforce `TOLERANCE = 1e-2` as an **absolute** bound on a per-example
-**sum** of bits, and hard-gate the pipeline on it. At this corpus's scale that is
-~8e-5 relative:
+The scale everything below is measured against, from the live `train.log`:
 
     Iter 1: Val loss 2.463 nats/token   ×   127129/3675 = 34.6 unmasked tokens/step
-      = 85.2 nats = ~123 bits per example        (from the live train.log)
+      = 85.2 nats = ~123 bits per example, at 3.55 bits/token
 
-A per-token disagreement of 1e-3 nats — unremarkable for this arithmetic — sums to
-0.05 bits, **five times** the old bound. The check was likelier to fail on float
-noise than on a bug, and a check that cries wolf on its first honest run gets
-loosened by whoever is holding the pipeline at 2am. The rule now:
+Two rules have been retired here. The first was `TOLERANCE = 1e-2`, an
+**absolute** bound on a per-example **sum** of bits (~8e-5 relative at that
+scale) that hard-gated the pipeline: a per-token disagreement of 1e-3 nats —
+unremarkable for this arithmetic — sums to 0.05 bits, five times that bound, so
+it was likelier to fail on float noise than on a bug. The second was the relative
+rule that replaced it, `|Δ| / max(|full|, 1 bit) < 5e-2`, whose 1-bit floor made
+the allowance for every example at or below 1 bit a **fixed 0.05 bits**,
+regardless of length or value. That is the wrong quantity twice over:
 
-    error(h) = |chunked[h] − full[h]| / max(|full[h]|, --abs-floor)
+* **vacuous exactly where the numbers get small.** A memorized tuned example is
+  ~0.05 bits, so the allowance *was* the whole example: the chunked path could
+  report 0.0 or 0.10 bits for it and pass. Below that the allowance exceeds the
+  number entirely — and the tuned arm is the one `learned_bits` subtracts.
+* **simultaneously too tight, at the typical length.** 0.05 bits over 34.6
+  answer tokens is 1.44e-3 bits/token = 1.00e-3 nats/token: the expected float
+  disagreement itself, with **no** margin. On a 350-token example that same
+  fixed 0.05 bits demands 10× *better* per-token agreement; on a 3-token example
+  it is ~12× looser than the noise.
 
-Relative, because the quantity spans orders of magnitude (a base example is ~10²
-bits; a memorized tuned example is ~10⁻²) and one absolute bound cannot be right
-for both. Floored at 1 bit, because below that the model is essentially certain
-and a ratio stops carrying information.
+Length is what generates the disagreement — the column is a *sum over tokens*,
+and the two paths differ per token — and length is the one thing a per-example
+floor cannot see. The rule now is two-sided, each example judged by whichever
+half is more permissive for it:
+
+    allowance(h) = max( --tolerance × |full[h]| , --per-token-bits × tokens(h) )
+    pass  iff  |chunked[h] − full[h]| < allowance(h),  for every h
+
+* the **relative** half carries the large end: at ~123 bits, `5e-2` is ~6 bits of
+  room — generous against float noise (~0.05 bits) and far inside what a
+  mis-assembled row costs, since a wrong row is a different token's logprob and
+  moves an example by tens of percent;
+* the **per-token** half carries the small end, and unlike a picked floor its
+  size is an *argument*: the two paths are expected to disagree by ~1e-3
+  nats/token = 1.44e-3 bits/token, so the uncalibrated allowance is `5e-3`
+  bits/token, ~3.5× that — at **every** length. For a 35-token tuned example
+  that is 0.175 bits: honest noise (~0.05 bits) passes with 3.5× of room, while
+  one mis-assembled row costs ~3.55 bits and fails by 20×. Under the old fixed
+  floor that same noise sat exactly *on* the bound — a coin flip every run.
+
+`tokens(h)` is the count the compared column actually sums over — `answer_tokens`
+for `bits`, `trainer_tokens` for `trainer_bits`, `decision_tokens` for
+`decision_bits` — so `--column` accepts only columns that are such a sum, and a
+row that records no count is **refused** rather than judged by a length-blind
+bound. The two files must also agree on that count per example: a disagreement
+means the two runs masked the same example differently.
+
+**What this still cannot do, said out loud.** A memorized tuned example carries
+~0.05 bits over ~35 tokens — 1.4e-3 bits/token, the arithmetic noise floor
+itself. At that scale no bound on a per-example bits sum can separate signal from
+float noise. So the run's report *counts* the examples whose allowance exceeded
+their own bits and states that for those it resolved a divergence wrong in
+**kind** and nothing finer, instead of quoting a ratio that sounds like a
+precision.
 
 **Calibration status: AWAITING CALIBRATION — no GPU parity run has ever been made
 against this code**, so nobody knows what these two paths actually agree to, and
-no number here is a measured bound. Rather than invent one, `--tolerance` now
-defaults to *unset*: the check enforces only a deliberately coarse `5e-2` relative
-ceiling — an order-of-magnitude argument that resolves a chunked path wrong in
-**kind** (rows off by one, the wrong cache, the prompt scored as the answer), not
-one off by a little — reports the observed **max relative divergence**
-prominently, and prints a `NOT CALIBRATED` banner *on a pass*, because an
-uncalibrated pass is the one that gets mistaken for a validated one.
+no number here is a measured bound. Both halves default to *unset*, both defaults
+are deliberately coarse, the observed **max relative divergence** *and* **max
+per-token divergence** are reported, and a `NOT CALIBRATED` banner prints *on a
+pass* — naming the half still at its default, because the bound is the larger of
+the two and calibrating one alone tightens nothing.
 
-**What an operator must do:** run stage 1c or 2b once, read the reported "max
-relative divergence", and add `--tolerance <a small multiple of it>` to **both**
-`parity_check.py` invocations in `run_bits_experiment.sh`. Until that is done, a
-pass from those stages means "not wrong in kind", not "validated to a stated
-precision", and the script's comments say so at both call sites.
+**What an operator must do:** run stage 1c or 2b once, read the two reported
+maxima, and add `--tolerance <a small multiple of the first>` and
+`--per-token-bits <a small multiple of the second>` to **both** `parity_check.py`
+invocations in `run_bits_experiment.sh`. Until that is done, a pass from those
+stages means "not wrong in kind", not "validated to a stated precision", and the
+script's comments say so at both call sites.
+
+**A parity pair is two runs that differ in ONE thing.** Pairing the two files by
+content hash says the *examples* are the same; it used to say nothing at all
+about the *runs*, so two files scored under different models, adapters, windows
+or masks would be declared in parity — or, worse, declared out of parity,
+condemning a chunked path that was fine. `parity_check.py` now reads the same run
+fingerprint `score_bits.py` stamps on every row and refuses (**exit 2**, distinct
+from a numeric failure's 1) unless:
+
+* the two files **agree** on `model`, `adapter`, `adapter_digest`,
+  `max_seq_length` and `match_trainer` — a key present on one side only counts as
+  a mismatch, which is the "one file was written by a different version of the
+  scorer" case;
+* they **differ** in the forward path (`full_forward`, `chunk`) — the one thing
+  this check exists to vary. Two files describing the same forward path agree
+  perfectly and prove nothing: it is the empty comparison wearing a full set of
+  rows. (Two different `--chunk` values on both sides *is* a valid pair —
+  different prefill boundaries are different arithmetic.)
+* both files record a fingerprint at all, and each records exactly one — a file
+  holding two fingerprints is two runs spliced together.
+
+`--allow-fingerprint-mismatch` waives it, loudly. **A non-finite value is
+refused, too:** every comparison against NaN is False, so a NaN never displaced
+the old worst-so-far sentinel and the check reported "max relative divergence
+-1.000e+00" — a divergence that cannot exist — and exited 0. A NaN or inf in
+either file now fails with the offending rows named.
 
 ### Honest caveats
 
@@ -900,13 +973,18 @@ refuses to start until that is clear. What that leaves unvalidated, precisely:
   118-example split, so it catches a mask wrong in **kind** (prompt scored as
   answer), not one off by a single token, and it says so in its own output.
 * **The chunked-vs-full-forward parity check has never run** (stages 1c / 2b),
-  **and its tolerance is therefore uncalibrated.** It is now a *relative* bound
-  with an absolute floor rather than the old absolute `1e-2` bits (which was
-  ~8e-5 relative at this corpus's scale, tighter than the arithmetic can
-  support), but no number in it is measured. Until a real run reports its "max
-  relative divergence" and an operator sets `--tolerance` from it, these stages
-  resolve a forward path wrong in **kind**, not one off by a little — the check
-  prints `NOT CALIBRATED` on its own passes so this cannot be forgotten.
+  **and both halves of its bound are therefore uncalibrated.** The rule is now
+  `max(--tolerance × |full|, --per-token-bits × tokens)` — relative at the large
+  end, per token at the small end — rather than the old absolute `1e-2` bits
+  (~8e-5 relative at this corpus's scale, tighter than the arithmetic can
+  support) or the fixed 0.05-bit floor that replaced it (the whole of a memorized
+  tuned example, and the expected noise itself at 34.6 tokens). Its `5e-3`
+  bits/token default is an *argument* from an expected 1e-3 nats/token, not a
+  measurement: nothing here has been run. Until a real run reports its "max
+  relative divergence" and "max per-token divergence" and an operator sets both
+  flags from them, these stages resolve a forward path wrong in **kind**, not one
+  off by a little — the check prints `NOT CALIBRATED` on its own passes, naming
+  the half still at its default, so this cannot be forgotten.
 * **The decision-field mask has been verified only against a character-level
   stub tokenizer**, never a real one.
 * **The mislabel screen's power is unknown.** The cut is now scale-free, so
