@@ -60,8 +60,9 @@ is unambiguous.
 | [H002](year-1/H002-2026-09-06-high-information-subset.md) | 2026-09-06 | HYPOTHESIS | A small high-information subset reaches the same gate score in materially fewer iterations | untested |
 | [H003](year-1/H003-2026-09-06-best-checkpoint-not-last.md) | 2026-09-06 | HYPOTHESIS | The best checkpoint is not the last one | untested |
 | [H004](year-1/H004-2026-09-06-baseline-labels-cap-hard-tier.md) | 2026-09-06 | HYPOTHESIS | Distilling the deterministic baseline will pull the hard tier down toward it | untested |
+| [O014](year-1/O014-2026-09-06-six-rounds-and-still-finding.md) | 2026-09-06 | OBSERVATION | Six correction rounds, each smaller and none empty — the book is closed with its remaining findings listed, not fixed | standing |
 
-**31 entries.** The row count of the table above equals the file count of
+**32 entries.** The row count of the table above equals the file count of
 `year-1/`; check it with
 `ls scripts/model-factory/labbook/year-1/*.md | wc -l`.
 
@@ -100,4 +101,4 @@ paper over it with a strikethrough.
 
 ## Next free ids
 
-`E010` · `O014` · `H005` · `P006`
+`E010` · `O015` · `H005` · `P006`
