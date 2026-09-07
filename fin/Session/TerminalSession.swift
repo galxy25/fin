@@ -73,7 +73,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var stdinWriter: TTYStdinWriter?
     private var runTask: Task<Void, Never>?
     /// Tail of the outbound write chain — see `send(bytes:)` for why writes are serialized.
-    private var writeChain: Task<Void, Never>?
+    private var writeChain: Task<Bool, Never>?
+    /// The most recently created write, readable outside `send(bytes:)` — this is how
+    /// `sendAgentInput` (which triggers a write indirectly, through SwiftTerm's
+    /// synchronous delegate callback, and so cannot itself return one) hands its own
+    /// caller the real outcome. Always the same value as `writeChain` at the instant a
+    /// `send(bytes:)` call returns; kept as a separate property only so its name reads
+    /// right from that call site rather than exposing the chain's own bookkeeping.
+    private var lastSendTask: Task<Bool, Never>?
     /// Cached so an unexpected drop (see `run()`'s cleanup) can reconnect itself without
     /// waiting for `SessionManager` to be told to do so via a foreground/wake trigger.
     private var lastServer: Server?
@@ -166,6 +173,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         // the new one would deliver stale keystrokes to a fresh shell.
         writeChain?.cancel()
         writeChain = nil
+        lastSendTask = nil
 
         runTask = Task { [weak self] in
             await self?.run(server: server, credentials: credentials, environment: environment, generation: myGeneration)
@@ -186,6 +194,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         runTask?.cancel()
         writeChain?.cancel()
         writeChain = nil
+        lastSendTask = nil
         let closingClient = client
         client = nil
         stdinWriter = nil
@@ -201,17 +210,45 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// channel out of order. With a human typing that's a rare cosmetic glitch; with
     /// something writing programmatically (the agent sending a command, or a multi-line
     /// paste) reordering corrupts the command itself, so ordering has to be guaranteed.
-    func send(bytes: [UInt8]) {
-        guard let stdinWriter else { return }
-        eventLog.recordInput(bytes)
+    ///
+    /// Returns a `Task` resolving to whether the bytes actually reached the channel —
+    /// `false` for a disconnected session (no `stdinWriter`) or a write that threw.
+    /// `@discardableResult` so keystrokes and other fire-and-forget callers are unchanged;
+    /// a caller that needs to know the real outcome (the agent's send path in particular)
+    /// awaits it. The event log records the input only AFTER a confirmed successful
+    /// write, not before: previously a disconnected session silently dropped the bytes
+    /// while the log — and anything reading it, including the agent — still showed them
+    /// as delivered. `lastError` carries the failure for the same reason `connect()`
+    /// already uses it for a failed handshake, so both are one published surface.
+    @discardableResult
+    func send(bytes: [UInt8]) -> Task<Bool, Never> {
+        let writer = stdinWriter
         let previousWrite = writeChain
-        writeChain = Task {
+        let thisWrite = Task<Bool, Never> {
+            // Always wait for whatever was queued before this — regardless of ITS
+            // outcome — so the actual writes stay strictly ordered even when this call
+            // (or an earlier one) turns out to have nothing to send to.
             await previousWrite?.value
-            try? await stdinWriter.write(ByteBuffer(bytes: bytes))
+            guard let writer else {
+                self.lastError = "Input was not sent: the terminal session is not connected."
+                return false
+            }
+            do {
+                try await writer.write(ByteBuffer(bytes: bytes))
+                self.eventLog.recordInput(bytes)
+                return true
+            } catch {
+                self.lastError = "Input was not sent: \(error)"
+                return false
+            }
         }
+        writeChain = thisWrite
+        lastSendTask = thisWrite
+        return thisWrite
     }
 
-    func send(text: String) {
+    @discardableResult
+    func send(text: String) -> Task<Bool, Never> {
         send(bytes: Array(text.utf8))
     }
 
@@ -219,11 +256,18 @@ final class TerminalSession: ObservableObject, Identifiable {
     ///
     /// Routed through SwiftTerm's `sendUserInput` instead of straight to `send(bytes:)`
     /// so the terminal's own OSC 133 interaction state advances exactly as it does for
-    /// typed input. `sendUserInput` registers the input and then calls back through the
-    /// view delegate into `send(bytes:)` above, so this still results in a single write.
-    func sendAgentInput(_ text: String) {
-        guard !text.isEmpty else { return }
+    /// typed input. `sendUserInput` calls back through the view delegate into
+    /// `send(bytes:)` above SYNCHRONOUSLY (confirmed against the vendored
+    /// `Terminal.sendUserInput` — it calls `tdel?.send` directly, no queueing), so by the
+    /// time this returns, `send(bytes:)` has already run and set `lastSendTask` — that's
+    /// what lets this hand back the real outcome despite not calling `send(bytes:)`
+    /// itself. Nil only when there was nothing to send (`text` empty) — a no-op, not a
+    /// failure, and callers should treat it as trivially successful.
+    @discardableResult
+    func sendAgentInput(_ text: String) -> Task<Bool, Never>? {
+        guard !text.isEmpty else { return nil }
         terminalView.getTerminal().sendUserInput(Array(text.utf8)[...])
+        return lastSendTask
     }
 
     func resize(cols: Int, rows: Int) {
@@ -368,7 +412,7 @@ extension TerminalSession: TerminalViewDelegate {
     nonisolated func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
 
     nonisolated func send(source: TerminalView, data: ArraySlice<UInt8>) {
-        MainActor.assumeIsolated { send(bytes: Array(data)) }
+        MainActor.assumeIsolated { _ = send(bytes: Array(data)) }
     }
 
     nonisolated func scrolled(source: TerminalView, position: Double) {}

@@ -141,9 +141,34 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
     /// than always leading with the agent name. Records an `.attention` cross-device
     /// signal so the owner's other devices hear it too, then — like every banner here —
     /// only surfaces the local alert when the user isn't already looking at the app.
-    func notifyAgentUpdate(agentName: String, title: String, body: String, agentID: UUID) {
+    ///
+    /// Returns the REAL outcome — `AgentNotifyOutcome` (shared with the daemon's own
+    /// `onNotify` hook, `FinAgentCore/AgentTurnEngine.swift`) — instead of assuming the
+    /// banner posted. `.delivered` only when `UNUserNotificationCenter.add` actually
+    /// confirms scheduling it; `.failed` when it's not authorized or the add call threw;
+    /// `.queued` when the app is foregrounded, so no banner was even attempted (the owner
+    /// may already be looking, but that's not a confirmed push, so callers must not call
+    /// it "sent").
+    func notifyAgentUpdate(
+        agentName: String, title: String, body: String, agentID: UUID
+    ) async -> AgentNotifyOutcome {
         recordSignal(.attention, agentID: agentID, agentName: agentName, text: body)
-        guard !isAppActive else { return }
+        guard !isAppActive else { return .queued }
+
+        switch await currentAuthorizationStatus() {
+        case .authorized, .provisional:
+            break
+        #if os(iOS) || os(visionOS)
+        case .ephemeral:
+            // App-Clip-only status; iOS/visionOS-only in the SDK (unavailable on macOS),
+            // hence the platform guard rather than an unconditional case.
+            break
+        #endif
+        case .denied, .notDetermined:
+            return .failed
+        @unknown default:
+            return .failed
+        }
 
         let headline = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let content = UNMutableNotificationContent()
@@ -157,7 +182,34 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request)
+        do {
+            try await post(request)
+            return .delivered
+        } catch {
+            return .failed
+        }
+    }
+
+    /// Reads the live OS authorization status, unless a test has forced one — real
+    /// device/notification-center authorization is unreachable (and unstable) from an
+    /// XCTest host, so `notifyAgentUpdate`'s tests never depend on it.
+    private func currentAuthorizationStatus() async -> UNAuthorizationStatus {
+        #if DEBUG
+        if let authorizationOverrideForTesting { return authorizationOverrideForTesting }
+        #endif
+        return await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    /// Schedules the banner with the OS, unless a test has substituted its own sink —
+    /// same reasoning as `currentAuthorizationStatus`.
+    private func post(_ request: UNNotificationRequest) async throws {
+        #if DEBUG
+        if let postOverrideForTesting {
+            try await postOverrideForTesting(request)
+            return
+        }
+        #endif
+        try await UNUserNotificationCenter.current().add(request)
     }
 
     nonisolated static func preview(of reply: String) -> String {
@@ -169,6 +221,9 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
     }
 
     private var isAppActive: Bool {
+        #if DEBUG
+        if let isAppActiveOverrideForTesting { return isAppActiveOverrideForTesting }
+        #endif
         #if os(iOS) || os(visionOS)
         return UIApplication.shared.applicationState == .active
         #elseif os(macOS)
@@ -177,6 +232,22 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         return true
         #endif
     }
+
+    #if DEBUG
+    /// Test seam for `notifyAgentUpdate`'s outcome: real app-active state and real OS
+    /// notification authorization are both unreachable/unstable from an XCTest host (no
+    /// permission is ever granted to a test runner, and "active" varies with how it was
+    /// launched), so tests force them here instead of asserting against live system state.
+    var isAppActiveOverrideForTesting: Bool?
+    var authorizationOverrideForTesting: UNAuthorizationStatus?
+    var postOverrideForTesting: ((UNNotificationRequest) async throws -> Void)?
+
+    func resetTestOverrides() {
+        isAppActiveOverrideForTesting = nil
+        authorizationOverrideForTesting = nil
+        postOverrideForTesting = nil
+    }
+    #endif
 
     // MARK: - UNUserNotificationCenterDelegate
 

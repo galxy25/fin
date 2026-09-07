@@ -324,6 +324,21 @@ struct AgentRemoteConsoleView: View {
                 .font(.caption)
                 .italic()
                 .foregroundStyle(.secondary)
+        case .turnStarted:
+            // The whole point of this kind: a visible "received" the instant a headless
+            // daemon records the user message, seconds before any tool call or reply —
+            // not just exhaustiveness filler like the two cases above.
+            Label("received", systemImage: "bolt.circle")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        case .turnProgress:
+            // No emitter exists yet anywhere (see `AgentLogKind.turnProgress`'s doc
+            // comment) — handled here only so this switch stays exhaustive the day one
+            // is added, mirroring the .notice/.approval case above.
+            Text(record.text)
+                .font(.caption)
+                .italic()
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -377,13 +392,21 @@ struct AgentRemoteConsoleView: View {
         }
     }
 
-    /// Sender-side render state for one of this device's relay rows.
+    /// Sender-side render state for one of this device's relay rows. The two
+    /// rejection sentinels (`rejectedLength`, `rejectedSubmit`) are distinguished
+    /// by EXACT match — checked before the generic `rejectedPrefix` fallback so
+    /// a future sentinel that only shares the prefix still renders as "rejected"
+    /// (via `.rejectedLength`'s catch-all role below) rather than silently
+    /// falling through to "sent".
     static func relayState(
         appliedAt: Date?, appliedByDeviceID8: String?, createdAt: Date, now: Date = Date()
     ) -> RelayRowState {
         if appliedAt != nil {
+            if appliedByDeviceID8 == AgentRelayApplier.rejectedSubmit {
+                return .rejectedSubmit
+            }
             return appliedByDeviceID8?.hasPrefix(AgentRelayApplier.rejectedPrefix) == true
-                ? .rejected
+                ? .rejectedLength
                 : .sent
         }
         let floor = TimeInterval(AgentRelayApplier.unappliedRetentionDays) * 86_400
@@ -391,7 +414,7 @@ struct AgentRemoteConsoleView: View {
     }
 
     enum RelayRowState {
-        case sending, sent, rejected, expired
+        case sending, sent, rejectedLength, rejectedSubmit, expired
     }
 
     /// Cloud pending rows, with the same mirror handoff as relay rows: once the
@@ -447,8 +470,12 @@ struct AgentRemoteConsoleView: View {
                     Label("sent", systemImage: "checkmark")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                case .rejected:
+                case .rejectedLength:
                     Label("not delivered (too long)", systemImage: "exclamationmark.triangle")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                case .rejectedSubmit:
+                    Label("not delivered", systemImage: "exclamationmark.triangle")
                         .font(.caption2)
                         .foregroundStyle(.orange)
                 case .expired:

@@ -21,11 +21,21 @@ import FoundationNetworking
 final class DaemonTranscriptUplink {
     /// The app's `AgentLogKind` raw values. A kind outside this set decodes as `.notice`
     /// in the app anyway; mapping it here keeps the intent visible in the document.
+    /// `turnStarted`/`turnProgress` are the turn-visibility schema (see `record` below
+    /// for `turnStarted`'s immediate, non-batched flush) — only `turnStarted` is
+    /// actually emitted today (`AgentTurnEngine.submit`); `turnProgress` has no emitter
+    /// yet anywhere, listed here only so the wire schema is already correct the day one
+    /// is added.
     static let mirrorKinds: Set<String> = [
         "userMessage", "assistantMessage", "reasoning", "toolCall",
         "toolResult", "approval", "notice", "error",
+        "turnStarted", "turnProgress",
     ]
     static let fallbackKind = "notice"
+    /// The one kind whose mirror line must reach the app within seconds, not wait for
+    /// the batched flush interval — `record` below flushes immediately whenever an
+    /// event of this kind comes through.
+    static let immediateFlushKind = "turnStarted"
     /// Stands in for `agentID` when the config omits it — the key stays present so the
     /// document shape never varies, and an all-zero id is obviously not a real agent.
     static let unsetAgentID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
@@ -94,6 +104,14 @@ final class DaemonTranscriptUplink {
 
     /// Appends one audit event as a mirror line, evicting the oldest once the ring is
     /// full. Unencodable events are dropped rather than truncating the document.
+    ///
+    /// `turnStarted` additionally kicks an IMMEDIATE flush — its whole reason to exist
+    /// is the app seeing "received" within seconds, not waiting out `flushSeconds` (which
+    /// can be minutes) or the caller's own post-turn flush (which, by definition, hasn't
+    /// happened yet — the turn just started). Stays a fire-and-forget `Task` rather than
+    /// making `record` itself `async`: every other call site is a plain, synchronous
+    /// notice, and this is the one kind that needs to jump the queue, not a reason to
+    /// make the whole ring API asynchronous.
     func record(_ event: AgentAuditEvent) {
         sequence += 1
         guard let line = mirrorLine(for: event, sequence: sequence) else { return }
@@ -102,6 +120,11 @@ final class DaemonTranscriptUplink {
             lines.removeFirst(lines.count - maxLines)
         }
         isDirty = true
+        if event.kind == Self.immediateFlushKind {
+            Task { [weak self] in
+                await self?.flush()
+            }
+        }
     }
 
     /// The whole document: every retained line, newline-joined, exactly as PUT.
@@ -124,8 +147,8 @@ final class DaemonTranscriptUplink {
             "text": MemoryRedactor.redact(event.text),
             "model": modelIdentifier,
             "temperature": temperature,
-            "attempt": 1,
-            "retry_count": 0,
+            "attempt": event.attempt,
+            "retry_count": event.retryCount,
             "is_failure": event.isFailure,
         ]
         if let toolName = event.toolName { object["tool_name"] = toolName }

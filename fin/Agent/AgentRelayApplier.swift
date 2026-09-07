@@ -57,6 +57,27 @@ final class AgentRelayApplier {
     /// Sentinel for an over-length message (the composer enforces the same cap
     /// client-side; this is belt and braces against older builds and raw writes).
     static let rejectedLength = "rejected:length"
+    /// Sentinel for a message the target runtime's own `submit` repeatedly
+    /// REJECTED (a configuration blocker, most plausibly) rather than something
+    /// this device's own pre-checks caught. Same shape as `rejectedLength` —
+    /// starts with `rejectedPrefix`, so `AgentRemoteConsoleView.relayState`
+    /// already treats it as "not delivered" with zero changes there beyond a
+    /// distinct label for this specific reason.
+    static let rejectedSubmit = "rejected:submit"
+    /// How many CONSECUTIVE `submit` rejections one relay row tolerates before
+    /// it is marked persistently rejected instead of retried again.
+    ///
+    /// Picked 3, not 1: this loop already re-verifies `configurationBlocker` and
+    /// `sessionConnected` immediately before submitting (see the unarmed claim
+    /// path below), so a single `.rejected` is already a narrow, plausibly
+    /// transient race rather than a proven-stuck configuration — flipping to
+    /// "not delivered" on the first bad break would be trigger-happy. Not
+    /// higher than 5 either: this pass reruns on every CloudKit import, every
+    /// watchdog foreground tick, and after every finished turn, so even 3
+    /// consecutive rejections land within seconds to low minutes of real time,
+    /// not hours — there is no reason to make the sender wait longer than that
+    /// to learn a message truly isn't getting through.
+    static let maxSubmitRejections = 3
 
     private let context: ModelContext
     private let deviceID8: String
@@ -76,6 +97,12 @@ final class AgentRelayApplier {
     /// between submit and the context save, so a relaunch never re-injects a
     /// message this device already delivered.
     private var ledger: AgentRelayAppliedLedger
+    /// Per-row count of consecutive `submit` rejections — see `maxSubmitRejections`
+    /// and `rejectedSubmit` for what happens once a row trips the cap. In-memory
+    /// only, on purpose: losing it on relaunch is harmless (a few extra retries
+    /// before the cap trips again), unlike `ledger`, whose durability guards
+    /// against re-injecting an already-delivered command.
+    private var submitRejections = AgentRelaySubmitRejectionTracker()
     private var syncObserver: NSObjectProtocol?
     private var applyPassTask: Task<Void, Never>?
     private var rerunRequested = false
@@ -198,8 +225,16 @@ final class AgentRelayApplier {
             // The SAME path a typed message takes — submit's send_input calls still
             // pass through manual-mode approval and the destructive heuristic.
             // Started and queued both count as delivered; only an outright
-            // rejection leaves the row pending for the next check.
-            guard target.runtime.submit(text) != .rejected else { continue }
+            // rejection leaves the row pending for the next check — up to a cap,
+            // past which it stops retrying silently and gets a visible sentinel
+            // instead, the same way an over-length message already does.
+            guard target.runtime.submit(text) != .rejected else {
+                if submitRejections.recordRejection(for: message.id, cap: Self.maxSubmitRejections) {
+                    stamp(message, appliedBy: Self.rejectedSubmit)
+                }
+                continue
+            }
+            submitRejections.recordSuccess(for: message.id)
             stamp(message)
             target.runtime.recordSupervisionNotice(
                 "[relay] applied message \(message.id.uuidString.lowercased().prefix(8)) from device \(message.authorDeviceID8)"
@@ -313,5 +348,33 @@ struct AgentRelayAppliedLedger {
         if let data = try? JSONEncoder().encode(ids) {
             defaults.set(String(decoding: data, as: UTF8.self), forKey: Self.key(agentID: agentID))
         }
+    }
+}
+
+/// Per-relay-row count of CONSECUTIVE `submit` rejections, pulled out as its own
+/// small value type — the same reason `claimJitterMillis` is a free static
+/// function rather than inlined into `applyPendingNow`: a pure, directly
+/// testable unit beats asserting on the applier's full SwiftData + runtime
+/// fixture just to prove three strikes trips the cap and a fourth call after a
+/// success does not carry a stale near-cap count forward.
+struct AgentRelaySubmitRejectionTracker {
+    private var counts: [UUID: Int] = [:]
+
+    /// Records one more rejection for `id`. Returns whether this rejection just
+    /// reached (or, in principle, passed) `cap` — the caller's cue to stop
+    /// retrying and mark the row persistently rejected instead.
+    @discardableResult
+    mutating func recordRejection(for id: UUID, cap: Int) -> Bool {
+        let count = (counts[id] ?? 0) + 1
+        counts[id] = count
+        return count >= cap
+    }
+
+    /// Clears any tracked count for `id`. Called on a successful submit (started
+    /// or queued) so a row that eventually gets through doesn't carry a stale
+    /// near-cap count into some later, unrelated retry sequence — rejections
+    /// must be CONSECUTIVE to trip the cap, not merely frequent over time.
+    mutating func recordSuccess(for id: UUID) {
+        counts.removeValue(forKey: id)
     }
 }

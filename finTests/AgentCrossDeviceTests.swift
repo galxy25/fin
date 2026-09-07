@@ -1,6 +1,7 @@
 import XCTest
 import CloudKit
 import SwiftData
+import UserNotifications
 @testable import fin
 
 /// Covers the cross-device layer: signal writes riding every notify path, the pure
@@ -16,7 +17,10 @@ final class AgentCrossDeviceTests: XCTestCase {
     }
 
     override func tearDown() {
-        MainActor.assumeIsolated { AgentNotificationService.shared.persistSignal = nil }
+        MainActor.assumeIsolated {
+            AgentNotificationService.shared.persistSignal = nil
+            AgentNotificationService.shared.resetTestOverrides()
+        }
         Self.scrubDurableState()
         super.tearDown()
     }
@@ -171,13 +175,18 @@ final class AgentCrossDeviceTests: XCTestCase {
     /// The model's `notify` tool is a deliberate, model-chosen push, so it writes its
     /// cross-device signal regardless of notifyOnResponse (that gate mutes only the
     /// automatic turn-finished banner) and confirms delivery — the app-local channel is
-    /// always present.
+    /// always present. Forces the app-active/authorization/post seams so the assertion
+    /// exercises the real success path deterministically rather than depending on live
+    /// (untestable) OS notification-authorization state.
     @MainActor
-    func testNotifyToolWritesAttentionSignalAndConfirms() {
+    func testNotifyToolWritesAttentionSignalAndConfirms() async {
         let signals = captureSignals()
         let (runtime, agent, _) = makeRuntime(notifyOnResponse: false)
+        AgentNotificationService.shared.isAppActiveOverrideForTesting = false
+        AgentNotificationService.shared.authorizationOverrideForTesting = .authorized
+        AgentNotificationService.shared.postOverrideForTesting = { _ in }
 
-        let result = runtime.executeNotify(
+        let result = await runtime.executeNotify(
             title: "Deploy done", body: "main is live on prod.", rawArguments: "{}"
         )
 
@@ -187,14 +196,46 @@ final class AgentCrossDeviceTests: XCTestCase {
         XCTAssertEqual(signals().first?.agentID, agent.id)
     }
 
+    /// Mirrors the case that motivated item 3's app-side fix: the OS confirms a send was
+    /// attempted but not authorized (or the post itself failed) — the tool must say so,
+    /// never claim "Sent to the owner." for an unconfirmed push.
+    @MainActor
+    func testNotifyToolReportsFailureWhenNotAuthorized() async {
+        let (runtime, _, _) = makeRuntime(notifyOnResponse: false)
+        AgentNotificationService.shared.isAppActiveOverrideForTesting = false
+        AgentNotificationService.shared.authorizationOverrideForTesting = .denied
+
+        let result = await runtime.executeNotify(
+            title: "Deploy done", body: "main is live on prod.", rawArguments: "{}"
+        )
+
+        XCTAssertTrue(result.contains("Delivery failed"), "got: \(result)")
+        XCTAssertFalse(result.contains("Sent to the owner."), "must not claim delivery: \(result)")
+    }
+
+    /// Mirrors the app-foregrounded case: no banner is even attempted, so the tool must
+    /// not claim delivery — this is the exact "confirmed-false-promoted-to-delivered"
+    /// scenario the finding named.
+    @MainActor
+    func testNotifyToolReportsQueuedWhenAppIsForegrounded() async {
+        let (runtime, _, _) = makeRuntime(notifyOnResponse: false)
+        AgentNotificationService.shared.isAppActiveOverrideForTesting = true
+
+        let result = await runtime.executeNotify(
+            title: "Deploy done", body: "main is live on prod.", rawArguments: "{}"
+        )
+
+        XCTAssertFalse(result.contains("Sent to the owner."), "must not claim delivery: \(result)")
+    }
+
     /// An empty body is a correctable tool error, not a silent no-op push: no signal, no
     /// banner, and the model is told to supply a body.
     @MainActor
-    func testNotifyToolRequiresABody() {
+    func testNotifyToolRequiresABody() async {
         let signals = captureSignals()
         let (runtime, _, _) = makeRuntime()
 
-        let result = runtime.executeNotify(title: "hi", body: "   ", rawArguments: "{}")
+        let result = await runtime.executeNotify(title: "hi", body: "   ", rawArguments: "{}")
 
         XCTAssertTrue(result.contains("non-empty \"body\""), "got: \(result)")
         XCTAssertTrue(signals().isEmpty, "an empty-body notify must not write a signal")
@@ -203,11 +244,14 @@ final class AgentCrossDeviceTests: XCTestCase {
     /// A model-authored notification records its `.attention` signal with a redacted,
     /// capped preview — it leaves the device, exactly like every other signal here.
     @MainActor
-    func testNotifyAgentUpdateSignalIsRedactedAndCapped() {
+    func testNotifyAgentUpdateSignalIsRedactedAndCapped() async {
         let signals = captureSignals()
         let secret = "shipped with password=hunter2 and then " + String(repeating: "y", count: 300)
+        AgentNotificationService.shared.isAppActiveOverrideForTesting = false
+        AgentNotificationService.shared.authorizationOverrideForTesting = .authorized
+        AgentNotificationService.shared.postOverrideForTesting = { _ in }
 
-        AgentNotificationService.shared.notifyAgentUpdate(
+        _ = await AgentNotificationService.shared.notifyAgentUpdate(
             agentName: "Fin", title: "Shipped", body: secret, agentID: UUID()
         )
 
@@ -536,7 +580,7 @@ final class AgentCrossDeviceTests: XCTestCase {
                 appliedByDeviceID8: overlong.appliedByDeviceID8,
                 createdAt: overlong.createdAt
             ),
-            .rejected
+            .rejectedLength
         )
         XCTAssertEqual(
             AgentRemoteConsoleView.relayState(
@@ -574,7 +618,14 @@ final class AgentCrossDeviceTests: XCTestCase {
                 appliedAt: now, appliedByDeviceID8: AgentRelayApplier.rejectedLength,
                 createdAt: now, now: now
             ),
-            .rejected
+            .rejectedLength
+        )
+        XCTAssertEqual(
+            AgentRemoteConsoleView.relayState(
+                appliedAt: now, appliedByDeviceID8: AgentRelayApplier.rejectedSubmit,
+                createdAt: now, now: now
+            ),
+            .rejectedSubmit
         )
         XCTAssertEqual(
             AgentRemoteConsoleView.relayState(
@@ -709,6 +760,96 @@ final class AgentCrossDeviceTests: XCTestCase {
         XCTAssertTrue((0..<2000).contains(
             AgentRelayApplier.claimJitterMillis(deviceID8: "bbbb2222", messageID: id)
         ))
+    }
+
+    // MARK: - Submit-rejection cap (item 5: a visible sentinel, not an infinite silent retry)
+
+    /// The pure counting/cap decision behind the `.rejectedSubmit` sentinel, covered
+    /// directly for the same reason `claimJitterMillis` is: proving three strikes trips
+    /// the cap (and two do not) doesn't need a live `AgentRuntime`/SwiftData fixture,
+    /// and — critically — reproducing a genuine `submit() == .rejected` outcome from
+    /// `AgentRelayApplier.applyPendingNow()` isn't practical to construct at all: the
+    /// loop already re-verifies `configurationBlocker`/`sessionConnected` immediately
+    /// before every submit, with no suspension point between that recheck and the call,
+    /// so nothing in a hermetic test can make submit itself reject while satisfying the
+    /// applier's own pre-checks a moment earlier — exactly why the fix has to be provably
+    /// correct at this smaller, directly testable grain instead.
+    @MainActor
+    func testSubmitRejectionTrackerTripsAtTheCapNotBefore() {
+        var tracker = AgentRelaySubmitRejectionTracker()
+        let id = UUID()
+        let cap = AgentRelayApplier.maxSubmitRejections
+
+        for attempt in 1..<cap {
+            XCTAssertFalse(
+                tracker.recordRejection(for: id, cap: cap),
+                "attempt \(attempt) of \(cap) must not trip the cap yet"
+            )
+        }
+        XCTAssertTrue(
+            tracker.recordRejection(for: id, cap: cap),
+            "the \(cap)th consecutive rejection must trip the cap"
+        )
+    }
+
+    /// A row that eventually gets through must not carry a stale near-cap count into
+    /// some later, unrelated retry sequence — the cap counts CONSECUTIVE rejections.
+    func testSubmitRejectionTrackerResetsOnSuccess() {
+        var tracker = AgentRelaySubmitRejectionTracker()
+        let id = UUID()
+        let cap = 3
+
+        XCTAssertFalse(tracker.recordRejection(for: id, cap: cap))
+        XCTAssertFalse(tracker.recordRejection(for: id, cap: cap))
+        tracker.recordSuccess(for: id)
+
+        // Two fresh rejections after the reset — still short of the cap.
+        XCTAssertFalse(tracker.recordRejection(for: id, cap: cap))
+        XCTAssertFalse(tracker.recordRejection(for: id, cap: cap))
+    }
+
+    /// Different rows are tracked independently — one message's rejections must never
+    /// count toward another's cap.
+    func testSubmitRejectionTrackerIsPerMessage() {
+        var tracker = AgentRelaySubmitRejectionTracker()
+        let a = UUID()
+        let b = UUID()
+        let cap = 3
+
+        XCTAssertFalse(tracker.recordRejection(for: a, cap: cap))
+        XCTAssertFalse(tracker.recordRejection(for: a, cap: cap))
+        // b's first rejection must not inherit a's count.
+        XCTAssertFalse(tracker.recordRejection(for: b, cap: cap))
+    }
+
+    /// `rejectedSubmit` mirrors `rejectedLength`'s exact shape (`rejectedPrefix` +
+    /// a reason suffix), which is what lets `AgentRemoteConsoleView.relayState`'s
+    /// existing generic prefix check keep working unmodified for it, and it renders
+    /// as a distinct, correctly-worded "not delivered" state rather than either
+    /// falling through to "sent" or borrowing the length-specific "(too long)" text.
+    @MainActor
+    func testRejectedSubmitSentinelSharesThePrefixAndRendersDistinctly() {
+        XCTAssertTrue(AgentRelayApplier.rejectedSubmit.hasPrefix(AgentRelayApplier.rejectedPrefix))
+
+        let now = Date()
+        XCTAssertEqual(
+            AgentRemoteConsoleView.relayState(
+                appliedAt: now, appliedByDeviceID8: AgentRelayApplier.rejectedSubmit,
+                createdAt: now, now: now
+            ),
+            .rejectedSubmit
+        )
+        XCTAssertNotEqual(
+            AgentRemoteConsoleView.relayState(
+                appliedAt: now, appliedByDeviceID8: AgentRelayApplier.rejectedSubmit,
+                createdAt: now, now: now
+            ),
+            AgentRemoteConsoleView.relayState(
+                appliedAt: now, appliedByDeviceID8: AgentRelayApplier.rejectedLength,
+                createdAt: now, now: now
+            ),
+            "a submit rejection and a length rejection must render as distinguishable states"
+        )
     }
 
     /// Crash-before-save replay: the durable per-agent ledger makes a FRESH

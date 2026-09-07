@@ -161,8 +161,9 @@ struct DaemonConfig: Decodable {
     var agent: AgentConfig
     /// The initial instruction submitted the moment the session is up.
     var task: String
-    /// Shell command run with $FIN_EVENT ("request-input" | "task-complete") and
-    /// $FIN_MESSAGE in its environment. The hook a push service plugs into later.
+    /// Shell command run with $FIN_EVENT ("request-input" | "task-complete" |
+    /// "agent-stalled") and $FIN_MESSAGE in its environment. The hook a push service
+    /// plugs into later.
     var notifyCommand: String?
     /// JSONL audit trail destination. Defaults to ./fin-agentd-audit.jsonl.
     var auditLogPath: String?
@@ -261,7 +262,7 @@ final class Daemon {
     /// moments before shutdown, and an exit 300ms later would kill the POST mid-flight —
     /// the one alert a non-resident daemon exists to deliver. Bounded by the client's
     /// own request timeout, so a dead control plane can't wedge a shutdown.
-    private var lastNotifyTask: Task<Void, Never>?
+    private var lastNotifyTask: Task<Bool, Never>?
     /// The app-side Agent UUID from the config; validated at load, so nil here means
     /// "unset", never "malformed".
     private let agentID: UUID?
@@ -715,10 +716,12 @@ final class Daemon {
         }
         // The model's notify tool: a proactively-social push the model composes itself,
         // title and all — distinct from the event-driven pushes the harness fires on its
-        // own for request-input/task-complete. Returns whether a channel exists, so the
-        // tool tells the model the truth instead of promising a delivery that no-oped.
+        // own for request-input/task-complete. Awaits the REAL outcome (bounded — see
+        // `notifyFromTool`), so the tool tells the model the truth instead of promising a
+        // delivery that only ever got handed off.
         engine.onNotify = { [weak self] title, body in
-            self?.notifyFromTool(title: title, body: body) ?? false
+            guard let self else { return .unavailable }
+            return await self.notifyFromTool(title: title, body: body)
         }
         // The model's read_session tool. THE READ HALF of the private-socket design: the
         // agent's shell can only see its own tmux server, so the one path to the machine's
@@ -795,7 +798,7 @@ final class Daemon {
                     record(AgentAuditEvent(kind: "notice", text: line))
                 }
                 if consecutiveFailures >= 5 {
-                    notify(event: "request-input", message: "fin-agentd giving up after 5 consecutive failed turns: \(message)")
+                    notify(event: "agent-stalled", message: "fin-agentd giving up after 5 consecutive failed turns: \(message)")
                     await fail("5 consecutive turn failures; last: \(message)")
                 }
             case .toolBudgetExhausted:
@@ -941,6 +944,10 @@ final class Daemon {
     /// — the redacted cloud transcript the app renders.
     private func record(_ event: AgentAuditEvent) {
         auditLog.append(event)
+        // The immediate (non-batched) flush for turnStarted lives on the uplink itself
+        // (see `DaemonTranscriptUplink.record`) — it owns `flush`, `mirrorKinds`, and
+        // the policy of which kinds jump the batch interval, so the decision belongs
+        // there, not duplicated here from the outside.
         transcript?.record(event)
     }
 
@@ -1099,26 +1106,48 @@ final class Daemon {
         }
     }
 
+    /// Bounded wait for the tool call to learn the notify send's real outcome. Being
+    /// social must never block the mission indefinitely on a network round-trip, but a
+    /// few seconds is worth spending so the model isn't told a flat lie about what
+    /// happened — past this, the send is still running (`lastNotifyTask` keeps it alive
+    /// through shutdown draining) and the tool honestly reports "queued", never "sent".
+    private static let notifyToolTimeoutSeconds: Double = 5
+
     /// The model's `notify` tool, wired to `engine.onNotify`. Unlike `notify(event:)`,
     /// the model authored the title, so the control-plane push takes it verbatim
-    /// (`sendDirect`) rather than the event→title table. Returns whether any channel was
-    /// there to carry it — the tool relays that truth to the model. Fire-and-forget by
-    /// design: being social must never block the mission on a network round-trip.
-    private func notifyFromTool(title: String, body: String) -> Bool {
-        if let client = notifyClient {
-            lastNotifyTask = Task { await client.sendDirect(title: title, body: body) }
-        }
+    /// (`sendDirect`) rather than the event→title table. AWAITS the send (bounded by
+    /// `notifyToolTimeoutSeconds`) instead of firing it detached and reporting only
+    /// whether a channel exists — see `AgentNotifyOutcome` for what each case means and
+    /// `notifyOutcome` below for the decision table that turns the two raw channel
+    /// signals into one.
+    private func notifyFromTool(title: String, body: String) async -> AgentNotifyOutcome {
+        guard hasNotifyChannel else { return .unavailable }
+
         // The shell hook is title-less by contract (FIN_EVENT/FIN_MESSAGE only), so the
-        // model's title rides in as the event label and the body is the message.
-        runNotifyCommand(event: "notify", message: body)
-        return hasNotifyChannel
+        // model's title rides in as the event label and the body is the message. Launching
+        // it either succeeds or fails synchronously — there's nothing to await beyond that.
+        let commandLaunched = runNotifyCommand(event: "notify", message: body)
+
+        guard let client = notifyClient else {
+            return notifyOutcome(commandLaunched: commandLaunched, hasClient: false, confirmed: nil)
+        }
+
+        let sendTask = Task { await client.sendDirect(title: title, body: body) }
+        lastNotifyTask = sendTask
+
+        let confirmed = await firstToFinish(sendTask, timeoutSeconds: Self.notifyToolTimeoutSeconds)
+
+        return notifyOutcome(commandLaunched: commandLaunched, hasClient: true, confirmed: confirmed)
     }
 
     /// Fires the optional `notifyCommand` shell hook with $FIN_EVENT/$FIN_MESSAGE. Shared
     /// by the harness's own events and the model's notify tool; a launch failure is logged
-    /// and swallowed — a broken notifier must never take down the agent.
-    private func runNotifyCommand(event: String, message: String) {
-        guard let command = config.notifyCommand, !command.isEmpty else { return }
+    /// and swallowed — a broken notifier must never take down the agent. Returns whether
+    /// the process actually launched (not whether it went on to succeed, which a fire-and-
+    /// forget shell hook can't report).
+    @discardableResult
+    private func runNotifyCommand(event: String, message: String) -> Bool {
+        guard let command = config.notifyCommand, !command.isEmpty else { return false }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", command]
@@ -1128,8 +1157,10 @@ final class Daemon {
         process.environment = environment
         do {
             try process.run()
+            return true
         } catch {
             log("notifyCommand failed to launch: \(error)")
+            return false
         }
     }
 
@@ -1137,6 +1168,91 @@ final class Daemon {
         let stamp = ISO8601DateFormatter().string(from: Date())
         print("[\(stamp)] \(message)")
         fflush(stdout)
+    }
+}
+
+// MARK: - Notify race
+
+/// The decision table behind `notifyFromTool`, pulled out as a pure free function for
+/// the same reason `firstToFinish` is: `Daemon` needs a real SSH-adjacent setup to
+/// construct, so a `private` method on it can't be driven directly from a unit test.
+/// This can, with three plain inputs standing in for the two raw signals a real call
+/// gathers:
+///
+/// - `commandLaunched`: whether the shell hook's process started (see
+///   `runNotifyCommand`'s doc comment — a launch is not confirmation of anything).
+/// - `hasClient`: whether a control-plane `notifyClient` is configured at all.
+/// - `confirmed`: only meaningful when `hasClient` is true, and shaped exactly like
+///   `firstToFinish`'s own return value — `.some(true)` the client confirmed delivery,
+///   `.some(false)` the client confirmed the send did NOT go out, `nil` the bounded
+///   wait elapsed with no answer yet (still possibly in flight).
+///
+/// The one rule this exists to enforce: a CONFIRMED failure from the client — the only
+/// signal in this whole function that is actually confirmed — is never overridden by
+/// `commandLaunched`, which proves nothing beyond "a process started". Overriding it
+/// was the reintroduced false-"sent" bug this function replaces. The same "a launch is
+/// not a confirmation" reasoning is why a bare launch reports `.queued`, not
+/// `.delivered` — `AgentNotifyOutcome.delivered`'s own contract is "the channel
+/// CONFIRMED the push went out", and `runNotifyCommand` only ever tells us the process
+/// started, never whether the script it ran went on to actually succeed.
+func notifyOutcome(commandLaunched: Bool, hasClient: Bool, confirmed: Bool?) -> AgentNotifyOutcome {
+    guard hasClient else {
+        // The shell hook is the only channel there is. A launch failure is a real,
+        // confirmed failure of the one channel that was configured — never "no
+        // channel", which `hasNotifyChannel` has already ruled out by the time this is
+        // reached. A launch that succeeds is NOT a confirmed delivery, though — a
+        // fire-and-forget script can still fail downstream (bad webhook URL, a non-2xx
+        // from curl, DNS) with no way for this process to find out — so it reports
+        // `.queued`: handed off, unconfirmed, honest either way.
+        return commandLaunched ? .queued : .failed
+    }
+    switch confirmed {
+    case .some(true):
+        return .delivered
+    case .some(false):
+        return .failed
+    case .none:
+        return .queued
+    }
+}
+
+/// Races an already-running task against a deadline WITHOUT blocking on the loser. A
+/// `TaskGroup` won't do here — it implicitly awaits every child task before returning,
+/// even an unconsumed one past `cancelAll()`, so a slow send would still hold up the
+/// caller for its full duration despite the "timeout". This uses two independent
+/// unstructured tasks racing to resume one continuation instead: the instant either
+/// finishes, this returns — a still-running `task` (the caller is expected to keep its
+/// own reference, e.g. `Daemon.lastNotifyTask`) keeps going untouched in the background.
+/// Not `private` so `notifyFromTool`'s bounded-wait behavior is directly testable
+/// without staging a real network call.
+func firstToFinish(_ task: Task<Bool, Never>, timeoutSeconds: Double) async -> Bool? {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Bool?, Never>) in
+        let resumeGuard = ResumeOnce()
+        Task {
+            let result = await task.value
+            if await resumeGuard.markFirst() {
+                continuation.resume(returning: result)
+            }
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(timeoutSeconds))
+            if await resumeGuard.markFirst() {
+                continuation.resume(returning: nil)
+            }
+        }
+    }
+}
+
+/// A `CheckedContinuation` traps if resumed twice; this lets `firstToFinish`'s two
+/// independent racing tasks agree on which one gets to resume it, with the actor's own
+/// isolation doing the synchronization instead of a lock.
+private actor ResumeOnce {
+    private var didResume = false
+
+    func markFirst() -> Bool {
+        guard !didResume else { return false }
+        didResume = true
+        return true
     }
 }
 

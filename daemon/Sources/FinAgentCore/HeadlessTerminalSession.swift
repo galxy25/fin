@@ -117,8 +117,10 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
     /// Tail of the outbound write chain — writes are chained rather than each getting its
     /// own detached Task: unstructured tasks are scheduled independently, so two calls in
     /// quick succession could reach the channel out of order, corrupting a programmatic
-    /// multi-byte send.
-    private var writeChain: Task<Void, Never>?
+    /// multi-byte send. Resolves to whether ITS write actually reached the channel — see
+    /// `send(bytes:)` — so a caller awaiting the chain's tail learns the real outcome, not
+    /// just that a write was attempted.
+    private var writeChain: Task<Bool, Never>?
     /// Bumped on every connect()/disconnect(); a superseded run() checks its captured
     /// generation before touching shared state.
     private var generation = 0
@@ -272,11 +274,14 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
         Task { try? await closingClient?.close() }
     }
 
-    /// Input originating from the agent. Recorded in the event log and written to the
-    /// channel in send order.
-    public func sendAgentInput(_ text: String) {
-        guard !text.isEmpty else { return }
-        send(bytes: Array(text.utf8))
+    /// Input originating from the agent. Written to the channel in send order; the event
+    /// log records it only once the write is CONFIRMED (see `send(bytes:)`). Returns the
+    /// real outcome — `nil` only for empty text, a no-op the caller can treat as trivially
+    /// successful, never a claim about a byte that was never sent.
+    @discardableResult
+    public func sendAgentInput(_ text: String) -> Task<Bool, Never>? {
+        guard !text.isEmpty else { return nil }
+        return send(bytes: Array(text.utf8))
     }
 
     /// Runs a command on a SEPARATE SSH exec channel — not the PTY, not the agent's shell.
@@ -457,14 +462,38 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
         return trimmed.split(separator: "\n").first.map(String.init) ?? trimmed
     }
 
-    private func send(bytes: [UInt8]) {
-        guard let stdinWriter else { return }
-        eventLog.recordInput(bytes)
+    /// Same reasoning as the app's `TerminalSession.send(bytes:)`: writes are chained
+    /// (not each its own detached Task) so concurrent sends stay in order, the event log
+    /// records the input only AFTER a confirmed successful write (not before — a
+    /// disconnected session used to silently drop the bytes while the log, and anything
+    /// reading it, still showed them as delivered), and the returned `Task` resolves to
+    /// the real outcome so a caller — `AgentTurnEngine.executeSendInput` in particular —
+    /// can tell a confirmed send apart from one this "NO HUMAN IN THE LOOP" daemon just
+    /// dropped on the floor.
+    @discardableResult
+    private func send(bytes: [UInt8]) -> Task<Bool, Never> {
+        let writer = stdinWriter
         let previousWrite = writeChain
-        writeChain = Task {
+        let thisWrite = Task<Bool, Never> {
+            // Always wait for whatever was queued before this — regardless of ITS
+            // outcome — so the actual writes stay strictly ordered even when this call
+            // (or an earlier one) turns out to have nothing to send to.
             await previousWrite?.value
-            try? await stdinWriter.write(ByteBuffer(bytes: bytes))
+            guard let writer else {
+                self.lastError = "Input was not sent: the terminal session is not connected."
+                return false
+            }
+            do {
+                try await writer.write(ByteBuffer(bytes: bytes))
+                self.eventLog.recordInput(bytes)
+                return true
+            } catch {
+                self.lastError = "Input was not sent: \(error)"
+                return false
+            }
         }
+        writeChain = thisWrite
+        return thisWrite
     }
 
     private func run(generation myGeneration: Int) async {

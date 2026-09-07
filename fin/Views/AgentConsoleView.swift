@@ -320,6 +320,11 @@ struct AgentConsoleView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        case .system where message.isFailure:
+            // Only local notices reach here — see `visibleMessages`.
+            Label(message.text, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.red)
         case .system:
             // Only local notices reach here — see `visibleMessages`.
             Text(message.text)
