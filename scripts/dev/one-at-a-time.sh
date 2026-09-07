@@ -81,6 +81,23 @@ done
 echo $$ > "$LOCK/pid"
 trap 'release' EXIT INT TERM HUP
 
+# A model loaded in LM Studio holds unified memory the build will need, and it
+# holds it whether or not anything is using it. On 2026-09-07 a `swift test` was
+# killed by the system TWICE while an IDLE 7.15 GB model sat resident for a daemon
+# that was not running — the second time an hour after that exact hazard had been
+# written down, which is why this is a check and not a note. Unload before a
+# build; reload after. Safe whenever no daemon is running.
+resident_model_gb() {
+  command -v lms >/dev/null 2>&1 || { echo 0; return; }
+  lms ps 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9.]+$/ && $(i+1) == "GB") s += $i } END { printf "%d", s + 0 }'
+}
+_m=$(resident_model_gb)
+if [ "${_m:-0}" -ge "${FIN_MAX_RESIDENT_MODEL_GB:-2}" ]; then
+  log "refusing to start: ${_m}GB of models are loaded in LM Studio and will compete for unified memory."
+  log "  unload them first (lms unload --all) and reload after the build, or set FIN_MAX_RESIDENT_MODEL_GB to override."
+  exit 75
+fi
+
 waited=0
 while :; do
   n=$(other_builds); f=$(free_gb)
