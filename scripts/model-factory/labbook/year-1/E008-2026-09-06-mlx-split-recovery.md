@@ -13,7 +13,7 @@ sources:
   - "git grep -n 'datasets/mlx' 0fe0883 -- ':(exclude)docs/labbook' ':(exclude)scripts/model-factory/labbook' -> exit 1, no output. BOTH exclusions are needed at this revision; the one-exclusion form exits 0 here with 11 hits. At 5305044 (docs/labbook deleted) one suffices; at 704ab09 none is needed. Full matrix in O005"
 related: [E006, O001, O005, O010, P005]
 corrects: []
-superseded-by: O010
+superseded-by: [O010, O013]
 ---
 
 **Migrated entry.** Written as `docs/labbook/entries/E003-2026-09-06-mlx-split-recovery.md`

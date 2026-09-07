@@ -3,8 +3,8 @@ id: E004
 date: 2026-09-06
 occurred: 2026-09-05 20:15:29 — in flight
 kind: EXPERIMENT
-title: Run 1 — fin-foreman-e4b-mlx, a 2-epoch LoRA on gemma-4 E4B (OPEN)
-status: open
+title: Run 1 — fin-foreman-e4b-mlx, a 2-epoch LoRA on gemma-4 E4B (CLOSED by E009)
+status: closed
 tags: [training, mlx, lora, run-1]
 sources:
   - "local-artifact: models/candidates/fin-foreman-e4b-mlx/launch-train.sh (the exact argv)"
@@ -15,7 +15,30 @@ sources:
   - 8aa690c — the corpus commit (2026-09-05 19:26)
 related: [E003, O001, O004, P004, H003]
 corrects: []
-superseded-by: null
+superseded-by: E009
+---
+
+## Closed 2026-09-06 by E009
+
+**Appended 2026-09-06, after the run finished and was gated.** This is the one
+edit the README's append-only rule permits to a published entry beyond the
+`superseded-by:` back-pointer: *"a status change is itself an append ... except
+on an `open` EXPERIMENT, whose closure is the one case where the original entry
+is the right place for the result."* Two front-matter fields changed with it —
+`status: open` → `closed`, and the title's `(OPEN)` marker → `(CLOSED by E009)`.
+Nothing below this block was altered; the section that follows still reads
+"Status: OPEN" because that is what it said while the run was going, and E004 is
+the record of the run rather than of the result.
+
+The run ended **2026-09-06 14:28:36** — 18 h 13 m 07 s, 14.607 s/iteration,
+against the 14:25:17-14:25:58 this entry projected from checkpoint mtimes. Final
+validation loss **0.003** at iteration 4490 (`train.log:223`, a 225-line file).
+
+**The gate sweep it named as its closing event ran 14:38-14:48 and promoted
+nothing:** 43, 44, 42, 45 of 51 for checkpoints 1000, 2250, 3500 and 4490
+against a champion re-recorded at 49/51. The result, the method, the verdict and
+what none of it shows are in **E009**.
+
 ---
 
 ## Status: OPEN

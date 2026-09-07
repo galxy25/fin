@@ -6,7 +6,7 @@
 # dies the moment the sentence it excuses is reworded. Every waiver needs a
 # reason; the checker refuses to load one without.
 #
-# A waiver is an editorial act on the record. There are exactly five reasons a
+# A waiver is an editorial act on the record. There are exactly six reasons a
 # branch name is legitimate in this book, and each entry below names which:
 #
 #   quoted-defect      The book is quoting a false sentence in order to correct
@@ -20,6 +20,13 @@
 #                      There is no revision to pin, because the event has not
 #                      happened.
 #   not-a-git-object   Hex that is a content digest or a model snapshot id.
+#   corrected-elsewhere The sentence is a PUBLISHED defect that a later entry
+#                      corrects. Append-only forbids rewriting it, so the
+#                      waiver is a pointer: it must name the correcting entry,
+#                      that entry must exist, and its `corrects:` front matter
+#                      must list the entry being waived. check_citations.py
+#                      enforces all three -- a waiver that points nowhere fails
+#                      the run. Added by O013; see the README's step 5.
 #
 # Nothing else. If a new waiver does not fit one of these, the citation is
 # wrong and wants pinning, not excusing.
@@ -54,3 +61,25 @@ O010-2026-09-06-fixing-a-citation-is-a-citation.md | in a commit made **12m50s a
 O010-2026-09-06-fixing-a-citation-is-a-citation.md | a line number stated against a branch name | shorthand-subject: the BRANCH-LINE rule's own description shows the shape it rejects
 O010-2026-09-06-fixing-a-citation-is-a-citation.md | `gate_sweep.sh` is not on main". | quoted-defect: names the false sentence three entries carried, with the correction beneath it
 O010-2026-09-06-fixing-a-citation-is-a-citation.md | because markdown emphasis broke the pattern | shorthand-subject: quotes the literal text the first BRANCH-LOCUS regex failed to match
+
+# --- corrected-elsewhere (round 5, O013) ----------------------------------
+# The sixth reason. These nine sentences are PUBLISHED defects: O008's regime
+# forbids rewriting them in place, so the checker would fire on them forever.
+# The waiver is a pointer, not an excuse — it names the entry that carries the
+# correct value, and check_citations.py verifies that the named entry exists
+# and that its `corrects:` front matter lists the entry being waived.
+P001-2026-09-06-promotion-protocol.md | On `imac-site` that file is 217 lines rather than 202 | corrected-elsewhere: O013 item 1 — 219 lines with the rule at 212 at 78e6c36 and at 2d5bb29, read 2026-09-06 20:52:57 PDT; P001's own front matter already carried the right figures
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | `main` now means `587fb9a` | corrected-elsewhere: O013 item 2 — the tip was 2d5bb29 when read 2026-09-06 20:52:57 PDT, and this sentence was already false at commit time per O010's own table 187 lines below it
+O005-2026-09-06-no-provenance-in-verdicts.md | `587fb9a` — `main` today | corrected-elsewhere: O013 item 3 — the caption rotted while the measurement, pinned to a sha, did not
+O005-2026-09-06-no-provenance-in-verdicts.md | `main`, which pointed at `704ab09` while this book was written | corrected-elsewhere: O013 item 3 — "points at 587fb9a now" was false at commit time and is false at 2d5bb29
+E008-2026-09-06-mlx-split-recovery.md | false at `main` today (`587fb9a`) | corrected-elsewhere: O013 item 4 — still non-empty at 2d5bb29 but with 25 hits rather than 1, and 24 of them inside scripts/model-factory/
+O005-2026-09-06-no-provenance-in-verdicts.md | the same command with `main` in place of the sha also returns | corrected-elsewhere: O013 item 5 — the numstat is 797 0 at 2d5bb29, not 31 0; the coincidence the sentence warned against relying on has ended
+O005-2026-09-06-no-provenance-in-verdicts.md | so on branch `labbook` every | corrected-elsewhere: O013 item 6 — the anchor is still 22 at 6ea70e9 and at 2d5bb29, but it was stated against a moving name
+O005-2026-09-06-no-provenance-in-verdicts.md | and the name `main` moved out from under three of this entry's citations | corrected-elsewhere: O013 item 7 — the open-ended "now" meant b9876c1 and would mean 2d5bb29 at this reading
+O003-2026-09-06-three-prompts-no-parity.md | Swift paraphrase differs between `main` and `imac-site` too | corrected-elsewhere: O013 item 8 — the blob is d8d332b2 at both 78e6c36 and 2d5bb29, so the two are byte-identical at the tips named
+
+# --- round 5's four legitimate firings ------------------------------------
+O003-2026-09-06-three-prompts-no-parity.md | An earlier draft of this section said | quoted-defect: the retired "is `f0ca4af` now" sentence is quoted so the paragraph correcting it has something to correct
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | a bare `git grep` on `labbook` exits 0 with | quoted-defect: round 1's superseded claim, quoted inside O010's round-by-round table beside the counts that falsify it
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | `main` is a name, not a revision | shorthand-subject: the sentence names the branch in order to state that it is not a revision
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | The book said `run_evals.py` is 217 | quoted-defect: quotes E005's and P001's wrong line count, corrected in the next sentence with the tip that falsified it

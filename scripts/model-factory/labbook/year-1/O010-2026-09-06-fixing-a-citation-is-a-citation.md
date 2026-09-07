@@ -15,7 +15,7 @@ sources:
   - "587fb9a:content/claims-ledger.md — the sibling ledger's §8 entry on a 22-minute bug lifetime stated as 'a day' in five places; verified here with git log -S CARVE_OUT_RE -- content/check-claims.py"
 related: [O005, O008, O009, E008, H001, P002, E005]
 corrects: [O005, O009, E008, H001, P002, E005]
-superseded-by: null
+superseded-by: O013
 ---
 
 ## What was observed

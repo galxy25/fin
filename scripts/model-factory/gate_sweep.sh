@@ -73,8 +73,11 @@ fi
 # Prove the served endpoint actually answers for the id we will send, BEFORE
 # spending 51 scenarios on it. mlx_lm.server reports its model id as the PATH
 # passed to --model; sending anything else 404s per request, run_evals degrades
-# every scenario to `clarify`, and the 5 clarify scenarios pass — 10/51 that
-# looks like a catastrophic fine-tune and is really an empty measurement.
+# every scenario to `clarify`, and the 10 clarify scenarios pass — 5 core
+# (c01-c05) and 5 hard (h13, h22-h25) — for a 10/51 that looks like a
+# catastrophic fine-tune and is really an empty measurement. An earlier version
+# of this comment said "the 5 clarify scenarios", which is the core half only
+# and does not add up to the 10/51 in the same sentence; see O011.
 probe() {  # probe <base-url> <model-id>
   local body
   body=$(curl -s -m 90 "$1/chat/completions" -H 'Content-Type: application/json' \

@@ -14,7 +14,7 @@ sources:
   - 704ab09:evals/tmux-routing/run_evals.py:195 (the core-only exit rule, in a 202-line file; the same statement is at 210 of 217 at cd64914 and f0ca4af, and at 212 of 219 at 78e6c36 — see the table in E005)
 related: [P002, P004, O002, O005, O006]
 corrects: []
-superseded-by: null
+superseded-by: O013
 ---
 
 ## Protocol

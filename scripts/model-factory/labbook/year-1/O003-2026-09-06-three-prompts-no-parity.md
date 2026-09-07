@@ -18,7 +18,7 @@ sources:
   - "merged from docs/labbook/entries/O003-2026-09-06-prompt-skew-mid-run.md (the parallel book, 4705b67) — see the merge note below"
 related: [E001, E004, E006, O002, O005, P002, P005]
 corrects: []
-superseded-by: null
+superseded-by: O013
 ---
 
 **Merged from two drafts.** Both books wrote up the `router.md` divergence on

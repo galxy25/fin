@@ -16,7 +16,7 @@ sources:
   - "merged from docs/labbook/entries/O005-2026-09-06-factory-docs-drift.md (the parallel book, 4705b67) — see the merge note below"
 related: [O002, O003, O006, O010, E002, E004, E006, E008, P001, P005]
 corrects: []
-superseded-by: O010
+superseded-by: [O010, O013]
 ---
 
 **Merged from two drafts.** Both books numbered an entry `O005` on 2026-09-06:

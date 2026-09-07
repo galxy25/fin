@@ -17,7 +17,7 @@ sources:
   - "merged from docs/labbook/entries/O004-2026-09-06-stale-champion-record.md (the parallel book, 4705b67) — see the merge note below"
 related: [P001, P004, E001, O003, O005, H004]
 corrects: []
-superseded-by: null
+superseded-by: E009
 ---
 
 **Merged from two drafts.** Both books recorded the stale champion on

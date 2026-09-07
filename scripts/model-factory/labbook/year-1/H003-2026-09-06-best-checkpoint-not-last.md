@@ -15,7 +15,7 @@ sources:
   - "merged from docs/labbook/entries/H002-2026-09-06-best-checkpoint-is-not-last.md (the parallel book, 4705b67) — see the merge note below"
 related: [O001, O004, P004, E004, H001, H002]
 corrects: []
-superseded-by: null
+superseded-by: E009
 ---
 
 **Merged from two drafts.** Both lab books opened on 2026-09-06 wrote this

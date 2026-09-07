@@ -171,13 +171,20 @@ forward*, and rewrote the old citation as though the repository had always had
 that shape. Do not retrofit today's repository onto yesterday's revision.
 - **A branch name is not a revision.** `main` is a moving pointer: it was
 `704ab09` while this book was written, `587fb9a` when round 3 shipped,
-`077d970` when round 4 started pinning and `b9876c1` an hour later. That is
-**five distinct tips from this book's merge base onward, out of eight that
-`main` took on 2026-09-06**:
+`077d970` when round 4 started pinning, `b9876c1` an hour later, `7fb54b5` when
+the gate ran, and `2d5bb29` when read at 2026-09-06 20:52:57 PDT. That is
+**eight distinct tips from this book's merge base onward, out of eleven that
+the branch took on 2026-09-06** — `704ab09`, `919cfcb`, `587fb9a`, `077d970`,
+`b9876c1`, `7fb54b5`, `3ea4a65`, `2d5bb29`:
 
 ```sh
-git reflog show main --date=format:'%Y-%m-%d %H:%M:%S' | grep -c 2026-09-06   # 8
+git reflog show main --date=format:'%Y-%m-%d %H:%M:%S' | grep -c 2026-09-06   # 11
 ```
+
+Round 4 wrote five-of-eight here and did not re-run it; round 5 did, and got
+eleven (O013). **Do not carry these two numbers forward by hand either** — they
+are a count of the repository, and the count is the maintenance, not the
+sentence.
 
 and `git grep 'datasets/mlx' main` changed answer across them without anyone
 touching the factory. `imac-site` advanced three commits in the same window
@@ -375,16 +382,39 @@ entries that follow it most closely.
    branch currently resolves to, so pinning is a copy rather than an
    investigation. `--self-test` proves the checker still fires.
 
+   **Round 5 (O013) found nine sentences it was letting through**, including the
+   one E005 quotes as retired and two inside O010 itself. Three gaps and the
+   rules that close them:
+
+   | it missed | because | now |
+   | --- | --- | --- |
+   | a sentence-initial preposition before a branch name | the preposition list was compiled case-sensitively, so a capitalised "On" never matched | `BRANCH-LOCUS` folds case on the preposition |
+   | a claim split across a hard wrap | the scanner read one physical line at a time and the book wraps at ~76 columns | prose is joined into **logical lines**; tables and headings stand alone |
+   | a branch as the SUBJECT of a tip claim, with a sha beside it | the rules only ever matched *preposition + branch*, and every proximity test accepted the adjacent sha — but a sha does not say *when* | `BRANCH-SUBJECT`, and `BRANCH-TIP`, which demands an explicit **read declaration** ("read at …") |
+
+   Plus `BRANCH-LINECOUNT`, for a line count asserted against a branch rather
+   than a sha, which no rule had ever checked.
+
    If a branch name is genuinely correct, it goes in `citation-waivers.txt`
-   with one of the five permitted reasons, keyed to its exact sentence so it
+   with one of the **six** permitted reasons, keyed to its exact sentence so it
    dies when that sentence is reworded. The checker prints how many are in
    force on every run — do not restate the number here, since it is a count of
-   the book by the book. Adding a sixth *reason* is a change to the rules and
+   the book by the book. Adding a seventh *reason* is a change to the rules and
    belongs in an entry, not in a waiver line.
 
+   The sixth reason, `corrected-elsewhere`, arrived with O013 and exists because
+   append-only and a mechanical checker collide: a published defect cannot be
+   rewritten, so the rule fires on it forever. That waiver must name the entry
+   that carries the correct value, and **the checker verifies the pointer** —
+   the named entry has to exist and its `corrects:` front matter has to list the
+   entry being waived. A waiver that points nowhere fails the run.
+
    **This step exists because the editorial version of it failed four times in
-   a row** (O010). Knowing the rule was never the control; running the command
-   is the control, and now the command runs itself.
+   a row** (O010), and round 5 is the first round in which the *mechanical*
+   version of it also failed. A checker that misses the defect it was written
+   for is worse than none, because its exit code is read as a warrant. Extend
+   the self-test whenever a real defect gets through: `--self-test` now plants
+   all three of round 5's forms plus the correctly-written version of each.
 
 6. Commit the entry and the index row together. One entry per commit where
    practical, so `git log` over this directory reads as the lab notebook's own

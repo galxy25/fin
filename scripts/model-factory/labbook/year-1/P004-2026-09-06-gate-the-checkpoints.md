@@ -13,7 +13,7 @@ sources:
   - "local-artifact: models/candidates/fin-foreman-e4b-mlx/fuse-and-gate.md"
 related: [P001, H003, O001, O002]
 corrects: []
-superseded-by: null
+superseded-by: E009
 ---
 
 ## Status: proposed, never yet run

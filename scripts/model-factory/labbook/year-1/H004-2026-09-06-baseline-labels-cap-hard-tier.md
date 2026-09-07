@@ -17,7 +17,7 @@ sources:
   - "merged from docs/labbook/entries/H001-2026-09-06-hard-tier-regression.md (the parallel book, 4705b67) — see the merge note below"
 related: [O007, O002, E005, E001, P004, H003]
 corrects: []
-superseded-by: null
+superseded-by: E009
 ---
 
 **Merged from two drafts.** Both books wrote this hypothesis on 2026-09-06:
