@@ -346,6 +346,27 @@ final class DaemonDirectiveClientTests: XCTestCase {
         XCTAssertEqual(pending.first?.text, "check the build")
     }
 
+    /// Regression for a resident-daemon bug: with the default `.useProtocolCachePolicy`,
+    /// `URLSession.shared`'s disk-backed `URLCache` can satisfy a poll from a stale cached
+    /// response without ever reaching the network — silently, with no error to audit, and
+    /// surviving a process restart (unlike the in-memory ETag this client tracks itself).
+    /// Every poll request must explicitly opt out of that layer; freshness is this client's
+    /// own job via If-None-Match.
+    func testPollRequestsBypassTheLocalURLCache() async {
+        let body = document("""
+        {"id": "d-1", "kind": "user_message", "text": "one"}
+        """)
+        var seenCachePolicies: [URLRequest.CachePolicy] = []
+        let client = makeClient(fetch: { request in
+            seenCachePolicies.append(request.cachePolicy)
+            return (body, self.response(200))
+        })
+
+        _ = await client.poll()
+
+        XCTAssertEqual(seenCachePolicies, [.reloadIgnoringLocalCacheData])
+    }
+
     func testAppliedDirectivesAreNotReturnedAgain() async {
         let body = document("""
         {"id": "d-1", "kind": "user_message", "text": "one"},

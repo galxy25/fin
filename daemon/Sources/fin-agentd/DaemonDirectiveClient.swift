@@ -569,6 +569,16 @@ final class DaemonDirectiveClient {
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = Self.requestTimeout
+        // Freshness is handled entirely above by our own ETag/If-None-Match tracking —
+        // Foundation's protocol cache policy must not also intervene. `URLSession.shared`
+        // uses a disk-backed `URLCache` by default, which can satisfy this exact URL from
+        // a stale response (S3 sends no explicit Cache-Control, so a Last-Modified-based
+        // heuristic freshness window applies) without ever reaching the network — and that
+        // cache survives a process restart, unlike the in-memory ETag above. Left at the
+        // default `.useProtocolCachePolicy`, a resident daemon can poll forever and keep
+        // getting served the snapshot from its first fetch, silently, with no error to
+        // audit: the cache hit looks exactly like an ordinary successful 200.
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         if let etag = document.etag { request.setValue(etag, forHTTPHeaderField: "If-None-Match") }
         do {
             let (data, response) = try await fetch(request)
