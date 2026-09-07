@@ -1,0 +1,56 @@
+# Citation-checker waivers — scripts/model-factory/labbook/check_citations.py
+#
+# Format:  <file> | <exact snippet from the offending line> | <reason>
+#
+# Keyed by TEXT, not by line number, so a waiver survives edits above it and
+# dies the moment the sentence it excuses is reworded. Every waiver needs a
+# reason; the checker refuses to load one without.
+#
+# A waiver is an editorial act on the record. There are exactly five reasons a
+# branch name is legitimate in this book, and each entry below names which:
+#
+#   quoted-defect      The book is quoting a false sentence in order to correct
+#                      it. Rewriting the quotation would erase the evidence.
+#   asserted-absence   The citation's content is that the path does NOT exist
+#                      at that revision. The checker failing to resolve it is
+#                      the finding, not a defect.
+#   shorthand-subject  The `main:…:N` form is named as a form, not used as a
+#                      citation.
+#   future-state       A claim about what becomes true when a branch merges.
+#                      There is no revision to pin, because the event has not
+#                      happened.
+#   not-a-git-object   Hex that is a content digest or a model snapshot id.
+#
+# Nothing else. If a new waiver does not fit one of these, the citation is
+# wrong and wants pinning, not excusing.
+
+# --- not-a-git-object -----------------------------------------------------
+E002-2026-09-06-base-model-selection.md | 0f35c6f6d386f7f74e628bd7c6526ce531212300 | not-a-git-object: a HuggingFace model snapshot revision, resolvable only against the hub
+
+# --- asserted-absence -----------------------------------------------------
+H003-2026-09-06-best-checkpoint-not-last.md | git cat-file -e 59b0515:scripts/model-factory/gate_sweep.sh → fails | asserted-absence: the front matter records that this command FAILS at 59b0515; a resolvable path would falsify the entry
+H003-2026-09-06-best-checkpoint-not-last.md | git cat-file -e 59b0515:scripts/model-factory/gate_sweep.sh` fails | asserted-absence: the body's evidence is the non-resolution; see O002 for the different 140-line script that now occupies this path at 077d970
+
+# --- quoted-defect --------------------------------------------------------
+E005-2026-09-06-baselines-reproduce.md | An earlier draft of this entry said "on | quoted-defect: the superseded sentence is quoted verbatim above its correction; the table beneath it carries the pinned values
+E008-2026-09-06-mlx-split-recovery.md | a bare `git grep` on `labbook` exits 0 with | quoted-defect: round 1's false claim, quoted in the draft table; the same row pins cdb895a, 0fe0883 and 5305044
+O002-2026-09-06-stale-champion.md | an earlier draft said "not on main" | quoted-defect: the retired wording is quoted so the correction beside it is legible
+O003-2026-09-06-three-prompts-no-parity.md | "because `main` has not moved" | quoted-defect: round 3's deleted assertion, quoted so the blob comparison that replaced it has something to replace
+O005-2026-09-06-no-provenance-in-verdicts.md | but the sentence "exits 1 with no output at `main`" is now simply false | quoted-defect: the false sentence is the subject of the paragraph correcting it
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | But the sentence "exits 1 with no output at `main`" became false | quoted-defect: same sentence, quoted as the worked example of a claim going stale without anyone touching it
+
+# --- shorthand-subject ----------------------------------------------------
+O005-2026-09-06-no-provenance-in-verdicts.md | The `main:README.md:N` shorthand still | shorthand-subject: names the citation form as a form; O010's census counts the real instances
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | anchors and silently omitted the seven | shorthand-subject: describes the class of anchor round 3's sweep covered, with the census command printed below it
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | shorthand as a | shorthand-subject: the two uncounted README mentions are identified by naming the form they were mistaken for
+
+# --- future-state ---------------------------------------------------------
+O009-2026-09-06-two-books-one-factory.md | the longer both live on `main`, the more outside | future-state: quotes the older book's forward-looking argument about a merge that has not happened
+O009-2026-09-06-two-books-one-factory.md | The rule binds at the merge to `main`; | future-state: O008's regime boundary is defined by a merge event, so there is no revision to pin until it occurs
+
+# --- the rule's own statement of the forbidden form (round 4) -------------
+README.md | `main:README.md:44` is not a citation | shorthand-subject: rule 2 shows the forbidden form in order to forbid it
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | in a commit made **12m50s after `main` moved** | quoted-defect: quotes O003's deleted assertion beside the measurement that falsifies it
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | a line number stated against a branch name | shorthand-subject: the BRANCH-LINE rule's own description shows the shape it rejects
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | `gate_sweep.sh` is not on main". | quoted-defect: names the false sentence three entries carried, with the correction beneath it
+O010-2026-09-06-fixing-a-citation-is-a-citation.md | because markdown emphasis broke the pattern | shorthand-subject: quotes the literal text the first BRANCH-LOCUS regex failed to match
