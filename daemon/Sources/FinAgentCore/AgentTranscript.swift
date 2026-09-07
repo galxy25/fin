@@ -41,6 +41,10 @@ struct AgentMessage: Identifiable {
     /// A heartbeat-injected user turn: the model must see it, but the console renders
     /// it as a subtle status row rather than a full user bubble.
     var isHeartbeat: Bool = false
+    /// Marks a `.system` local notice as reporting a real failure (a run that gave up,
+    /// a send that couldn't be delivered) rather than benign narration — lets the
+    /// console render it visually distinct instead of blending in with routine notices.
+    var isFailure: Bool = false
     /// For `.assistant` messages: how long the model took to produce this turn.
     var turnDurationMS: Int?
     /// When this message entered the conversation. Restored history carries its
@@ -101,8 +105,8 @@ struct AgentTranscript {
         messages[index].setToolCallDuration(durationMS, forCallID: callID)
     }
 
-    mutating func appendLocalNotice(_ text: String) {
-        messages.append(AgentMessage(role: .system, text: text, isLocalOnly: true))
+    mutating func appendLocalNotice(_ text: String, isFailure: Bool = false) {
+        messages.append(AgentMessage(role: .system, text: text, isLocalOnly: true, isFailure: isFailure))
     }
 
     /// The provenance block `markdownExport` prints above the conversation. A small

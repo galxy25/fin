@@ -1468,9 +1468,7 @@ final class AgentRuntime: ObservableObject {
             guard let self else { return "unavailable" }
             let encoded = (try? JSONSerialization.data(withJSONObject: ["title": title, "body": body]))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-            return await MainActor.run {
-                self.executeNotify(title: title, body: body, rawArguments: encoded)
-            }
+            return await self.executeNotify(title: title, body: body, rawArguments: encoded)
         }
 
         let modelSession = LanguageModelSession(
@@ -1519,7 +1517,7 @@ final class AgentRuntime: ObservableObject {
     }
 
     private func failRun(_ message: String) {
-        transcript.appendLocalNotice(message)
+        transcript.appendLocalNotice(message, isFailure: true)
         state = .failed(message)
     }
 
@@ -1528,7 +1526,6 @@ final class AgentRuntime: ObservableObject {
     private func runEndpointLoop() async -> String? {
         var client = makeClient()
         var consecutiveEmptyReplies = 0
-        var lastAnswerText: String?
 
         // A forced tool round from `forceToolCallIfNeeded` may already sit in the
         // transcript before this loop starts — `wireMessages` picks it up like any other
@@ -1545,7 +1542,7 @@ final class AgentRuntime: ObservableObject {
             guard let completion = outcome.completion else {
                 if Task.isCancelled { return nil }
                 let message = outcome.errorMessage ?? "The model call failed."
-                transcript.appendLocalNotice(message)
+                transcript.appendLocalNotice(message, isFailure: true)
                 state = .failed(message)
                 return nil
             }
@@ -1577,8 +1574,6 @@ final class AgentRuntime: ObservableObject {
             // but a blank non-tool "final answer" is never a valid answer. Give the model
             // one nudge before giving up, so a single dropped-token blank reply doesn't
             // fail the whole run.
-            if !completion.text.isEmpty { lastAnswerText = completion.text }
-
             if completion.toolCalls.isEmpty {
                 let trimmedText = completion.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard trimmedText.isEmpty else {
@@ -1590,7 +1585,7 @@ final class AgentRuntime: ObservableObject {
                 consecutiveEmptyReplies += 1
                 guard consecutiveEmptyReplies < 2 else {
                     let message = "The model stopped without producing an answer."
-                    transcript.appendLocalNotice(message)
+                    transcript.appendLocalNotice(message, isFailure: true)
                     state = .failed(message)
                     return nil
                 }
@@ -1620,11 +1615,10 @@ final class AgentRuntime: ObservableObject {
             client = makeClient()
         }
 
-        transcript.appendLocalNotice(
-            "Stopped after \(Self.maxToolRoundTrips) tool calls without finishing. Send another message to continue."
-        )
-        state = .idle
-        return lastAnswerText
+        let message = "Stopped after \(Self.maxToolRoundTrips) tool calls without finishing. Send another message to continue."
+        transcript.appendLocalNotice(message, isFailure: true)
+        state = .failed(message)
+        return nil
     }
 
     /// How many times a single model turn may be attempted before the run gives up.
@@ -1754,7 +1748,7 @@ final class AgentRuntime: ObservableObject {
             return message
 
         case AgentToolSpec.notify.name:
-            return executeNotify(
+            return await executeNotify(
                 title: call.argument("title") ?? "",
                 body: call.argument("body") ?? "",
                 rawArguments: call.arguments
@@ -1957,13 +1951,16 @@ final class AgentRuntime: ObservableObject {
     }
 
     /// The model's `notify` tool: Fin's proactively-social push, in the app-local runtime.
-    /// The delivery surface is always present here — a local notification, no server or
-    /// APNs — so unlike the headless engine this never reports "unavailable"; it hands the
-    /// model-authored title and body to `AgentNotificationService` and confirms. Internal
-    /// so the empty-body guard is testable directly. Note this is the model's CHOICE: no
-    /// heartbeat, turn-finish, or watchdog path routes here — those keep their own
-    /// notification calls — so the tool never double-fires with them.
-    func executeNotify(title: String, body: String, rawArguments: String) -> String {
+    /// A local notification is always the available surface here — no server or APNs to be
+    /// unconfigured — but "available" and "delivered" are different claims: awaits the REAL
+    /// outcome from `AgentNotificationService.notifyAgentUpdate` (an `AgentNotifyOutcome`,
+    /// shared with the daemon's `onNotify` hook in `FinAgentCore/AgentTurnEngine.swift`)
+    /// rather than assuming success once the call is made — the same confirmed-vs-lied-about
+    /// distinction item 3 fixed for the daemon's push path. Internal so the empty-body guard
+    /// is testable directly. Note this is the model's CHOICE: no heartbeat, turn-finish, or
+    /// watchdog path routes here — those keep their own notification calls — so the tool
+    /// never double-fires with them.
+    func executeNotify(title: String, body: String, rawArguments: String) async -> String {
         let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedBody.isEmpty else {
             let message = "Error: notify requires a non-empty \"body\" argument."
@@ -1973,21 +1970,36 @@ final class AgentRuntime: ObservableObject {
         }
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let startedAt = Date()
+        let outcome = await AgentNotificationService.shared.notifyAgentUpdate(
+            agentName: agent.name,
+            title: trimmedTitle,
+            body: trimmedBody,
+            agentID: agent.id
+        )
         record(
             .toolCall,
             trimmedTitle.isEmpty ? "notify: \(trimmedBody)" : "notify: \(trimmedTitle) — \(trimmedBody)",
             toolName: AgentToolSpec.notify.name,
             toolArguments: rawArguments,
             disposition: .unguarded,
-            toolDurationMS: Self.elapsedMS(since: startedAt)
+            toolDurationMS: Self.elapsedMS(since: startedAt),
+            isFailure: outcome == .failed
         )
-        AgentNotificationService.shared.notifyAgentUpdate(
-            agentName: agent.name,
-            title: trimmedTitle,
-            body: trimmedBody,
-            agentID: agent.id
-        )
-        return "Sent to the owner."
+        switch outcome {
+        case .delivered:
+            return "Sent to the owner."
+        case .queued:
+            return "Not pushed — the app is currently active on this device, so the owner is "
+                + "likely already looking at it; no confirmed push went out. Say anything "
+                + "important in your reply text too."
+        case .failed:
+            return "Delivery failed — notifications aren't authorized on this device, or "
+                + "scheduling the alert failed, so the owner was not reached. Say anything "
+                + "important in your reply text instead."
+        case .unavailable:
+            return "No push channel is configured, so the owner was not reached — say anything "
+                + "important in your reply text instead, and keep going."
+        }
     }
 
     /// Auto-saves this conversation's episodic memory after each completed turn. The
@@ -2258,9 +2270,12 @@ final class AgentRuntime: ObservableObject {
 
         if Task.isCancelled { return "Cancelled before sending." }
 
-        // A disconnected session's write path silently drops bytes (its stdin writer is
-        // gone), so sending would confirm delivery of something that never arrived —
-        // and then wait the full timeout for output that provably cannot come.
+        // A disconnected session's write path drops bytes, so sending would confirm
+        // delivery of something that never arrived — and then wait the full timeout for
+        // output that provably cannot come. This is a fast pre-check, not the only
+        // enforcement any more: `state` can still flip between here and the real write
+        // (a race, not a certainty), which is exactly why the writes below now report
+        // their own real outcome instead of being trusted on sight.
         guard session.state == .connected else {
             let message = "Error: the terminal session is not connected (\(String(describing: session.state))). "
                 + "Nothing was sent. Tell the user the session needs to reconnect before commands can run."
@@ -2271,22 +2286,35 @@ final class AgentRuntime: ObservableObject {
 
         let baselineEventID = session.eventLog.events.last?.id
         let executedAt = Date()
-        // The "real work" signal that refreshes a watchdog-armed episode's beat
-        // budget — stamped here, past the authorization, cancellation, and
-        // connected-session guards, at the point where bytes are actually written
-        // to a live channel. An attempted-but-undelivered send (denied, cancelled,
-        // or into a disconnected session that silently drops stdin) must not count
-        // as progress, or a dead session's loop would refresh its own budget
-        // forever.
-        beatUsedSendInput = true
         // The Return is sent as its own write, a beat after the text: a \r riding in the
         // same stdin burst as a multi-character chunk is treated by TUI input libraries
         // (Claude Code's included) as part of a paste — inserted, not submitted. A live
         // wrapper test showed exactly that: two commands merged un-submitted in the inner
         // agent's input box. The pause makes the \r arrive as a lone keypress event.
-        session.sendAgentInput(Self.typedBody(input))
+        //
+        // Both calls return the real send outcome (nil only means "empty text, nothing
+        // to send" — vacuously fine, not a failure) — awaited below before anything
+        // downstream trusts that the bytes actually reached the shell.
+        let bodySend = session.sendAgentInput(Self.typedBody(input))
         try? await Task.sleep(for: .milliseconds(250))
-        session.sendAgentInput("\r")
+        let returnSend = session.sendAgentInput("\r")
+        let bodySent = await bodySend?.value ?? true
+        let returnSent = await returnSend?.value ?? true
+        guard bodySent, returnSent else {
+            let reason = session.lastError.map { " (\($0))" } ?? ""
+            let message = "Error: sending input to the terminal failed\(reason). The command may be "
+                + "partially typed or not sent at all — verify with read_terminal before retrying, "
+                + "rather than assuming it went through."
+            record(.error, message, toolName: toolName,
+                   toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        // The "real work" signal that refreshes a watchdog-armed episode's beat budget —
+        // stamped here, now that the write is CONFIRMED, not merely attempted: an
+        // undelivered send (denied, cancelled, or dropped by a session that disconnected
+        // between the guard above and the actual write) must not count as progress, or a
+        // dead session's loop would refresh its own budget forever.
+        beatUsedSendInput = true
         let outcome = await awaitOutput(
             seconds: awaitOutputSeconds,
             after: baselineEventID,

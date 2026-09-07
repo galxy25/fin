@@ -114,6 +114,31 @@ final class DaemonNotifyClientTests: XCTestCase {
         XCTAssertTrue(title.contains("[redacted]"))
     }
 
+    /// `send`/`sendDirect` must report the REAL outcome, not just "handed off" — this is
+    /// what lets a caller (the `notify` tool's bounded await) tell the model the truth.
+    func testSendReturnsTrueOnConfirmedDelivery() async {
+        let client = makeClient { request in
+            HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        }
+        let delivered = await client.send(event: "task-complete", message: "done")
+        XCTAssertTrue(delivered)
+    }
+
+    func testSendReturnsFalseOnHTTPFailure() async {
+        let client = makeClient { request in
+            HTTPURLResponse(url: request.url!, statusCode: 503, httpVersion: nil, headerFields: nil)!
+        }
+        let delivered = await client.send(event: "task-complete", message: "done")
+        XCTAssertFalse(delivered)
+    }
+
+    func testSendDirectReturnsFalseOnTransportError() async {
+        struct Unreachable: Error {}
+        let client = makeClient { _ in throw Unreachable() }
+        let delivered = await client.sendDirect(title: "hi", body: "there")
+        XCTAssertFalse(delivered)
+    }
+
     func testTitlesPerEvent() {
         XCTAssertEqual(
             DaemonNotifyClient.title(event: "request-input", agentName: "Nimbus"),
@@ -122,6 +147,10 @@ final class DaemonNotifyClientTests: XCTestCase {
         XCTAssertEqual(
             DaemonNotifyClient.title(event: "task-complete", agentName: "Nimbus"),
             "Nimbus: task complete"
+        )
+        XCTAssertEqual(
+            DaemonNotifyClient.title(event: "agent-stalled", agentName: "Nimbus"),
+            "Nimbus is stuck"
         )
         XCTAssertEqual(
             DaemonNotifyClient.title(event: "someday-a-new-event", agentName: "Nimbus"),
@@ -230,5 +259,118 @@ final class DaemonNotifyClientTests: XCTestCase {
         """
         let config = try JSONDecoder().decode(DaemonConfig.self, from: Data(json.utf8))
         XCTAssertNil(config.controlPlane, "no block, no client — the daemon stays silent")
+    }
+}
+
+/// `firstToFinish` is the bounded-wait race `notifyFromTool` uses so the `notify` tool
+/// call awaits a real outcome without blocking indefinitely — covered directly since
+/// `Daemon` itself (SSH session, supervision, …) is too heavy to stage just for this.
+final class NotifyRaceTests: XCTestCase {
+
+    func testReturnsTheResultWhenTheTaskFinishesFirst() async {
+        let task = Task<Bool, Never> { true }
+        let result = await firstToFinish(task, timeoutSeconds: 5)
+        XCTAssertEqual(result, true)
+    }
+
+    func testReturnsFalseWhenTheTaskFinishesFirstWithFailure() async {
+        let task = Task<Bool, Never> { false }
+        let result = await firstToFinish(task, timeoutSeconds: 5)
+        XCTAssertEqual(result, false)
+    }
+
+    /// The whole point: a task slower than the deadline must not hold up the caller for
+    /// its own full duration — the race returns nil at (about) the deadline, not later.
+    func testReturnsNilAtTheDeadlineWithoutWaitingForTheSlowTask() async {
+        let task = Task<Bool, Never> {
+            try? await Task.sleep(for: .seconds(5))
+            return true
+        }
+        let startedAt = Date()
+        let result = await firstToFinish(task, timeoutSeconds: 0.1)
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        XCTAssertNil(result)
+        XCTAssertLessThan(elapsed, 1.0, "must return near the deadline, not wait out the slow task")
+        task.cancel()
+    }
+}
+
+/// `notifyOutcome` is `notifyFromTool`'s decision table pulled out as a pure function —
+/// same rationale as `NotifyRaceTests` above: `Daemon` is too heavy to stage just to
+/// drive one `private` method. This is the regression cover for the bug where a
+/// CONFIRMED control-plane failure got silently overridden into `.delivered` by the
+/// shell hook's mere (unconfirmed) launch, and for `.unavailable` being reported for a
+/// channel that was actually configured and attempted, just unsuccessfully.
+final class NotifyOutcomeDecisionTests: XCTestCase {
+
+    // MARK: - Client-only / dual-channel: the client's confirmed result always wins
+
+    func testConfirmedDeliveryIsDelivered() {
+        XCTAssertEqual(
+            notifyOutcome(commandLaunched: false, hasClient: true, confirmed: true),
+            .delivered
+        )
+    }
+
+    func testConfirmedDeliveryIsDeliveredEvenWithNoCommandHook() {
+        // A client-only configuration (no notifyCommand at all) must still report a
+        // confirmed success as delivered.
+        XCTAssertEqual(
+            notifyOutcome(commandLaunched: false, hasClient: true, confirmed: true),
+            .delivered
+        )
+    }
+
+    func testConfirmedFailureIsFailedRegardlessOfCommandLaunch() {
+        // THE regression: a confirmed-false client result must never be promoted to
+        // `.delivered` just because the unrelated, unconfirmable shell hook launched.
+        XCTAssertEqual(
+            notifyOutcome(commandLaunched: true, hasClient: true, confirmed: false),
+            .failed
+        )
+    }
+
+    func testConfirmedFailureWithNoCommandHookIsAlsoFailed() {
+        XCTAssertEqual(
+            notifyOutcome(commandLaunched: false, hasClient: true, confirmed: false),
+            .failed
+        )
+    }
+
+    func testUnconfirmedWithinTheBoundIsQueuedRegardlessOfCommandLaunch() {
+        XCTAssertEqual(
+            notifyOutcome(commandLaunched: true, hasClient: true, confirmed: nil),
+            .queued
+        )
+        XCTAssertEqual(
+            notifyOutcome(commandLaunched: false, hasClient: true, confirmed: nil),
+            .queued
+        )
+    }
+
+    // MARK: - Shell-hook-only (no control-plane client configured)
+
+    func testCommandLaunchWithNoClientIsQueuedNotDelivered() {
+        // A launch is not a confirmation: `AgentNotifyOutcome.delivered` means the
+        // channel CONFIRMED the push went out, and a fire-and-forget shell hook can
+        // never confirm that (see `runNotifyCommand`'s own doc comment). `.queued` is
+        // the honest answer — handed off, unconfirmed — matching the client-side
+        // unconfirmed case above rather than overclaiming success.
+        XCTAssertEqual(
+            notifyOutcome(commandLaunched: true, hasClient: false, confirmed: nil),
+            .queued
+        )
+    }
+
+    func testCommandLaunchFailureWithNoClientIsFailedNotUnavailable() {
+        // A configured-but-failed-to-launch shell hook is a real failure of a channel
+        // that DOES exist — must never read as "no channel configured" (`.unavailable`
+        // is reserved for `hasNotifyChannel == false`, decided before this function is
+        // ever called).
+        XCTAssertEqual(
+            notifyOutcome(commandLaunched: false, hasClient: false, confirmed: nil),
+            .failed
+        )
     }
 }

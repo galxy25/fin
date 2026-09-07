@@ -16,6 +16,8 @@ private extension AgentLogKind {
         case .approval: return .green
         case .notice: return .secondary
         case .error: return .red
+        case .turnStarted: return .cyan
+        case .turnProgress: return .secondary
         }
     }
 }

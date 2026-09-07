@@ -66,6 +66,28 @@ final class AgentEngineDispatchTests: XCTestCase {
                        "expected the typed body and a lone \\r, in that order")
     }
 
+    /// Item 4's daemon-side half: a dropped write (the SSH channel goes away between the
+    /// `isSessionConnected` pre-check and the actual write — a real, narrow TOCTOU window,
+    /// not merely a disconnected-at-the-guard case) must surface as a real tool error, not
+    /// a silent no-op the model believes succeeded and then waits out `awaitOutput`'s full
+    /// timeout for a reply that can never arrive — same shape as the app's
+    /// `AgentRuntime.executeSendInput` failure path (`fin/Agent/AgentRuntime.swift`), whose
+    /// own coverage lives one layer down in `finTests/TerminalSessionSendTests.swift`.
+    func testSendInputFailsWhenTheWriteIsNotConfirmed() async {
+        let session = RecordingStubSession()
+        session.failSends = true
+        let engine = makeEngine(session: session)
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendInput.name,
+            #"{"input": "echo hi\n", "await_output_seconds": 1}"#
+        ))
+
+        XCTAssertTrue(result.contains("sending input to the terminal failed"), "got: \(result)")
+        XCTAssertTrue(result.contains("simulated write failure"), "expected lastError folded in: \(result)")
+        XCTAssertTrue(session.sentInputs.isEmpty, "a failed write must not be recorded as sent")
+    }
+
     // MARK: - remember / recall
 
     func testMemoryToolsAnswerHonestlyInsteadOfUnknownTool() async {
@@ -202,7 +224,7 @@ final class AgentEngineDispatchTests: XCTestCase {
         let engine = makeEngine(audit: { audited.append($0) })
         engine.onNotify = { title, body in
             pushes.append((title, body))
-            return true // a channel is configured
+            return .delivered // the channel confirmed the push went out
         }
 
         let result = await engine.execute(call(
@@ -219,11 +241,11 @@ final class AgentEngineDispatchTests: XCTestCase {
         }, "the notification must be recorded in the audit trail")
     }
 
-    /// A configured-but-unreachable channel (hook returns false) must be reported to the
-    /// model honestly, not dressed up as a delivered push.
+    /// A configured-but-unreachable channel (hook reports unavailable) must be reported
+    /// to the model honestly, not dressed up as a delivered push.
     func testNotifyReportsWhenNoChannelDelivered() async {
         let engine = makeEngine()
-        engine.onNotify = { _, _ in false }
+        engine.onNotify = { _, _ in .unavailable }
 
         let result = await engine.execute(call(
             AgentToolSpec.notify.name,
@@ -233,9 +255,44 @@ final class AgentEngineDispatchTests: XCTestCase {
         XCTAssertFalse(result.hasPrefix("Sent"), "an undelivered push must not claim success")
     }
 
+    /// A send that hasn't been confirmed within the runner's bounded wait must be
+    /// reported as still in flight — never a false "sent" and never a false "failed".
+    func testNotifyReportsQueuedWhenUnconfirmed() async {
+        let engine = makeEngine()
+        engine.onNotify = { _, _ in .queued }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.notify.name,
+            #"{"title": "FYI", "body": "still deploying."}"#
+        ))
+        XCTAssertTrue(result.contains("Queued"), "got: \(result)")
+        XCTAssertFalse(result.hasPrefix("Sent"), "an unconfirmed push must not claim success")
+        XCTAssertFalse(result.contains("not reached"), "a queued push is not the same as no channel")
+    }
+
+    /// A channel that IS configured and WAS attempted, but is confirmed not to have
+    /// delivered, must read as a real failure — distinct from both "sent" and from "no
+    /// channel configured" (a runner reports `.unavailable` only when nothing exists at
+    /// all; a confirmed failed send on a real channel is a different fact).
+    func testNotifyReportsFailedOnConfirmedFailure() async {
+        let engine = makeEngine()
+        engine.onNotify = { _, _ in .failed }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.notify.name,
+            #"{"title": "FYI", "body": "push channel is down."}"#
+        ))
+        XCTAssertTrue(result.contains("failed"), "got: \(result)")
+        XCTAssertFalse(result.hasPrefix("Sent"), "a confirmed-failed push must not claim success")
+        XCTAssertFalse(
+            result.contains("No push channel is configured"),
+            "a confirmed failure is not the same claim as no channel existing: got \(result)"
+        )
+    }
+
     func testNotifyRequiresABody() async {
         let engine = makeEngine()
-        engine.onNotify = { _, _ in XCTFail("hook must not fire for an empty body"); return true }
+        engine.onNotify = { _, _ in XCTFail("hook must not fire for an empty body"); return .delivered }
 
         let result = await engine.execute(call(
             AgentToolSpec.notify.name, #"{"title": "hi"}"#
@@ -263,7 +320,7 @@ final class AgentEngineDispatchTests: XCTestCase {
         let engine = makeEngine()
         engine.onNotify = { _, _ in
             XCTFail("no tool other than notify itself may push to the owner")
-            return true
+            return .delivered
         }
         engine.onRequestInput = { _ in }
         engine.onMonitorStart = { _ in 60 }
@@ -634,5 +691,46 @@ final class AgentEngineDispatchTests: XCTestCase {
         // The note is in the header, not inside the fence, where a pane could have printed it.
         let header = result.components(separatedBy: TmuxSessionRead.beginMarker).first ?? ""
         XCTAssertTrue(header.contains("Only the last"), "got header: \(header)")
+    }
+
+    // MARK: - Turn visibility (item 6): turnStarted + real attempt/retry propagation
+
+    /// `submit()` must record `turnStarted` the INSTANT the user message is recorded —
+    /// before any tool call or LLM round trip — and every subsequent event in the same
+    /// round trip must carry the REAL attempt/retry count `completeWithRetries` reaches,
+    /// not a hardcoded 1/0.
+    ///
+    /// Exercised against a real, refused loopback connection rather than a mock:
+    /// `AgentEndpointClient` calls `URLSession.shared` directly with no injectable
+    /// transport, so there is no way to drive `completeWithRetries`'s retry loop
+    /// without a real socket somewhere. Port 1 on 127.0.0.1 refuses instantly (an
+    /// OS-level ECONNREFUSED, not a timeout) and needs no dev-machine setup — no SSH,
+    /// no LM Studio — unlike this package's other network-adjacent live tests, which is
+    /// why this one runs unconditionally instead of `XCTSkip`-ing itself.
+    func testSubmitEmitsTurnStartedImmediatelyAndStampsRealAttemptRetryCounts() async {
+        var events: [AgentAuditEvent] = []
+        let engine = makeEngine(audit: { events.append($0) })
+
+        _ = await engine.submit("hello")
+
+        XCTAssertEqual(events.first?.kind, "userMessage")
+        XCTAssertEqual(events.first?.attempt, 1)
+        XCTAssertEqual(events.first?.retryCount, 0)
+
+        let second = events.dropFirst().first
+        XCTAssertEqual(second?.kind, "turnStarted",
+                       "turnStarted must be the event right after userMessage — got: \(events.map(\.kind))")
+        XCTAssertEqual(second?.attempt, 1)
+        XCTAssertEqual(second?.retryCount, 0)
+
+        let errorEvents = events.filter { $0.kind == "error" }
+        XCTAssertEqual(
+            errorEvents.map(\.attempt), [1, 2, 3],
+            "each retry's own error event must carry the attempt that actually ran"
+        )
+        XCTAssertEqual(
+            errorEvents.map(\.retryCount), [0, 1, 2],
+            "retryCount is attempt - 1"
+        )
     }
 }

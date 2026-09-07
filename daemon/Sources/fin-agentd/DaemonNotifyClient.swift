@@ -61,6 +61,7 @@ final class DaemonNotifyClient {
         switch event {
         case "request-input": return "\(agentName) needs input"
         case "task-complete": return "\(agentName): task complete"
+        case "agent-stalled": return "\(agentName) is stuck"
         default: return agentName
         }
     }
@@ -84,8 +85,11 @@ final class DaemonNotifyClient {
     // MARK: - Send
 
     /// POSTs one event. Failures audit (throttled) and are otherwise swallowed —
-    /// a dead control plane must never take down the agent.
-    func send(event: String, message: String) async {
+    /// a dead control plane must never take down the agent. Returns whether the post
+    /// actually succeeded, so a caller that needs the real outcome (not just "handed
+    /// off") can report it honestly instead of assuming delivery.
+    @discardableResult
+    func send(event: String, message: String) async -> Bool {
         await deliver(
             title: Self.title(event: event, agentName: agentName),
             body: Self.alertBody(message)
@@ -96,12 +100,14 @@ final class DaemonNotifyClient {
     /// the `event`→title table `send(event:)` uses and pushes the given headline verbatim
     /// (still redacted + capped, since it still leaves the machine). An empty title falls
     /// back to the agent's name so a lock screen always has something to show. Same
-    /// swallow-and-throttle failure discipline as `send(event:)`.
-    func sendDirect(title: String, body: String) async {
+    /// swallow-and-throttle failure discipline, and the same real-outcome return, as
+    /// `send(event:)`.
+    @discardableResult
+    func sendDirect(title: String, body: String) async -> Bool {
         let redactedTitle = MemoryRedactor.redact(title)
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        await deliver(
+        return await deliver(
             title: redactedTitle.isEmpty ? agentName : redactedTitle,
             body: Self.alertBody(body)
         )
@@ -109,13 +115,16 @@ final class DaemonNotifyClient {
 
     /// Shared POST for both `send(event:)` and `sendDirect`: the title and body are
     /// already resolved and redacted by the caller. (Named `deliver`, not `post`, so it
-    /// doesn't shadow the injected `post` transport this ultimately calls.)
-    private func deliver(title: String, body: String) async {
+    /// doesn't shadow the injected `post` transport this ultimately calls.) Returns true
+    /// only on a confirmed 2xx response — every other outcome (bad URL, transport error,
+    /// non-2xx) is false, audited, and swallowed.
+    @discardableResult
+    private func deliver(title: String, body: String) async -> Bool {
         var base = endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") { base.removeLast() }
         guard !base.isEmpty, let url = URL(string: base + "/notify") else {
             registerFailure("[notify] control plane URL is not a valid URL")
-            return
+            return false
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = Self.requestTimeout
@@ -131,10 +140,13 @@ final class DaemonNotifyClient {
             let response = try await post(request)
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                 registerFailure("[notify] post failed: HTTP \(http.statusCode)")
+                return false
             }
+            return true
         } catch {
             let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             registerFailure("[notify] post failed: \(text.prefix(200))")
+            return false
         }
     }
 

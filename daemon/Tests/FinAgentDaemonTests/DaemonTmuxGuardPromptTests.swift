@@ -241,9 +241,12 @@ final class GuardStubSession: AgentSessionDriving {
     /// no verdict.
     var reportedTmux: String? = "/private/tmp/tmux-501/fin,4242,0"
 
-    func sendAgentInput(_ text: String) {
+    @discardableResult
+    func sendAgentInput(_ text: String) -> Task<Bool, Never>? {
+        guard !text.isEmpty else { return nil }
         sentInputs.append(text)
         eventLog.recordInput(Array(text.utf8))
+        return Task { true }
     }
 
     func probeEnvironment(_ name: String, timeout: TimeInterval) async -> String? {

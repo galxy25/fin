@@ -20,6 +20,7 @@ private enum MirrorReaderContract {
     static let kinds: Set<String> = [
         "userMessage", "assistantMessage", "reasoning", "toolCall",
         "toolResult", "approval", "notice", "error",
+        "turnStarted", "turnProgress",
     ]
     /// A default `ISO8601DateFormatter` — no fractional seconds, which it rejects.
     static let timestampFormatter = ISO8601DateFormatter()
@@ -310,5 +311,85 @@ final class DaemonTranscriptUplinkTests: XCTestCase {
         uplink.record(AgentAuditEvent(kind: "notice", text: "one"))
         await uplink.flush()
         XCTAssertTrue(lines.contains { $0.hasPrefix("[transcript] put failed:") }, "got: \(lines)")
+    }
+
+    // MARK: - Turn visibility (item 6): turnStarted/turnProgress schema
+
+    func testMirrorKindsCarriesTheTurnVisibilitySchema() {
+        XCTAssertTrue(DaemonTranscriptUplink.mirrorKinds.contains("turnStarted"))
+        XCTAssertTrue(DaemonTranscriptUplink.mirrorKinds.contains("turnProgress"))
+        XCTAssertEqual(DaemonTranscriptUplink.immediateFlushKind, "turnStarted")
+    }
+
+    /// The one property that makes `turnStarted` worth a dedicated kind at all: the app
+    /// must see it within seconds, not wait out a `flushSeconds` window that can be
+    /// minutes long. The flush runs as its own unstructured `Task`, so this polls
+    /// briefly rather than assuming it has landed the instant `record` returns.
+    func testTurnStartedFlushesImmediatelyNotOnTheBatchedInterval() async {
+        var putCount = 0
+        let uplink = makeUplink(flushSeconds: 300, put: { request in
+            putCount += 1
+            return HTTPURLResponse(url: request.url!, statusCode: 200,
+                                   httpVersion: nil, headerFields: nil)!
+        })
+
+        uplink.record(AgentAuditEvent(kind: "turnStarted", text: "[turn] started"))
+
+        let deadline = Date().addingTimeInterval(2)
+        while putCount == 0, Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertEqual(putCount, 1, "turnStarted must flush immediately, not wait for a 300s window")
+    }
+
+    /// The immediate flush is turnStarted's special case, not a general "record always
+    /// flushes now" regression — every other kind still waits for `flushIfDue`/an
+    /// explicit `flush()`, exactly as before this change.
+    func testOtherKindsDoNotTriggerAnImmediateFlush() async {
+        var putCount = 0
+        let uplink = makeUplink(flushSeconds: 300, put: { request in
+            putCount += 1
+            return HTTPURLResponse(url: request.url!, statusCode: 200,
+                                   httpVersion: nil, headerFields: nil)!
+        })
+
+        uplink.record(AgentAuditEvent(kind: "notice", text: "not urgent"))
+        // Give a (wrongly) spawned flush task a moment to land before asserting it didn't.
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(putCount, 0, "only turnStarted jumps the batch interval")
+    }
+
+    /// Was hardcoded `1`/`0` for every line regardless of what actually happened —
+    /// now carries whatever `AgentTurnEngine` stamped on the event.
+    func testLineReflectsTheEventsRealAttemptAndRetryCount() throws {
+        let uplink = makeUplink()
+        uplink.record(AgentAuditEvent(
+            kind: "error", text: "endpoint timed out (attempt 2, retrying)",
+            isFailure: true, attempt: 2, retryCount: 1
+        ))
+
+        let line = try XCTUnwrap(uplink.lines.first)
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["attempt"] as? Int, 2)
+        XCTAssertEqual(object["retry_count"] as? Int, 1)
+    }
+
+    /// An event that never specifies attempt/retryCount (the overwhelming majority of
+    /// call sites) still gets the fresh-turn default, unchanged from before this item.
+    func testLineDefaultsToAttemptOneRetryCountZero() throws {
+        let uplink = makeUplink()
+        uplink.record(AgentAuditEvent(kind: "notice", text: "connected"))
+
+        let line = try XCTUnwrap(uplink.lines.first)
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["attempt"] as? Int, 1)
+        XCTAssertEqual(object["retry_count"] as? Int, 0)
     }
 }

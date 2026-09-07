@@ -2,6 +2,28 @@
 // Keep this file free of UI, SwiftData, and app-only imports.
 import Foundation
 
+/// The real outcome of one `onNotify` push, reported honestly rather than collapsed to
+/// "a channel exists". A runner awaits its actual send (bounded — see the runner's own
+/// timeout) before answering, so the model never hears "sent" for a push that hasn't
+/// gone out, and never hears "failed" for one that's simply still in flight.
+public enum AgentNotifyOutcome: Equatable, Sendable {
+    /// The channel confirmed the push went out.
+    case delivered
+    /// Handed off to a channel, but no confirmation arrived within the runner's bounded
+    /// wait — most likely still in flight, not a known failure.
+    case queued
+    /// A channel IS configured and a send was attempted, but is confirmed NOT to have
+    /// gone out (a non-2xx/transport error a confirming channel reported, or the only
+    /// configured channel failing to even launch). Distinct from `unavailable` (no
+    /// channel exists at all) — an operator debugging silence needs to know which one
+    /// it is, and a definite failure from a channel that CAN confirm must never be
+    /// papered over by another channel that merely launched without confirming anything
+    /// (see `runNotifyCommand`'s own doc comment on what a launch does and doesn't prove).
+    case failed
+    /// No push channel is configured at all.
+    case unavailable
+}
+
 /// Model + sampling configuration for a headless engine. The daemon reads this straight
 /// from its JSON config; the fields mirror the app's `Agent` model minus everything
 /// UI-facing (name, default mode, notification prefs).
@@ -42,19 +64,30 @@ public struct AgentEngineConfiguration {
 public struct AgentAuditEvent: Codable, Sendable {
     public var timestamp: Date
     /// Mirrors the app's `AgentLogKind` raw values: userMessage, assistantMessage,
-    /// reasoning, toolCall, toolResult, notice, error.
+    /// reasoning, toolCall, toolResult, notice, error, turnStarted, turnProgress.
     public var kind: String
     public var text: String
     public var toolName: String?
     public var toolArguments: String?
     public var isFailure: Bool
+    /// Which model-call attempt (1-based) this event corresponds to, and how many
+    /// retries that took (`attempt - 1`) — both default to a fresh turn's 1/0 and are
+    /// only ever set to something else by `AgentTurnEngine`, which tracks its own
+    /// current attempt/retry count across a round trip and stamps every event with it
+    /// (see `AgentTurnEngine.record`). Exists so the cloud mirror line's `attempt`/
+    /// `retry_count` fields can report what actually happened instead of a hardcoded
+    /// 1/0 for every line regardless of real retry activity.
+    public var attempt: Int
+    public var retryCount: Int
 
     public init(
         kind: String,
         text: String,
         toolName: String? = nil,
         toolArguments: String? = nil,
-        isFailure: Bool = false
+        isFailure: Bool = false,
+        attempt: Int = 1,
+        retryCount: Int = 0
     ) {
         self.timestamp = Date()
         self.kind = kind
@@ -62,6 +95,8 @@ public struct AgentAuditEvent: Codable, Sendable {
         self.toolName = toolName
         self.toolArguments = toolArguments
         self.isFailure = isFailure
+        self.attempt = attempt
+        self.retryCount = retryCount
     }
 }
 
@@ -117,10 +152,11 @@ public final class AgentTurnEngine {
     /// Fired when the MODEL calls `notify` — the proactively-social push. The engine
     /// never calls this on its own (no heartbeat, no completion, no forced path routes
     /// here); it fires only from `executeNotify`, so a notification is always a choice
-    /// the model made. Returns whether the runner has a live channel to carry it, so the
-    /// tool can tell the model the truth. Nil hook → the tool reports it's unavailable in
-    /// this runtime, the same honesty as the headless memory tools.
-    public var onNotify: ((_ title: String, _ body: String) -> Bool)?
+    /// the model made. Async so the runner can actually AWAIT the send (bounded — see
+    /// `AgentNotifyOutcome`) instead of reporting a channel's mere existence as delivery.
+    /// Nil hook → the tool reports it's unavailable in this runtime, the same honesty as
+    /// the headless memory tools.
+    public var onNotify: ((_ title: String, _ body: String) async -> AgentNotifyOutcome)?
     /// Fired when the model calls `read_session`. `session` is a name the engine has
     /// ALREADY validated (`TmuxSessionRead.validate`) or nil for "list the sessions";
     /// `lines` is already clamped. The runner turns that into a fixed argv on a channel of
@@ -178,6 +214,18 @@ public final class AgentTurnEngine {
         max(512, configuration.contextWindowTokens - configuration.maxOutputTokens - 512)
     }
 
+    /// The model-call attempt/retry count `record` stamps on every event — see
+    /// `AgentAuditEvent.attempt`/`retryCount`. Reset to a fresh 1/0 at the top of
+    /// `submit` (so a new turn never inherits the previous turn's last completion's
+    /// numbers) and advanced by `completeWithRetries` at the start of each of its own
+    /// attempts — meaning it holds whatever attempt most recently ran once
+    /// `completeWithRetries` returns, whether that attempt succeeded or exhausted
+    /// retries, and every `record` call for the rest of that round trip (the assistant
+    /// message it produced, its reasoning, the tool results that follow it) carries
+    /// that same, accurate count.
+    private var currentAttempt = 1
+    private var currentRetryCount = 0
+
     private func record(
         _ kind: String,
         _ text: String,
@@ -191,7 +239,9 @@ public final class AgentTurnEngine {
             text: text,
             toolName: toolName,
             toolArguments: toolArguments,
-            isFailure: isFailure
+            isFailure: isFailure,
+            attempt: currentAttempt,
+            retryCount: currentRetryCount
         ))
     }
 
@@ -203,9 +253,19 @@ public final class AgentTurnEngine {
         guard !isBusy else { return .failed("The engine is already running a turn.") }
         isBusy = true
         defer { isBusy = false }
+        // A fresh turn must never inherit the previous turn's last completion's
+        // attempt/retry count — see `currentAttempt`'s doc comment.
+        currentAttempt = 1
+        currentRetryCount = 0
 
         transcript.append(AgentMessage(role: .user, text: trimmed))
         record("userMessage", trimmed)
+        // Turn-visibility signal (item 6 of the message-delivery-reliability work): the
+        // INSTANT the user message is recorded, before any tool call or LLM round trip —
+        // the whole point is the app/supervisor sees "received" within seconds, not only
+        // once a reply is ready. See `DaemonTranscriptUplink` for the immediate (not
+        // batched) flush this specific kind gets on the daemon side.
+        record("turnStarted", "[turn] started")
 
         // Deterministic pre-classification, exactly as the app does it: the two
         // unambiguous intents get their tool executed before the model is ever asked.
@@ -339,6 +399,12 @@ public final class AgentTurnEngine {
 
         for attempt in 1...Self.maxModelAttempts {
             if Task.isCancelled { return (nil, nil) }
+            // Set BEFORE the call, not after: a failed attempt's own "error" record
+            // below (and, on success, every `record` call for the rest of this round
+            // trip) must reflect the attempt that is actually running, not the one
+            // that just finished.
+            currentAttempt = attempt
+            currentRetryCount = attempt - 1
             do {
                 let completion = try await client.complete(
                     messages: transcript.wireMessages,
@@ -418,7 +484,7 @@ public final class AgentTurnEngine {
             )
 
         case AgentToolSpec.notify.name:
-            return executeNotify(
+            return await executeNotify(
                 title: call.argument("title") ?? "",
                 body: call.argument("body") ?? "",
                 rawArguments: call.arguments
@@ -511,12 +577,11 @@ public final class AgentTurnEngine {
     }
 
     /// The model's `notify` tool: record the note, hand it to the runner's push channel,
-    /// and report back honestly. Deliberately synchronous and cheap — a proactively-social
-    /// push must never become a reason the mission stalls, so the runner fires-and-forgets
-    /// the actual delivery; this returns the moment it's handed off. A missing hook or an
-    /// unconfigured channel is told plainly so the model can fall back to its reply text
-    /// rather than believing a phantom owner heard it.
-    private func executeNotify(title: String, body: String, rawArguments: String) -> String {
+    /// and await the REAL outcome (bounded — see `AgentNotifyOutcome`) before answering,
+    /// so a proactively-social push never becomes a false "sent" or a false "failed". A
+    /// missing hook or an unconfigured channel is told plainly so the model can fall back
+    /// to its reply text rather than believing a phantom owner heard it.
+    private func executeNotify(title: String, body: String, rawArguments: String) async -> String {
         let toolName = AgentToolSpec.notify.name
         let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedBody.isEmpty else {
@@ -538,11 +603,19 @@ public final class AgentTurnEngine {
                    toolArguments: rawArguments, isFailure: true)
             return message
         }
-        let delivered = onNotify(trimmedTitle, trimmedBody)
-        return delivered
-            ? "Sent to the owner."
-            : "No push channel is configured, so the owner was not reached — say anything "
+        switch await onNotify(trimmedTitle, trimmedBody) {
+        case .delivered:
+            return "Sent to the owner."
+        case .queued:
+            return "Queued for the owner — delivery wasn't confirmed within a few seconds, "
+                + "but it may still land. Say anything important in your reply text too."
+        case .failed:
+            return "Delivery failed — a push channel is configured but the send is confirmed "
+                + "not to have gone out. Say anything important in your reply text instead."
+        case .unavailable:
+            return "No push channel is configured, so the owner was not reached — say anything "
                 + "important in your reply text instead, and keep going."
+        }
     }
 
     /// The model's `read_session` tool: validate the NAME, clamp the size, hand both to
@@ -708,10 +781,26 @@ public final class AgentTurnEngine {
         // same stdin burst as a multi-character chunk is treated by TUI input libraries
         // (Claude Code's included) as part of a paste — inserted, not submitted. The
         // app's live wrapper test showed exactly that failure; the pause makes the \r
-        // arrive as a lone keypress event. Same fix as `AgentRuntime.executeSendInput`.
-        session.sendAgentInput(AgentTurnLogic.typedBody(input))
+        // arrive as a lone keypress event. Same fix as `AgentRuntime.executeSendInput` —
+        // and, unlike the `isSessionConnected` pre-check above, this one is not a race:
+        // both calls are awaited below for their REAL outcome before anything downstream
+        // (including `awaitOutput`, which would otherwise wait out its full timeout for
+        // output that a dropped write can never produce) trusts that the bytes landed.
+        let bodySend = session.sendAgentInput(AgentTurnLogic.typedBody(input))
         try? await Task.sleep(for: .milliseconds(250))
-        session.sendAgentInput("\r")
+        let returnSend = session.sendAgentInput("\r")
+        let bodySent = await bodySend?.value ?? true
+        let returnSent = await returnSend?.value ?? true
+        guard bodySent, returnSent else {
+            let reason = session.lastError.map { " (\($0))" } ?? ""
+            let message = "Error: sending input to the terminal failed\(reason). The command may be "
+                + "partially typed or not sent at all — verify with read_terminal before retrying, "
+                + "rather than assuming it went through. NO HUMAN IS WATCHING THIS SESSION — do not "
+                + "repeat the send blind; confirm the session is reconnected first."
+            record("error", message, toolName: toolName,
+                   toolArguments: rawArguments, isFailure: true)
+            return message
+        }
         let outcome = await awaitOutput(
             seconds: awaitOutputSeconds,
             after: baselineEventID,

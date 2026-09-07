@@ -275,10 +275,22 @@ final class RecordingStubSession: AgentSessionDriving {
     /// driving. Nothing in the engine probes anything now, and a test watches this to keep
     /// it that way.
     private(set) var environmentProbes: [String] = []
+    /// Test seam: when set, every subsequent `sendAgentInput` reports a dropped write
+    /// (matching a disconnected `HeadlessTerminalSession`) instead of recording it, so
+    /// `executeSendInput`'s failure-propagation path can be exercised without SSH.
+    var failSends = false
+    private(set) var lastError: String?
 
-    func sendAgentInput(_ text: String) {
+    @discardableResult
+    func sendAgentInput(_ text: String) -> Task<Bool, Never>? {
+        guard !text.isEmpty else { return nil }
+        if failSends {
+            lastError = "stub: simulated write failure"
+            return Task { false }
+        }
         sentInputs.append(text)
         eventLog.recordInput(Array(text.utf8))
+        return Task { true }
     }
 
     func probeEnvironment(_ name: String, timeout: TimeInterval) async -> String? {
