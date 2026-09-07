@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Re-signs the 7-day presigned S3 URLs in fin-agentd's config and restarts the
+	     daemon so it reads them. Rendered by install.sh (see README.md, "Refresh").
+
+	     Two slots a week because ONE slot against 7-day URLs has zero slack: sign
+	     Sunday 04:00 and the URLs die the following Sunday 04:00, the very minute of
+	     the next run. With Sunday+Wednesday every URL is renewed with ~3.5 days left
+	     on it. A MISSED run has no slack at all, in either arrangement: miss Sunday
+	     (Mac powered off — launchd does not replay slots missed while off) and the
+	     next attempt is Wednesday 04:00, which is exactly when Sunday's signature
+	     expires. Two slots halve the exposure; they do not survive a miss. That is why
+	     refresh.sh pushes a /notify when it fails and launch-agentd.sh warns when
+	     provision-state.json's expires_at is inside 48 hours.
+
+	     ProgramArguments points at the INSTALLED copy under
+	     ~/Library/Application Support/fin-agentd/bin/, never at the git checkout: this
+	     directory lives on an unmerged branch, and one `git checkout main` in that
+	     worktree would turn this job into a silent ENOENT and the site deaf a week
+	     later. -->
+	<key>Label</key>
+	<string>dev.levischoen.fin.agentd.refresh</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__FIN_REFRESH_SCRIPT__</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Weekday</key>
+			<integer>0</integer>
+			<key>Hour</key>
+			<integer>4</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+		<dict>
+			<key>Weekday</key>
+			<integer>3</integer>
+			<key>Hour</key>
+			<integer>4</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>FIN_AGENTD_HOME</key>
+		<string>__FIN_AGENTD_HOME__</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>__FIN_AGENTD_LOG_DIR__/refresh.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>__FIN_AGENTD_LOG_DIR__/refresh.err.log</string>
+</dict>
+</plist>

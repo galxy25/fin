@@ -1644,7 +1644,13 @@ final class AgentRuntime: ObservableObject {
             do {
                 let completion = try await client.complete(
                     messages: transcript.wireMessages,
-                    tools: AgentToolSpec.all
+                    // NOT `.all`: `read_session` needs the daemon's second SSH exec channel
+                    // and a machine whose tmux sessions it manages, so in the app it can
+                    // only ever answer "not available here" — and its own description tells
+                    // the model to reach for it whenever someone asks what is running. The
+                    // app reads other sessions with `tmux capture-pane` through send_input,
+                    // which is what this runtime's routing prompt already says.
+                    tools: AgentToolSpec.roster(readSession: false)
                 )
                 return (completion, attempt, nil)
             } catch {
@@ -1732,6 +1738,21 @@ final class AgentRuntime: ObservableObject {
                 rawArguments: call.arguments
             )
 
+        case AgentToolSpec.readSession.name:
+            // The roster is shared with fin-agentd (AgentToolSpec.all), so the app
+            // advertises this tool and must answer for it honestly rather than as an
+            // unknown tool. It genuinely cannot provide it: read_session reads a tmux
+            // session the app's SSH session is NOT in, over a second exec channel the
+            // daemon opens, and the app drives one arbitrary server where the user's own
+            // session is usually the one on screen already.
+            let message = "Error: read_session is not available in the Fin app — it reads other "
+                + "tmux sessions from the resident daemon, which is not what is running here. "
+                + "Use read_terminal for this terminal, or `tmux capture-pane -p -t <session>` "
+                + "through send_input if this server has other sessions."
+            record(.error, message, toolName: call.name,
+                   toolArguments: call.arguments, isFailure: true)
+            return message
+
         case AgentToolSpec.notify.name:
             return executeNotify(
                 title: call.argument("title") ?? "",
@@ -1741,7 +1762,7 @@ final class AgentRuntime: ObservableObject {
 
         default:
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
-                + AgentToolSpec.all.map(\.name).joined(separator: ", ") + "."
+                + AgentToolSpec.roster(readSession: false).map(\.name).joined(separator: ", ") + "."
             record(.error, message, toolName: call.name, isFailure: true)
             return message
         }

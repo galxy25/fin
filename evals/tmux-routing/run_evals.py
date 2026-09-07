@@ -34,9 +34,26 @@ HERE = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
-# Guarded executor — the ONLY thing allowed to send keys, in evals and (as the
-# design to port) in production. The allow-list comes from the registry, never
-# from what happens to exist on the server.
+# Guarded executor — the ONLY thing allowed to send keys. The allow-list comes
+# from the registry, never from what happens to exist on the server.
+#
+# NOT PORTED ANY MORE, AND THE DIFFERENCE IS THE POINT. Production's counterpart
+# is TmuxCommandGuard in daemon/Sources/FinAgentCore/TmuxCommandGuard.swift, wired
+# into AgentTurnEngine.executeSendInput — and it no longer has an allow-list, a
+# registry snapshot, a session-name check, or a "fin-*" namespace. Eight reviews
+# walked through that design 35 different ways, so the boundary moved out of the
+# parser: the agent's shell runs on its OWN tmux socket (`exec tmux -L fin …`), a
+# different server process from the human's, and every tmux command it types must
+# name that socket explicitly or be refused. Sessions on the agent's own server
+# are all the agent's own, so there is nothing left to register. The human's
+# sessions are READ through a `read_session` tool that runs a fixed argv on a
+# separate SSH channel, and cannot be written at all.
+#
+# What this harness still tests is the ROUTER's policy — which session a model
+# should aim at, given a registry — not production's enforcement, which is now a
+# socket boundary plus a small "name your server" rule. The refuse-scenarios below
+# remain the spec for the router's judgment; do not port an allow-list back out of
+# them.
 # ---------------------------------------------------------------------------
 class GuardedTmuxExecutor:
     def __init__(self, socket_name: str, registry: dict):

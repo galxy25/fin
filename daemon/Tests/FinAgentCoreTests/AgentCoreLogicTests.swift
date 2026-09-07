@@ -267,9 +267,22 @@ final class RecordingStubSession: AgentSessionDriving {
     let eventLog = TerminalEventLog()
     var isSessionConnected = true
     private(set) var sentInputs: [String] = []
+    /// What the "live shell" would answer if anything asked it for an environment variable.
+    var environment: [String: String] = [:]
+    /// Every variable the engine asked about, in order. It must stay EMPTY: the engine used
+    /// to probe `$TMUX` before any send its prefilter thought might be tmux — which is any
+    /// send containing a quote — typing an `echo` into whatever program the model was
+    /// driving. Nothing in the engine probes anything now, and a test watches this to keep
+    /// it that way.
+    private(set) var environmentProbes: [String] = []
 
     func sendAgentInput(_ text: String) {
         sentInputs.append(text)
         eventLog.recordInput(Array(text.utf8))
+    }
+
+    func probeEnvironment(_ name: String, timeout: TimeInterval) async -> String? {
+        environmentProbes.append(name)
+        return environment[name]
     }
 }

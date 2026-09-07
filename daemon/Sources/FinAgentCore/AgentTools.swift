@@ -180,7 +180,65 @@ public struct AgentToolSpec {
         ]
     )
 
-    static let all: [AgentToolSpec] = [readTerminal, sendInput, remember, recall, requestInput, monitor, notify]
+    /// The read half of the private-socket design, in the model's hands as a NAME, never
+    /// as a command line (`TmuxSessionRead`). Fin's shell lives on its own tmux socket, so
+    /// `tmux capture-pane -t main` typed into that shell reaches Fin's own server, where
+    /// the human's sessions do not exist. This tool is the supported path to them: the
+    /// runner runs a fixed `tmux capture-pane` argv on a separate channel against the
+    /// machine's default socket, and the only thing the model contributes is one validated
+    /// session name.
+    ///
+    /// The listing is folded into the same tool rather than split into a second one, so
+    /// the discovery step is impossible to miss: no arguments lists, a name reads.
+    static let readSession = AgentToolSpec(
+        name: "read_session",
+        description: "Look at ANOTHER terminal session on this machine — the owner's own work, "
+            + "or another agent's session. Call it with NO arguments to list the sessions by name, "
+            + "then call it again with one of those exact names to see that session's screen. Use "
+            + "it whenever you are asked what is running, what another session printed, or how "
+            + "someone else's work is going. read_terminal shows only YOUR terminal; this is the "
+            + "only way to see the others, and it is read-only — it cannot type into them.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "session": [
+                    "type": "string",
+                    "description": "The session's name, exactly as the listing printed it. "
+                        + "Omit to list the sessions instead of reading one. A name only — not a "
+                        + "command, not a tmux argument.",
+                ],
+                "lines": [
+                    "type": "integer",
+                    "description": "How many trailing lines of that session's screen to return "
+                        + "(1-\(TmuxSessionRead.maxLines)). Omit for the default "
+                        + "(\(TmuxSessionRead.defaultLines)).",
+                ],
+            ],
+            "required": [String](),
+        ]
+    )
+
+    static let all: [AgentToolSpec] = [
+        readTerminal, sendInput, readSession, remember, recall, requestInput, monitor, notify,
+    ]
+
+    /// The roster MINUS the tools a runtime cannot actually provide.
+    ///
+    /// A shared roster is the right default — the app and the daemon should not drift — but
+    /// advertising a tool whose dispatch can only answer "not available here" is a trap the
+    /// model walks into once per conversation: it costs a turn, prints a red error row, and
+    /// the description ("this is the only way to see the others", "use it whenever you are
+    /// asked what is running") is written to make it call. `read_session` is exactly that in
+    /// the Fin app: it needs a second SSH exec channel against a machine whose tmux sessions
+    /// the app is not managing, and the app's own routing prompt tells the model to use
+    /// `tmux capture-pane` for that instead — two contradictory instructions, the
+    /// tool-shaped one always failing.
+    ///
+    /// So the runtime that cannot serve it does not offer it. The dispatch's honest error
+    /// stays as a backstop for a model that names the tool anyway.
+    static func roster(readSession available: Bool) -> [AgentToolSpec] {
+        available ? all : all.filter { $0.name != readSession.name }
+    }
 
     static let knownToolNames: Set<String> = Set(all.map(\.name))
 
