@@ -39,8 +39,30 @@ free_gb() {
 
 other_builds() {
   # Any xcodebuild or SwiftPM build/test driver that is not our own ancestor.
-  pgrep -f 'xcodebuild|swift-build|swift-test|swift-package' 2>/dev/null \
-    | grep -vx "$$" | grep -vx "$PPID" | wc -l | tr -d ' '
+  #
+  # Match the EXECUTABLE, not the command line. `pgrep -f` matches the whole
+  # command line, so anything that merely MENTIONS a build tool counts as one:
+  # on 2026-09-07 this loop waited out its full two-hour timeout against a single
+  # monitor process whose only crime was grepping for the string "swift-build".
+  # A watcher looking for builds is not a build. `ps -o comm=` gives the running
+  # program's own name, which a shell wrapper's arguments cannot forge.
+  ps -axo pid=,comm= 2>/dev/null | while read -r _pid _comm; do
+    case "${_comm##*/}" in
+      xcodebuild|swift-build|swift-test|swift-frontend|swift-package|swiftc)
+        [ "$_pid" = "$$" ] || [ "$_pid" = "$PPID" ] || echo "$_pid" ;;
+    esac
+  done | wc -l | tr -d ' '
+}
+
+# The pids we are waiting on, so an orphan from a killed run is distinguishable
+# from a live neighbour without another session having to guess.
+other_build_pids() {
+  ps -axo pid=,comm= 2>/dev/null | while read -r _pid _comm; do
+    case "${_comm##*/}" in
+      xcodebuild|swift-build|swift-test|swift-frontend|swift-package|swiftc)
+        [ "$_pid" = "$$" ] || [ "$_pid" = "$PPID" ] || echo "$_pid" ;;
+    esac
+  done | tr '\n' ' '
 }
 
 release() { rm -rf "$LOCK"; }
@@ -63,7 +85,7 @@ waited=0
 while :; do
   n=$(other_builds); f=$(free_gb)
   if [ "$n" -eq 0 ] && [ "$f" -ge "$MIN_FREE_GB" ]; then break; fi
-  [ $((waited % 60)) -eq 0 ] && log "holding: other builds=$n, free=${f}GB (need 0 and >=${MIN_FREE_GB}GB)"
+  [ $((waited % 60)) -eq 0 ] && log "holding: other builds=$n [$(other_build_pids)], free=${f}GB (need 0 and >=${MIN_FREE_GB}GB)"
   sleep 10; waited=$((waited + 10))
   [ "$waited" -lt "$MAX_WAIT_S" ] || { log "gave up after ${MAX_WAIT_S}s waiting for a quiet machine"; exit 75; }
 done
