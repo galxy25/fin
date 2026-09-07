@@ -12,6 +12,8 @@ sources:
   - 78e6c36 — "Name your tmux server, or nothing" (committed 2026-09-06 13:22:14)
   - 6ea70e9 — "Lab book round 4: make the branch-citation rule mechanical, not editorial" (committed 2026-09-06 14:24:25)
   - 2d5bb29:scripts/model-factory/labbook/check_citations.py — the checker this entry extends
+  - "measured 2026-09-06 21:35 PDT against the checker as `d2f40b0` shipped it and again after widening: the substitution table and the T007 fixture result, both pasted below"
+  - "measured 2026-09-06 21:35 PDT over this book's 33 files: 132 prose branch mentions in logical lines, 117 of them with no read declaration — the cost of the structural rule, pasted below"
   - 2d5bb29:scripts/model-factory/labbook/year-1/P001-2026-09-06-promotion-protocol.md:82-84 — the retired sentence, still in the body
   - 2d5bb29:scripts/model-factory/labbook/year-1/O010-2026-09-06-fixing-a-citation-is-a-citation.md:88 — the "now means" sentence
   - 2d5bb29:scripts/model-factory/labbook/year-1/O005-2026-09-06-no-provenance-in-verdicts.md:102 — the table row labelled with a branch name
@@ -349,6 +351,85 @@ indistinguishable from a read time to any reader and to any regex.
   already has the right words in it: *"… was `78e6c36` when read at 2026-09-06
   13:22:14"*.
 
+### The limit these two rules still have
+
+The paragraph above says `BRANCH-SUBJECT` "closes the grammatical gap". As
+written at `d2f40b0` that overstated what was shipped, and the round-5 audit
+showed it by substituting **one word**. Demonstrated against the checker as
+`d2f40b0` had it:
+
+```
+  O013's own sentence              ['BRANCH-TIP']
+  temporal swap: presently         NO FINDING     ← `main` means `587fb9a` presently
+  temporal swap: at this writing   NO FINDING
+  temporal swap: as things stand   NO FINDING
+```
+
+`TIP_PREDICATE` is a closed list of verbs and `TIP_NOW_RE` a closed list of
+temporal phrases. The two overlap enough to catch each other's single
+substitutions in the *predicate* — swap `means` for `designates` and `now` still
+fires `BRANCH-TIP` — but a swap on the temporal side alone had nothing behind
+it, and that is a one-word edit to the very sentence this entry is built on.
+
+**What was done:** both lists are wider (`presently`, `nowadays`, `at this
+writing`, `as things stand`, `as of this writing`, `at the tip`, `for now` on
+the temporal side; `designates`, `equals`, `refers to`, `sits on`, `stands on`
+on the predicate side), one guard was added so a *negated* predicate is not read
+as a tip claim — O009 says a bare id on one branch did not name the entry the
+other book named, which is a claim about what a branch failed to do and not
+about where it points — and fixture **`T007-substituted.md`** plants the
+substituted wording so the widening cannot silently regress. Re-run:
+
+```
+  T007-substituted.md expect ['BRANCH-TIP']
+                   got    ['BRANCH-TIP']  PASS
+```
+
+**What was not done, and will not be by widening:** a wider closed list is still
+a closed list. Both of these still escape, and they were run, not imagined:
+
+```
+  verb + temporal both off the list   NO FINDING
+     "`main` tracks `587fb9a` as of this afternoon."
+  no tip predicate at all             NO FINDING
+     "The tip we scored against was `main`, i.e. `587fb9a`."
+```
+
+**The structural alternative was measured before being declined.** The rule that
+does not depend on vocabulary is: *every prose mention of a branch name must
+carry a read declaration in its logical line, unconditionally* — no verb list,
+no adverb list. Both counts, run 2026-09-06 21:35 PDT over this book's 33 files:
+
+```sh
+# what the branch rules find today (live + waived, every BRANCH-* rule)
+35 findings at 27 distinct file:line sites
+
+# what the structural rule would find
+prose branch mentions (logical lines, fences skipped):        132
+  ...with no read declaration in the same logical line:       117
+```
+
+**117 against 27 sites.** In an append-only book that is roughly ninety
+additional waiver lines, and a rule that needs a waiver nine times out of ten is
+the cry-wolf failure the six precision guards above exist to prevent. So the
+structural rule is the right rule and it is not affordable against a book
+already written; it would be affordable against a book that adopted it on day
+one.
+
+*(The 35/27 above is also the measurement that shows the widening cost nothing:
+the checker as `d2f40b0` shipped it produces the same 35 findings at the same 27
+sites on the same book. The wider lists fire on `T007` and on nothing that was
+already written.)*
+
+**The honest statement of what this checker does**, replacing "closes the
+grammatical gap": *`BRANCH-SUBJECT` and `BRANCH-TIP` catch the nine sentences
+this book actually shipped, plus the substitutions nearest to them. They are
+enumerative, not structural, and a writer who does not know the lists can evade
+them without trying.* The checker is a floor under the failure mode that has
+recurred five times, not a proof of its absence — and this entry's opening
+claim, that "a checker that misses the defect it was written for is worse than
+none, because its exit code is read as a warrant", applies to this checker too.
+
 ### And one more the rules found on their own
 
 **`BRANCH-LINECOUNT`.** `LINE-CLAIM` re-derives a stated line count only when it
@@ -414,10 +495,16 @@ sentence that got through:
 | `T004-wrapped.md` | P001's sentence, hard-wrapped across two lines exactly as the book wraps it | `BRANCH-LOCUS`, `BRANCH-LINE`, `BRANCH-LINECOUNT` |
 | `T005-subject.md` | the two subject-form claims and the table-row caption | `BRANCH-TIP` |
 | `T006-tip-ok.md` | the same three claims written correctly, with "read at" | nothing |
+| `T007-substituted.md` | the same claims with one word swapped off each closed list — "means … presently", "designates … at this writing", "sits on … as things stand" | `BRANCH-TIP` |
 
 The third is the one that matters most: a checker that fires on everything
 teaches nothing. `T006` proves the rule can be satisfied and shows the exact
 wording that satisfies it.
+
+`T007` was added by the round-5 audit and is the one that keeps the widened
+lists wide. It is not evidence that the vocabulary gap is closed — see *the
+limit these two rules still have*, above — only that the three substitutions
+that were demonstrated to escape no longer do.
 
 ## What this does not show
 
@@ -425,6 +512,11 @@ wording that satisfies it.
   these rules*. Nine sentences is what five rules find; a sixth rule would
   probably find more, and the honest reading of "the audit found four and the
   rules found nine" is that reading does not scale, not that nine is the total.
+- **It does not show the rules are hard to evade.** They are closed word lists
+  and a one-word substitution walked through them until the round-5 audit;
+  two demonstrated substitutions still do. The section above states the limit
+  and the measured cost (117 findings) of the structural rule that would not
+  have it.
 - **It does not check that a sha is the *right* sha.** `SHA-EXISTS` proves a sha
   resolves; nothing proves it is the revision the claim is about. The four-way
   contradiction in item 1 involved no unresolvable sha.
@@ -452,6 +544,13 @@ wording that satisfies it.
   the factory references `datasets/mlx`" is false at `2d5bb29` — 25 hits, 24 of
   them inside `scripts/model-factory/`. That is a change in the world rather
   than an error in O005, and it deserves its own entry.
+- **`BRANCH-SUBJECT` and `BRANCH-TIP` are enumerative and a structural rule
+  exists.** Requiring a read declaration beside every prose branch mention needs
+  no word lists and cannot be evaded by vocabulary; it fires 117 times on this
+  book against these rules' 13, which is ~104 waivers append-only would have to
+  carry forever. *Settled by:* adopting it in a book that starts with it, or by
+  a `--strict` mode that a new entry must pass while the published corpus is
+  scanned under the enumerative rules. Neither is done.
 - **The checker has no test for the waiver validation it just gained.**
   `--self-test` proves the rules fire; it does not yet plant a
   `corrected-elsewhere` waiver pointing at a non-existent entry and assert that

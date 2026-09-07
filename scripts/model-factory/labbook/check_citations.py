@@ -39,6 +39,19 @@ Rules enforced
                   is indistinguishable from a read time to any reader, so the
                   words "read at" are what the rule requires.
 
+  KNOWN LIMIT of BRANCH-SUBJECT and BRANCH-TIP: both are CLOSED WORD LISTS --
+  TIP_PREDICATE enumerates the verbs, TIP_NOW_RE the temporal phrases. Round 5
+  shipped them claiming to close the defect shape; the round-5 audit showed the
+  shape escaping on a ONE-WORD substitution ("`main` means `587fb9a`
+  presently" fired nothing). Both lists were widened and T007 locks the
+  widening in, but a wider closed list is still a closed list: a verb and a
+  temporal phrase both off the lists still escape, and prose has unbounded
+  ways to say "now". The structural alternative -- require a read declaration
+  beside EVERY prose branch mention, unconditionally -- was measured against
+  this book: 117 findings, against the 35 (at 27 sites) every BRANCH-* rule
+  finds today, which in an append-only book means ~90 new waivers. Recorded in
+  O013, not fixed.
+
   BRANCH-LINECOUNT  A line count -- "that file is 217 lines" -- asserted in the
                   same logical line as an unpinned branch. LINE-CLAIM only
                   re-derives counts stated beside a `<sha>:<path>` anchor, so a
@@ -334,10 +347,20 @@ CLOCKY_RE = re.compile(r"\d[:.-]$")
 # "the name `main`, which ... points at `587fb9a`" and "`main` is 219 lines"
 # matched nothing at all -- and that is the shape of every round-5 finding.
 TIP_PREDICATE = (
-    r"(?:now\s+|currently\s+|today\s+)?"
+    r"(?:now\s+|currently\s+|today\s+|presently\s+)?"
     r"(?:means|meant|points?\s+(?:at|to)|pointed\s+(?:at|to)"
     r"|resolves?\s+to|resolved\s+to|has\s+moved\s+to|moved\s+to"
-    r"|sits\s+at|stands\s+at|tip\s+is|is|was)"
+    r"|sits\s+(?:at|on)|sat\s+(?:at|on)|stands\s+(?:at|on)|stood\s+(?:at|on)"
+    r"|designates?|designated|equals?|equalled|refers?\s+to|referred\s+to"
+    r"|tip\s+is|is|was)"
+)
+
+# A negated predicate is not a tip claim. "`labbook` did not name the entry"
+# (O009) says what a branch failed to do, not what it currently resolves to,
+# and reporting it would teach the reader to skim -- the failure mode the
+# precision guards below exist to prevent.
+NEGATED_PREDICATE_RE = re.compile(
+    r"\b(?:not|never|n't|no\s+longer)\s*$", re.IGNORECASE
 )
 BRANCH_SUBJECT_RE_TMPL = (
     r"(?<![\w/-])[`'\"*_]{0,3}(?P<ref>{names})(?!@\{)[`'\"*_]{0,3}"
@@ -362,8 +385,11 @@ MAIN_AS_ADJECTIVE = {
 # to the instant it was typed and to no other, which is the one thing a reader
 # cannot recover.
 TIP_NOW_RE = re.compile(
-    r"\b(?:now|today|currently|at\s+the\s+moment|as\s+of\s+now"
-    r"|right\s+now|at\s+present|these\s+days)\b",
+    r"\b(?:now|today|currently|presently|nowadays|at\s+the\s+moment|as\s+of\s+now"
+    r"|right\s+now|for\s+now|at\s+present|these\s+days|at\s+the\s+tip"
+    r"|as\s+(?:things|matters)\s+stand"
+    r"|as\s+of\s+(?:this\s+writing|today|now)"
+    r"|at\s+(?:this|the\s+time\s+of)\s+writing)\b",
     re.IGNORECASE,
 )
 
@@ -606,6 +632,9 @@ def scan_file(
         for m in subject_re.finditer(text):
             ref = m.group("ref")
             if label_row or adjectival(ref, m.end("ref")):
+                continue
+            # "`labbook` did NOT name X" is not a claim about a tip.
+            if NEGATED_PREDICATE_RE.search(m.group("gap") or ""):
                 continue
             # Sentence scope, not a character window: "what `main` meant while
             # this book was written" sits 85 characters from the `704ab09` that
@@ -956,6 +985,20 @@ It is the sha, not the name `main`, which pointed at `704ab09` while this book
 was written and points at `587fb9a` now.
 """
 
+# The round-5 audit's finding: TIP_PREDICATE and TIP_NOW_RE are closed word
+# lists, so the defect O013 says they close evaded on a ONE-WORD substitution --
+# "`main` means `587fb9a` presently" fired nothing at all. The lists are wider
+# now and this fixture is what keeps them wide. It is NOT a claim that the gap
+# is closed; see O013's "the limit these two rules still have".
+SELF_TEST_SUBSTITUTED = """---
+id: T007
+---
+`main` means `587fb9a` presently, and `imac-site` designates `78e6c36` at this
+writing.
+
+`labbook` sits on `6ea70e9` as things stand.
+"""
+
 # The same three claims, written correctly. A rule nothing can satisfy teaches
 # nothing, so this fixture must stay silent.
 SELF_TEST_TIP_OK = """---
@@ -997,6 +1040,8 @@ def self_test() -> int:
         (root / "year-1" / "T004-wrapped.md").write_text(SELF_TEST_WRAPPED)
         (root / "year-1" / "T005-subject.md").write_text(SELF_TEST_SUBJECT)
         (root / "year-1" / "T006-tip-ok.md").write_text(SELF_TEST_TIP_OK)
+        (root / "year-1" / "T007-substituted.md").write_text(
+            SELF_TEST_SUBSTITUTED)
 
         findings, _ = run(root, repo_root, verify_lines=True, waivers=[])
         by_file: dict[str, set[str]] = {}
@@ -1030,6 +1075,11 @@ def self_test() -> int:
             ),
             "T005-subject.md": (
                 "branch as subject: '`main` now means `587fb9a`'",
+                {"BRANCH-TIP"},
+            ),
+            "T007-substituted.md": (
+                "one-word substitutions off the closed lists: "
+                "'means ... presently', 'designates ... at this writing'",
                 {"BRANCH-TIP"},
             ),
         }

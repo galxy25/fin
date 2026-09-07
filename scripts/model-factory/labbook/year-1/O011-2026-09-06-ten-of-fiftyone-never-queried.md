@@ -11,7 +11,7 @@ sources:
   - 2d5bb29:scripts/model-factory/gate_sweep.sh:73-88 — the comment block and `probe()` added in response
   - 2d5bb29:scripts/model-factory/gate_sweep.sh:143-144 — `probe` in the `serve &&` chain, and `"$FUSED"` as the model id where an invented label used to be
   - 7fb54b5 — `git show 7fb54b5 -- scripts/model-factory/gate_sweep.sh` is the whole 23-line diff, including `SERVE-FAILED` → `SERVE-OR-PROBE-FAILED`
-  - "evals/tmux-routing/scenarios.json at 2d5bb29 — 51 scenarios, 25 hard, expected actions route 24 / start 13 / clarify 10 / refuse 4 (parsed 2026-09-06 20:47 PDT)"
+  - "evals/tmux-routing/scenarios.json — 51 scenarios, 25 hard, expected actions route 24 / start 13 / clarify 10 / refuse 4; clarify is c01-c05 (core) and h13, h22-h25 (hard). Parsed once, re-parsed 2026-09-06 21:33:14 PDT after the audit, output pasted below"
   - "local-artifact: models/gate-sweep/eval-1000.log — the per-class breakdown a real run prints, quoted below"
 related: [E009, O012, P004, P001, E005]
 corrects: []
@@ -44,17 +44,25 @@ server did not have, every request 404'd, and `router_llm.py` degraded each
 scenario to its clarify fallback.
 
 The corpus has **exactly 10 scenarios whose expected action is `clarify`**
-(`scenarios.json`, parsed 2026-09-06 20:56 PDT: route 24 / start 13 / clarify 10
-/ refuse 4). A router that answers `clarify` to everything scores 10/51 — every
-clarify scenario, nothing else, at every checkpoint, forever.
+(`scenarios.json`, re-parsed 2026-09-06 **21:33:14** PDT: route 24 / start 13 /
+clarify 10 / refuse 4). A router that answers `clarify` to everything scores
+10/51 — every clarify scenario, nothing else, at every checkpoint, forever.
 
 ### Correcting the count in the commit that fixed it
 
 `7fb54b5`'s commit message says *"exactly the five clarify scenarios passed"*
-and `2d5bb29:scripts/model-factory/gate_sweep.sh:76` carries the same figure
+and `7fb54b5:scripts/model-factory/gate_sweep.sh:76` carried the same figure
 beside the same 10/51 in one sentence. **Five and 10/51 cannot both be right,
-and the number is ten.** Parsed at 2026-09-06 20:56 PDT, the ten clarify
-scenarios are:
+and the number is ten.** Re-parsed at 2026-09-06 21:33:14 PDT — output pasted
+rather than described, which is the rule this entry exists to enforce:
+
+```sh
+$ python3 -c "import json; …"      # evals/tmux-routing/scenarios.json
+scenarios 51 | hard 25
+expected actions: {'route': 24, 'start': 13, 'clarify': 10, 'refuse': 4}
+clarify core: ['c01', 'c02', 'c03', 'c04', 'c05']
+clarify hard: ['h13', 'h22', 'h23', 'h24', 'h25']
+```
 
 | tier | ids | count |
 | --- | --- | ---: |
@@ -63,11 +71,21 @@ scenarios are:
 
 So the empty-pipe signature decomposes as **core 5/26, hard 5/25, overall
 10/51**. "Five" was a count of the core half, written while the total was a
-count of both. The script's comment is corrected in the same commit as this
-entry; the commit message stands as written, with this as its correction, and
-the mistake is instructive in its own right — *the fix for a miscounted
-measurement shipped a miscount*, which is O010's subject arriving in a new
-place.
+count of both. The script's comment was corrected in the same commit as this
+entry and re-verified against the corpus in the audit —
+`grep -n clarify scripts/model-factory/gate_sweep.sh` at `:76-77` now reads *"the
+10 clarify scenarios pass — 5 core (c01-c05) and 5 hard (h13, h22-h25)"*, which
+is the parse above. The commit message stands as written, with this as its
+correction, and the mistake is instructive in its own right — *the fix for a
+miscounted measurement shipped a miscount*, which is O010's subject arriving in
+a new place.
+
+*Corrected.* At `d2f40b0` this entry dated the same single `scenarios.json`
+parse two ways — **20:47 PDT** in the front matter and **20:56 PDT** twice in
+the body. One read has one time. Neither is recoverable, so both are replaced
+by the re-parse above, whose output is pasted in full. A read time that cannot
+be reconstructed is not a smaller defect than a wrong number; it is the same
+defect, since a tip and a corpus are both things that move.
 
 So the number was not a measurement of a damaged model. It was a measurement of
 **an empty pipe**, and it was stable across checkpoints for the same reason a

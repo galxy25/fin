@@ -172,22 +172,34 @@ that shape. Do not retrofit today's repository onto yesterday's revision.
 - **A branch name is not a revision.** `main` is a moving pointer: it was
 `704ab09` while this book was written, `587fb9a` when round 3 shipped,
 `077d970` when round 4 started pinning, `b9876c1` an hour later, `7fb54b5` when
-the gate ran, and `2d5bb29` when read at 2026-09-06 20:52:57 PDT. That is
-**eight distinct tips from this book's merge base onward, out of eleven that
-the branch took on 2026-09-06** — `704ab09`, `919cfcb`, `587fb9a`, `077d970`,
-`b9876c1`, `7fb54b5`, `3ea4a65`, `2d5bb29`:
+the gate ran, `2d5bb29` when read at 2026-09-06 20:52:57 PDT, and `d2f40b0`
+when read at 2026-09-06 21:28:54 PDT. **This census does not have a stable
+value and no revision of this file can state one**, for the reason the next
+paragraph gives. Run it; do not read it:
 
 ```sh
-git reflog show main --date=format:'%Y-%m-%d %H:%M:%S' | grep -c 2026-09-06   # 11
+git reflog show main --date=format:'%Y-%m-%d %H:%M:%S' | grep -c 2026-09-06
 ```
 
-Round 4 wrote five-of-eight here and did not re-run it; round 5 did, and got
-eleven (O013). **Do not carry these two numbers forward by hand either** — they
-are a count of the repository, and the count is the maintenance, not the
-sentence.
+**Every number this sentence has ever carried was falsified by the commit that
+carried it.** Round 4 wrote five-of-eight and did not re-run it. Round 5 re-ran
+it, got **eleven**, wrote eleven — and then committed `d2f40b0` to `main`, which
+made it **twelve** (verified 2026-09-06 21:28:54 PDT, the same command, output
+`12`), and made the distinct-tips count **nine** rather than eight. That is not
+carelessness a more careful writer avoids: *a tally of the default branch's own
+tips, written into a commit that lands on that branch, increments itself the
+instant it is published.* The sentence is self-refuting by construction, so this
+revision carries the command and no answer.
 
-and `git grep 'datasets/mlx' main` changed answer across them without anyone
-touching the factory. `imac-site` advanced three commits in the same window
+**And the checker cannot help here.** The count lives in a fenced block, which
+`check_citations.py` skips by design (`FENCE_RE`), and no rule re-derives a
+reflog count in any case. The only control on this number is running the
+command, which is the same control the paragraph below prescribes for every
+command in the book.
+
+Across those tips, `git grep 'datasets/mlx'` changed answer without anyone
+touching the factory (O013 item 4: one hit at `587fb9a`, twenty-five at
+`2d5bb29`). `imac-site` advanced three commits in the same window
 (`git rev-list --count cd64914..78e6c36` → 3). Cite the sha. If prose needs the
 name, give the sha beside it and say when it was read. This one is now checked
 by `check_citations.py` rather than trusted to the writer.

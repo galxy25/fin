@@ -31,6 +31,33 @@ After the third number, the session running the sweep reported the hard tier as
 **"falling monotonically"** and offered it as evidence that the last checkpoint
 would not be the best one.
 
+> **That quotation is UNSOURCED, and it is this entry's central evidence.** The
+> four scores are artifacts — `results.tsv` and `sweep.log`, quoted above and in
+> the front matter. The claim made *about* them while the sweep was still
+> running is not. It survives only as this entry's own account of what the
+> session said, and as the commit message of `d2f40b0`, which is the commit that
+> published this entry. Searched for, not assumed:
+>
+> ```sh
+> $ grep -ic monoton models/gate-sweep/sweep.log models/gate-sweep/results.tsv
+> models/gate-sweep/sweep.log:0
+> models/gate-sweep/results.tsv:0
+> $ git log --all --grep=monoton --oneline     # in this repository
+> d2f40b0 Lab book round 5: run 1 gated and closed, …   ← this entry's own commit
+> 011577a Auto-increment TestFlight build numbers; …    ← unrelated
+> ```
+>
+> So an entry whose whole subject is over-reading a partial measurement rests
+> on a self-report with no artifact behind it. O011 flags its own unsourced
+> item — "the broken sweep's start and end times are UNSOURCED" — and at
+> `d2f40b0` this entry flagged nothing, which is the same asymmetry it is
+> complaining about, pointed the other way. *Settled by:* a transcript or a
+> written note timestamped between the third and fourth rows. Neither exists.
+>
+> **What does not depend on the quotation:** the four scores, the ≥3-scenario
+> threshold H003 and H004 wrote down in advance, and the rule below. Those stand
+> on artifacts. The *narrative* — that someone said it, and when — does not.
+
 The fourth number was 19. **The final checkpoint was the best candidate** on the
 overall total (45/51, the highest of the four) and second-best on the hard tier.
 

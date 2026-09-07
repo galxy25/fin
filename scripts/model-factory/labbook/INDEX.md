@@ -67,16 +67,36 @@ is unambiguous.
 
 ## What closes next
 
-| entry | closed by |
-| --- | --- |
-| ~~E004 (open)~~ | **closed 2026-09-06 by E009** — the sweep ran; nothing promoted |
-| ~~H004~~ | **settled 2026-09-06 by E009**: outcome A, hard 21/18/16/19 against the base's 24 |
-| H003 | **still open after E009.** Four un-repeated points cannot resolve a 2-scenario difference (O012); it needs a repeat, not another sweep |
-| H001 | a `score_bits.py` pass (`d4901d4` on `bits-curriculum`) over `datasets/mlx/train.jsonl` under base and adapter |
-| H002 | the three-arm experiment (selected / random control / full) in that entry |
-| ~~P004 (proposed → active)~~ | **its first actual run was 2026-09-06 14:38-14:48 (E009)** |
-| P005 (standing gap) | a build that emits `datasets/<id>/manifest.json` — which also closes O005's smallest fix and O003's recurrence guard |
-| E008 (open remainder) | a committed `split_dataset.py`, which would make the split reproducible-by-command instead of recoverable-by-archaeology |
+| entry | closed by | `status:` still reads |
+| --- | --- | --- |
+| ~~E004 (open)~~ | **closed 2026-09-06 by E009** — the sweep ran; nothing promoted | `closed` ✓ — an open EXPERIMENT is the one entry a result may be written into |
+| H004 | **settled 2026-09-06 by E009**: outcome A, hard 21/18/16/19 against the base's 24, and core 26/26 | `untested` — **unchanged on purpose**, see below |
+| H003 | **still open after E009.** Four un-repeated points cannot resolve a 2-scenario difference (O012); it needs a repeat, not another sweep | `untested` ✓ |
+| H001 | a `score_bits.py` pass (`d4901d4` on `bits-curriculum`) over `datasets/mlx/train.jsonl` under base and adapter | `untested` ✓ |
+| H002 | the three-arm experiment (selected / random control / full) in that entry | `untested` ✓ |
+| P004 | **its first actual run was 2026-09-06 14:38-14:48 (E009)** | `proposed` — **unchanged on purpose**, see below |
+| P005 (standing gap) | a build that emits `datasets/<id>/manifest.json` — which also closes O005's smallest fix and O003's recurrence guard | `active` ✓ |
+| E008 (open remainder) | a committed `split_dataset.py`, which would make the split reproducible-by-command instead of recoverable-by-archaeology | `closed` ✓ |
+
+**Why H004 and P004 are not struck through.** At `d2f40b0` this table struck
+both out as done. They are not done in the only place a reader checks —
+`H004:7` reads `status: untested`, `P004:7` reads `status: proposed` and
+`P004:19` heads a section *"Status: proposed, never yet run"* — and the status
+column of the entry table above says the same for both. The strikethroughs
+asserted a state change the files do not carry.
+
+The files are right and the strikethroughs were wrong. The README's rule is that
+**a status change is itself an append** — "write a new entry that records the
+change and set `superseded-by:` on the old one. Do not silently edit `status:`
+in place — except on an `open` EXPERIMENT". H004 is a HYPOTHESIS and P004 a
+PROCESS, so neither takes the carve-out E004 took; both already carry
+`superseded-by: E009`, which is the whole permitted edit. E009 is the entry that
+records what changed: H004 is supported on both halves, and P004 ran for the
+first time on 2026-09-06 at 14:38-14:48.
+
+So a reader who wants H004's verdict reads E009, not H004's front matter. That
+is what append-only costs, and this table's job is to say so rather than to
+paper over it with a strikethrough.
 
 ## Next free ids
 
