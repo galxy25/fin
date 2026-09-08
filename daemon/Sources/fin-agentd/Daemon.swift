@@ -1083,8 +1083,20 @@ final class Daemon {
     /// Runs one fixed `TmuxSessionRead` argv and turns the result into an outcome —
     /// shared by the direct capture path, the resolver's `list-windows` and sampling
     /// calls, and the final read of whichever window resolution settles on.
+    ///
+    /// `redact` defaults on — every PANE CAPTURE this tool ever returns is somebody
+    /// else's terminal content and must be scrubbed before it reaches the model, exactly
+    /// as before this resolver existed. Pass `false` ONLY for `list-windows -a`: that
+    /// output is STRUCTURAL METADATA the resolver parses (session/window names, working
+    /// directories), not displayed pane content, and redaction breaks it outright —
+    /// `MemoryRedactor`'s long-base64/hex mask (`[A-Za-z0-9+/]{40,}`) matches an ordinary
+    /// Unix path just as happily as it matches a secret, since `/` and letters are both
+    /// in that character class. A cwd 40+ characters wide — not a rare length — silently
+    /// became "[redacted]" and broke every match against it. Caught live: "pocketdj"
+    /// resolved correctly once, by luck, whenever its full path stayed under the
+    /// threshold; a longer path (or a deeper `forges/` checkout) failed every time.
     private func runFixedSessionCommand(
-        _ argv: [String], session: HeadlessTerminalSession
+        _ argv: [String], session: HeadlessTerminalSession, redact: Bool = true
     ) async -> AgentReadSessionOutcome {
         let commandLine = TmuxSessionRead.commandLine(argv)
         do {
@@ -1103,9 +1115,9 @@ final class Daemon {
             // — `runFixedCommand` throws, carrying tmux's own sentence.)
             if result.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                !result.diagnostics.isEmpty {
-                return .failed(MemoryRedactor.redact(result.diagnostics))
+                return .failed(redact ? MemoryRedactor.redact(result.diagnostics) : result.diagnostics)
             }
-            var text = MemoryRedactor.redact(result.output)
+            var text = redact ? MemoryRedactor.redact(result.output) : result.output
             // TWO DIFFERENT CUTS, AND THE NOTE HAS TO NAME THE RIGHT ONE. The byte cap keeps
             // the newest bytes, so what the model sees really is the bottom of the pane; the
             // read ceiling stops collecting partway up, so what survives is the MIDDLE, and
@@ -1156,7 +1168,7 @@ final class Daemon {
                 + "\"session:window\".]")
         }
         guard case .text(let listing, _) = await runFixedSessionCommand(
-            TmuxSessionResolution.listWindowsArguments(), session: session
+            TmuxSessionResolution.listWindowsArguments(), session: session, redact: false
         ) else {
             return await literalFallback()
         }
