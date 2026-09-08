@@ -94,6 +94,12 @@ struct RootView: View {
             FeedbackService.shared.audit = { [weak sessionManager] line in
                 sessionManager?.recordLifecycleEvent(line)
             }
+            // CloudKit sync failures (and recoveries) join the same trail — without
+            // this, a sync error was visible only on the iCloud Sync screen, in the
+            // moment, and nowhere else.
+            CloudSyncActivityMonitor.shared.audit = { [weak sessionManager] line in
+                sessionManager?.recordLifecycleEvent(line)
+            }
             FeedbackService.shared.sweepTrajectories(context: modelContext)
             #if DEBUG
             await autoOpenSessionIfNeeded()

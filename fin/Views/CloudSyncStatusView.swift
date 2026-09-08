@@ -1,6 +1,7 @@
 import SwiftUI
 import CloudKit
 import CoreData
+import os
 #if os(iOS) || os(visionOS)
 import UIKit
 #else
@@ -22,9 +23,27 @@ final class CloudSyncActivityMonitor: ObservableObject {
         case inFlight
         case succeeded(Date)
         case failed(String, Date)
+
+        fileprivate var isFailed: Bool {
+            if case .failed = self { return true }
+            return false
+        }
     }
 
     @Published private(set) var activity: Activity = .idle
+
+    private static let logger = Logger(subsystem: "dev.levischoen.fin", category: "CloudSyncActivityMonitor")
+
+    /// Audit sink for sync failures (and recoveries from one) — without this, a
+    /// CloudKit sync error was visible only to whoever happened to have the iCloud
+    /// Sync screen open at that moment, and nowhere else: not the agent log, not
+    /// the iCloud mirror, not remotely debuggable at all. `FinApp` wires this to
+    /// `SessionManager.recordLifecycleEvent`, matching `FeedbackService.audit` and
+    /// `AgentMemoryIndexRegistry.audit`. Defaults to os_log so nothing is silently
+    /// dropped before that wiring runs.
+    var audit: @MainActor (String) -> Void = {
+        CloudSyncActivityMonitor.logger.warning("\($0, privacy: .public)")
+    }
 
     private init() {
         NotificationCenter.default.addObserver(
@@ -44,10 +63,24 @@ final class CloudSyncActivityMonitor: ObservableObject {
             activity = .inFlight
             return
         }
+        let wasFailed = activity.isFailed
         if let error = event.error {
             activity = .failed(error.localizedDescription, endDate)
+            audit("[icloud] \(Self.describe(event.type)) failed: \(error.localizedDescription)")
         } else {
             activity = .succeeded(endDate)
+            if wasFailed {
+                audit("[icloud] sync recovered — \(Self.describe(event.type)) succeeded")
+            }
+        }
+    }
+
+    private static func describe(_ type: NSPersistentCloudKitContainer.EventType) -> String {
+        switch type {
+        case .setup: return "setup"
+        case .import: return "import"
+        case .export: return "export"
+        @unknown default: return "sync"
         }
     }
 }
