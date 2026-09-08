@@ -287,6 +287,17 @@ struct AgentRemoteConsoleView: View {
             }
         case .assistantMessage:
             Text(record.text)
+        case .toolCall where record.toolName == "notify":
+            // A notification the agent sent the owner is the whole point of this
+            // screen for a "what's the cloud agent up to" check-in — plain
+            // readable prose (the text is already "notify: <title> — <body>",
+            // not code) with a bell, not a generic gray monospaced tool blob.
+            Label(record.text, systemImage: "bell")
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
         case .toolCall:
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: record.toolName == "send_input" ? "arrow.right.square" : "eye")
@@ -298,6 +309,14 @@ struct AgentRemoteConsoleView: View {
             .padding(8)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
+        case .toolResult where record.toolName == "notify":
+            // The delivery outcome ("Sent to the owner." / "Queued…" / "Delivery
+            // failed…") is short and exactly what a notification check-in needs
+            // to see at a glance — shown plainly, not buried in a collapsed
+            // DisclosureGroup like an arbitrary tool result.
+            Label(record.text, systemImage: "checkmark.bubble")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         case .toolResult:
             DisclosureGroup {
                 Text(record.text)
