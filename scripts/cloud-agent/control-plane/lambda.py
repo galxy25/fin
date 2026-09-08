@@ -61,6 +61,11 @@ CONFIG_KEY = "fin/agentd/{agent}.json"
 STATUS_KEY = "fin/status-{agent}.json"
 INBOX_KEY = "fin/inbox/{agent}.json"
 TRANSCRIPT_KEY = "fin/transcripts/{agent}.jsonl"
+# Hourly chunks, distinct from TRANSCRIPT_KEY above — see "cloud transcript
+# (hourly S3 chunks)" below for why this exists alongside the rolling object.
+TRANSCRIPT_CHUNK_KEY = "fin/transcripts/{agent}/{hour}.jsonl"
+MEMORY_KEY = "fin/memory/{agent}.json"
+ARTIFACT_PREFIX = "fin/artifacts/"
 
 # Auto-provisioning: when POST /workers finds no config for an agent, it
 # instantiates this template — the hand-provisioned config shape with every
@@ -1440,6 +1445,307 @@ def sweep(_event=None):
     }
 
 
+# --- cloud transcript (hourly S3 chunks) --------------------------------------
+#
+# The daemon's transcript used to be one rolling object (TRANSCRIPT_KEY above),
+# fully overwritten on every flush — a restart starts that ring empty, so the
+# next flush truncates the whole history ("the restart-overwrites-history bug",
+# documented in scripts/mac-fin-agentd/provision-config.sh, never fixed there).
+# Chunking by UTC hour means a restart only affects the CURRENT hour's
+# in-flight chunk; every prior hour is already durable in S3 and can never be
+# truncated. Each PUT is the whole hour's accumulated lines (the daemon's own
+# in-memory ring already holds them) — same "the caller sends the whole
+# document" shape as every other S3 write in this file, just partitioned by
+# hour instead of by agent alone.
+
+TRANSCRIPT_HOUR = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}$")
+MAX_TRANSCRIPT_CHUNK_BYTES = 2 * 1024 * 1024
+MAX_TRANSCRIPT_CHUNK_LINES = 5000
+
+
+def put_transcript_chunk(event):
+    """PUT /transcript-chunk — {"agent", "hour": "yyyy-MM-ddTHH", "lines": [str,...]}.
+    Overwrites the named hour's chunk wholesale; the daemon is the only writer
+    for its own hour key, so this needs no conditional PUT."""
+    body = _body(event)
+    agent = str(body.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    hour = str(body.get("hour") or "").strip()
+    if not TRANSCRIPT_HOUR.match(hour):
+        raise ApiError(400, "hour must match yyyy-MM-ddTHH (UTC)")
+    lines = body.get("lines")
+    if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
+        raise ApiError(400, "lines must be an array of strings")
+    if len(lines) > MAX_TRANSCRIPT_CHUNK_LINES:
+        raise ApiError(400, "lines exceeds {} entries".format(MAX_TRANSCRIPT_CHUNK_LINES))
+    encoded = "\n".join(lines).encode("utf-8")
+    if len(encoded) > MAX_TRANSCRIPT_CHUNK_BYTES:
+        raise ApiError(413, "chunk exceeds {} bytes".format(MAX_TRANSCRIPT_CHUNK_BYTES))
+    key = TRANSCRIPT_CHUNK_KEY.format(agent=_key_slug(agent), hour=hour)
+    S3.put_object(Bucket=BUCKET, Key=key, Body=encoded, ContentType="application/json")
+    return _response(200, {"agent": agent, "hour": hour, "lines": len(lines)})
+
+
+def _list_transcript_hours(agent):
+    prefix = "fin/transcripts/{}/".format(_key_slug(agent))
+    hours, token = [], None
+    while True:
+        kwargs = {"Bucket": BUCKET, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = S3.list_objects_v2(**kwargs)
+        for entry in page.get("Contents", []):
+            name = entry["Key"][len(prefix):]
+            if name.endswith(".jsonl"):
+                hours.append(name[:-len(".jsonl")])
+        token = page.get("NextContinuationToken")
+        if not token:
+            break
+    return sorted(hours)
+
+
+def _get_transcript_chunk(agent, hour):
+    key = TRANSCRIPT_CHUNK_KEY.format(agent=_key_slug(agent), hour=hour)
+    try:
+        raw = S3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NoSuchBucket", "AccessDenied"):
+            return []
+        raise
+    text = raw.decode("utf-8", "replace")
+    return [line for line in text.split("\n") if line.strip()]
+
+
+def get_transcript_chunks(event):
+    """GET /transcript-chunks?agent=&hour= — omit hour for the hour list plus
+    the latest chunk's lines (the "load the recent conversation quickly" case);
+    pass hour to page in one specific earlier chunk."""
+    params = event.get("queryStringParameters") or {}
+    agent = str(params.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    hours = _list_transcript_hours(agent)
+    requested_hour = str(params.get("hour") or "").strip()
+    if requested_hour:
+        if not TRANSCRIPT_HOUR.match(requested_hour):
+            raise ApiError(400, "hour must match yyyy-MM-ddTHH (UTC)")
+        return _response(200, {
+            "agent": agent, "hours": hours,
+            "chunk": {"hour": requested_hour, "lines": _get_transcript_chunk(agent, requested_hour)},
+        })
+    latest = hours[-1] if hours else None
+    return _response(200, {
+        "agent": agent, "hours": hours,
+        "chunk": {"hour": latest, "lines": _get_transcript_chunk(agent, latest)} if latest else None,
+    })
+
+
+# --- agent memory (S3 journal, source of truth for cross-device sync) --------
+#
+# One JSON document per agent: a collection of memory entries, atomically
+# rewritten on every save — "a collection of journals that are atomically
+# written," not one unbounded append-only stream. Both the app (its own
+# `remember` calls) and the daemon (a daemon-hosted conversation's `remember`
+# calls) push entries here and pull the whole document to merge into their own
+# local store — this Lambda is the one place both sides agree on, so client
+# and cloud agents stay in sync.
+
+MAX_MEMORY_ENTRIES = 2000
+MAX_MEMORY_FIELD_BYTES = 8 * 1024
+MAX_MEMORY_DOC_BYTES = 4 * 1024 * 1024
+
+
+def _read_memory_document(agent):
+    key = MEMORY_KEY.format(agent=_key_slug(agent))
+    try:
+        raw = S3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NoSuchBucket", "AccessDenied"):
+            return {"version": 1, "entries": []}
+        raise
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        LOG.warning("memory document for %s is not JSON", agent)
+        return {"version": 1, "entries": []}
+    if not isinstance(document, dict) or not isinstance(document.get("entries"), list):
+        return {"version": 1, "entries": []}
+    return document
+
+
+def _require_memory_field(body, field, max_bytes=None):
+    value = body.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError(400, "{} must be a non-empty string".format(field))
+    if max_bytes is not None and len(value.encode("utf-8")) > max_bytes:
+        raise ApiError(400, "{} exceeds {} bytes".format(field, max_bytes))
+    return value
+
+
+def put_memory_entry(event):
+    """POST /memory — one entry, upserted by id into the agent's document.
+    {"agent", "id", "agentId"?, "conversationId"?, "kind", "title", "content",
+    "tags"?, "originDevice8"?, "createdAt", "updatedAt"}. Last-writer-wins on a
+    same-id race — the same accepted risk this file already takes for the
+    inbox document (CloudAgentChannel.appendedInboxDocument on the app side);
+    at Fin's current single-account scale a genuine collision is vanishingly
+    rare and, worst case, just loses one duplicate save, not data."""
+    body = _body(event)
+    agent = str(body.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    entry_id = _require_memory_field(body, "id", max_bytes=200)
+    kind = str(body.get("kind") or "episodic").strip()
+    if kind not in ("episodic", "cumulative"):
+        raise ApiError(400, "kind must be 'episodic' or 'cumulative'")
+    title = _require_memory_field(body, "title", max_bytes=MAX_MEMORY_FIELD_BYTES)
+    content = _require_memory_field(body, "content", max_bytes=MAX_MEMORY_FIELD_BYTES)
+    tags = body.get("tags")
+    if tags is not None and not isinstance(tags, str):
+        raise ApiError(400, "tags must be a string")
+    created_at = body.get("createdAt")
+    if _parse_iso(created_at) is None:
+        raise ApiError(400, "createdAt must be an ISO8601 timestamp")
+    updated_at = body.get("updatedAt") or created_at
+    if _parse_iso(updated_at) is None:
+        raise ApiError(400, "updatedAt must be an ISO8601 timestamp")
+    agent_id = body.get("agentId")
+    if agent_id is not None and not isinstance(agent_id, str):
+        raise ApiError(400, "agentId must be a string or null")
+    conversation_id = body.get("conversationId")
+    if conversation_id is not None and not isinstance(conversation_id, str):
+        raise ApiError(400, "conversationId must be a string or null")
+    origin_device8 = body.get("originDevice8")
+    if origin_device8 is not None and not DEVICE_ID8.match(str(origin_device8)):
+        origin_device8 = None
+
+    entry = {
+        "id": entry_id, "agentId": agent_id, "conversationId": conversation_id,
+        "kind": kind, "title": title, "content": content, "tags": tags or "",
+        "originDevice8": origin_device8, "createdAt": created_at, "updatedAt": updated_at,
+    }
+
+    document = _read_memory_document(agent)
+    entries = [e for e in document["entries"] if e.get("id") != entry_id]
+    entries.append(entry)
+    entries.sort(key=lambda e: e.get("updatedAt") or "")
+    if len(entries) > MAX_MEMORY_ENTRIES:
+        entries = entries[-MAX_MEMORY_ENTRIES:]
+    document = {"version": 1, "updatedAt": _iso(_now()), "entries": entries}
+    encoded = json.dumps(document, sort_keys=True).encode("utf-8")
+    if len(encoded) > MAX_MEMORY_DOC_BYTES:
+        raise ApiError(413, "memory document exceeds {} bytes".format(MAX_MEMORY_DOC_BYTES))
+    S3.put_object(
+        Bucket=BUCKET, Key=MEMORY_KEY.format(agent=_key_slug(agent)),
+        Body=encoded, ContentType="application/json",
+    )
+    LOG.info("upserted memory entry %s for %s", entry_id, agent)
+    return _response(200, {"agent": agent, "id": entry_id, "entries": len(entries)})
+
+
+def get_memory(event):
+    """GET /memory?agent=&since= — the whole document, or entries updated at or
+    after `since` (ISO8601) when given."""
+    params = event.get("queryStringParameters") or {}
+    agent = str(params.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    document = _read_memory_document(agent)
+    since = _parse_iso(params.get("since"))
+    entries = document["entries"]
+    if since is not None:
+        entries = [e for e in entries if (_parse_iso(e.get("updatedAt")) or _now()) >= since]
+    return _response(200, {"agent": agent, "entries": entries})
+
+
+# --- artifacts (per-account plain-text file store) ----------------------------
+#
+# "a second filesystem apart from the iOS native one" — one flat, agent-
+# writable space of plain text files (no binary/MIME handling: "other
+# artifacts are arbitrary text files" is the whole v1 scope). One prefix for
+# the whole Fin account — no multi-tenant user/auth system exists to scope
+# this further at the deployment's current single-account scale.
+
+ARTIFACT_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$")
+MAX_ARTIFACT_BYTES = 1024 * 1024
+MAX_ARTIFACT_LIST_ITEMS = 1000
+
+
+def _require_artifact_path(path):
+    if not path or ".." in path.split("/") or not ARTIFACT_PATH.match(path):
+        raise ApiError(400, "path must match [A-Za-z0-9][A-Za-z0-9._/-]{0,300} with no .. segment")
+    return path
+
+
+def list_artifacts(_event):
+    """GET /artifacts — every path in the account's artifacts folder, sorted."""
+    items, token = [], None
+    while len(items) < MAX_ARTIFACT_LIST_ITEMS:
+        kwargs = {
+            "Bucket": BUCKET, "Prefix": ARTIFACT_PREFIX,
+            "MaxKeys": min(1000, MAX_ARTIFACT_LIST_ITEMS - len(items)),
+        }
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = S3.list_objects_v2(**kwargs)
+        for entry in page.get("Contents", []):
+            items.append({
+                "path": entry["Key"][len(ARTIFACT_PREFIX):],
+                "size": entry["Size"],
+                "updatedAt": _iso(entry["LastModified"]),
+            })
+        token = page.get("NextContinuationToken")
+        if not token:
+            break
+    items.sort(key=lambda i: i["path"])
+    return _response(200, {"artifacts": items})
+
+
+def get_artifact(_event, path):
+    _require_artifact_path(path)
+    try:
+        obj = S3.get_object(Bucket=BUCKET, Key=ARTIFACT_PREFIX + path)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NoSuchBucket"):
+            raise ApiError(404, "no artifact at {}".format(path))
+        raise
+    content = obj["Body"].read().decode("utf-8", "replace")
+    return _response(200, {
+        "path": path, "content": content,
+        "updatedAt": _iso(obj["LastModified"]),
+    })
+
+
+def put_artifact(event, path):
+    _require_artifact_path(path)
+    body = _body(event)
+    content = body.get("content")
+    if not isinstance(content, str):
+        raise ApiError(400, "content must be a string")
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_ARTIFACT_BYTES:
+        raise ApiError(413, "artifact exceeds {} bytes".format(MAX_ARTIFACT_BYTES))
+    S3.put_object(
+        Bucket=BUCKET, Key=ARTIFACT_PREFIX + path,
+        Body=encoded, ContentType="text/plain; charset=utf-8",
+    )
+    LOG.info("wrote artifact %s (%d bytes)", path, len(encoded))
+    return _response(200, {"path": path, "size": len(encoded)})
+
+
+def delete_artifact(_event, path):
+    _require_artifact_path(path)
+    # S3 DELETE is idempotent by construction — no existence check needed, and
+    # "already gone" is as successful an outcome as "just deleted" for a DELETE.
+    S3.delete_object(Bucket=BUCKET, Key=ARTIFACT_PREFIX + path)
+    LOG.info("deleted artifact %s", path)
+    return _response(200, {"path": path, "deleted": True})
+
+
 # --- entry point -------------------------------------------------------------
 
 
@@ -1473,6 +1779,22 @@ def _route(event):
         return put_secret(event, parts[1])
     if method == "DELETE" and len(parts) == 2 and parts[0] == "secrets":
         return delete_secret(event, parts[1])
+    if method == "PUT" and parts == ["transcript-chunk"]:
+        return put_transcript_chunk(event)
+    if method == "GET" and parts == ["transcript-chunks"]:
+        return get_transcript_chunks(event)
+    if method == "POST" and parts == ["memory"]:
+        return put_memory_entry(event)
+    if method == "GET" and parts == ["memory"]:
+        return get_memory(event)
+    if method == "GET" and parts == ["artifacts"]:
+        return list_artifacts(event)
+    if method == "GET" and len(parts) >= 2 and parts[0] == "artifacts":
+        return get_artifact(event, "/".join(parts[1:]))
+    if method == "PUT" and len(parts) >= 2 and parts[0] == "artifacts":
+        return put_artifact(event, "/".join(parts[1:]))
+    if method == "DELETE" and len(parts) >= 2 and parts[0] == "artifacts":
+        return delete_artifact(event, "/".join(parts[1:]))
     raise ApiError(404, "no route for {} {}".format(method or "?", path))
 
 
