@@ -52,6 +52,13 @@ struct RootView: View {
         // A tap queued while the paywall was up gets claimed the moment the
         // entitlement unlocks (see the isUnlocked guard in the claim itself).
         .onChange(of: isUnlocked) { _, _ in openPendingRemoteAgentIfNeeded() }
+        // A cold launch from a killed state (the common case for a notification
+        // tap) can reach this view before CloudKit's initial import has delivered
+        // the tapped agent's own record — the claim's `agents.first(where:)`
+        // guard fails silently that first pass, and nothing retried it, so the
+        // tap stranded the user on the home screen once the agent finally synced
+        // in. Retrying on every `agents` change closes that race.
+        .onChange(of: agents) { _, _ in openPendingRemoteAgentIfNeeded() }
         .sheet(item: $remoteAgentTarget) { agent in
             // Same entitlement gate as the root switch: the target can only be
             // set while unlocked, but a lapse mid-presentation must not leave a

@@ -140,6 +140,9 @@ struct ControlStripView: View {
         // before this screen existed.
         .onAppear { openPendingAgentIfNeeded() }
         .onChange(of: sessionManager.pendingAgentOpen) { _, _ in openPendingAgentIfNeeded() }
+        // Same race RootView closes for the remote half: a cold launch can reach
+        // this view before CloudKit's initial import lands the tapped agent.
+        .onChange(of: agents) { _, _ in openPendingAgentIfNeeded() }
         .sheet(isPresented: $showingClipboard) {
             ClipboardManagerView(session: session)
         }
