@@ -258,6 +258,11 @@ final class Daemon {
     private var transcript: DaemonTranscriptUplink?
     /// The push-notification client; nil when the config has no `controlPlane` block.
     private var notifyClient: DaemonNotifyClient?
+    /// Owns the on-disk goals ledger. Always constructed (there is always a state
+    /// directory to keep it in) — `goal_upsert`/`goal_log` are advertised whenever this
+    /// is non-nil, which today is unconditional, matching `composedHeartbeatPrompt`
+    /// already reading the same file unconditionally.
+    private var goalsLedger: GoalsLedgerStore?
     /// The most recent push send, awaited on the exit paths: task-complete fires a push
     /// moments before shutdown, and an exit 300ms later would kill the POST mid-flight —
     /// the one alert a non-resident daemon exists to deliver. Bounded by the client's
@@ -744,6 +749,43 @@ final class Daemon {
         engine.onSendSession = { [weak self] session, text, awaitSeconds in
             guard let self else { return .failed("the daemon is shutting down.") }
             return await self.sendSession(session: session, text: text, awaitSeconds: awaitSeconds)
+        }
+        // The model's goal_upsert/goal_log tools — the write half of the goals ledger
+        // `composedHeartbeatPrompt`/`composedSystemPrompt` already read unconditionally
+        // (see `goalsLedgerPath`). MUST load before any write: the store's own document
+        // starts empty, and the first addGoal/appendUpdate call persists whatever is in
+        // memory — an unloaded store would silently overwrite a real ledger with nothing.
+        //
+        // FAIL CLOSED ON A LOAD FAILURE, not just log-and-continue: the ledger is
+        // documented user-editable working memory (a hand-edit can leave one goal
+        // missing `id`/`title`, which fails the WHOLE document's decode, not just that
+        // entry — Goal.init(from:) isn't lenient on those two fields the way it is on
+        // `state`/`kind`). Caught in review: wiring the write hooks anyway after a load
+        // failure meant the model's very first successful goal_upsert would silently
+        // overwrite every goal already on disk with an empty document. Leaving the hooks
+        // nil instead makes goal_upsert/goal_log honestly report "not available" — the
+        // read-only prompt sections are unaffected either way, since they go through
+        // LedgerDocument.loadIfPresent (which degrades the same file to "no ledger"
+        // rather than throwing), not through this store.
+        let ledgerStore = GoalsLedgerStore(fileURL: URL(fileURLWithPath: goalsLedgerPath))
+        do {
+            try await ledgerStore.load()
+            goalsLedger = ledgerStore
+            engine.onGoalUpsert = { [weak self] id, title, state, why, nextAction, blockedOn, tags, source in
+                guard let self, let ledger = self.goalsLedger else { return .failed("the daemon is shutting down.") }
+                return await self.goalUpsert(
+                    ledger: ledger, id: id, title: title, state: state, why: why,
+                    nextAction: nextAction, blockedOn: blockedOn, tags: tags, source: source
+                )
+            }
+            engine.onGoalLog = { [weak self] goalID, kind, text in
+                guard let self, let ledger = self.goalsLedger else { return .failed("the daemon is shutting down.") }
+                return await self.goalLog(ledger: ledger, goalID: goalID, kind: kind, text: text)
+            }
+        } catch {
+            log("goals ledger: existing file at \(goalsLedgerPath) could not be read (\(error)) — "
+                + "goal_upsert/goal_log are disabled this run rather than risk overwriting it. "
+                + "Fix the file (or remove it to start fresh) and restart to re-enable them.")
         }
 
         if let uplink = transcript {
@@ -1370,6 +1412,120 @@ final class Daemon {
         // confirm anything." The send itself is unaffected either way.
         guard everSucceeded else { return .sent(after: .allAttemptsFailed) }
         return .sent(after: .observed(lastCapture ?? previous ?? ""))
+    }
+
+    /// The model's `goal_upsert` tool, wired to `engine.onGoalUpsert`. Whether `id`
+    /// creates or updates is decided HERE, not the engine — the engine has no ledger to
+    /// check existence against. An id already in the ledger updates only the fields
+    /// given, leaving the rest as they are; a fresh id creates a goal and needs `title`,
+    /// the one field a goal cannot exist without.
+    ///
+    /// Changing `state` away from `.blocked` clears `blockedOn` even if the caller didn't
+    /// mention it — a stale "blocked on X" surviving on a goal that is no longer blocked
+    /// is exactly the kind of thing `needsBlockerSurface`/the tick's "surfaced once, then
+    /// sit quiet" rule depends on being accurate. An explicit `blockedOn` in the SAME call
+    /// (re-blocking, or blocking for the first time) is applied after, so it still wins.
+    private func goalUpsert(
+        ledger: GoalsLedgerStore,
+        id: String, title: String?, state: GoalState?, why: String?,
+        nextAction: String?, blockedOn: String?, tags: [String]?, source: String?
+    ) async -> AgentGoalUpsertOutcome {
+        let existing = await ledger.document.goals.first(where: { $0.id == id })
+        let wasUpdate = existing != nil
+        switch Self.mergedGoal(
+            existing: existing, id: id, title: title, state: state, why: why,
+            nextAction: nextAction, blockedOn: blockedOn, tags: tags, source: source
+        ) {
+        case .failure(let reason):
+            return .failed(reason)
+        case .success(let goal):
+            do {
+                try await ledger.addGoal(goal)
+                log("[goal_upsert] \(wasUpdate ? "updated" : "created") \(id)")
+                return wasUpdate ? .updated(id: id) : .created(id: id)
+            } catch {
+                let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                log("goal_upsert failed: \(reason)")
+                return .failed(reason)
+            }
+        }
+    }
+
+    /// Pure: computes the `Goal` a `goal_upsert` call should save, given the EXISTING
+    /// goal (nil for a fresh id) and the fields the model provided. No I/O, no ledger —
+    /// extracted so the merge semantics are directly testable, the same way
+    /// `TmuxSessionSend.validateTarget` is. Caught in review, both fixed here:
+    ///   - an update's `title` could be silently blanked to "" (no guard, unlike create);
+    ///     now guarded the same way create already was.
+    ///   - `tags` REPLACES the existing list wholesale on update, not merged — this is
+    ///     unchanged behavior (the alternative, always-append, has its own surprises —
+    ///     no way to ever REMOVE a tag), but is now stated plainly in the tool
+    ///     description (`AgentTools.swift`) rather than left implicit.
+    /// `blockedOn` clearing when `state` leaves `.blocked` — and an explicit `blockedOn`
+    /// in the SAME call still winning — are both unchanged from the original logic;
+    /// review confirmed that part was already correct.
+    /// Not `Result<Goal, String>`: `Result`'s failure type must conform to `Error`, which
+    /// a plain `String` does not, and a one-off wrapper type would only exist to satisfy
+    /// that — this says the same thing with less ceremony.
+    enum MergedGoalResult: Equatable {
+        case success(Goal)
+        case failure(String)
+    }
+
+    nonisolated static func mergedGoal(
+        existing: Goal?, id: String, title: String?, state: GoalState?, why: String?,
+        nextAction: String?, blockedOn: String?, tags: [String]?, source: String?
+    ) -> MergedGoalResult {
+        if var updated = existing {
+            if let title {
+                let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else {
+                    return .failure("\"title\" was given but empty — omit it to leave the "
+                        + "existing title unchanged, don't send an empty string to blank it.")
+                }
+                updated.title = trimmed
+            }
+            if let state {
+                updated.state = state
+                if state != .blocked { updated.blockedOn = nil }
+            }
+            if let why { updated.why = why }
+            if let nextAction { updated.nextAction = nextAction }
+            if let blockedOn { updated.blockedOn = blockedOn }
+            if let tags { updated.tags = tags }
+            if let source { updated.source = source }
+            return .success(updated)
+        }
+        guard let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .failure("\"\(id)\" does not exist yet, and no \"title\" was given to create it.")
+        }
+        return .success(Goal(
+            id: id, title: title.trimmingCharacters(in: .whitespacesAndNewlines), state: state ?? .open,
+            why: why, nextAction: nextAction, blockedOn: blockedOn,
+            tags: tags ?? [], source: source
+        ))
+    }
+
+    /// The model's `goal_log` tool, wired to `engine.onGoalLog`. An unknown `goal_id` is
+    /// reported as a failure here (unlike `GoalsLedgerStore.appendUpdate`'s own silent
+    /// no-op for that case) — silently accepting a log entry against a goal that does not
+    /// exist would tell the model its progress note was recorded when nothing was written.
+    private func goalLog(
+        ledger: GoalsLedgerStore, goalID: String, kind: UpdateKind, text: String
+    ) async -> AgentGoalLogOutcome {
+        let exists = await ledger.document.goals.contains(where: { $0.id == goalID })
+        guard exists else {
+            return .failed("no goal with id \"\(goalID)\" exists.")
+        }
+        do {
+            try await ledger.appendUpdate(Update(kind: kind, text: text), toGoal: goalID)
+            log("[goal_log] \(kind.rawValue) on \(goalID)")
+            return .logged
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            log("goal_log failed: \(reason)")
+            return .failed(reason)
+        }
     }
 
     /// Bounded wait for the tool call to learn the notify send's real outcome. Being

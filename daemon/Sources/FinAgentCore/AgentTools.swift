@@ -268,8 +268,92 @@ public struct AgentToolSpec {
         ]
     )
 
+    /// Creates or updates a goal in the persisted goals ledger — see `GoalsLedger.swift`
+    /// and `evals/goals-ledger/prompts/tick.md` for the full decision taxonomy this tool
+    /// exists to serve. Deliberately ONE upsert shape (id omitted = create, id given =
+    /// update only the fields provided) rather than separate create/update tools: the
+    /// tick's own instruction is "prefer updating... only genuinely new work gets a new
+    /// goal," and a single call the model can use either way keeps that choice cheap.
+    static let goalUpsert = AgentToolSpec(
+        name: "goal_upsert",
+        description: "Create or update a goal in your persisted goals ledger — the durable "
+            + "record of what the user wants, which survives restarts and reloads into every "
+            + "turn. Prefer UPDATING an existing goal (give its id) over creating a new one: a "
+            + "message about work the ledger already tracks — however paraphrased, typo'd, or "
+            + "terse — attaches to that goal. Only genuinely new work gets a new goal (omit id). "
+            + "Use this on ingest (a new message creates or updates a goal) and whenever a "
+            + "goal's state, next action, or blocker changes — not for routine progress notes, "
+            + "which are goal_log instead.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "id": [
+                    "type": "string",
+                    "description": "A short slug you choose, e.g. \"g-pocketdj-indexer\". Give "
+                        + "an EXISTING goal's id to update it — only the fields you provide "
+                        + "change, the rest are left as they are. Give a NEW id (one not "
+                        + "already in the ledger) to create a goal.",
+                ],
+                "title": ["type": "string", "description": "Short goal title. Required when creating a new id."],
+                "state": [
+                    "type": "string",
+                    "enum": ["open", "active", "blocked", "done"],
+                    "description": "open: accepted but not started. active: in flight. "
+                        + "blocked: waiting on something — set blocked_on too. done: finished — "
+                        + "log a close update too, via goal_log, to report it.",
+                ],
+                "why": ["type": "string", "description": "What the user wants and how you'll know it's done."],
+                "next_action": ["type": "string", "description": "The single concrete next step."],
+                "blocked_on": ["type": "string", "description": "What state == blocked is waiting on. Clear by setting state away from blocked."],
+                "tags": [
+                    "type": "array",
+                    "items": ["type": "string"],
+                    "description": "Phrases the user is likely to use for this goal, for future "
+                        + "matching. REPLACES the whole existing list on update, not merged — "
+                        + "include every tag you want kept, not just new ones.",
+                ],
+                "source": ["type": "string", "description": "The inbox/user message id that created or updated this goal, if any."],
+            ],
+            "required": ["id"],
+        ]
+    )
+
+    /// Appends one timestamped entry to a goal's update log — the mechanism behind
+    /// `hasCloseUpdate`/`needsBlockerSurface` (`GoalsLedger.swift`): a `close` entry is
+    /// what makes a `done` goal's report owed-and-paid, a `report` entry is what makes a
+    /// surfaced blocker sit quiet instead of being re-nagged. Kept separate from
+    /// `goal_upsert` because most ticks log progress far more often than they change a
+    /// goal's shape, and folding both into one call would make the common case verbose.
+    static let goalLog = AgentToolSpec(
+        name: "goal_log",
+        description: "Record what happened on a goal — progress, a blocker, that you reported "
+            + "something to the user, or a closing report on a done goal. This is what makes "
+            + "the ledger idempotent across restarts: \"was this blocker already surfaced?\", "
+            + "\"was this done goal already closed out?\" become ledger questions, never "
+            + "memory-of-the-conversation questions. Log a close entry the same turn you set "
+            + "a goal's state to done, or it will keep showing as owing its closing report.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "goal_id": ["type": "string", "description": "The goal this entry belongs to."],
+                "kind": [
+                    "type": "string",
+                    "enum": ["progress", "blocker", "report", "close", "note"],
+                    "description": "progress: work happened. blocker: why it stopped (also "
+                        + "set the goal's state to blocked and blocked_on via goal_upsert). "
+                        + "report: you told the user something (this is what stops a surfaced "
+                        + "blocker from being re-nagged). close: a done goal's closing report. "
+                        + "note: anything else.",
+                ],
+                "text": ["type": "string", "description": "What happened, one or two sentences."],
+            ],
+            "required": ["goal_id", "kind", "text"],
+        ]
+    )
+
     static let all: [AgentToolSpec] = [
-        readTerminal, sendInput, readSession, sendSession, remember, recall, requestInput, monitor, notify,
+        readTerminal, sendInput, readSession, sendSession, goalUpsert, goalLog,
+        remember, recall, requestInput, monitor, notify,
     ]
 
     /// The roster MINUS the tools a runtime cannot actually provide.
@@ -286,10 +370,13 @@ public struct AgentToolSpec {
     ///
     /// So the runtime that cannot serve it does not offer it. The dispatch's honest error
     /// stays as a backstop for a model that names the tool anyway.
-    static func roster(readSession readAvailable: Bool, sendSession sendAvailable: Bool) -> [AgentToolSpec] {
+    static func roster(
+        readSession readAvailable: Bool, sendSession sendAvailable: Bool, goalsLedger ledgerAvailable: Bool = false
+    ) -> [AgentToolSpec] {
         all.filter { spec in
             (readAvailable || spec.name != readSession.name)
                 && (sendAvailable || spec.name != sendSession.name)
+                && (ledgerAvailable || (spec.name != goalUpsert.name && spec.name != goalLog.name))
         }
     }
 

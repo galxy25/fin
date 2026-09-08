@@ -533,17 +533,19 @@ final class AgentEngineDispatchTests: XCTestCase {
     /// `tmux capture-pane` for that, so the two instructions contradicted each other and the
     /// tool-shaped one always failed.
     func testTheRosterDropsReadSessionForARuntimeThatCannotServeIt() {
-        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true)
+        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true)
             .contains { $0.name == "read_session" })
-        XCTAssertFalse(AgentToolSpec.roster(readSession: false, sendSession: true)
+        XCTAssertFalse(AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true)
             .contains { $0.name == "read_session" })
         // Nothing else moves: the two rosters differ by exactly that one tool.
         XCTAssertEqual(
-            AgentToolSpec.roster(readSession: true, sendSession: true).count,
-            AgentToolSpec.roster(readSession: false, sendSession: true).count + 1
+            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true).count,
+            AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true).count + 1
         )
-        XCTAssertEqual(AgentToolSpec.roster(readSession: true, sendSession: true).map(\.name),
-                       AgentToolSpec.all.map(\.name))
+        XCTAssertEqual(
+            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true).map(\.name),
+            AgentToolSpec.all.map(\.name)
+        )
         // …and the dispatch keeps its honest error for a model that names it anyway.
         XCTAssertTrue(AgentToolSpec.knownToolNames.contains("read_session"))
     }
@@ -901,6 +903,144 @@ final class AgentEngineDispatchTests: XCTestCase {
                           "an all-polls-failed wait must not read identically to no wait at all")
         XCTAssertTrue(result.hasPrefix("Sent to main:0."), "the send itself is still honest — got: \(result)")
         XCTAssertTrue(result.localizedCaseInsensitiveContains("could not"), "got: \(result)")
+    }
+
+    // MARK: - goal_upsert / goal_log
+
+    func testGoalUpsertWithoutARunnerHookIsAnHonestError() async {
+        let engine = makeEngine()
+        // onGoalUpsert left nil.
+
+        let result = await engine.execute(call(
+            AgentToolSpec.goalUpsert.name, #"{"id": "g-x", "title": "test"}"#
+        ))
+
+        XCTAssertTrue(result.contains("not available"), "got: \(result)")
+    }
+
+    func testGoalUpsertRejectsAnEmptyID() async {
+        let engine = makeEngine()
+        engine.onGoalUpsert = { _, _, _, _, _, _, _, _ in
+            XCTFail("an empty id must never reach the runner")
+            return .failed("")
+        }
+
+        let result = await engine.execute(call(AgentToolSpec.goalUpsert.name, #"{"title": "test"}"#))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+    }
+
+    /// THE INJECTION/VALIDATION GATE, same shape as send_session's target check: an
+    /// illegal state value never reaches the hook, and the message names the legal set.
+    func testGoalUpsertRejectsAnIllegalStateValue() async {
+        let engine = makeEngine()
+        engine.onGoalUpsert = { _, _, _, _, _, _, _, _ in
+            XCTFail("an illegal state must never reach the runner")
+            return .failed("")
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.goalUpsert.name, #"{"id": "g-x", "state": "finished"}"#
+        ))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("open"), "the message should name the legal values — got: \(result)")
+    }
+
+    func testGoalUpsertPassesValidatedArgumentsToTheHook() async {
+        var seen: (id: String, title: String?, state: GoalState?, why: String?, next: String?, blocked: String?, tags: [String]?, source: String?)?
+        let engine = makeEngine()
+        engine.onGoalUpsert = { id, title, state, why, next, blocked, tags, source in
+            seen = (id, title, state, why, next, blocked, tags, source)
+            return .created(id: id)
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.goalUpsert.name,
+            #"{"id": "g-pocketdj", "title": "Fix PocketDJ indexer", "state": "active", "why": "so it stops skipping new albums", "next_action": "wait for its reply", "tags": ["pocketdj", "indexer"], "source": "m-1"}"#
+        ))
+
+        XCTAssertEqual(seen?.id, "g-pocketdj")
+        XCTAssertEqual(seen?.title, "Fix PocketDJ indexer")
+        XCTAssertEqual(seen?.state, .active)
+        XCTAssertEqual(seen?.why, "so it stops skipping new albums")
+        XCTAssertEqual(seen?.next, "wait for its reply")
+        XCTAssertEqual(seen?.tags, ["pocketdj", "indexer"])
+        XCTAssertEqual(seen?.source, "m-1")
+        XCTAssertEqual(result, "Created goal g-pocketdj.")
+    }
+
+    func testGoalUpsertReportsUpdateDistinctlyFromCreate() async {
+        let engine = makeEngine()
+        engine.onGoalUpsert = { id, _, _, _, _, _, _, _ in .updated(id: id) }
+
+        let result = await engine.execute(call(AgentToolSpec.goalUpsert.name, #"{"id": "g-x", "state": "done"}"#))
+        XCTAssertEqual(result, "Updated goal g-x.")
+    }
+
+    func testGoalUpsertReportsARunnerFailureHonestly() async {
+        let engine = makeEngine()
+        engine.onGoalUpsert = { _, _, _, _, _, _, _, _ in .failed("no title given for a new goal") }
+
+        let result = await engine.execute(call(AgentToolSpec.goalUpsert.name, #"{"id": "g-new"}"#))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("no title given"), "got: \(result)")
+    }
+
+    func testGoalLogRejectsAnIllegalKindValue() async {
+        let engine = makeEngine()
+        engine.onGoalLog = { _, _, _ in
+            XCTFail("an illegal kind must never reach the runner")
+            return .failed("")
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.goalLog.name, #"{"goal_id": "g-x", "kind": "celebration", "text": "done!"}"#
+        ))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("progress"), "the message should name the legal values — got: \(result)")
+    }
+
+    func testGoalLogPassesValidatedArgumentsToTheHook() async {
+        var seen: (goalID: String, kind: UpdateKind, text: String)?
+        let engine = makeEngine()
+        engine.onGoalLog = { goalID, kind, text in
+            seen = (goalID, kind, text)
+            return .logged
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.goalLog.name,
+            #"{"goal_id": "g-pocketdj", "kind": "blocker", "text": "waiting on its reply"}"#
+        ))
+
+        XCTAssertEqual(seen?.goalID, "g-pocketdj")
+        XCTAssertEqual(seen?.kind, .blocker)
+        XCTAssertEqual(seen?.text, "waiting on its reply")
+        XCTAssertEqual(result, "Logged blocker on g-pocketdj.")
+    }
+
+    func testGoalLogReportsARunnerFailureHonestly() async {
+        let engine = makeEngine()
+        engine.onGoalLog = { _, _, _ in .failed("no goal with id \"g-ghost\" exists.") }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.goalLog.name, #"{"goal_id": "g-ghost", "kind": "note", "text": "hi"}"#
+        ))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("g-ghost"), "got: \(result)")
+    }
+
+    /// The roster gate — same shape as send_session's, and independent of both other
+    /// dimensions: a runtime can serve read/send without the ledger, or vice versa.
+    func testTheRosterDropsGoalToolsWhenNoLedgerHook() {
+        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true)
+            .contains { $0.name == "goal_upsert" })
+        XCTAssertFalse(AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: false)
+            .contains { $0.name == "goal_upsert" })
+        XCTAssertFalse(AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: false)
+            .contains { $0.name == "goal_log" })
+        // Independent of the other two gates.
+        XCTAssertTrue(AgentToolSpec.roster(readSession: false, sendSession: false, goalsLedger: true)
+            .contains { $0.name == "goal_upsert" })
     }
 
     // MARK: - Turn visibility (item 6): turnStarted + real attempt/retry propagation

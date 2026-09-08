@@ -328,6 +328,12 @@ public enum GoalsTick {
     static let maxDetailedGoals = 20
     static let maxTitleLength = 120
     static let maxFieldLength = 200
+    /// `id` is model-chosen (`goal_upsert`'s `id` argument) and only advisorily "a short
+    /// slug" — nothing else bounds its length before it lands in the ledger. Caught in
+    /// review: every OTHER rendered field was already clipped, `id` was the one
+    /// exception, silently violating this section's own "must never blow up every
+    /// future system prompt and heartbeat" invariant for a verbose or malformed id.
+    static let maxIDLength = 64
 
     private static func clip(_ text: String, to limit: Int) -> String {
         text.count <= limit ? text : text.prefix(limit) + "…"
@@ -350,7 +356,7 @@ public enum GoalsTick {
         let closedOutCount = ledger.goals.count - attention.count
 
         var blocks = attention.prefix(maxDetailedGoals).map { goal -> String in
-            var lines = ["- \(goal.id) [\(goal.state.rawValue), p\(goal.priority)] \(clip(goal.title, to: maxTitleLength))"]
+            var lines = ["- \(clip(goal.id, to: maxIDLength)) [\(goal.state.rawValue), p\(goal.priority)] \(clip(goal.title, to: maxTitleLength))"]
             if let why = goal.why, !why.isEmpty {
                 lines.append("  why: \(clip(why, to: maxFieldLength))")
             }
@@ -372,7 +378,7 @@ public enum GoalsTick {
             return lines.joined(separator: "\n")
         }
         for goal in attention.dropFirst(maxDetailedGoals) {
-            blocks.append("- \(goal.id) [\(goal.state.rawValue), p\(goal.priority)] \(clip(goal.title, to: maxTitleLength)) (details trimmed — read the ledger file if this goal needs driving)")
+            blocks.append("- \(clip(goal.id, to: maxIDLength)) [\(goal.state.rawValue), p\(goal.priority)] \(clip(goal.title, to: maxTitleLength)) (details trimmed — read the ledger file if this goal needs driving)")
         }
         if closedOutCount > 0 {
             blocks.append("- \(closedOutCount) done goal\(closedOutCount == 1 ? "" : "s") closed out with the user (not shown)")
@@ -448,4 +454,22 @@ public actor GoalsLedgerStore {
         )
         try data.write(to: fileURL, options: .atomic)
     }
+}
+
+// MARK: - Tool outcomes
+
+/// What a runner's `goal_upsert` hook hands back. Mirrors `AgentReadSessionOutcome`'s
+/// honesty rule: `.created`/`.updated` are kept apart (not collapsed into one `.ok`) so
+/// the tool result can tell the model plainly which one happened — useful when it wasn't
+/// sure whether an id already existed.
+public enum AgentGoalUpsertOutcome: Equatable, Sendable {
+    case created(id: String)
+    case updated(id: String)
+    case failed(String)
+}
+
+/// What a runner's `goal_log` hook hands back.
+public enum AgentGoalLogOutcome: Equatable, Sendable {
+    case logged
+    case failed(String)
 }

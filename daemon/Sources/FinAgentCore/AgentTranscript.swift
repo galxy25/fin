@@ -22,6 +22,17 @@ struct AgentToolCall: Identifiable, Equatable {
         if let number = object[key] as? NSNumber { return number.stringValue }
         return nil
     }
+
+    /// Best-effort string-array argument lookup (`goal_upsert`'s `tags`). Non-string
+    /// elements are dropped rather than failing the whole call — one malformed tag must
+    /// not lose every other one.
+    func stringArrayArgument(_ key: String) -> [String]? {
+        guard let data = arguments.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let array = object[key] as? [Any]
+        else { return nil }
+        return array.compactMap { $0 as? String }
+    }
 }
 
 struct AgentMessage: Identifiable {

@@ -178,6 +178,26 @@ public final class AgentTurnEngine {
         (_ session: String, _ text: String, _ awaitSeconds: Int) async -> AgentSendSessionOutcome
     )?
 
+    /// Fired when the model calls `goal_upsert`. `id` is always present (the engine
+    /// rejects an empty one); `state`, when given, has ALREADY been validated against
+    /// `GoalState`'s cases — the tool result names the illegal value otherwise, and the
+    /// hook never sees one. Whether `id` creates or updates is the runner's call (does a
+    /// goal with that id already exist in its ledger?), not the engine's — the engine has
+    /// no ledger to check against. Nil hook → unavailable, exactly like `onReadSession`.
+    public var onGoalUpsert: (
+        (
+            _ id: String, _ title: String?, _ state: GoalState?, _ why: String?,
+            _ nextAction: String?, _ blockedOn: String?, _ tags: [String]?, _ source: String?
+        ) async -> AgentGoalUpsertOutcome
+    )?
+
+    /// Fired when the model calls `goal_log`. `kind` has already been validated against
+    /// `UpdateKind`'s cases; `goalID`/`text` have already been checked non-empty. Nil
+    /// hook → unavailable, exactly like `onReadSession`.
+    public var onGoalLog: (
+        (_ goalID: String, _ kind: UpdateKind, _ text: String) async -> AgentGoalLogOutcome
+    )?
+
     /// The tmux guard (see `TmuxCommandGuard`). NOT an optional hook, on purpose: a nil
     /// hook reads as "allow", and a guard must never be disarmed by omission.
     /// `.unenforced` is the explicit, named opt-out for a host with no tmux server of its
@@ -425,7 +445,8 @@ public final class AgentTurnEngine {
                     // model spends a turn calling something that can only answer
                     // "unavailable here". The dispatch's honest error stays as a backstop.
                     tools: AgentToolSpec.roster(
-                        readSession: onReadSession != nil, sendSession: onSendSession != nil
+                        readSession: onReadSession != nil, sendSession: onSendSession != nil,
+                        goalsLedger: onGoalUpsert != nil
                     )
                 )
                 return (completion, nil)
@@ -519,10 +540,33 @@ public final class AgentTurnEngine {
                 rawArguments: call.arguments
             )
 
+        case AgentToolSpec.goalUpsert.name:
+            return await executeGoalUpsert(
+                id: call.argument("id"),
+                title: call.argument("title"),
+                rawState: call.argument("state"),
+                why: call.argument("why"),
+                nextAction: call.argument("next_action"),
+                blockedOn: call.argument("blocked_on"),
+                tags: call.stringArrayArgument("tags"),
+                source: call.argument("source"),
+                rawArguments: call.arguments
+            )
+
+        case AgentToolSpec.goalLog.name:
+            return await executeGoalLog(
+                goalID: call.argument("goal_id"),
+                rawKind: call.argument("kind"),
+                text: call.argument("text"),
+                rawArguments: call.arguments
+            )
+
         default:
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
-                + AgentToolSpec.roster(readSession: onReadSession != nil, sendSession: onSendSession != nil)
-                    .map(\.name).joined(separator: ", ") + "."
+                + AgentToolSpec.roster(
+                    readSession: onReadSession != nil, sendSession: onSendSession != nil,
+                    goalsLedger: onGoalUpsert != nil
+                ).map(\.name).joined(separator: ", ") + "."
             record("error", message, toolName: call.name, isFailure: true)
             return message
         }
@@ -806,6 +850,106 @@ public final class AgentTurnEngine {
                 readOnly: false
             )
             return "Sent to \(target). What that session showed afterward:\n\n\(framed)"
+        }
+    }
+
+    /// The model's `goal_upsert` tool: validate `id` (non-empty) and `state` (one of
+    /// `GoalState`'s cases, if given), then hand off. Whether `id` creates or updates —
+    /// and whether a missing `title` on a genuine create is an error — is the RUNNER's
+    /// call: the engine has no ledger to check existence against, only the daemon's
+    /// `onGoalUpsert` hook does.
+    private func executeGoalUpsert(
+        id rawID: String?,
+        title: String?,
+        rawState: String?,
+        why: String?,
+        nextAction: String?,
+        blockedOn: String?,
+        tags: [String]?,
+        source: String?,
+        rawArguments: String
+    ) async -> String {
+        let toolName = AgentToolSpec.goalUpsert.name
+        guard let id = rawID?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else {
+            let message = "Error: goal_upsert requires a non-empty \"id\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        var state: GoalState?
+        if let rawState, !rawState.isEmpty {
+            guard let parsed = GoalState(rawValue: rawState) else {
+                let message = "Error: goal_upsert's \"state\" must be one of open, active, "
+                    + "blocked, done — got \"\(rawState)\"."
+                record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+                return message
+            }
+            state = parsed
+        }
+        record(
+            "toolCall",
+            "goal_upsert: \(id)" + (title.map { " (\($0))" } ?? ""),
+            toolName: toolName, toolArguments: rawArguments
+        )
+        guard let onGoalUpsert else {
+            let message = "Error: goal_upsert is not available in this runtime — there is no "
+                + "persisted goals ledger here."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onGoalUpsert(id, title, state, why, nextAction, blockedOn, tags, source) {
+        case .failed(let reason):
+            let message = "Error: goal_upsert could not save \"\(id)\": \(reason)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        case .created(let savedID):
+            return "Created goal \(savedID)."
+        case .updated(let savedID):
+            return "Updated goal \(savedID)."
+        }
+    }
+
+    /// The model's `goal_log` tool: validate `goal_id`/`text` (non-empty) and `kind`
+    /// (one of `UpdateKind`'s cases), then hand off.
+    private func executeGoalLog(
+        goalID rawGoalID: String?,
+        rawKind: String?,
+        text rawText: String?,
+        rawArguments: String
+    ) async -> String {
+        let toolName = AgentToolSpec.goalLog.name
+        guard let goalID = rawGoalID?.trimmingCharacters(in: .whitespacesAndNewlines), !goalID.isEmpty else {
+            let message = "Error: goal_log requires a non-empty \"goal_id\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        guard let rawKind, let kind = UpdateKind(rawValue: rawKind) else {
+            let message = "Error: goal_log's \"kind\" must be one of progress, blocker, report, "
+                + "close, note — got \"\(rawKind ?? "nil")\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        guard let text = rawText?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            let message = "Error: goal_log requires a non-empty \"text\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        record(
+            "toolCall", "goal_log: \(goalID) [\(kind.rawValue)]",
+            toolName: toolName, toolArguments: rawArguments
+        )
+        guard let onGoalLog else {
+            let message = "Error: goal_log is not available in this runtime — there is no "
+                + "persisted goals ledger here."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onGoalLog(goalID, kind, text) {
+        case .failed(let reason):
+            let message = "Error: goal_log could not record an entry on \"\(goalID)\": \(reason)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        case .logged:
+            return "Logged \(kind.rawValue) on \(goalID)."
         }
     }
 
