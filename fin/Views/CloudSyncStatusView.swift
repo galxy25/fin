@@ -65,8 +65,9 @@ final class CloudSyncActivityMonitor: ObservableObject {
         }
         let wasFailed = activity.isFailed
         if let error = event.error {
-            activity = .failed(error.localizedDescription, endDate)
-            audit("[icloud] \(Self.describe(event.type)) failed: \(error.localizedDescription)")
+            let detail = Self.describeFailure(error)
+            activity = .failed(detail, endDate)
+            audit("[icloud] \(Self.describe(event.type)) failed: \(detail)")
         } else {
             activity = .succeeded(endDate)
             if wasFailed {
@@ -82,6 +83,28 @@ final class CloudSyncActivityMonitor: ObservableObject {
         case .export: return "export"
         @unknown default: return "sync"
         }
+    }
+
+    /// `CKError.partialFailure`'s own `localizedDescription` is usually just
+    /// Foundation's generic fallback ("The operation couldn't be completed...") —
+    /// the actual reason lives per-record under `CKPartialErrorsByItemIDKey`, one
+    /// entry per record that failed independently of the rest of the batch. Surface
+    /// those reasons (record IDs here are our own UUIDs, not user content) so the
+    /// audit line names the real cause instead of just the outer wrapper.
+    private static func describeFailure(_ error: Error) -> String {
+        let nsError = error as NSError
+        guard nsError.domain == CKErrorDomain,
+              nsError.code == CKError.Code.partialFailure.rawValue,
+              let perItem = nsError.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: Error],
+              !perItem.isEmpty
+        else {
+            return error.localizedDescription
+        }
+        let reasons = Array(Set(perItem.values.map { ($0 as NSError).localizedDescription })).sorted()
+        let shown = reasons.prefix(3).joined(separator: "; ")
+        let omitted = perItem.count - min(perItem.count, 3)
+        let suffix = omitted > 0 ? " (+\(omitted) more)" : ""
+        return "\(error.localizedDescription) — \(shown)\(suffix)"
     }
 }
 
