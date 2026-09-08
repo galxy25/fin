@@ -267,21 +267,39 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         [.banner, .list, .sound]
     }
 
-    /// A tap deep-links to the agent named in the payload — either a local
-    /// notification's own "fin" payload, or a cross-device CloudKit push whose
-    /// query-notification fields carry the agent id and its origin device (see
-    /// `AgentSignalSubscriber`). A "fin" payload carries no origin field because
-    /// it doesn't need one: local banners are minted by THIS device, so the
-    /// origin is the local device by construction.
+    /// Parses a "fin" notification payload — `{"agentID": "<uuid>",
+    /// "originDeviceID8"?: "<8 hex>"}` — used by both a local (on-device)
+    /// banner's `userInfo` and a daemon-originated `/notify` push's APNs
+    /// payload (`lambda.py`'s `notify`). `originDeviceID8` is absent for a
+    /// local banner (minted by THIS device, so the origin is local by
+    /// construction) and present for a daemon push (the daemon isn't the
+    /// receiving device, so it must say so explicitly) — the caller decides
+    /// what an absent origin means, this just reports what the payload said.
+    nonisolated static func parseFinPayload(
+        _ userInfo: [AnyHashable: Any]
+    ) -> (agentID: UUID, originDeviceID8: String?)? {
+        guard let fin = userInfo["fin"] as? [String: Any],
+              let idString = fin["agentID"] as? String,
+              let agentID = UUID(uuidString: idString)
+        else { return nil }
+        let origin = fin["originDeviceID8"] as? String
+        return (agentID, origin?.isEmpty == false ? origin : nil)
+    }
+
+    /// A tap deep-links to the agent named in the payload — either a "fin"
+    /// payload (a local notification, or a daemon push relayed through the
+    /// control plane) or a cross-device CloudKit push whose query-notification
+    /// fields carry the agent id and its origin device (see
+    /// `AgentSignalSubscriber`). A "fin" payload with no origin field means a
+    /// local banner: minted by THIS device, so the origin is the local device
+    /// by construction.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
         let userInfo = response.notification.request.content.userInfo
-        if let fin = userInfo["fin"] as? [String: Any],
-           let idString = fin["agentID"] as? String,
-           let agentID = UUID(uuidString: idString) {
-            onOpenAgent?(agentID, DeviceIdentity.short)
+        if let parsed = Self.parseFinPayload(userInfo) {
+            onOpenAgent?(parsed.agentID, parsed.originDeviceID8 ?? DeviceIdentity.short)
         } else if let target = AgentSignalSubscriber.openTarget(fromPushUserInfo: userInfo) {
             onOpenAgent?(target.agentID, target.originDeviceID8)
         }

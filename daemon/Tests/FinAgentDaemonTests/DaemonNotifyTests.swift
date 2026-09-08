@@ -7,7 +7,8 @@ import FoundationNetworking
 
 /// The `/notify` wire contract and the client's failure discipline. The Lambda side of
 /// the contract lives in scripts/cloud-agent/control-plane/lambda.py (`notify`); the
-/// body keys asserted here — `title`, `body`, `agent` — are what it validates, so a
+/// body keys asserted here — `title`, `body`, `agent` required, `agentID`/
+/// `originDeviceID8` when the daemon has them — are what it validates, so a
 /// drift on either side fails loudly in exactly one place.
 @MainActor
 final class DaemonNotifyClientTests: XCTestCase {
@@ -15,6 +16,8 @@ final class DaemonNotifyClientTests: XCTestCase {
     private func makeClient(
         endpointURL: String = "https://cp.example",
         agentName: String = "Nimbus",
+        agentID: UUID? = nil,
+        originDeviceID8: String = "",
         audit: @escaping (String) -> Void = { _ in },
         post: @escaping (URLRequest) async throws -> URLResponse = { request in
             HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
@@ -24,6 +27,8 @@ final class DaemonNotifyClientTests: XCTestCase {
             endpointURL: endpointURL,
             token: "cp-token-123",
             agentName: agentName,
+            agentID: agentID,
+            originDeviceID8: originDeviceID8,
             audit: audit,
             post: post
         )
@@ -54,6 +59,48 @@ final class DaemonNotifyClientTests: XCTestCase {
         XCTAssertEqual(object["body"] as? String, "Which branch should I deploy?")
         XCTAssertEqual(object["agent"] as? String, "Nimbus")
         XCTAssertEqual(object.count, 3, "the contract has exactly three keys")
+    }
+
+    /// An unpaired daemon (no agentID) omits both new keys rather than sending
+    /// them null — a push still lands, it just can't deep-link a tap. Same
+    /// three-key shape as `testSendPostsTheNotifyContract`, pinned separately
+    /// here so a regression on either optional field fails in the right test.
+    func testSendOmitsAgentIDAndOriginDeviceID8WhenUnpaired() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        }
+
+        await client.send(event: "task-complete", message: "done")
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(captured?.httpBody)) as? [String: Any]
+        )
+        XCTAssertNil(object["agentID"])
+        XCTAssertNil(object["originDeviceID8"])
+        XCTAssertEqual(object.count, 3)
+    }
+
+    /// A daemon paired to an Agent record (the normal case) includes both —
+    /// this is what lets the Lambda (`lambda.py`'s `notify`) build the "fin"
+    /// payload a tap deep-links from (see `AgentNotificationService`).
+    func testSendIncludesAgentIDAndOriginDeviceID8WhenPaired() async throws {
+        let agentID = UUID()
+        var captured: URLRequest?
+        let client = makeClient(agentID: agentID, originDeviceID8: "a4a1d987") { request in
+            captured = request
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        }
+
+        await client.sendDirect(title: "Deploy done", body: "main is live on prod.")
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(captured?.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(object["agentID"] as? String, agentID.uuidString)
+        XCTAssertEqual(object["originDeviceID8"] as? String, "a4a1d987")
+        XCTAssertEqual(object.count, 5, "title, body, agent, agentID, originDeviceID8")
     }
 
     /// The model's `notify` tool authors its own title, so `sendDirect` must push that

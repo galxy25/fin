@@ -341,6 +341,43 @@ final class AgentCrossDeviceTests: XCTestCase {
         XCTAssertNil(AgentSignalSubscriber.openTarget(fromPushUserInfo: ["aps": ["alert": "hi"] as NSObject]))
     }
 
+    /// The "fin" payload parse shared by a local (on-device) notification and a
+    /// daemon-originated `/notify` push relayed through the control plane
+    /// (lambda.py's `notify`) — the same dict shape, distinguished only by
+    /// whether `originDeviceID8` is present. Missing/garbage origin values
+    /// degrade to nil (the caller then assumes local origin), never drop the
+    /// agent id itself.
+    func testParseFinPayloadTable() {
+        let agentID = UUID()
+
+        // Local banner: no origin field at all.
+        let local = AgentNotificationService.parseFinPayload(
+            ["fin": ["kind": "agentReply", "agentID": agentID.uuidString]]
+        )
+        XCTAssertEqual(local?.agentID, agentID)
+        XCTAssertNil(local?.originDeviceID8)
+
+        // Daemon push relayed through the control plane: origin present.
+        let remote = AgentNotificationService.parseFinPayload(
+            ["fin": ["agentID": agentID.uuidString, "originDeviceID8": "a4a1d987"]]
+        )
+        XCTAssertEqual(remote?.agentID, agentID)
+        XCTAssertEqual(remote?.originDeviceID8, "a4a1d987")
+
+        // Empty origin string degrades to nil, same as an absent field.
+        let emptyOrigin = AgentNotificationService.parseFinPayload(
+            ["fin": ["agentID": agentID.uuidString, "originDeviceID8": ""]]
+        )
+        XCTAssertEqual(emptyOrigin?.agentID, agentID)
+        XCTAssertNil(emptyOrigin?.originDeviceID8)
+
+        // No parseable agent id, foreign payload, or no "fin" key at all → nil.
+        XCTAssertNil(AgentNotificationService.parseFinPayload(["fin": ["agentID": "not-a-uuid"]]))
+        XCTAssertNil(AgentNotificationService.parseFinPayload(["fin": ["agentID": 7]]))
+        XCTAssertNil(AgentNotificationService.parseFinPayload([:]))
+        XCTAssertNil(AgentNotificationService.parseFinPayload(["aps": ["alert": "hi"]]))
+    }
+
     /// The pure half of the push parse: the agent id is load-bearing, the origin
     /// is best-effort — missing, empty, or garbage-typed degrades to a nil origin
     /// (routing then falls back to residence) without dropping the tap.

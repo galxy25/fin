@@ -127,6 +127,11 @@ IDLE_STATES = ("idle", "task-complete")
 # characters that can do neither key traversal nor tag-filter surprises.
 AGENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 
+# DeviceIdentity.short's shape (fin/Models/DeviceIdentity.swift): lowercase hex,
+# 8 characters — the app-side origin-device id a /notify push's tap routing
+# echoes back verbatim.
+DEVICE_ID8 = re.compile(r"^[0-9a-f]{8}$")
+
 # --- service-credential store (Secrets Manager) ------------------------------
 # Secrets live at fin/service-creds/<agentScope>/<service>. The scope is the
 # agent's key slug (lowercased display name), or the reserved scope "shared",
@@ -1043,9 +1048,9 @@ def put_device_token(event):
 
 
 def notify(event):
-    """POST /notify — {"title", "body", "agent"?}: one APNs alert to every
-    registered device. The response reports counts and APNs reason strings only —
-    never a token, never the auth key, never the JWT."""
+    """POST /notify — {"title", "body", "agent"?, "agentID"?, "originDeviceID8"?}:
+    one APNs alert to every registered device. The response reports counts and
+    APNs reason strings only — never a token, never the auth key, never the JWT."""
     if not _apns_configured():
         raise ApiError(503, "APNs key is not configured; redeploy with FIN_APNS_KEY_PATH set (see control-plane/README.md)")
     body = _body(event)
@@ -1064,6 +1069,19 @@ def notify(event):
     agent = str(body.get("agent") or "").strip()
     if agent and not AGENT_NAME.match(agent):
         raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+
+    # Neither is secret and both are best-effort: a malformed value here just
+    # means the eventual tap can't deep-link (same tolerant-parse philosophy as
+    # the app's own AgentSignalSubscriber.openTarget), never a hard failure of
+    # the push itself.
+    agent_id = str(body.get("agentID") or "").strip()
+    try:
+        agent_id = str(uuid.UUID(agent_id)) if agent_id else ""
+    except ValueError:
+        agent_id = ""
+    origin_device_id8 = str(body.get("originDeviceID8") or "").strip()
+    if not DEVICE_ID8.match(origin_device_id8):
+        origin_device_id8 = ""
 
     rows = _scan(table=DEVICE_TOKENS_TABLE)
     if not rows:
@@ -1085,9 +1103,15 @@ def notify(event):
         raise ApiError(500, "APNs provider token signing failed; check the deployed APNS_* environment")
 
     payload = {"aps": {"alert": {"title": title, "body": text}, "sound": "default"}}
-    if agent:
-        # Custom key for the app's future tap routing; harmless to older builds.
-        payload["finAgent"] = agent
+    if agent_id:
+        # Same "fin" dict shape a local (on-device) notification's userInfo
+        # carries — AgentNotificationService.didReceive reads either one the
+        # same way. originDeviceID8 tells it this push did NOT originate on
+        # the receiving device, so a tap routes to the remote conversation
+        # instead of assuming local origin (see AgentNotificationService.swift).
+        payload["fin"] = {"agentID": agent_id}
+        if origin_device_id8:
+            payload["fin"]["originDeviceID8"] = origin_device_id8
 
     delivered, removed, failures = 0, 0, []
     with httpx.Client(http2=True, timeout=APNS_REQUEST_TIMEOUT) as client:

@@ -31,6 +31,16 @@ final class DaemonNotifyClient {
     let endpointURL: String
     private let token: String
     let agentName: String
+    /// The Agent record this push is about, when the daemon has been paired to
+    /// one (`config.agentID`) — lets a tap deep-link straight to the
+    /// conversation instead of just opening the app. Nil for an unpaired
+    /// daemon: the push still lands, it just can't route a tap anywhere.
+    let agentID: UUID?
+    /// This Mac's own `DeviceIdentity.short`-equivalent (`config.deviceToken8`)
+    /// — the push's true origin. Without it, a tap would default to treating
+    /// the RECEIVING device as the origin (the local-banner assumption), which
+    /// is wrong for every device but this one.
+    let originDeviceID8: String
     /// Injected transport, so tests never touch the network.
     var post: (URLRequest) async throws -> URLResponse
     let audit: (String) -> Void
@@ -40,6 +50,8 @@ final class DaemonNotifyClient {
         endpointURL: String,
         token: String,
         agentName: String,
+        agentID: UUID? = nil,
+        originDeviceID8: String = "",
         audit: @escaping (String) -> Void = { _ in },
         post: @escaping (URLRequest) async throws -> URLResponse = { request in
             let (_, response) = try await URLSession.shared.data(for: request)
@@ -49,6 +61,8 @@ final class DaemonNotifyClient {
         self.endpointURL = endpointURL
         self.token = token
         self.agentName = agentName
+        self.agentID = agentID
+        self.originDeviceID8 = originDeviceID8
         self.audit = audit
         self.post = post
     }
@@ -74,12 +88,24 @@ final class DaemonNotifyClient {
         return String(redacted.prefix(maxMessageLength)) + "…"
     }
 
-    /// The `/notify` contract: `{"agent", "body", "title"}`.
-    static func requestBody(title: String, body: String, agentName: String) -> Data? {
-        try? JSONSerialization.data(
-            withJSONObject: ["title": title, "body": body, "agent": agentName],
-            options: [.sortedKeys]
-        )
+    /// The `/notify` contract: `{"agent", "body", "title"}` required, plus
+    /// `"agentID"`/`"originDeviceID8"` when the daemon has them — the Lambda
+    /// forwards those into the APNs payload's `fin` dict so a tap on the
+    /// resulting push can deep-link (see `AgentNotificationService`), instead
+    /// of just opening the app cold. Omitted (not sent as null) when absent,
+    /// so an unpaired daemon's push is byte-identical to before this existed.
+    static func requestBody(
+        title: String, body: String, agentName: String,
+        agentID: UUID? = nil, originDeviceID8: String = ""
+    ) -> Data? {
+        var object: [String: Any] = ["title": title, "body": body, "agent": agentName]
+        if let agentID {
+            object["agentID"] = agentID.uuidString
+        }
+        if !originDeviceID8.isEmpty {
+            object["originDeviceID8"] = originDeviceID8
+        }
+        return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
     // MARK: - Send
@@ -134,7 +160,9 @@ final class DaemonNotifyClient {
         request.httpBody = Self.requestBody(
             title: title,
             body: body,
-            agentName: agentName
+            agentName: agentName,
+            agentID: agentID,
+            originDeviceID8: originDeviceID8
         )
         do {
             let response = try await post(request)

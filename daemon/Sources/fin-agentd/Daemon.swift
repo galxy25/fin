@@ -799,6 +799,8 @@ final class Daemon {
                 endpointURL: block.endpointURL,
                 token: block.token,
                 agentName: config.supervision?.agentName ?? "Agent",
+                agentID: agentID,
+                originDeviceID8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
                 audit: { [weak self] line in
                     self?.log(line)
                     self?.record(AgentAuditEvent(kind: "notice", text: line))
