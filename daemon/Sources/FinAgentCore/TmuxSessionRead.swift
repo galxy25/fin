@@ -234,19 +234,30 @@ public enum TmuxSessionRead {
     ///
     /// `note` (a cut, a byte cap, a read that stopped early) goes in the HEADER, outside
     /// the fence: inside it, it would be indistinguishable from text the pane printed.
+    /// `readOnly` defaults true for `read_session`'s own captures — the claim is correct
+    /// there. `send_session` reuses this same fencing/preamble machinery for what a pane
+    /// showed AFTER it just typed into that pane, and passes `false`: "(read-only; you
+    /// cannot type into it)" would be a flatly false statement about a session this
+    /// daemon just sent real keystrokes to, in the very same tool result that says so.
+    /// Caught in review, not shipped: reusing this frame unmodified for a write result
+    /// was the mistake, not this function needing a second header at all.
     public static func frameCapture(
         session: String,
         lines: Int,
         output: String,
-        note: String? = nil
+        note: String? = nil,
+        readOnly: Bool = true
     ) -> String {
         let body = output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else {
             return "tmux session \"\(session)\" is empty (its current pane has printed nothing "
                 + "that is still on screen)."
         }
+        let capability = readOnly
+            ? "(read-only; you cannot type into it). "
+            : "(shown after send_session just typed into it). "
         return "tmux session \"\(session)\", last \(lines) lines of its current pane "
-            + "(read-only; you cannot type into it). "
+            + capability
             + (note.map { "\($0) " } ?? "")
             + "\(untrustedPreamble)\n"
             + fenced(body)

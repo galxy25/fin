@@ -533,17 +533,34 @@ final class AgentEngineDispatchTests: XCTestCase {
     /// `tmux capture-pane` for that, so the two instructions contradicted each other and the
     /// tool-shaped one always failed.
     func testTheRosterDropsReadSessionForARuntimeThatCannotServeIt() {
-        XCTAssertTrue(AgentToolSpec.roster(readSession: true).contains { $0.name == "read_session" })
-        XCTAssertFalse(AgentToolSpec.roster(readSession: false).contains { $0.name == "read_session" })
+        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true)
+            .contains { $0.name == "read_session" })
+        XCTAssertFalse(AgentToolSpec.roster(readSession: false, sendSession: true)
+            .contains { $0.name == "read_session" })
         // Nothing else moves: the two rosters differ by exactly that one tool.
         XCTAssertEqual(
-            AgentToolSpec.roster(readSession: true).count,
-            AgentToolSpec.roster(readSession: false).count + 1
+            AgentToolSpec.roster(readSession: true, sendSession: true).count,
+            AgentToolSpec.roster(readSession: false, sendSession: true).count + 1
         )
-        XCTAssertEqual(AgentToolSpec.roster(readSession: true).map(\.name),
+        XCTAssertEqual(AgentToolSpec.roster(readSession: true, sendSession: true).map(\.name),
                        AgentToolSpec.all.map(\.name))
         // …and the dispatch keeps its honest error for a model that names it anyway.
         XCTAssertTrue(AgentToolSpec.knownToolNames.contains("read_session"))
+    }
+
+    /// `send_session` is gated independently — a runtime could plausibly serve reads
+    /// without offering writes (the app target, today, offers neither; a future host
+    /// might reasonably want read-only). Same reasoning as the read-side test: an
+    /// advertised tool that can only answer "unavailable" is a trap, not a convenience.
+    func testTheRosterDropsSendSessionIndependentlyOfReadSession() {
+        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true)
+            .contains { $0.name == "send_session" })
+        XCTAssertFalse(AgentToolSpec.roster(readSession: true, sendSession: false)
+            .contains { $0.name == "send_session" })
+        // Dropping send must not also drop read — the two are independent gates.
+        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: false)
+            .contains { $0.name == "read_session" })
+        XCTAssertTrue(AgentToolSpec.knownToolNames.contains("send_session"))
     }
 
     /// The name reaches the hook validated and unchanged, and the frame tells the model
@@ -718,6 +735,172 @@ final class AgentEngineDispatchTests: XCTestCase {
         // The note is in the header, not inside the fence, where a pane could have printed it.
         let header = result.components(separatedBy: TmuxSessionRead.beginMarker).first ?? ""
         XCTAssertTrue(header.contains("Only the last"), "got header: \(header)")
+    }
+
+    // MARK: - send_session
+
+    func testSendSessionWithoutARunnerHookIsAnHonestError() async {
+        let engine = makeEngine()
+        // onSendSession left nil.
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendSession.name, #"{"session": "main:0", "text": "hello"}"#
+        ))
+
+        XCTAssertTrue(result.contains("not available"), "got: \(result)")
+        XCTAssertFalse(result.hasPrefix("Sent to"), "an unavailable hook must never claim success")
+    }
+
+    /// THE INJECTION/AMBIGUITY GATE that makes `send_session` stricter than
+    /// `read_session`: a bare name — even one `read_session`'s own resolver would happily
+    /// match — is refused here, never passed to the hook. Sending is not read-only, so
+    /// there is no room for "probably the right window."
+    func testSendSessionRejectsABareNameEvenWhenItWouldReadResolveFine() async {
+        let engine = makeEngine()
+        engine.onSendSession = { _, _, _ in
+            XCTFail("a bare/non-colon target must never reach the runner")
+            return .failed("")
+        }
+
+        for bare in ["main", "pocketdj", "fin"] {
+            let result = await engine.execute(call(
+                AgentToolSpec.sendSession.name, #"{"session": "\#(bare)", "text": "hi"}"#
+            ))
+            XCTAssertTrue(result.contains("EXACT") || result.contains("exact"), "got: \(result)")
+            XCTAssertTrue(result.contains("read_session"), "must point at the fix — got: \(result)")
+        }
+    }
+
+    func testSendSessionAcceptsAnExplicitSessionColonWindowTarget() async {
+        var seen: [(String, String, Int)] = []
+        let engine = makeEngine()
+        engine.onSendSession = { session, text, awaitSeconds in
+            seen.append((session, text, awaitSeconds))
+            return .sent(after: .notWaited)
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendSession.name, #"{"session": "main:2", "text": "are you there?"}"#
+        ))
+
+        XCTAssertEqual(seen.count, 1)
+        XCTAssertEqual(seen.first?.0, "main:2")
+        XCTAssertEqual(seen.first?.1, "are you there?")
+        XCTAssertEqual(seen.first?.2, 0, "omitted await_output_seconds must clamp to 0 (no wait)")
+        XCTAssertEqual(result, "Sent to main:2.")
+    }
+
+    func testSendSessionRejectsEmptyText() async {
+        let engine = makeEngine()
+        engine.onSendSession = { _, _, _ in
+            XCTFail("empty text must never reach the runner")
+            return .failed("")
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendSession.name, #"{"session": "main:0", "text": "   "}"#
+        ))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+    }
+
+    func testSendSessionRejectsTextOverTheLengthCap() async {
+        let engine = makeEngine()
+        engine.onSendSession = { _, _, _ in
+            XCTFail("oversized text must never reach the runner")
+            return .failed("")
+        }
+        let tooLong = String(repeating: "x", count: TmuxSessionSend.maxTextLength + 1)
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendSession.name,
+            #"{"session": "main:0", "text": "\#(tooLong)"}"#
+        ))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+    }
+
+    func testSendSessionClampsAwaitOutputSecondsToTheCeiling() async {
+        var seenAwait: Int?
+        let engine = makeEngine()
+        engine.onSendSession = { _, _, awaitSeconds in
+            seenAwait = awaitSeconds
+            return .sent(after: .notWaited)
+        }
+
+        _ = await engine.execute(call(
+            AgentToolSpec.sendSession.name,
+            #"{"session": "main:0", "text": "hi", "await_output_seconds": 999999}"#
+        ))
+
+        XCTAssertEqual(seenAwait, TmuxSessionSend.maxAwaitSeconds)
+    }
+
+    func testSendSessionReportsARunnerFailureHonestly() async {
+        let engine = makeEngine()
+        engine.onSendSession = { _, _, _ in .failed("can't find pane: main:9 (exit 1)") }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendSession.name, #"{"session": "main:9", "text": "hi"}"#
+        ))
+
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("can't find pane"), "the real reason must survive — got: \(result)")
+        XCTAssertFalse(result.hasPrefix("Sent to"), "a failed send must never read as success")
+    }
+
+    /// When the caller waited and something came back, it is exactly as untrusted as a
+    /// `read_session` capture and must be fenced the same way — including the note
+    /// staying outside the fence, mirroring `testReadSessionNoteStaysOutsideTheUntrustedDataFence`.
+    func testSendSessionFramesWhatFollowedLikeAReadSessionCapture() async {
+        let engine = makeEngine()
+        engine.onSendSession = { _, _, _ in .sent(after: .observed("pane content after the send")) }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendSession.name,
+            #"{"session": "main:2", "text": "status?", "await_output_seconds": 10}"#
+        ))
+
+        XCTAssertTrue(result.hasPrefix("Sent to main:2."), "got: \(result)")
+        XCTAssertTrue(result.contains(TmuxSessionRead.beginMarker), "got: \(result)")
+        XCTAssertTrue(result.contains(TmuxSessionRead.endMarker), "got: \(result)")
+        XCTAssertTrue(result.contains("pane content after the send"), "got: \(result)")
+        // The write result must never repeat read_session's own "(read-only; you cannot
+        // type into it)" claim — false for a session this call just typed into.
+        XCTAssertFalse(result.contains("read-only"), "got: \(result)")
+    }
+
+    /// Engine-layer half of the critical embedded-newline finding: multi-line text must
+    /// never reach the hook at all, exactly like a bare (non-colon) target.
+    func testSendSessionRejectsTextContainingAnEmbeddedNewline() async {
+        let engine = makeEngine()
+        engine.onSendSession = { _, _, _ in
+            XCTFail("multi-line text must never reach the runner")
+            return .failed("")
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendSession.name,
+            #"{"session": "main:0", "text": "line one\nline two"}"#
+        ))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.localizedCaseInsensitiveContains("newline"), "got: \(result)")
+    }
+
+    /// `.allAttemptsFailed` must read as "I tried to wait and couldn't confirm anything,"
+    /// never collapse into the same "Sent to X." text `.notWaited` produces — that
+    /// collapse (a plain `nil` for both) was the actual bug caught in review.
+    func testSendSessionDistinguishesAllPollsFailingFromNoWaitRequested() async {
+        let engine = makeEngine()
+        engine.onSendSession = { _, _, _ in .sent(after: .allAttemptsFailed) }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.sendSession.name,
+            #"{"session": "main:0", "text": "hi", "await_output_seconds": 10}"#
+        ))
+
+        XCTAssertNotEqual(result, "Sent to main:0.",
+                          "an all-polls-failed wait must not read identically to no wait at all")
+        XCTAssertTrue(result.hasPrefix("Sent to main:0."), "the send itself is still honest — got: \(result)")
+        XCTAssertTrue(result.localizedCaseInsensitiveContains("could not"), "got: \(result)")
     }
 
     // MARK: - Turn visibility (item 6): turnStarted + real attempt/retry propagation

@@ -166,6 +166,18 @@ public final class AgentTurnEngine {
     /// must never be answered with a lie or an "unknown tool".
     public var onReadSession: ((_ session: String?, _ lines: Int) async -> AgentReadSessionOutcome)?
 
+    /// Fired when the model calls `send_session`. `session` has ALREADY been validated as
+    /// an EXPLICIT "session:window" target (`TmuxSessionSend.validateTarget` — no bare
+    /// names reach here, unlike `onReadSession`), and `text` has already been trimmed and
+    /// length-checked. `awaitSeconds` is already clamped. The runner types the text, then
+    /// Enter, on the same kind of fixed-argv channel `onReadSession` uses — real
+    /// keystrokes into a pane this process does not otherwise control, which is why the
+    /// target arrives pre-validated to exactly one shape instead of a name to resolve.
+    /// Nil hook → the tool reports it is unavailable, exactly like `onReadSession`.
+    public var onSendSession: (
+        (_ session: String, _ text: String, _ awaitSeconds: Int) async -> AgentSendSessionOutcome
+    )?
+
     /// The tmux guard (see `TmuxCommandGuard`). NOT an optional hook, on purpose: a nil
     /// hook reads as "allow", and a guard must never be disarmed by omission.
     /// `.unenforced` is the explicit, named opt-out for a host with no tmux server of its
@@ -412,7 +424,9 @@ public final class AgentTurnEngine {
                     // (the app, a test harness) must not be told the tool exists, or the
                     // model spends a turn calling something that can only answer
                     // "unavailable here". The dispatch's honest error stays as a backstop.
-                    tools: AgentToolSpec.roster(readSession: onReadSession != nil)
+                    tools: AgentToolSpec.roster(
+                        readSession: onReadSession != nil, sendSession: onSendSession != nil
+                    )
                 )
                 return (completion, nil)
             } catch {
@@ -497,9 +511,17 @@ public final class AgentTurnEngine {
                 rawArguments: call.arguments
             )
 
+        case AgentToolSpec.sendSession.name:
+            return await executeSendSession(
+                session: call.argument("session"),
+                text: call.argument("text"),
+                awaitSeconds: call.argument("await_output_seconds").flatMap(Int.init),
+                rawArguments: call.arguments
+            )
+
         default:
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
-                + AgentToolSpec.roster(readSession: onReadSession != nil)
+                + AgentToolSpec.roster(readSession: onReadSession != nil, sendSession: onSendSession != nil)
                     .map(\.name).joined(separator: ", ") + "."
             record("error", message, toolName: call.name, isFailure: true)
             return message
@@ -709,6 +731,82 @@ public final class AgentTurnEngine {
     /// small window cannot be handed a capture that evicts the conversation it belongs to.
     private var readSessionByteBudget: Int {
         max(2_000, min(TmuxSessionRead.maxResponseBytes, contextBudget))
+    }
+
+    /// The model's `send_session` tool: validate the TARGET (must be an explicit
+    /// "session:window", not a bare name — see `TmuxSessionSend`'s design note for why
+    /// this tool is deliberately stricter than `read_session`), validate and bound the
+    /// text, clamp the wait, hand all three to the runner's hook, and frame whatever
+    /// comes back exactly the way `read_session` frames a capture — the "after" text is
+    /// still somebody else's pane content, still untrusted, and the runner has already
+    /// redacted it the same way `read_session`'s does before this ever sees it.
+    private func executeSendSession(
+        session raw: String?,
+        text rawText: String?,
+        awaitSeconds requested: Int?,
+        rawArguments: String
+    ) async -> String {
+        let toolName = AgentToolSpec.sendSession.name
+        let trimmedTarget = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmedTarget.isEmpty else {
+            let message = "Error: send_session requires a \"session\" target — an exact "
+                + "\"session:window\", never omitted. Call read_session first to find one."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        guard let target = TmuxSessionSend.validateTarget(name: trimmedTarget) else {
+            let message = TmuxSessionSend.targetRejectionMessage(for: trimmedTarget)
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        guard let text = rawText.flatMap(TmuxSessionSend.validateText) else {
+            let message = TmuxSessionSend.textRejectionMessage(for: rawText ?? "")
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        let awaitSeconds = TmuxSessionSend.clampAwaitSeconds(requested)
+        record(
+            "toolCall",
+            "send_session: \(target) (\(text.count) chars"
+                + (awaitSeconds > 0 ? ", waiting up to \(awaitSeconds)s" : "") + ")",
+            toolName: toolName, toolArguments: rawArguments
+        )
+        guard let onSendSession else {
+            let message = "Error: send_session is not available in this runtime — there is no "
+                + "way to type into another session from here. Say plainly in your reply that "
+                + "you cannot reach it."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onSendSession(target, text, awaitSeconds) {
+        case .failed(let why):
+            let message = "Error: send_session could not send to \"\(target)\": \(why)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        case .sent(.notWaited):
+            return "Sent to \(target)."
+        case .sent(.allAttemptsFailed):
+            // Distinct from `.notWaited` on purpose — a wait WAS requested and every
+            // attempt to confirm it failed. The send itself is not in doubt; only the
+            // observation of what followed is.
+            return "Sent to \(target). Waited up to \(awaitSeconds)s afterward, but could not "
+                + "read that session's screen to confirm what happened — the message may still "
+                + "have gone through. Check with read_session."
+        case .sent(.observed(let after)):
+            let byteBudget = readSessionByteBudget
+            let fitted = TmuxSessionRead.fit(after, intoBytes: byteBudget)
+            let framed = TmuxSessionRead.frameCapture(
+                session: target,
+                lines: TmuxSessionRead.defaultLines,
+                output: fitted.text,
+                note: fitted.trimmed
+                    ? "Only the last \(byteBudget / 1024) KB of what followed is shown — it was "
+                        + "larger than one tool result may occupy in this model's context window."
+                    : nil,
+                readOnly: false
+            )
+            return "Sent to \(target). What that session showed afterward:\n\n\(framed)"
+        }
     }
 
     private func executeReadTerminal(lines requested: Int?, rawArguments: String) async -> String {

@@ -731,6 +731,14 @@ final class Daemon {
             guard let self else { return .failed("the daemon is shutting down.") }
             return await self.readSession(name: name, lines: lines)
         }
+        // The model's send_session tool. THE WRITE HALF, and the owner-approved exception
+        // to "the agent cannot type into other sessions" — real keystrokes, on the same
+        // kind of channel as the read above, into a target the model has already named
+        // exactly (never resolved here the way a bare read name is).
+        engine.onSendSession = { [weak self] session, text, awaitSeconds in
+            guard let self else { return .failed("the daemon is shutting down.") }
+            return await self.sendSession(session: session, text: text, awaitSeconds: awaitSeconds)
+        }
 
         if let uplink = transcript {
             log("cloud transcript enabled: last \(uplink.maxLines) lines, "
@@ -1265,6 +1273,97 @@ final class Daemon {
                 self?.log("read_session classification failed: \(reason)")
             }
         )
+    }
+
+    /// The model's `send_session` tool, wired to `engine.onSendSession`. `session` has
+    /// ALREADY been validated as an explicit "session:window" target by the engine
+    /// (`TmuxSessionSend.validateTarget`) — this function validates AGAIN, same
+    /// belt-and-braces reasoning as `readSession`'s own re-validation, and for the same
+    /// reason: the engine's check protects a host that wires this hook to something
+    /// else, this one protects the argv actually sent from a future engine change.
+    ///
+    /// Two SEPARATE fixed commands, not one: `send-keys -l -t <target> -- <text>` (literal
+    /// mode, so the message text is never read as a key name or a `send-keys` flag — `--`
+    /// specifically guards a message starting with `-`, confirmed against real tmux, not
+    /// assumed), then `send-keys -t <target> Enter` (a real key press) only once the first
+    /// succeeds. A message typed but never submitted is reported as a failure, not a
+    /// partial success — nothing here claims "sent" for that.
+    ///
+    /// `awaitSeconds > 0` polls `capture-pane` once a second until the pane stops
+    /// changing across `TmuxSessionSend.quietPollsToSettle` consecutive polls or the
+    /// budget runs out, then returns that final capture — redacted exactly like
+    /// `readSession`'s own capture, since it is exactly the same kind of untrusted pane
+    /// content, just observed after this daemon caused it rather than found it as-is.
+    private func sendSession(session rawTarget: String, text rawText: String, awaitSeconds: Int) async -> AgentSendSessionOutcome {
+        guard let sshSession = session else {
+            return .failed("the daemon has no SSH session open.")
+        }
+        guard let target = TmuxSessionSend.validateTarget(name: rawTarget) else {
+            // Unreachable through the engine, which validates first; if it is ever
+            // reached, the answer is a refusal, never a best-effort send.
+            return .failed("\"\(rawTarget)\" is not a legal \"session:window\" target.")
+        }
+        // Same belt-and-braces reasoning as the target check above, and the one this
+        // codebase already applies to `readSession`'s name: two validations of the same
+        // rule protect the argv actually sent from a future engine change, not just from
+        // today's single call site. Text is exactly as load-bearing as the target here —
+        // an unvalidated text could be empty, over length, or (most importantly) carry an
+        // embedded newline that defeats the whole "typed, then a separate Enter submits
+        // it" design (see `TmuxSessionSend.validateText`'s doc comment).
+        guard let text = TmuxSessionSend.validateText(rawText) else {
+            return .failed("the message text failed validation (empty, too long, or contains a newline).")
+        }
+        let sendOutcome = await runFixedSessionCommand(
+            TmuxSessionSend.sendTextArguments(session: target, text: text), session: sshSession
+        )
+        guard case .text = sendOutcome else {
+            if case .failed(let reason) = sendOutcome { return .failed(reason) }
+            return .failed("could not type the message.")
+        }
+        let enterOutcome = await runFixedSessionCommand(
+            TmuxSessionSend.sendEnterArguments(session: target), session: sshSession
+        )
+        guard case .text = enterOutcome else {
+            if case .failed(let reason) = enterOutcome {
+                return .failed("typed the message but could not submit it (Return failed): \(reason)")
+            }
+            return .failed("typed the message but could not submit it (Return failed).")
+        }
+        let preview = text.count > 120 ? String(text.prefix(120)) + "…" : text
+        let line = "[send_session] sent to \(target): \"\(preview)\""
+        log(line)
+        record(AgentAuditEvent(kind: "notice", text: line))
+
+        guard awaitSeconds > 0 else { return .sent(after: .notWaited) }
+        var previous: String?
+        var everSucceeded = false
+        var quietStreak = 0
+        let deadline = Date().addingTimeInterval(TimeInterval(awaitSeconds))
+        var lastCapture: String?
+        while Date() < deadline, !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(TmuxSessionSend.pollInterval))
+            let outcome = await runFixedSessionCommand(
+                TmuxSessionRead.captureArguments(session: target, lines: TmuxSessionRead.defaultLines),
+                session: sshSession
+            )
+            guard case .text(let captured, _) = outcome else { continue }
+            everSucceeded = true
+            lastCapture = captured
+            if captured == previous {
+                quietStreak += 1
+                if quietStreak >= TmuxSessionSend.quietPollsToSettle { break }
+            } else {
+                quietStreak = 0
+                previous = captured
+            }
+        }
+        // `everSucceeded` is what separates "the wait settled/ran out normally" from
+        // "every single poll failed for the whole budget" — collapsing the latter into
+        // `.notWaited` (a plain nil, before this was caught in review) told the model
+        // "you didn't ask me to wait" when the real story was "I tried and couldn't
+        // confirm anything." The send itself is unaffected either way.
+        guard everSucceeded else { return .sent(after: .allAttemptsFailed) }
+        return .sent(after: .observed(lastCapture ?? previous ?? ""))
     }
 
     /// Bounded wait for the tool call to learn the notify send's real outcome. Being

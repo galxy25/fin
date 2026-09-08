@@ -225,8 +225,51 @@ public struct AgentToolSpec {
         ]
     )
 
+    /// THE WRITE HALF — see `TmuxSessionSend.swift`'s design note for why this is a real
+    /// change to the threat model, not an extension of `read_session`'s. Deliberately
+    /// stricter in its own parameter shape too: no bare-name convenience, because a wrong
+    /// guess here types real keystrokes into somebody else's pane instead of just
+    /// returning a wrong-but-harmless read.
+    static let sendSession = AgentToolSpec(
+        name: "send_session",
+        description: "Type a message into ANOTHER terminal session on this machine — e.g. "
+            + "messaging another Claude Code agent working in a different project. Unlike "
+            + "read_session, this REQUIRES the exact \"session:window\" target (call read_session "
+            + "first, even with just a bare guess, to find and confirm it — a bare name here is "
+            + "refused). Types your text, presses Return to submit it, and can optionally wait "
+            + "and return what appeared afterward. This really sends real keystrokes to a real "
+            + "pane — confirm you have the right target before calling it, don't guess.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "session": [
+                    "type": "string",
+                    "description": "The EXACT \"session:window\" target to type into — e.g. "
+                        + "\"main:2\", copied from a read_session result. Not a bare name.",
+                ],
+                "text": [
+                    "type": "string",
+                    "description": "The message to type, verbatim. ONE LINE — no newlines; "
+                        + "Return is pressed for you afterward, so don't include one. A "
+                        + "multi-part message needs separate send_session calls, one line "
+                        + "each. Up to \(TmuxSessionSend.maxTextLength) characters.",
+                ],
+                "await_output_seconds": [
+                    "type": "integer",
+                    "description": "How long to wait and watch that session's screen after "
+                        + "sending, in seconds (0-\(TmuxSessionSend.maxAwaitSeconds)), returning "
+                        + "what it shows once it stops changing. Omit (or 0) to send and return "
+                        + "immediately without waiting — the natural choice if you'll check back "
+                        + "with read_session later. Another agent composing a real answer can "
+                        + "take real time; a short wait here often just shows it still working.",
+                ],
+            ],
+            "required": ["session", "text"],
+        ]
+    )
+
     static let all: [AgentToolSpec] = [
-        readTerminal, sendInput, readSession, remember, recall, requestInput, monitor, notify,
+        readTerminal, sendInput, readSession, sendSession, remember, recall, requestInput, monitor, notify,
     ]
 
     /// The roster MINUS the tools a runtime cannot actually provide.
@@ -243,8 +286,11 @@ public struct AgentToolSpec {
     ///
     /// So the runtime that cannot serve it does not offer it. The dispatch's honest error
     /// stays as a backstop for a model that names the tool anyway.
-    static func roster(readSession available: Bool) -> [AgentToolSpec] {
-        available ? all : all.filter { $0.name != readSession.name }
+    static func roster(readSession readAvailable: Bool, sendSession sendAvailable: Bool) -> [AgentToolSpec] {
+        all.filter { spec in
+            (readAvailable || spec.name != readSession.name)
+                && (sendAvailable || spec.name != sendSession.name)
+        }
     }
 
     static let knownToolNames: Set<String> = Set(all.map(\.name))
