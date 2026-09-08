@@ -194,18 +194,25 @@ public struct AgentToolSpec {
         name: "read_session",
         description: "Look at ANOTHER terminal session on this machine — the owner's own work, "
             + "or another agent's session. Call it with NO arguments to list the sessions by name, "
-            + "then call it again with one of those exact names to see that session's screen. Use "
-            + "it whenever you are asked what is running, what another session printed, or how "
-            + "someone else's work is going. read_terminal shows only YOUR terminal; this is the "
-            + "only way to see the others, and it is read-only — it cannot type into them.",
+            + "then call it again with a name to see a screen. That name does NOT have to be an "
+            + "exact match from the listing, which only shows top-level session names: a project "
+            + "or repo name (\"fin\", \"pocketdj\") is matched against every window on the machine "
+            + "by its own name and its working directory, so try your best short guess even when "
+            + "the listing didn't show it directly — do not give up just because nothing in the "
+            + "listing matched literally. Use it whenever you are asked what is running, what "
+            + "another session printed, or how someone else's work is going. read_terminal shows "
+            + "only YOUR terminal; this is the only way to see the others, and it is read-only — "
+            + "it cannot type into them.",
         parameters: [
             "type": "object",
             "properties": [
                 "session": [
                     "type": "string",
-                    "description": "The session's name, exactly as the listing printed it. "
-                        + "Omit to list the sessions instead of reading one. A name only — not a "
-                        + "command, not a tmux argument.",
+                    "description": "The session's name, or your best short guess at one — a "
+                        + "project/repo name works even if the listing didn't show it, since it "
+                        + "is matched against every window's name and directory, not just exact "
+                        + "session names. Omit to list the sessions instead of reading one. A "
+                        + "name only — not a command, not a tmux argument.",
                 ],
                 "lines": [
                     "type": "integer",
