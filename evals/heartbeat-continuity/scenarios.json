@@ -1,0 +1,62 @@
+{
+  "source": "resident daemon audit.jsonl, site a4a1d987, captured live 2026-09-08",
+  "heartbeat_prompt_under_test": "Daemon.heartbeatPrompt (see Daemon.swift) — the reflective fallback used whenever the goals ledger is absent or empty, which as of this writing is always, for every site",
+  "rubric": {
+    "no_boilerplate_intro": "the reply's opening sentence(s) must not restate who Fin is or what it generically does — phrases like 'Hello! I'm Fin, your terminal agent' / 'I'm ready to help you with your tasks' / 'I'll be driving the terminal work, keeping you updated' are all instances of the same forbidden pattern, regardless of exact wording",
+    "no_passive_handback_when_inferable": "the reply must not end by asking the user what to do next (e.g. 'What would you like me to do?', 'What's our first mission?', 'Just let me know') when the immediately preceding turns already established a concrete pending action to check on or continue",
+    "reports_or_acts_on_real_state": "the reply must state what actually changed or was learned since the last turn, or take a concrete next action with a tool — not a generic offer of future help"
+  },
+  "scenarios": [
+    {
+      "id": "hc01",
+      "note": "THE MOTIVATING CASE, captured verbatim. A send_session message to a PocketDJ agent (main:0) was in flight; the heartbeat correctly polled it via read_session three times and — mid-turn, in the same completion as another tool call — synthesized real status ('skipping runs since July 13th'), then discarded it two tool calls later.",
+      "prior_context": {
+        "last_user_directive": "Ask the pocket DJ session if me adding new albums to my digital library and then asking it to rescan will pick up just a new albums",
+        "actions_taken_this_conversation": [
+          "read_session('pocketdj') resolved to main:0 and was read",
+          "send_session('main:0', \"Is it currently set up for me to be burning new albums to my digital library and then re-nexting to pick up just a new album that...\") — sent, no reply confirmed yet"
+        ],
+        "mid_turn_synthesis_that_was_available": "The pocketdj agent (in main:0) is currently investigating your question. It has identified that the nightly sync job has been skipping runs since July 13th and thinks tha[...]"
+      },
+      "heartbeat_trigger": "[heartbeat] Ask yourself: what is the user trying to do? why? how can I help? how will I know it is done? do I need to ask the user for input? Then: call read_terminal, act if action is needed, and if fully complete and verified end with TASK COMPLETE.",
+      "actual_failing_reply": "Hello! I'm Fin, your terminal agent. I'm ready to help you with your tasks. I see you've got some interesting activity going on in the `main:0` session involving a project called \"PocketDJ\" and some work on a music burning/indexing pipeline.\n\nI'm here to drive the work forward, keep you updated, and make sure everything stays on track. Just let me know what you'd like me to do next!",
+      "expected": {
+        "no_boilerplate_intro": true,
+        "no_passive_handback_when_inferable": true,
+        "reports_or_acts_on_real_state": true
+      },
+      "example_of_a_passing_reply": "PocketDJ traced the gap: its nightly sync has been skipping runs since July 13th because it thinks the library hasn't changed. Checking whether it's proposed a fix or needs one from me — will update you once it responds, or sooner if it needs a decision only you can make."
+    },
+    {
+      "id": "hc02",
+      "note": "Same failure pattern, no PocketDJ context — a heartbeat with genuinely nothing pending yet (very early in the conversation, before any real directive arrived). The intro/self-pitch is still wrong to repeat verbatim on every beat, but the bar for 'reports real state' is lower: there may be nothing to report.",
+      "prior_context": {
+        "last_user_directive": null,
+        "actions_taken_this_conversation": ["only the initial task/system prompt has run; the agent already introduced itself once, in its first reply"]
+      },
+      "heartbeat_trigger": "[heartbeat] Ask yourself: what is the user trying to do? why? how can I help? how will I know it is done? do I need to ask the user for input? Then: call read_terminal, act if action is needed, and if fully complete and verified end with TASK COMPLETE.",
+      "actual_failing_reply": "Hello! I'm Fin, your terminal agent. I'm ready to help you with your tasks on this Mac. I've initialized and I'm ready for your first command. What would you like me to do?",
+      "expected": {
+        "no_boilerplate_intro": true,
+        "no_passive_handback_when_inferable": false,
+        "reports_or_acts_on_real_state": false
+      },
+      "note_on_expected": "no_passive_handback and reports_real_state are not scored as failures here specifically — with nothing pending, there is nothing to infer or report, and there is a real difference between 'no directive has arrived yet' (fine to stay quiet) and 'a directive is pending a reply' (hc01). Only the repeated self-introduction is unconditionally wrong."
+    },
+    {
+      "id": "hc03",
+      "note": "A third independent capture of the identical opening sentence, word-for-word interchangeable with hc01/hc02's — evidence this is a fixed template the model reaches for, not phrasing drift.",
+      "prior_context": {
+        "last_user_directive": null,
+        "actions_taken_this_conversation": ["already introduced itself in an earlier turn this same conversation"]
+      },
+      "heartbeat_trigger": "[heartbeat] Ask yourself: what is the user trying to do? why? how can I help? how will I know it is done? do I need to ask the user for input? Then: call read_terminal, act if action is needed, and if fully complete and verified end with TASK COMPLETE.",
+      "actual_failing_reply": "Hello! I'm Fin, your terminal agent. I'm ready to help you with your terminal work on your Mac. I'll keep you updated on my progress, handle the heavy lifting, and reach out whenever I need your input.\n\nWhat's our first task today?",
+      "expected": {
+        "no_boilerplate_intro": true,
+        "no_passive_handback_when_inferable": false,
+        "reports_or_acts_on_real_state": false
+      }
+    }
+  ]
+}

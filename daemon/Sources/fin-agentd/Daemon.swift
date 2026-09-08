@@ -307,9 +307,15 @@ final class Daemon {
     // Nonisolated (immutable String) so `composedHeartbeatPrompt`'s no-ledger fork can
     // return it from a nonisolated context.
     nonisolated static let heartbeatPrompt = """
-        [heartbeat] Ask yourself: what is the user trying to do? why? how can I help? how will I \
-        know it is done? do I need to ask the user for input? Then: call read_terminal, act if \
-        action is needed, and if fully complete and verified end with TASK COMPLETE.
+        [heartbeat] This is a CONTINUATION of an ongoing session, not a new conversation — you \
+        already introduced yourself once; never repeat a greeting or self-introduction here. \
+        Figure out the mission's next concrete step yourself and take it with your tools — do \
+        not end by asking the user what to do next; inferring that is your job. Check what \
+        changed: read_terminal for your own work, and read_session for any other session a \
+        mission depends on (including one you messaged with send_session, to see whether it \
+        replied). Only call request_input when you are genuinely blocked on a decision only the \
+        user can make. If the mission is fully finished and you have confirmed it, end with the \
+        exact phrase TASK COMPLETE.
         """
 
     /// The system prompt the engine actually runs: the configured (or stock) prompt,
