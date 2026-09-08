@@ -1046,24 +1046,46 @@ final class Daemon {
     ///
     /// stderr is kept separate from stdout so tmux's own `can't find session: nope` is
     /// reported as a FAILED read rather than framed as the contents of a pane.
+    ///
+    /// A BARE NAME (no `session:window` colon) is ambiguous the moment its session hosts
+    /// more than one window: `tmux capture-pane -t main` silently answers with whatever
+    /// window happens to be ACTIVE, which is often not the one meant — a wrong-but-
+    /// successful read, not a tmux error, so nothing catches it on its own. So a bare name
+    /// resolves through `TmuxSessionResolution` FIRST (structural match against every
+    /// window's name and directory, falling back to a same-endpoint classification call
+    /// when structure alone can't settle it) before ever falling through to the literal,
+    /// possibly-wrong-window capture. An explicit `session:window` target is trusted
+    /// exactly as given — the model was precise, so this is too.
     private func readSession(name: String?, lines: Int) async -> AgentReadSessionOutcome {
         guard let session else {
             return .failed("the daemon has no SSH session open.")
         }
-        let argv: [String]
-        if let name {
-            guard let validated = TmuxSessionRead.validate(name: name) else {
-                // Unreachable through the engine, which validates first; if it is ever
-                // reached, the answer is a refusal, never a best-effort quote.
-                return .failed("\"\(name)\" is not a legal tmux session name.")
-            }
-            argv = TmuxSessionRead.captureArguments(
-                session: validated,
-                lines: min(max(lines, 1), TmuxSessionRead.maxLines)
-            )
-        } else {
-            argv = TmuxSessionRead.listArguments()
+        guard let name else {
+            return await runFixedSessionCommand(TmuxSessionRead.listArguments(), session: session)
         }
+        guard let validated = TmuxSessionRead.validate(name: name) else {
+            // Unreachable through the engine, which validates first; if it is ever
+            // reached, the answer is a refusal, never a best-effort quote.
+            return .failed("\"\(name)\" is not a legal tmux session name.")
+        }
+        let clampedLines = min(max(lines, 1), TmuxSessionRead.maxLines)
+
+        guard !validated.contains(":") else {
+            // Already an explicit session:window[.pane] target — read it literally.
+            return await runFixedSessionCommand(
+                TmuxSessionRead.captureArguments(session: validated, lines: clampedLines),
+                session: session
+            )
+        }
+        return await resolveBareNameAndRead(validated, lines: clampedLines, session: session)
+    }
+
+    /// Runs one fixed `TmuxSessionRead` argv and turns the result into an outcome —
+    /// shared by the direct capture path, the resolver's `list-windows` and sampling
+    /// calls, and the final read of whichever window resolution settles on.
+    private func runFixedSessionCommand(
+        _ argv: [String], session: HeadlessTerminalSession
+    ) async -> AgentReadSessionOutcome {
         let commandLine = TmuxSessionRead.commandLine(argv)
         do {
             let result = try await session.runFixedCommand(
@@ -1104,6 +1126,133 @@ final class Daemon {
             log("read_session failed: \(reason)")
             return .failed(reason)
         }
+    }
+
+    /// The bare-name resolver. Enumerates every window on the default socket, narrows to
+    /// a candidate pool via `TmuxSessionResolution.candidates`, and either reads the sole
+    /// EXACT match directly or confirms a looser pool by sampling each candidate and
+    /// asking the model's own endpoint which one fits. Falls back to the literal (old,
+    /// possibly-wrong-window) capture whenever resolution can't get started or can't
+    /// settle on anything — never a worse outcome than before this existed, only
+    /// sometimes not a better one.
+    private func resolveBareNameAndRead(
+        _ requested: String, lines: Int, session: HeadlessTerminalSession
+    ) async -> AgentReadSessionOutcome {
+        // NEVER the plain, undisclosed read `readSession` used before this resolver
+        // existed: every exit through here says so, in the header, outside the fence —
+        // "resolution did not settle, so this is that session's plain active-window
+        // read, which may not be the window you meant" — because a silent literal read
+        // is indistinguishable from a confident one to the model, and would quietly
+        // reintroduce the exact ambiguity this function exists to catch.
+        let literalFallback: () async -> AgentReadSessionOutcome = {
+            let outcome = await self.runFixedSessionCommand(
+                TmuxSessionRead.captureArguments(session: requested, lines: lines), session: session
+            )
+            guard case .text(let text, _) = outcome else { return outcome }
+            return .text(text, note: "[read_session note: \"\(requested)\" could not be "
+                + "automatically resolved to a specific window, so this is that session's "
+                + "plain current-window read — it may not be the window you meant. Ask for "
+                + "read_session with no arguments to see every window and pick one by "
+                + "\"session:window\".]")
+        }
+        guard case .text(let listing, _) = await runFixedSessionCommand(
+            TmuxSessionResolution.listWindowsArguments(), session: session
+        ) else {
+            return await literalFallback()
+        }
+        let windows = TmuxSessionResolution.parseWindows(listing)
+        guard let (pool, tier) = TmuxSessionResolution.candidates(for: requested, in: windows) else {
+            return await literalFallback()
+        }
+
+        if tier == .exact, pool.count == 1 {
+            return await readResolvedWindow(pool[0], requested: requested, lines: lines, session: session)
+        }
+
+        let sampled = Array(pool.prefix(TmuxSessionResolution.maxClassificationCandidates))
+        var samples: [(window: TmuxSessionResolution.WindowInfo, text: String)] = []
+        for window in sampled {
+            // Built from tmux's OWN listing, not the model's word — but still validated
+            // before it reaches an argv, exactly like `readResolvedWindow` below: a
+            // session named starting with `-` is real tmux (`new-session -s -x` lets
+            // getopt consume `-x` as `-s`'s argument), and `TmuxSessionRead.validate`'s
+            // no-leading-dash rule exists precisely to keep that shape out of `-t`.
+            guard let validatedTarget = TmuxSessionRead.validate(
+                name: TmuxSessionResolution.target(for: window)
+            ) else { continue }
+            let outcome = await runFixedSessionCommand(
+                TmuxSessionRead.captureArguments(
+                    session: validatedTarget, lines: TmuxSessionResolution.sampleLines
+                ),
+                session: session
+            )
+            if case .text(let text, _) = outcome {
+                samples.append((window, text))
+            }
+        }
+        guard !samples.isEmpty else { return await literalFallback() }
+
+        guard let chosen = await classifySessionCandidate(requested: requested, samples: samples) else {
+            let described = samples.map { TmuxSessionResolution.describeCandidate($0.window) }
+                .joined(separator: "; ")
+            return .failed(
+                "\"\(requested)\" did not exactly match a live session or window. Automatic "
+                    + "matching by name/directory and by content could not confidently pick one "
+                    + "among: \(described). Call read_session with no arguments to list sessions, "
+                    + "or ask which one to read."
+            )
+        }
+        return await readResolvedWindow(
+            samples[chosen].window, requested: requested, lines: lines, session: session
+        )
+    }
+
+    /// Reads a window `resolveBareNameAndRead` settled on, at the requester's real line
+    /// count — the sampling reads above are deliberately short and never returned as the
+    /// answer. Re-validates the target this function itself built (defense in depth: a
+    /// pathological tmux session name should be unreadable even when we constructed the
+    /// string, not just when the model did), and the header names the resolution plainly
+    /// so it is never a silent substitution — visible to the model, the audit log, and
+    /// (via its reply) the owner.
+    private func readResolvedWindow(
+        _ window: TmuxSessionResolution.WindowInfo,
+        requested: String, lines: Int, session: HeadlessTerminalSession
+    ) async -> AgentReadSessionOutcome {
+        let target = TmuxSessionResolution.target(for: window)
+        guard let validatedTarget = TmuxSessionRead.validate(name: target) else {
+            return .failed("resolved \"\(requested)\" to \"\(target)\", which is not a readable target.")
+        }
+        let line = "[read_session] resolved \"\(requested)\" to "
+            + TmuxSessionResolution.describeCandidate(window)
+        log(line)
+        record(AgentAuditEvent(kind: "notice", text: line))
+        let outcome = await runFixedSessionCommand(
+            TmuxSessionRead.captureArguments(session: validatedTarget, lines: lines), session: session
+        )
+        guard case .text(let text, _) = outcome else { return outcome }
+        return .text(text, note: "[read_session note: \"\(requested)\" was resolved to "
+            + "\(validatedTarget) automatically]")
+    }
+
+    /// Asks the model's own configured endpoint which sampled candidate best matches
+    /// `requested`. A separate, minimal request — zero temperature, a tiny output cap,
+    /// no tools — this is a classification call, not a turn, and its failure (network,
+    /// malformed reply, "0 / none of these") is never fatal: the caller falls back to an
+    /// honest refusal that names every candidate it tried instead of guessing.
+    private func classifySessionCandidate(
+        requested: String, samples: [(window: TmuxSessionResolution.WindowInfo, text: String)]
+    ) async -> Int? {
+        let redacted = samples.map { (window: $0.window, text: MemoryRedactor.redact($0.text)) }
+        return await TmuxSessionResolution.classify(
+            requested: requested,
+            samples: redacted,
+            endpointURL: config.agent.endpointURL,
+            model: config.agent.modelIdentifier,
+            apiKey: config.agent.apiKey,
+            onFailure: { [weak self] reason in
+                self?.log("read_session classification failed: \(reason)")
+            }
+        )
     }
 
     /// Bounded wait for the tool call to learn the notify send's real outcome. Being

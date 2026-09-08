@@ -674,7 +674,7 @@ public final class AgentTurnEngine {
             record("error", message, toolName: toolName,
                    toolArguments: rawArguments, isFailure: true)
             return message
-        case .text(let output):
+        case .text(let output, let resolutionNote):
             guard let name else {
                 return TmuxSessionRead.frameListing(
                     TmuxSessionRead.fit(output, intoBytes: byteBudget).text
@@ -683,15 +683,21 @@ public final class AgentTurnEngine {
             let fitted = TmuxSessionRead.fit(
                 TmuxSessionRead.trim(output, toLastLines: lines), intoBytes: byteBudget
             )
+            let truncationNote = fitted.trimmed
+                ? "Only the last \(byteBudget / 1024) KB of that capture is shown — it was "
+                    + "larger than one tool result may occupy in this model's context window, "
+                    + "so the oldest lines were dropped and the newest kept."
+                : nil
+            // Both may apply (an auto-resolved read that was ALSO too big to show whole);
+            // both belong outside the fence, so both go in `frameCapture`'s `note:`, never
+            // folded into `output` where a hostile pane could forge an identical line.
+            let combinedNote = [resolutionNote, truncationNote].compactMap { $0 }
+                .joined(separator: " ")
             return TmuxSessionRead.frameCapture(
                 session: name,
                 lines: lines,
                 output: fitted.text,
-                note: fitted.trimmed
-                    ? "Only the last \(byteBudget / 1024) KB of that capture is shown — it was "
-                        + "larger than one tool result may occupy in this model's context window, "
-                        + "so the oldest lines were dropped and the newest kept."
-                    : nil
+                note: combinedNote.isEmpty ? nil : combinedNote
             )
         }
     }

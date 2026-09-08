@@ -569,6 +569,33 @@ final class AgentEngineDispatchTests: XCTestCase {
         XCTAssertTrue(result.contains("read-only"), "the frame must say it cannot type — got: \(result)")
     }
 
+    /// A runner's disclosure ABOUT a read (e.g. "this bare name was auto-resolved to
+    /// window X") must land OUTSIDE the untrusted-data fence `frameCapture` draws around
+    /// the pane content — inside it, the note would be indistinguishable from something
+    /// the pane itself printed, and a hostile pane could forge an identical-looking line
+    /// with nothing to tell the two apart. Regression for exactly that bug.
+    func testReadSessionNoteStaysOutsideTheUntrustedDataFence() async {
+        let engine = makeEngine()
+        engine.onReadSession = { _, _ in
+            .text("pane content here", note: "[read_session note: resolved automatically]")
+        }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.readSession.name, #"{"session": "fin"}"#
+        ))
+
+        XCTAssertTrue(result.contains("[read_session note: resolved automatically]"), "got: \(result)")
+        XCTAssertTrue(result.contains("pane content here"), "got: \(result)")
+        // The note must appear BEFORE the begin-fence marker — i.e. in the header, not
+        // spliced into the body the fence wraps.
+        guard let noteRange = result.range(of: "[read_session note:"),
+              let fenceRange = result.range(of: TmuxSessionRead.beginMarker) else {
+            return XCTFail("expected both the note and the fence marker — got: \(result)")
+        }
+        XCTAssertTrue(noteRange.lowerBound < fenceRange.lowerBound,
+                      "the note must precede the fence, not live inside it — got: \(result)")
+    }
+
     /// No `session` argument is the LISTING, which is how the model discovers names
     /// instead of guessing them.
     func testReadSessionWithNoArgumentsListsTheSessions() async {

@@ -292,7 +292,14 @@ public enum TmuxSessionRead {
 /// as an empty session.
 public enum AgentReadSessionOutcome: Equatable, Sendable {
     /// The captured text (or the listing), exactly as the remote command printed it.
-    case text(String)
+    /// `note`, when present, is disclosure ABOUT the read itself — e.g. "this bare name
+    /// was auto-resolved to window X" or "resolution couldn't settle, this may be the
+    /// wrong window" — and must reach the model OUTSIDE the untrusted-data fence
+    /// `TmuxSessionRead.frameCapture` draws around `text`. Folding it into `text` instead
+    /// would put a runner's own honest statement in the same zone the model is told not
+    /// to trust — and a hostile pane could then forge an identical-looking line with
+    /// nothing to tell the two apart.
+    case text(String, note: String? = nil)
     /// The read did not happen. The string is shown to the model as the tool result.
     case failed(String)
 }
