@@ -210,6 +210,21 @@ public final class AgentTurnEngine {
     /// "most recent". Nil hook → unavailable, exactly like `onReadSession`.
     public var onRecall: ((_ query: String) async -> AgentRecallOutcome)?
 
+    /// Fired when the model calls `write_artifact`. `path` has already been checked
+    /// non-empty; `content` rides through as-is (an empty file is a legitimate write,
+    /// unlike remember's title/content). Nil hook → unavailable, exactly like
+    /// `onReadSession`.
+    public var onWriteArtifact: ((_ path: String, _ content: String) async -> AgentArtifactWriteOutcome)?
+    /// Fired when the model calls `read_artifact`. `path` has already been checked
+    /// non-empty. Nil hook → unavailable, exactly like `onReadSession`.
+    public var onReadArtifact: ((_ path: String) async -> AgentArtifactReadOutcome)?
+    /// Fired when the model calls `list_artifacts`. Nil hook → unavailable, exactly
+    /// like `onReadSession`.
+    public var onListArtifacts: (() async -> AgentArtifactListOutcome)?
+    /// Fired when the model calls `delete_artifact`. `path` has already been checked
+    /// non-empty. Nil hook → unavailable, exactly like `onReadSession`.
+    public var onDeleteArtifact: ((_ path: String) async -> AgentArtifactDeleteOutcome)?
+
     /// The tmux guard (see `TmuxCommandGuard`). NOT an optional hook, on purpose: a nil
     /// hook reads as "allow", and a guard must never be disarmed by omission.
     /// `.unenforced` is the explicit, named opt-out for a host with no tmux server of its
@@ -458,7 +473,8 @@ public final class AgentTurnEngine {
                     // "unavailable here". The dispatch's honest error stays as a backstop.
                     tools: AgentToolSpec.roster(
                         readSession: onReadSession != nil, sendSession: onSendSession != nil,
-                        goalsLedger: onGoalUpsert != nil, memory: onRemember != nil
+                        goalsLedger: onGoalUpsert != nil, memory: onRemember != nil,
+                        artifacts: onWriteArtifact != nil
                     )
                 )
                 return (completion, nil)
@@ -517,6 +533,22 @@ public final class AgentTurnEngine {
 
         case AgentToolSpec.recall.name:
             return await executeRecall(query: call.argument("query"), rawArguments: call.arguments)
+
+        case AgentToolSpec.writeArtifact.name:
+            return await executeWriteArtifact(
+                path: call.argument("path"),
+                content: call.argument("content") ?? "",
+                rawArguments: call.arguments
+            )
+
+        case AgentToolSpec.readArtifact.name:
+            return await executeReadArtifact(path: call.argument("path"), rawArguments: call.arguments)
+
+        case AgentToolSpec.listArtifacts.name:
+            return await executeListArtifacts(rawArguments: call.arguments)
+
+        case AgentToolSpec.deleteArtifact.name:
+            return await executeDeleteArtifact(path: call.argument("path"), rawArguments: call.arguments)
 
         case AgentToolSpec.requestInput.name:
             return executeRequestInput(
@@ -578,7 +610,8 @@ public final class AgentTurnEngine {
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
                 + AgentToolSpec.roster(
                     readSession: onReadSession != nil, sendSession: onSendSession != nil,
-                    goalsLedger: onGoalUpsert != nil, memory: onRemember != nil
+                    goalsLedger: onGoalUpsert != nil, memory: onRemember != nil,
+                    artifacts: onWriteArtifact != nil
                 ).map(\.name).joined(separator: ", ") + "."
             record("error", message, toolName: call.name, isFailure: true)
             return message
@@ -1022,6 +1055,106 @@ public final class AgentTurnEngine {
         case .found(let hits):
             guard !hits.isEmpty else { return "No memories found." }
             return hits.map { "- \($0.title): \($0.content)" }.joined(separator: "\n")
+        }
+    }
+
+    /// The model's `write_artifact` tool: validate `path` (non-empty; the runner's own
+    /// store validates the charset/traversal rules), then hand off. `content` is
+    /// passed through as-is — an empty file is a legitimate write.
+    private func executeWriteArtifact(path rawPath: String?, content: String, rawArguments: String) async -> String {
+        let toolName = AgentToolSpec.writeArtifact.name
+        guard let path = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else {
+            let message = "Error: write_artifact requires a non-empty \"path\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        record("toolCall", "write_artifact: \(path)", toolName: toolName, toolArguments: rawArguments)
+        guard let onWriteArtifact else {
+            let message = "Error: write_artifact is not available in this runtime; "
+                + "there is no shared artifacts folder here."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onWriteArtifact(path, content) {
+        case .saved(let size):
+            return "Wrote \(path) (\(size) bytes)."
+        case .failed(let reason):
+            let message = "Error: write_artifact could not save \"\(path)\": \(reason)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+    }
+
+    /// The model's `read_artifact` tool: validate `path` (non-empty), then hand off.
+    private func executeReadArtifact(path rawPath: String?, rawArguments: String) async -> String {
+        let toolName = AgentToolSpec.readArtifact.name
+        guard let path = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else {
+            let message = "Error: read_artifact requires a non-empty \"path\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        record("toolCall", "read_artifact: \(path)", toolName: toolName, toolArguments: rawArguments)
+        guard let onReadArtifact else {
+            let message = "Error: read_artifact is not available in this runtime; "
+                + "there is no shared artifacts folder here."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onReadArtifact(path) {
+        case .found(let content):
+            return content
+        case .notFound:
+            return "No artifact at \(path)."
+        case .failed(let reason):
+            let message = "Error: read_artifact could not read \"\(path)\": \(reason)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+    }
+
+    /// The model's `list_artifacts` tool: no arguments to validate.
+    private func executeListArtifacts(rawArguments: String) async -> String {
+        let toolName = AgentToolSpec.listArtifacts.name
+        record("toolCall", "list_artifacts", toolName: toolName, toolArguments: rawArguments)
+        guard let onListArtifacts else {
+            let message = "Error: list_artifacts is not available in this runtime; "
+                + "there is no shared artifacts folder here."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onListArtifacts() {
+        case .found(let entries):
+            guard !entries.isEmpty else { return "No artifacts yet." }
+            return entries.map { "- \($0.path) (\($0.size) bytes)" }.joined(separator: "\n")
+        case .failed(let reason):
+            let message = "Error: list_artifacts failed: \(reason)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+    }
+
+    /// The model's `delete_artifact` tool: validate `path` (non-empty), then hand off.
+    private func executeDeleteArtifact(path rawPath: String?, rawArguments: String) async -> String {
+        let toolName = AgentToolSpec.deleteArtifact.name
+        guard let path = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else {
+            let message = "Error: delete_artifact requires a non-empty \"path\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        record("toolCall", "delete_artifact: \(path)", toolName: toolName, toolArguments: rawArguments)
+        guard let onDeleteArtifact else {
+            let message = "Error: delete_artifact is not available in this runtime; "
+                + "there is no shared artifacts folder here."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onDeleteArtifact(path) {
+        case .deleted:
+            return "Deleted \(path)."
+        case .failed(let reason):
+            let message = "Error: delete_artifact could not delete \"\(path)\": \(reason)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
         }
     }
 

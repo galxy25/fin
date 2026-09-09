@@ -351,9 +351,61 @@ public struct AgentToolSpec {
         ]
     )
 
+    /// The artifacts filesystem: one flat, plain-text space per Fin account — "a second
+    /// filesystem apart from the iOS native one" — shared by every agent, local or cloud.
+    static let writeArtifact = AgentToolSpec(
+        name: "write_artifact",
+        description: "Write (create or overwrite) a plain-text file in your shared artifacts "
+            + "folder — a place to save something the user or another one of your sessions "
+            + "should be able to find later, separate from any one conversation.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "path": [
+                    "type": "string",
+                    "description": "Relative file path, e.g. \"notes/todo.txt\". Letters, "
+                        + "digits, \".\", \"_\", \"-\", \"/\" only.",
+                ],
+                "content": ["type": "string", "description": "The file's full text content."],
+            ],
+            "required": ["path", "content"],
+        ]
+    )
+
+    static let readArtifact = AgentToolSpec(
+        name: "read_artifact",
+        description: "Read one file's content from your shared artifacts folder.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "path": ["type": "string", "description": "The file's relative path."],
+            ],
+            "required": ["path"],
+        ]
+    )
+
+    static let listArtifacts = AgentToolSpec(
+        name: "list_artifacts",
+        description: "List every file path in your shared artifacts folder.",
+        parameters: ["type": "object", "properties": [String: Any](), "required": [String]()]
+    )
+
+    static let deleteArtifact = AgentToolSpec(
+        name: "delete_artifact",
+        description: "Delete one file from your shared artifacts folder. Irreversible.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "path": ["type": "string", "description": "The file's relative path."],
+            ],
+            "required": ["path"],
+        ]
+    )
+
     static let all: [AgentToolSpec] = [
         readTerminal, sendInput, readSession, sendSession, goalUpsert, goalLog,
         remember, recall, requestInput, monitor, notify,
+        writeArtifact, readArtifact, listArtifacts, deleteArtifact,
     ]
 
     /// The roster MINUS the tools a runtime cannot actually provide.
@@ -372,13 +424,18 @@ public struct AgentToolSpec {
     /// stays as a backstop for a model that names the tool anyway.
     static func roster(
         readSession readAvailable: Bool, sendSession sendAvailable: Bool,
-        goalsLedger ledgerAvailable: Bool = false, memory memoryAvailable: Bool = false
+        goalsLedger ledgerAvailable: Bool = false, memory memoryAvailable: Bool = false,
+        artifacts artifactsAvailable: Bool = false
     ) -> [AgentToolSpec] {
-        all.filter { spec in
+        let artifactNames: Set<String> = [
+            writeArtifact.name, readArtifact.name, listArtifacts.name, deleteArtifact.name,
+        ]
+        return all.filter { spec in
             (readAvailable || spec.name != readSession.name)
                 && (sendAvailable || spec.name != sendSession.name)
                 && (ledgerAvailable || (spec.name != goalUpsert.name && spec.name != goalLog.name))
                 && (memoryAvailable || (spec.name != remember.name && spec.name != recall.name))
+                && (artifactsAvailable || !artifactNames.contains(spec.name))
         }
     }
 

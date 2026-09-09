@@ -264,6 +264,9 @@ final class Daemon {
     /// `controlPlane` block — same gate as `notifyClient`, since both ride the same
     /// bearer-token relay.
     private var memoryClient: DaemonMemoryClient?
+    /// The artifacts filesystem client; nil when the config has no `controlPlane`
+    /// block — same gate as `notifyClient`/`memoryClient`.
+    private var artifactClient: DaemonArtifactClient?
     /// Owns the on-disk goals ledger. Always constructed (there is always a state
     /// directory to keep it in) — `goal_upsert`/`goal_log` are advertised whenever this
     /// is non-nil, which today is unconditional, matching `composedHeartbeatPrompt`
@@ -838,6 +841,32 @@ final class Daemon {
                 await memory.recall(query: query)
             }
             log("memory sync enabled: control plane /memory as \"\(memory.agentName)\"")
+
+            // The model's artifacts tools: one shared, flat text-file space per Fin
+            // account, reachable through the same relay — "a second filesystem apart
+            // from the iOS native one."
+            let artifacts = DaemonArtifactClient(
+                endpointURL: block.endpointURL,
+                token: block.token,
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                }
+            )
+            artifactClient = artifacts
+            engine.onWriteArtifact = { path, content in
+                await artifacts.write(path: path, content: content)
+            }
+            engine.onReadArtifact = { path in
+                await artifacts.read(path: path)
+            }
+            engine.onListArtifacts = {
+                await artifacts.list()
+            }
+            engine.onDeleteArtifact = { path in
+                await artifacts.delete(path: path)
+            }
+            log("artifacts filesystem enabled: control plane /artifacts")
         }
 
         var consecutiveFailures = 0

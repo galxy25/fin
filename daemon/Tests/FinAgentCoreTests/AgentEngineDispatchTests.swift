@@ -207,6 +207,145 @@ final class AgentEngineDispatchTests: XCTestCase {
             .contains { $0.name == "remember" })
     }
 
+    // MARK: - artifacts (write_artifact / read_artifact / list_artifacts / delete_artifact)
+
+    func testArtifactToolsAnswerHonestlyWithNoHookWired() async {
+        let engine = makeEngine()
+        for (name, args) in [
+            (AgentToolSpec.writeArtifact.name, #"{"path": "a.txt", "content": "hi"}"#),
+            (AgentToolSpec.readArtifact.name, #"{"path": "a.txt"}"#),
+            (AgentToolSpec.listArtifacts.name, "{}"),
+            (AgentToolSpec.deleteArtifact.name, #"{"path": "a.txt"}"#),
+        ] {
+            let result = await engine.execute(call(name, args))
+            XCTAssertTrue(result.contains("not available in this runtime"), "\(name) got: \(result)")
+            XCTAssertFalse(result.contains("unknown tool"), "\(name) got: \(result)")
+        }
+    }
+
+    func testWriteArtifactRequiresANonEmptyPath() async {
+        let engine = makeEngine()
+        engine.onWriteArtifact = { _, _ in .saved(size: 0) }
+        let result = await engine.execute(call(AgentToolSpec.writeArtifact.name, #"{"content": "hi"}"#))
+        XCTAssertTrue(result.contains("Error") && result.contains("path"), "got: \(result)")
+    }
+
+    func testWriteArtifactAllowsEmptyContent() async {
+        var seenContent: String?
+        let engine = makeEngine()
+        engine.onWriteArtifact = { _, content in
+            seenContent = content
+            return .saved(size: 0)
+        }
+        let result = await engine.execute(call(AgentToolSpec.writeArtifact.name, #"{"path": "a.txt"}"#))
+        XCTAssertEqual(seenContent, "", "a missing content argument defaults to empty, not an error")
+        XCTAssertTrue(result.contains("a.txt"), "got: \(result)")
+    }
+
+    func testWriteArtifactPassesPathAndContentToTheHook() async {
+        var seen: (path: String, content: String)?
+        let engine = makeEngine()
+        engine.onWriteArtifact = { path, content in
+            seen = (path, content)
+            return .saved(size: 42)
+        }
+        let result = await engine.execute(call(
+            AgentToolSpec.writeArtifact.name, #"{"path": "notes/todo.txt", "content": "buy milk"}"#
+        ))
+        XCTAssertEqual(seen?.path, "notes/todo.txt")
+        XCTAssertEqual(seen?.content, "buy milk")
+        XCTAssertTrue(result.contains("42"), "got: \(result)")
+    }
+
+    func testWriteArtifactReportsARunnerFailureHonestly() async {
+        let engine = makeEngine()
+        engine.onWriteArtifact = { _, _ in .failed("path traversal rejected") }
+        let result = await engine.execute(call(AgentToolSpec.writeArtifact.name, #"{"path": "../x", "content": "y"}"#))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("path traversal rejected"), "got: \(result)")
+    }
+
+    func testReadArtifactRequiresANonEmptyPath() async {
+        let engine = makeEngine()
+        engine.onReadArtifact = { _ in .found(content: "x") }
+        let result = await engine.execute(call(AgentToolSpec.readArtifact.name, "{}"))
+        XCTAssertTrue(result.contains("Error") && result.contains("path"), "got: \(result)")
+    }
+
+    func testReadArtifactReturnsTheContentVerbatim() async {
+        let engine = makeEngine()
+        engine.onReadArtifact = { _ in .found(content: "buy milk") }
+        let result = await engine.execute(call(AgentToolSpec.readArtifact.name, #"{"path": "a.txt"}"#))
+        XCTAssertEqual(result, "buy milk")
+    }
+
+    func testReadArtifactSaysSoPlainlyWhenMissing() async {
+        let engine = makeEngine()
+        engine.onReadArtifact = { _ in .notFound }
+        let result = await engine.execute(call(AgentToolSpec.readArtifact.name, #"{"path": "missing.txt"}"#))
+        XCTAssertEqual(result, "No artifact at missing.txt.")
+    }
+
+    func testReadArtifactReportsARunnerFailureHonestly() async {
+        let engine = makeEngine()
+        engine.onReadArtifact = { _ in .failed("control plane unreachable") }
+        let result = await engine.execute(call(AgentToolSpec.readArtifact.name, #"{"path": "a.txt"}"#))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("control plane unreachable"), "got: \(result)")
+    }
+
+    func testListArtifactsReturnsEachPathAndSize() async {
+        let engine = makeEngine()
+        engine.onListArtifacts = {
+            .found([AgentArtifactEntry(path: "a.txt", size: 3), AgentArtifactEntry(path: "notes/b.txt", size: 7)])
+        }
+        let result = await engine.execute(call(AgentToolSpec.listArtifacts.name, "{}"))
+        XCTAssertTrue(result.contains("a.txt"), "got: \(result)")
+        XCTAssertTrue(result.contains("notes/b.txt"), "got: \(result)")
+    }
+
+    func testListArtifactsWithNoneSaysSoPlainly() async {
+        let engine = makeEngine()
+        engine.onListArtifacts = { .found([]) }
+        let result = await engine.execute(call(AgentToolSpec.listArtifacts.name, "{}"))
+        XCTAssertEqual(result, "No artifacts yet.")
+    }
+
+    func testDeleteArtifactRequiresANonEmptyPath() async {
+        let engine = makeEngine()
+        engine.onDeleteArtifact = { _ in .deleted }
+        let result = await engine.execute(call(AgentToolSpec.deleteArtifact.name, "{}"))
+        XCTAssertTrue(result.contains("Error") && result.contains("path"), "got: \(result)")
+    }
+
+    func testDeleteArtifactConfirmsTheDeletedPath() async {
+        let engine = makeEngine()
+        engine.onDeleteArtifact = { _ in .deleted }
+        let result = await engine.execute(call(AgentToolSpec.deleteArtifact.name, #"{"path": "a.txt"}"#))
+        XCTAssertEqual(result, "Deleted a.txt.")
+    }
+
+    func testDeleteArtifactReportsARunnerFailureHonestly() async {
+        let engine = makeEngine()
+        engine.onDeleteArtifact = { _ in .failed("control plane unreachable") }
+        let result = await engine.execute(call(AgentToolSpec.deleteArtifact.name, #"{"path": "a.txt"}"#))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("control plane unreachable"), "got: \(result)")
+    }
+
+    /// Same shape as the memory/goals-ledger gates: a runtime with no artifacts hook
+    /// must not advertise these four tools.
+    func testTheRosterDropsArtifactToolsWhenNoHook() {
+        let names: Set<String> = ["write_artifact", "read_artifact", "list_artifacts", "delete_artifact"]
+        let withHook = AgentToolSpec.roster(readSession: true, sendSession: true, artifacts: true)
+        let withoutHook = AgentToolSpec.roster(readSession: true, sendSession: true, artifacts: false)
+        XCTAssertTrue(names.isSubset(of: Set(withHook.map(\.name))))
+        XCTAssertTrue(Set(withoutHook.map(\.name)).isDisjoint(with: names))
+        // Independent of the other gates.
+        XCTAssertTrue(AgentToolSpec.roster(readSession: false, sendSession: false, artifacts: true)
+            .contains { $0.name == "write_artifact" })
+    }
+
     // MARK: - request_input
 
     func testRequestInputFiresHookAndReturnsCannedAcknowledgment() async {
@@ -636,17 +775,17 @@ final class AgentEngineDispatchTests: XCTestCase {
     /// `tmux capture-pane` for that, so the two instructions contradicted each other and the
     /// tool-shaped one always failed.
     func testTheRosterDropsReadSessionForARuntimeThatCannotServeIt() {
-        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true)
+        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true, artifacts: true)
             .contains { $0.name == "read_session" })
-        XCTAssertFalse(AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true, memory: true)
+        XCTAssertFalse(AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true, memory: true, artifacts: true)
             .contains { $0.name == "read_session" })
         // Nothing else moves: the two rosters differ by exactly that one tool.
         XCTAssertEqual(
-            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true).count,
-            AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true, memory: true).count + 1
+            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true, artifacts: true).count,
+            AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true, memory: true, artifacts: true).count + 1
         )
         XCTAssertEqual(
-            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true).map(\.name),
+            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true, artifacts: true).map(\.name),
             AgentToolSpec.all.map(\.name)
         )
         // …and the dispatch keeps its honest error for a model that names it anyway.
