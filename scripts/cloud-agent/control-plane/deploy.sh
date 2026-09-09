@@ -23,6 +23,7 @@ TABLE=fin-cloud-workers
 TOKENS_TABLE=fin-device-tokens
 API_NAME=fin-control-plane
 RULE=fin-worker-sweep
+WAKE_RULE=fin-worker-wake
 BUCKET=fin-agent-directives-011183829623
 FACTORY_BUCKET=fin-model-factory-011183829623
 AGENT_ROLE=fin-agent-ssm
@@ -220,6 +221,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Resource": "arn:aws:s3:::$BUCKET/fin/memory/_profile.lock"
     },
     {
+      "Sid": "InboxLockDelete",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::$BUCKET/fin/inbox/*.lock"
+    },
+    {
       "Sid": "ArtifactsReadWrite",
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:DeleteObject"],
@@ -402,6 +409,9 @@ GET /workers
 DELETE /workers/{workerId}
 GET /usage
 POST /sweep
+POST /wake
+PUT /inbox/{agent}/lock
+DELETE /inbox/{agent}/lock
 POST /presign
 POST /feedback
 PUT /secrets/{service}
@@ -440,6 +450,22 @@ cat > "$BUILD/target.json" <<JSON
 JSON
 aws events put-targets --rule "$RULE" --targets "file://$BUILD/target.json" >/dev/null
 
+# --- wake schedule -------------------------------------------------------------
+# Tighter cadence than the idle sweep on purpose: this schedule buys reply
+# latency for a user with no always-on computer of their own, and Lambda
+# invocations are effectively free at this volume — EC2 is the actual cost,
+# and wake() only ever launches one when nothing else already covers the agent.
+if ! aws events describe-rule --name "$WAKE_RULE" >/dev/null 2>&1; then
+  aws events put-rule --name "$WAKE_RULE" --schedule-expression 'rate(1 minute)' \
+    --description "launch a fin cloud worker for an unanswered inbox message" >/dev/null
+  echo "==> Created EventBridge rule $WAKE_RULE"
+fi
+
+cat > "$BUILD/wake-target.json" <<JSON
+[{"Id": "fin-control-plane-wake", "Arn": "$LAMBDA_ARN", "Input": "{\"source\": \"wake-schedule\"}"}]
+JSON
+aws events put-targets --rule "$WAKE_RULE" --targets "file://$BUILD/wake-target.json" >/dev/null
+
 # --- invoke permissions ------------------------------------------------------
 POLICY=$(aws lambda get-policy --function-name "$FUNCTION" --query Policy --output text 2>/dev/null || echo "")
 case "$POLICY" in
@@ -455,6 +481,13 @@ case "$POLICY" in
        --action lambda:InvokeFunction --principal events.amazonaws.com \
        --source-arn "arn:aws:events:$REGION:$ACCOUNT:rule/$RULE" >/dev/null
      echo "==> Allowed $RULE to invoke $FUNCTION" ;;
+esac
+case "$POLICY" in
+  *fin-cp-wake*) ;;
+  *) aws lambda add-permission --function-name "$FUNCTION" --statement-id fin-cp-wake \
+       --action lambda:InvokeFunction --principal events.amazonaws.com \
+       --source-arn "arn:aws:events:$REGION:$ACCOUNT:rule/$WAKE_RULE" >/dev/null
+     echo "==> Allowed $WAKE_RULE to invoke $FUNCTION" ;;
 esac
 
 ENDPOINT=$(aws apigatewayv2 get-api --api-id "$API_ID" --query ApiEndpoint --output text)

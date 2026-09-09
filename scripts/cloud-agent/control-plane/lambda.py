@@ -60,6 +60,7 @@ BINARY_KEY = "fin/agentd/fin-agentd"
 CONFIG_KEY = "fin/agentd/{agent}.json"
 STATUS_KEY = "fin/status-{agent}.json"
 INBOX_KEY = "fin/inbox/{agent}.json"
+INBOX_LOCK_KEY = "fin/inbox/{agent}.lock"
 TRANSCRIPT_KEY = "fin/transcripts/{agent}.jsonl"
 # Hourly chunks, distinct from TRANSCRIPT_KEY above — see "cloud transcript
 # (hourly S3 chunks)" below for why this exists alongside the rolling object.
@@ -573,6 +574,88 @@ def _provision_config(agent, config_key):
 # --- routes ------------------------------------------------------------------
 
 
+def _launch_worker(agent, instance_type, idle_minutes, browser, now, clear_inbox=True):
+    """The actual EC2 launch, shared by the explicit `POST /workers` route and
+    the automatic wake sweep below. Callers own their own pre-checks (agent
+    validation, the 409-on-already-live reconciliation) — this just launches
+    and records.
+
+    `clear_inbox` defaults True, preserving `create_worker`'s original meaning:
+    a manually-started worker begins a fresh conversation boundary, so any
+    still-queued inbox messages are discarded (a fresh instance's applied-id
+    ledger is empty and would otherwise replay them on boot). The wake sweep
+    passes False for the opposite reason — it launches BECAUSE a message is
+    sitting unanswered, so wiping it on the way up would defeat the whole
+    point of waking at all.
+    """
+    config_key = CONFIG_KEY.format(agent=_key_slug(agent))
+    try:
+        S3.head_object(Bucket=BUCKET, Key=config_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("404", "NoSuchKey", "NotFound"):
+            raise
+        # No hand-provisioned config: instantiate the template so the launch
+        # proceeds (400s only when the template is missing too).
+        _provision_config(agent, config_key)
+
+    user_data = USER_DATA.format(
+        binary_url=S3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET, "Key": BINARY_KEY},
+            ExpiresIn=PRESIGN_TTL_SECONDS,
+        ),
+        config_url=S3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET, "Key": config_key},
+            ExpiresIn=PRESIGN_TTL_SECONDS,
+        ),
+    )
+    if browser:
+        user_data += BROWSER_USER_DATA
+
+    if clear_inbox:
+        S3.put_object(
+            Bucket=BUCKET,
+            Key=INBOX_KEY.format(agent=_key_slug(agent)),
+            Body=b'{"version":1,"directives":[]}',
+            ContentType="application/json",
+        )
+
+    tags = [
+        {"Key": "Name", "Value": "fin-agent-{}".format(agent)},
+        {"Key": "fin-agent", "Value": agent},
+        {"Key": "fin-managed", "Value": "control-plane"},
+        {"Key": "fin-idle-minutes", "Value": str(idle_minutes)},
+    ]
+    if browser:
+        tags.append({"Key": "fin-browser", "Value": "1"})
+
+    instance = EC2.run_instances(
+        ImageId=_ami_id(),
+        InstanceType=instance_type,
+        MinCount=1,
+        MaxCount=1,
+        SecurityGroupIds=[_security_group_id()],
+        IamInstanceProfile={"Name": INSTANCE_PROFILE_NAME},
+        UserData=user_data,
+        MetadataOptions={"HttpTokens": "required"},
+        TagSpecifications=[{"ResourceType": "instance", "Tags": tags}],
+    )["Instances"][0]
+
+    worker_id = str(uuid.uuid4())
+    launched_at = _iso(instance.get("LaunchTime") or now)
+    _record(worker_id, agent, instance["InstanceId"], instance_type, launched_at, idle_minutes, "control-plane", browser)
+    return {
+        "workerId": worker_id,
+        "instanceId": instance["InstanceId"],
+        "agent": agent,
+        "instanceType": instance_type,
+        "launchedAt": launched_at,
+        "browser": browser,
+    }
+
+
 def create_worker(event):
     body = _body(event)
 
@@ -620,77 +703,9 @@ def create_worker(event):
         if alive:
             raise ApiError(409, "agent {} already has a live worker ({})".format(agent, alive[0]["workerId"]))
 
-    config_key = CONFIG_KEY.format(agent=_key_slug(agent))
-    try:
-        S3.head_object(Bucket=BUCKET, Key=config_key)
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code not in ("404", "NoSuchKey", "NotFound"):
-            raise
-        # No hand-provisioned config: instantiate the template so the launch
-        # proceeds (400s only when the template is missing too).
-        _provision_config(agent, config_key)
-
-    user_data = USER_DATA.format(
-        binary_url=S3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": BUCKET, "Key": BINARY_KEY},
-            ExpiresIn=PRESIGN_TTL_SECONDS,
-        ),
-        config_url=S3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": BUCKET, "Key": config_key},
-            ExpiresIn=PRESIGN_TTL_SECONDS,
-        ),
-    )
-    if browser:
-        user_data += BROWSER_USER_DATA
-
-    # A fresh worker starts with an empty applied-id ledger (it lives on the
-    # instance and dies with it), so any message still in the inbox document
-    # would REPLAY on boot. The launch is the conversation boundary: empty the
-    # inbox first — the transcript object is what persists history.
-    S3.put_object(
-        Bucket=BUCKET,
-        Key=INBOX_KEY.format(agent=_key_slug(agent)),
-        Body=b'{"version":1,"directives":[]}',
-        ContentType="application/json",
-    )
-
-    tags = [
-        {"Key": "Name", "Value": "fin-agent-{}".format(agent)},
-        {"Key": "fin-agent", "Value": agent},
-        {"Key": "fin-managed", "Value": "control-plane"},
-        {"Key": "fin-idle-minutes", "Value": str(idle_minutes)},
-    ]
-    if browser:
-        tags.append({"Key": "fin-browser", "Value": "1"})
-
-    instance = EC2.run_instances(
-        ImageId=_ami_id(),
-        InstanceType=instance_type,
-        MinCount=1,
-        MaxCount=1,
-        SecurityGroupIds=[_security_group_id()],
-        IamInstanceProfile={"Name": INSTANCE_PROFILE_NAME},
-        UserData=user_data,
-        MetadataOptions={"HttpTokens": "required"},
-        TagSpecifications=[{"ResourceType": "instance", "Tags": tags}],
-    )["Instances"][0]
-
-    worker_id = str(uuid.uuid4())
-    launched_at = _iso(instance.get("LaunchTime") or now)
-    _record(worker_id, agent, instance["InstanceId"], instance_type, launched_at, idle_minutes, "control-plane", browser)
-    LOG.info("launched %s for agent %s (%s%s)", instance["InstanceId"], agent, instance_type, ", browser" if browser else "")
-
-    return _response(201, {
-        "workerId": worker_id,
-        "instanceId": instance["InstanceId"],
-        "agent": agent,
-        "instanceType": instance_type,
-        "launchedAt": launched_at,
-        "browser": browser,
-    })
+    result = _launch_worker(agent, instance_type, idle_minutes, browser, now, clear_inbox=True)
+    LOG.info("launched %s for agent %s (%s%s)", result["instanceId"], agent, instance_type, ", browser" if browser else "")
+    return _response(201, result)
 
 
 def list_workers(_event):
@@ -1732,9 +1747,9 @@ def put_memory_profile(event):
     return _response(200, document)
 
 
-def _read_profile_lock():
+def _read_lock(key):
     try:
-        raw = S3.get_object(Bucket=BUCKET, Key=PROFILE_LOCK_KEY)["Body"].read()
+        raw = S3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in ("404", "NoSuchKey", "NoSuchBucket", "AccessDenied"):
@@ -1747,53 +1762,272 @@ def _read_profile_lock():
     return lock if isinstance(lock, dict) else None
 
 
-def claim_memory_profile_lock(event):
-    """PUT /memory/profile/lock — {"holder"}. Atomic claim via conditional PUT
-    (IfNoneMatch, same primitive `_provision_config` already uses for config
-    auto-provisioning); a claim that loses the race is told who holds it, and may
-    retry once the holder's claim is older than LOCK_STALE_AFTER_SECONDS —
-    compaction is low-stakes (a slightly-stale summary, never data loss), so a
-    crashed or slow holder must not wedge every other runner forever."""
-    body = _body(event)
-    holder = str(body.get("holder") or "").strip()
-    if not holder:
-        raise ApiError(400, "holder must be a non-empty string")
+def _claim_lock(key, holder):
+    """Atomic claim via conditional PUT (IfNoneMatch, the same primitive
+    `_provision_config` already uses for config auto-provisioning). A claim that
+    loses the race is told who holds it (409), and may retry once the holder's
+    claim is older than LOCK_STALE_AFTER_SECONDS — a crashed or slow holder must
+    not wedge every other runner forever. Shared by the memory-profile lock and
+    the per-agent inbox lock below; both are pure S3-metadata coordination, no
+    model reasoning involved on either end — a holder is just an id string.
+    """
     document = {"holder": holder, "claimedAt": _iso(_now())}
     encoded = json.dumps(document, sort_keys=True).encode("utf-8")
     try:
         S3.put_object(
-            Bucket=BUCKET, Key=PROFILE_LOCK_KEY, Body=encoded,
+            Bucket=BUCKET, Key=key, Body=encoded,
             ContentType="application/json", IfNoneMatch="*",
         )
-        return _response(200, document)
+        return document
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code not in ("PreconditionFailed", "ConditionalRequestConflict"):
             raise
 
-    existing = _read_profile_lock()
+    existing = _read_lock(key)
     claimed_at = existing and _parse_iso(existing.get("claimedAt"))
     if claimed_at is not None and (_now() - claimed_at).total_seconds() > LOCK_STALE_AFTER_SECONDS:
         # Stale — reclaim unconditionally. A second caller racing THIS reclaim is
         # the same accepted last-writer-wins risk as everywhere else in this file,
         # narrowed to the rare case of two callers both waiting out the same TTL.
-        S3.put_object(
-            Bucket=BUCKET, Key=PROFILE_LOCK_KEY, Body=encoded, ContentType="application/json",
-        )
-        return _response(200, document)
+        S3.put_object(Bucket=BUCKET, Key=key, Body=encoded, ContentType="application/json")
+        return document
     raise ApiError(409, "locked by {}".format((existing or {}).get("holder") or "another runner"))
+
+
+def _release_lock(key):
+    try:
+        S3.delete_object(Bucket=BUCKET, Key=key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("404", "NoSuchKey", "NoSuchBucket"):
+            raise
+
+
+def claim_memory_profile_lock(event):
+    """PUT /memory/profile/lock — {"holder"}. See `_claim_lock`."""
+    body = _body(event)
+    holder = str(body.get("holder") or "").strip()
+    if not holder:
+        raise ApiError(400, "holder must be a non-empty string")
+    return _response(200, _claim_lock(PROFILE_LOCK_KEY, holder))
 
 
 def release_memory_profile_lock(event):
     """DELETE /memory/profile/lock — unconditional; called by whoever finishes
     (success or failure) so the next attempt doesn't wait out the full TTL."""
-    try:
-        S3.delete_object(Bucket=BUCKET, Key=PROFILE_LOCK_KEY)
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code not in ("404", "NoSuchKey", "NoSuchBucket"):
-            raise
+    _release_lock(PROFILE_LOCK_KEY)
     return _response(200, {"released": True})
+
+
+# --- inbox coordination (per-agent claim lock) --------------------------------
+#
+# Multiple sites (the app's Mac-resident daemon, a hand-launched cloud worker,
+# an auto-woken one below) can all be alive and polling the SAME agent's inbox
+# at once — each site's own "already answered this" ledger lives on its own
+# disk (`DaemonDirectiveClient.appliedIDs`), invisible to every other site, so
+# without coordination two sites could both answer the same message. Same
+# fix as the memory profile's compaction lock, generalized to one lock per
+# agent: whoever claims `fin/inbox/{agent}.lock` first drives that message;
+# everyone else backs off and lets them, checking again once the claim
+# releases or goes stale. Entirely S3-metadata mechanics — a holder is just an
+# id string a site writes about itself, nothing here ever asks a model
+# anything.
+
+
+def claim_inbox_lock(event, agent):
+    """PUT /inbox/{agent}/lock — {"holder"}. See `_claim_lock`."""
+    body = _body(event)
+    holder = str(body.get("holder") or "").strip()
+    if not holder:
+        raise ApiError(400, "holder must be a non-empty string")
+    return _response(200, _claim_lock(INBOX_LOCK_KEY.format(agent=_key_slug(agent)), holder))
+
+
+def release_inbox_lock(event, agent):
+    """DELETE /inbox/{agent}/lock — unconditional; call after every claimed
+    turn, success or failure, so the next site doesn't wait out the TTL."""
+    _release_lock(INBOX_LOCK_KEY.format(agent=_key_slug(agent)))
+    return _response(200, {"released": True})
+
+
+# --- wake sweep (auto-launch when nothing is answering) -----------------------
+#
+# The idle sweep (above) answers "is a worker running for no reason"; this is
+# its mirror: "is a message sitting for no worker". Without it, a user with no
+# always-on computer of their own — the whole point of the cloud harness —
+# sends a voice message that lands in the inbox and then just sits there until
+# they remember to open the app and tap "Start Worker" by hand. Scheduled on
+# its own, tighter EventBridge cadence than the idle sweep (`fin-worker-wake`,
+# ~1 minute): Lambda invocations are effectively free at this volume, and
+# responsiveness — how long a message waits for a reply — is what this
+# schedule buys, not idle-cost precision.
+
+WAKE_GRACE_MINUTES = 3
+# Past this many hours of silence, stop trying to auto-launch and tell the
+# user instead — found live: an agent with an 11-day-old inbox message and no
+# active site would otherwise get a real EC2 instance launched for what reads
+# like abandoned test debris. Under the ceiling, a message gets a prompt,
+# unattended reply (the whole point, for someone with no spare computer);
+# past it, a human decides whether it's still worth answering.
+WAKE_NOTIFY_CEILING_HOURS = 72
+INBOX_NOTIFIED_KEY = "fin/inbox/{agent}.notified"
+
+
+def _lock_is_stale(lock, now):
+    if lock is None:
+        return True
+    claimed_at = _parse_iso(lock.get("claimedAt"))
+    return claimed_at is None or (now - claimed_at).total_seconds() > LOCK_STALE_AFTER_SECONDS
+
+
+def _wake_decision(has_live_worker, lock, inbox_last_modified, status, now):
+    """Pure: what should the wake sweep do about this agent right now? Every
+    input is already-fetched — no I/O, no model call, so this is directly
+    unit-testable without touching AWS. Returns an (action, detail) pair:
+    action is "wake" (launch a worker), "notify" (too stale to auto-launch —
+    tell the user instead), or None (nothing to do); detail is a one-line
+    reason, or None. Deliberately conservative: any one signal that "someone
+    already has this" wins.
+
+    - has_live_worker: an EC2 worker is already recorded live for this agent —
+      trust it to answer; the idle sweep, not this, is what retires it.
+    - lock: the current `fin/inbox/{agent}.lock` document, or None if absent.
+      A non-stale claim (checked via `_lock_is_stale`) means SOME site — not
+      necessarily an EC2 worker — is actively driving this agent's inbox
+      right now.
+    - inbox_last_modified: when the inbox object was last written — a proxy
+      for "when did the newest message arrive" (every send is a whole-
+      document PUT, so the object's own S3 timestamp needs no schema change
+      to carry this). None means no inbox exists yet — nothing to wake for.
+    - status: the agent's status document (`_read_status`'s shape), for the
+      "already answered" check — a turn that completed at or after the inbox
+      was last touched means whoever answered it already has, even though
+      nothing currently holds the lock (the common case: a healthy site
+      claims, answers, and releases within seconds, long before this sweep's
+      next tick).
+    """
+    if has_live_worker or inbox_last_modified is None:
+        return (None, None)
+    if not _lock_is_stale(lock, now):
+        return (None, None)
+    age = now - inbox_last_modified
+    if age < timedelta(minutes=WAKE_GRACE_MINUTES):
+        return (None, None)
+    last_turn = status and _parse_iso(status.get("last_turn_at"))
+    if last_turn is not None and last_turn >= inbox_last_modified:
+        return (None, None)
+    if age > timedelta(hours=WAKE_NOTIFY_CEILING_HOURS):
+        return ("notify", "unanswered inbox message idle for over {} hours, no live worker or active site".format(
+            WAKE_NOTIFY_CEILING_HOURS
+        ))
+    return ("wake", "unanswered inbox message, no live worker or active site")
+
+
+def _inbox_candidates():
+    """Every agent with an inbox object, its most-recently-stated agent name
+    (proper case, read from the newest directive's own `agent` field — the
+    filename itself only has the lowercased slug, and DynamoDB's 409 check in
+    `create_worker` compares agent names case-sensitively, so a wake-launched
+    worker recorded under the wrong case would silently let a later manual
+    "Start Worker" tap launch a duplicate) and the object's LastModified.
+    """
+    candidates = []
+    paginator = S3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix="fin/inbox/"):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".json"):
+                continue
+            try:
+                raw = S3.get_object(Bucket=BUCKET, Key=key)
+                body = raw["Body"].read()
+                last_modified = raw["LastModified"]
+            except ClientError:
+                continue
+            try:
+                document = json.loads(body)
+            except ValueError:
+                continue
+            directives = document.get("directives") if isinstance(document, dict) else None
+            agent = None
+            if isinstance(directives, list):
+                for entry in reversed(directives):
+                    if isinstance(entry, dict) and entry.get("agent"):
+                        agent = str(entry["agent"])
+                        break
+            if not agent:
+                continue
+            candidates.append((agent, last_modified))
+    return candidates
+
+
+def _already_notified(agent, inbox_last_modified):
+    """Surfaced once, then sit quiet — the same discipline the Mission
+    ledger's own conduct rules already use for a surfaced blocker: a stale
+    inbox message that gets one push, not one every minute forever. A NEWER
+    message arriving resets this (the marker's own `forLastModified` goes
+    stale relative to the fresh inbox timestamp), so a genuinely new stale
+    episode still gets its own alert."""
+    marker = _read_lock(INBOX_NOTIFIED_KEY.format(agent=_key_slug(agent)))
+    if marker is None:
+        return False
+    notified_for = _parse_iso(marker.get("forLastModified"))
+    return notified_for is not None and notified_for >= inbox_last_modified
+
+
+def _mark_notified(agent, inbox_last_modified):
+    S3.put_object(
+        Bucket=BUCKET, Key=INBOX_NOTIFIED_KEY.format(agent=_key_slug(agent)),
+        Body=json.dumps({"forLastModified": _iso(inbox_last_modified)}, sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def _notify_stale_inbox(agent, detail):
+    synthetic_event = {"body": json.dumps({
+        "title": "{} has an unanswered message".format(agent),
+        "body": "{} — open the app to answer it or start a worker by hand.".format(detail),
+        "agent": agent,
+    })}
+    try:
+        notify(synthetic_event)
+    except Exception:  # noqa: BLE001 - one agent's push failure must never
+        # abort the sweep for every other agent still waiting to be checked.
+        # No device tokens, APNs not configured, a transient APNs error — the
+        # marker below still gets written so this doesn't retry every tick.
+        LOG.exception("wake sweep: notify failed for agent %s", agent)
+
+
+def wake(_event=None):
+    now = _now()
+    live_agent_slugs = {_key_slug(a) for a in (w.get("agent") for w in _live_workers()) if a}
+    checked, launched, notified = [], [], []
+    for agent, last_modified in _inbox_candidates():
+        checked.append(agent)
+        try:
+            slug = _key_slug(agent)
+            has_live_worker = slug in live_agent_slugs
+            lock = _read_lock(INBOX_LOCK_KEY.format(agent=slug))
+            status = _read_status(agent)
+            action, detail = _wake_decision(has_live_worker, lock, last_modified, status, now)
+            if action == "wake":
+                result = _launch_worker(
+                    agent, DEFAULT_INSTANCE_TYPE, DEFAULT_IDLE_MINUTES, False, now, clear_inbox=False
+                )
+                LOG.info("woke %s for agent %s: %s", result["instanceId"], agent, detail)
+                launched.append({"agent": agent, "instanceId": result["instanceId"], "detail": detail})
+            elif action == "notify":
+                if not _already_notified(agent, last_modified):
+                    _notify_stale_inbox(agent, detail)
+                    _mark_notified(agent, last_modified)
+                    LOG.info("notified about stale inbox for agent %s: %s", agent, detail)
+                    notified.append({"agent": agent, "detail": detail})
+        except Exception:  # noqa: BLE001 - one agent's failure (EC2 throttled,
+            # a malformed status object, ...) must never stop the sweep from
+            # checking every other agent this tick.
+            LOG.exception("wake sweep: failed while checking agent %s", agent)
+    return {"generatedAt": _iso(now), "checked": checked, "launched": launched, "notified": notified}
 
 
 # --- artifacts (per-account plain-text file store) ----------------------------
@@ -1900,6 +2134,12 @@ def _route(event):
         return usage(event)
     if method == "POST" and parts == ["sweep"]:
         return _response(200, sweep(event))
+    if method == "POST" and parts == ["wake"]:
+        return _response(200, wake(event))
+    if method == "PUT" and len(parts) == 3 and parts[0] == "inbox" and parts[2] == "lock":
+        return claim_inbox_lock(event, parts[1])
+    if method == "DELETE" and len(parts) == 3 and parts[0] == "inbox" and parts[2] == "lock":
+        return release_inbox_lock(event, parts[1])
     if method == "POST" and parts == ["presign"]:
         return presign(event)
     if method == "POST" and parts == ["feedback"]:
@@ -1948,6 +2188,8 @@ def lambda_handler(event, _context=None):
     # authorize; the schedule's invoke permission is the authorization.
     if event.get("source") == "sweep-schedule":
         return sweep(event)
+    if event.get("source") == "wake-schedule":
+        return wake(event)
 
     try:
         _authorize(event)

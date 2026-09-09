@@ -271,6 +271,11 @@ final class Daemon {
     /// this daemon's own prompt-injection cache fresh; nil when the config has no
     /// `controlPlane` block — same gate as the other memory-adjacent clients.
     private var memoryConsolidator: DaemonMemoryConsolidator?
+    /// Cross-site inbox cooperation: claimed before this daemon answers a directive,
+    /// released after — so a second site polling the same agent's inbox backs off
+    /// instead of racing to answer the same message. Nil when the config has no
+    /// `controlPlane` block — same gate as the other memory-adjacent clients.
+    private var inboxLockClient: DaemonInboxLockClient?
     /// Stable for this whole process run — every automatically-recorded turn folds
     /// into the SAME growing episodic entry via a deterministic ledger id
     /// (`DaemonMemoryClient.rememberConversation`), mirroring `AgentRuntime`'s
@@ -915,6 +920,19 @@ final class Daemon {
             }
             log("artifacts filesystem enabled: control plane /artifacts")
 
+            // Cross-site inbox cooperation — see DaemonInboxLockClient's own doc
+            // comment. Same holder identity the memory-profile lock already uses.
+            inboxLockClient = DaemonInboxLockClient(
+                endpointURL: block.endpointURL,
+                token: block.token,
+                agentName: config.supervision?.agentName ?? "Agent",
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                }
+            )
+            log("inbox cooperation enabled: control plane /inbox/\(config.supervision?.agentName ?? "Agent")/lock")
+
             // Periodic compaction of episodic memory into the shared cumulative
             // profile, plus keeping this daemon's own system-prompt cache fresh —
             // "for cloud agents we need... memory cumulative workflows too."
@@ -1047,6 +1065,22 @@ final class Daemon {
             }
             if shuttingDown { break }
 
+            // Cross-site cooperation: another site (the Mac daemon, a hand-launched or
+            // auto-woken cloud worker) may already be driving this same agent's inbox.
+            // Only a CONFIRMED other holder suppresses processing this tick — a control
+            // plane hiccup (.failed) must never make the daemon stop answering messages
+            // altogether, so an unreachable lock endpoint degrades to "process anyway,"
+            // same as memory/notify already do when their own calls fail.
+            if let directive = nextDirective, let inboxLockClient {
+                let holder = config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8
+                if case .locked(let currentHolder) = await inboxLockClient.claim(holder: holder) {
+                    let line = "[inbox] \(directive.id) held by \(currentHolder) — leaving it for them"
+                    log(line)
+                    record(AgentAuditEvent(kind: "notice", text: line))
+                    nextDirective = nil
+                }
+            }
+
             if let directive = nextDirective {
                 supervision?.markApplied(directive.id)
                 // A directive or inbox message is how the user's answer arrives; lift
@@ -1064,6 +1098,7 @@ final class Daemon {
                 inFlightDirectiveID = directive.id
                 pendingUserMessageForDigest = text
                 outcome = await engine.submit(text)
+                await inboxLockClient?.release()
                 continue
             }
 
