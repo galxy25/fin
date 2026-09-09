@@ -371,12 +371,14 @@ public struct AgentToolSpec {
     /// So the runtime that cannot serve it does not offer it. The dispatch's honest error
     /// stays as a backstop for a model that names the tool anyway.
     static func roster(
-        readSession readAvailable: Bool, sendSession sendAvailable: Bool, goalsLedger ledgerAvailable: Bool = false
+        readSession readAvailable: Bool, sendSession sendAvailable: Bool,
+        goalsLedger ledgerAvailable: Bool = false, memory memoryAvailable: Bool = false
     ) -> [AgentToolSpec] {
         all.filter { spec in
             (readAvailable || spec.name != readSession.name)
                 && (sendAvailable || spec.name != sendSession.name)
                 && (ledgerAvailable || (spec.name != goalUpsert.name && spec.name != goalLog.name))
+                && (memoryAvailable || (spec.name != remember.name && spec.name != recall.name))
         }
     }
 

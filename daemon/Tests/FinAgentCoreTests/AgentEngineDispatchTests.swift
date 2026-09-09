@@ -90,18 +90,121 @@ final class AgentEngineDispatchTests: XCTestCase {
 
     // MARK: - remember / recall
 
-    func testMemoryToolsAnswerHonestlyInsteadOfUnknownTool() async {
+    /// With no `onRemember`/`onRecall` hook wired (a runner with no memory backend at
+    /// all), both tools answer honestly rather than as "unknown tool" — the roster is
+    /// shared with the app, so an unwired hook must not read as a missing tool.
+    func testMemoryToolsAnswerHonestlyWithNoHookWired() async {
         var audited: [AgentAuditEvent] = []
         let engine = makeEngine(audit: { audited.append($0) })
 
-        for name in [AgentToolSpec.remember.name, AgentToolSpec.recall.name] {
-            let result = await engine.execute(call(name, "{}"))
-            XCTAssertTrue(result.contains("unavailable in headless mode"), "got: \(result)")
-            XCTAssertFalse(result.contains("unknown tool"),
-                           "an advertised tool must never be answered as unknown")
-        }
+        let rememberResult = await engine.execute(
+            call(AgentToolSpec.remember.name, #"{"title": "Deploy target", "content": "prod-east"}"#)
+        )
+        XCTAssertTrue(rememberResult.contains("not available in this runtime"), "got: \(rememberResult)")
+        XCTAssertFalse(rememberResult.contains("unknown tool"))
+
+        let recallResult = await engine.execute(call(AgentToolSpec.recall.name, #"{"query": "deploy"}"#))
+        XCTAssertTrue(recallResult.contains("not available in this runtime"), "got: \(recallResult)")
+        XCTAssertFalse(recallResult.contains("unknown tool"))
+
         XCTAssertEqual(audited.filter { $0.kind == "toolCall" }.count, 2,
-                       "each memory call should still land in the audit trail")
+                       "each memory call should still land in the audit trail before the hook check")
+    }
+
+    func testRememberRequiresANonEmptyTitle() async {
+        let engine = makeEngine()
+        engine.onRemember = { _, _, _ in .saved }
+        let result = await engine.execute(call(AgentToolSpec.remember.name, #"{"content": "some fact"}"#))
+        XCTAssertTrue(result.contains("Error") && result.contains("title"), "got: \(result)")
+    }
+
+    func testRememberRequiresANonEmptyContent() async {
+        let engine = makeEngine()
+        engine.onRemember = { _, _, _ in .saved }
+        let result = await engine.execute(call(AgentToolSpec.remember.name, #"{"title": "Deploy target"}"#))
+        XCTAssertTrue(result.contains("Error") && result.contains("content"), "got: \(result)")
+    }
+
+    func testRememberPassesTitleContentAndTagsToTheHook() async {
+        var seen: (title: String, content: String, tags: String?)?
+        let engine = makeEngine()
+        engine.onRemember = { title, content, tags in
+            seen = (title, content, tags)
+            return .saved
+        }
+        let result = await engine.execute(call(
+            AgentToolSpec.remember.name,
+            #"{"title": "Deploy target", "content": "prod-east", "tags": "infra,deploy"}"#
+        ))
+        XCTAssertEqual(seen?.title, "Deploy target")
+        XCTAssertEqual(seen?.content, "prod-east")
+        XCTAssertEqual(seen?.tags, "infra,deploy")
+        XCTAssertTrue(result.contains("Deploy target"), "got: \(result)")
+    }
+
+    func testRememberReportsARunnerFailureHonestly() async {
+        let engine = makeEngine()
+        engine.onRemember = { _, _, _ in .failed("store is full") }
+        let result = await engine.execute(
+            call(AgentToolSpec.remember.name, #"{"title": "t", "content": "c"}"#)
+        )
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("store is full"), "got: \(result)")
+    }
+
+    func testRecallWithNoQueryMeansMostRecent() async {
+        var seenQuery: String?
+        let engine = makeEngine()
+        engine.onRecall = { query in
+            seenQuery = query
+            return .found([])
+        }
+        _ = await engine.execute(call(AgentToolSpec.recall.name, "{}"))
+        XCTAssertEqual(seenQuery, "")
+    }
+
+    func testRecallReturnsEachHitsTitleAndContent() async {
+        let engine = makeEngine()
+        engine.onRecall = { _ in
+            .found([
+                AgentRecallHit(title: "Deploy target", content: "prod-east"),
+                AgentRecallHit(title: "DB password location", content: "1Password, infra vault"),
+            ])
+        }
+        let result = await engine.execute(call(AgentToolSpec.recall.name, #"{"query": "deploy"}"#))
+        XCTAssertTrue(result.contains("Deploy target"), "got: \(result)")
+        XCTAssertTrue(result.contains("prod-east"), "got: \(result)")
+        XCTAssertTrue(result.contains("DB password location"), "got: \(result)")
+    }
+
+    func testRecallWithNoHitsSaysSoPlainly() async {
+        let engine = makeEngine()
+        engine.onRecall = { _ in .found([]) }
+        let result = await engine.execute(call(AgentToolSpec.recall.name, "{}"))
+        XCTAssertEqual(result, "No memories found.")
+    }
+
+    func testRecallReportsARunnerFailureHonestly() async {
+        let engine = makeEngine()
+        engine.onRecall = { _ in .failed("index is corrupt") }
+        let result = await engine.execute(call(AgentToolSpec.recall.name, "{}"))
+        XCTAssertTrue(result.contains("Error"), "got: \(result)")
+        XCTAssertTrue(result.contains("index is corrupt"), "got: \(result)")
+    }
+
+    /// Same shape as the goals-ledger gate: a runtime with no memory hook must not
+    /// advertise `remember`/`recall` — an advertised tool that can only answer
+    /// "unavailable" is a trap, not a convenience.
+    func testTheRosterDropsMemoryToolsWhenNoHook() {
+        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true, memory: true)
+            .contains { $0.name == "remember" })
+        XCTAssertFalse(AgentToolSpec.roster(readSession: true, sendSession: true, memory: false)
+            .contains { $0.name == "remember" })
+        XCTAssertFalse(AgentToolSpec.roster(readSession: true, sendSession: true, memory: false)
+            .contains { $0.name == "recall" })
+        // Independent of the other gates.
+        XCTAssertTrue(AgentToolSpec.roster(readSession: false, sendSession: false, memory: true)
+            .contains { $0.name == "remember" })
     }
 
     // MARK: - request_input
@@ -533,17 +636,17 @@ final class AgentEngineDispatchTests: XCTestCase {
     /// `tmux capture-pane` for that, so the two instructions contradicted each other and the
     /// tool-shaped one always failed.
     func testTheRosterDropsReadSessionForARuntimeThatCannotServeIt() {
-        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true)
+        XCTAssertTrue(AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true)
             .contains { $0.name == "read_session" })
-        XCTAssertFalse(AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true)
+        XCTAssertFalse(AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true, memory: true)
             .contains { $0.name == "read_session" })
         // Nothing else moves: the two rosters differ by exactly that one tool.
         XCTAssertEqual(
-            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true).count,
-            AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true).count + 1
+            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true).count,
+            AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true, memory: true).count + 1
         )
         XCTAssertEqual(
-            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true).map(\.name),
+            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true).map(\.name),
             AgentToolSpec.all.map(\.name)
         )
         // …and the dispatch keeps its honest error for a model that names it anyway.

@@ -260,6 +260,10 @@ final class Daemon {
     private var transcript: DaemonTranscriptUplink?
     /// The push-notification client; nil when the config has no `controlPlane` block.
     private var notifyClient: DaemonNotifyClient?
+    /// The memory sync client (remember/recall); nil when the config has no
+    /// `controlPlane` block — same gate as `notifyClient`, since both ride the same
+    /// bearer-token relay.
+    private var memoryClient: DaemonMemoryClient?
     /// Owns the on-disk goals ledger. Always constructed (there is always a state
     /// directory to keep it in) — `goal_upsert`/`goal_log` are advertised whenever this
     /// is non-nil, which today is unconditional, matching `composedHeartbeatPrompt`
@@ -810,6 +814,30 @@ final class Daemon {
                 }
             )
             log("push notifications enabled: control plane /notify as \"\(notifyClient?.agentName ?? "Agent")\"")
+
+            // The model's remember/recall tools: both agent and app read/write the SAME
+            // S3 memory document through the control plane, so a fact learned here is
+            // visible to the app (and vice versa) — same gate as notify, since both ride
+            // this bearer-token relay rather than a presigned URL.
+            let memory = DaemonMemoryClient(
+                endpointURL: block.endpointURL,
+                token: block.token,
+                agentName: config.supervision?.agentName ?? "Agent",
+                agentID: agentID,
+                originDeviceID8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                }
+            )
+            memoryClient = memory
+            engine.onRemember = { title, content, tags in
+                await memory.remember(title: title, content: content, tags: tags)
+            }
+            engine.onRecall = { query in
+                await memory.recall(query: query)
+            }
+            log("memory sync enabled: control plane /memory as \"\(memory.agentName)\"")
         }
 
         var consecutiveFailures = 0

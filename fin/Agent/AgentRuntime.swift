@@ -1644,7 +1644,7 @@ final class AgentRuntime: ObservableObject {
                     // the model to reach for it whenever someone asks what is running. The
                     // app reads other sessions with `tmux capture-pane` through send_input,
                     // which is what this runtime's routing prompt already says.
-                    tools: AgentToolSpec.roster(readSession: false, sendSession: false)
+                    tools: AgentToolSpec.roster(readSession: false, sendSession: false, memory: true)
                 )
                 return (completion, attempt, nil)
             } catch {
@@ -1756,7 +1756,7 @@ final class AgentRuntime: ObservableObject {
 
         default:
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
-                + AgentToolSpec.roster(readSession: false, sendSession: false).map(\.name).joined(separator: ", ") + "."
+                + AgentToolSpec.roster(readSession: false, sendSession: false, memory: true).map(\.name).joined(separator: ", ") + "."
             record(.error, message, toolName: call.name, isFailure: true)
             return message
         }

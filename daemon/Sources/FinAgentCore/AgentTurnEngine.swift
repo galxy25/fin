@@ -198,6 +198,18 @@ public final class AgentTurnEngine {
         (_ goalID: String, _ kind: UpdateKind, _ text: String) async -> AgentGoalLogOutcome
     )?
 
+    /// Fired when the model calls `remember`. `title`/`content` have already been
+    /// trimmed and checked non-empty; `tags` is the raw comma-separated string
+    /// (possibly nil), unparsed — the runner's own store decides how to split it. Nil
+    /// hook → unavailable, exactly like `onReadSession`.
+    public var onRemember: (
+        (_ title: String, _ content: String, _ tags: String?) async -> AgentRememberOutcome
+    )?
+
+    /// Fired when the model calls `recall`. `query` is already trimmed; empty means
+    /// "most recent". Nil hook → unavailable, exactly like `onReadSession`.
+    public var onRecall: ((_ query: String) async -> AgentRecallOutcome)?
+
     /// The tmux guard (see `TmuxCommandGuard`). NOT an optional hook, on purpose: a nil
     /// hook reads as "allow", and a guard must never be disarmed by omission.
     /// `.unenforced` is the explicit, named opt-out for a host with no tmux server of its
@@ -446,7 +458,7 @@ public final class AgentTurnEngine {
                     // "unavailable here". The dispatch's honest error stays as a backstop.
                     tools: AgentToolSpec.roster(
                         readSession: onReadSession != nil, sendSession: onSendSession != nil,
-                        goalsLedger: onGoalUpsert != nil
+                        goalsLedger: onGoalUpsert != nil, memory: onRemember != nil
                     )
                 )
                 return (completion, nil)
@@ -495,15 +507,16 @@ public final class AgentTurnEngine {
                 rawArguments: call.arguments
             )
 
-        case AgentToolSpec.remember.name, AgentToolSpec.recall.name:
-            // The specs are advertised (AgentToolSpec.all is shared with the app), so an
-            // unknown-tool error would be a lie about our own roster. There is no memory
-            // store in headless mode — say so honestly and give the model a way forward.
-            let message = "Memory tools are unavailable in headless mode; "
-                + "note anything important in your reply text instead."
-            record("toolCall", "\(call.name) (unavailable in headless mode)",
-                   toolName: call.name, toolArguments: call.arguments)
-            return message
+        case AgentToolSpec.remember.name:
+            return await executeRemember(
+                title: call.argument("title"),
+                content: call.argument("content"),
+                tags: call.argument("tags"),
+                rawArguments: call.arguments
+            )
+
+        case AgentToolSpec.recall.name:
+            return await executeRecall(query: call.argument("query"), rawArguments: call.arguments)
 
         case AgentToolSpec.requestInput.name:
             return executeRequestInput(
@@ -565,7 +578,7 @@ public final class AgentTurnEngine {
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
                 + AgentToolSpec.roster(
                     readSession: onReadSession != nil, sendSession: onSendSession != nil,
-                    goalsLedger: onGoalUpsert != nil
+                    goalsLedger: onGoalUpsert != nil, memory: onRemember != nil
                 ).map(\.name).joined(separator: ", ") + "."
             record("error", message, toolName: call.name, isFailure: true)
             return message
@@ -950,6 +963,65 @@ public final class AgentTurnEngine {
             return message
         case .logged:
             return "Logged \(kind.rawValue) on \(goalID)."
+        }
+    }
+
+    /// The model's `remember` tool: validate `title`/`content` (non-empty), then hand
+    /// off. `tags` rides through unparsed — the runner's own store decides its shape.
+    private func executeRemember(
+        title rawTitle: String?, content rawContent: String?, tags: String?, rawArguments: String
+    ) async -> String {
+        let toolName = AgentToolSpec.remember.name
+        guard let title = rawTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty else {
+            let message = "Error: remember requires a non-empty \"title\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        guard let content = rawContent?.trimmingCharacters(in: .whitespacesAndNewlines), !content.isEmpty else {
+            let message = "Error: remember requires a non-empty \"content\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        record("toolCall", "remember: \(title)", toolName: toolName, toolArguments: rawArguments)
+        guard let onRemember else {
+            let message = "Error: remember is not available in this runtime; "
+                + "note anything important in your reply text instead."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onRemember(title, content, tags) {
+        case .saved:
+            return "Saved \"\(title)\" to memory."
+        case .failed(let reason):
+            let message = "Error: remember could not save \"\(title)\": \(reason)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+    }
+
+    /// The model's `recall` tool: an empty query means "most recent", matching the
+    /// app's own `recall` semantics.
+    private func executeRecall(query rawQuery: String?, rawArguments: String) async -> String {
+        let toolName = AgentToolSpec.recall.name
+        let query = rawQuery?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        record(
+            "toolCall", query.isEmpty ? "recall: (most recent)" : "recall: \(query)",
+            toolName: toolName, toolArguments: rawArguments
+        )
+        guard let onRecall else {
+            let message = "Error: recall is not available in this runtime; "
+                + "note anything important in your reply text instead."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        switch await onRecall(query) {
+        case .failed(let reason):
+            let message = "Error: recall failed: \(reason)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        case .found(let hits):
+            guard !hits.isEmpty else { return "No memories found." }
+            return hits.map { "- \($0.title): \($0.content)" }.joined(separator: "\n")
         }
     }
 
