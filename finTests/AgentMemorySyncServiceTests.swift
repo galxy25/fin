@@ -258,4 +258,99 @@ final class AgentMemorySyncServiceTests: XCTestCase {
             XCTAssertEqual(row.title, "fresh local edit", "a stale pull must never clobber a fresher local row")
         }
     }
+
+    // MARK: - Cumulative profile sync
+
+    private func profileResponse(content: String, updatedAt: String?, for request: URLRequest) -> (Data, URLResponse) {
+        let updated = updatedAt.map { "\"\($0)\"" } ?? "null"
+        let body = #"{"content":"\#(content)","updatedAt":\#(updated)}"#
+        return (Data(body.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+
+    @MainActor
+    func testSyncCumulativeProfilePullsNewerRemoteContentWhenNoneExistsLocally() async throws {
+        try await withControlPlaneConfigured {
+            let (service, context) = try makeService()
+            service.transport = { request in
+                self.profileResponse(content: "Levi ships fast and verifies end to end", updatedAt: "2026-09-08T20:00:00Z", for: request)
+            }
+
+            await service.syncCumulativeProfile()
+
+            let record = try XCTUnwrap(try context.fetch(FetchDescriptor<AgentMemory>()).first)
+            XCTAssertEqual(record.kind, .cumulative)
+            XCTAssertEqual(record.content, "Levi ships fast and verifies end to end")
+        }
+    }
+
+    @MainActor
+    func testSyncCumulativeProfileDoesNotOverwriteAFresherLocalProfile() async throws {
+        try await withControlPlaneConfigured {
+            let (service, context) = try makeService()
+            let local = AgentMemory(kind: .cumulative, title: "User profile", tags: "profile")
+            local.content = "fresher local profile text"
+            local.updatedAt = Date()
+            context.insert(local)
+            try context.save()
+
+            service.transport = { request in
+                self.profileResponse(content: "stale server text", updatedAt: "2020-01-01T00:00:00Z", for: request)
+            }
+
+            await service.syncCumulativeProfile()
+
+            let record = try XCTUnwrap(try context.fetch(FetchDescriptor<AgentMemory>()).first)
+            XCTAssertEqual(record.content, "fresher local profile text")
+        }
+    }
+
+    @MainActor
+    func testSyncCumulativeProfilePushesLocalContentNewerThanTheWatermark() async throws {
+        try await withControlPlaneConfigured {
+            let (service, context) = try makeService()
+            let local = AgentMemory(kind: .cumulative, title: "User profile", tags: "profile")
+            local.content = "this device's own distilled profile"
+            local.updatedAt = Date()
+            context.insert(local)
+            try context.save()
+
+            var pushedContent: String?
+            service.transport = { request in
+                if request.httpMethod == "PUT" {
+                    let object = try? JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+                    pushedContent = object?["content"] as? String
+                    return self.profileResponse(content: local.content, updatedAt: "2026-09-08T20:00:00Z", for: request)
+                }
+                // GET: nothing on the server yet.
+                return self.profileResponse(content: "", updatedAt: nil, for: request)
+            }
+
+            await service.syncCumulativeProfile()
+
+            XCTAssertEqual(pushedContent, "this device's own distilled profile")
+        }
+    }
+
+    @MainActor
+    func testSyncCumulativeProfileDoesNotRepushContentAlreadyPastTheWatermark() async throws {
+        try await withControlPlaneConfigured {
+            let (service, context) = try makeService()
+            let local = AgentMemory(kind: .cumulative, title: "User profile", tags: "profile")
+            local.content = "already pushed"
+            local.updatedAt = Date()
+            context.insert(local)
+            try context.save()
+
+            var pushCount = 0
+            service.transport = { request in
+                if request.httpMethod == "PUT" { pushCount += 1 }
+                return self.profileResponse(content: "", updatedAt: nil, for: request)
+            }
+
+            await service.syncCumulativeProfile()
+            await service.syncCumulativeProfile()
+
+            XCTAssertEqual(pushCount, 1, "the second pass must see its own watermark and skip re-pushing unchanged content")
+        }
+    }
 }

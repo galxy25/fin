@@ -49,6 +49,17 @@ final class AgentMemorySyncService {
     private var syncTasks: [UUID: Task<Void, Never>] = [:]
     private var lastFailureAuditAt: [String: Date] = [:]
 
+    /// Ceiling between app-open-triggered profile syncs — Levi: "compaction should
+    /// happen by the app whenever I open it... no more frequently than every 15
+    /// minutes." Not per-agent (the profile isn't agent-scoped) and in-memory only
+    /// (matching every other pacing stamp on this type) — a cold launch always syncs
+    /// once; this ceiling only stops repeat triggers within one running session.
+    static let profileSyncCeiling: TimeInterval = 15 * 60
+    private static let lastPushedProfileKey = "fin.memory.profile.lastPushed"
+
+    private var lastProfileSyncAt: Date?
+    private var profileSyncTask: Task<Void, Never>?
+
     init(context: ModelContext, deviceID8: String = DeviceIdentity.short, defaults: UserDefaults = .standard) {
         self.context = context
         self.deviceID8 = deviceID8
@@ -214,6 +225,115 @@ final class AgentMemorySyncService {
         record.originDeviceID8 = originDevice8
         context.insert(record)
         return true
+    }
+
+    // MARK: - Cumulative profile (shared, cross-agent)
+
+    /// Kicks one profile sync pass, paced at `profileSyncCeiling` and coalesced against
+    /// an already-running pass. Called from `SessionManager.isAppActive`'s foreground
+    /// transition — "the app whenever I open it." A silent no-op with no control plane
+    /// configured, same as `syncIfDue`.
+    func compactCumulativeProfileIfDue(now: Date = Date()) {
+        guard CloudControlPlaneConfig.isConfigured else { return }
+        guard profileSyncTask == nil else { return }
+        if let last = lastProfileSyncAt, now.timeIntervalSince(last) < Self.profileSyncCeiling { return }
+        lastProfileSyncAt = now
+        profileSyncTask = Task { [weak self] in
+            await self?.syncCumulativeProfile()
+            self?.profileSyncTask = nil
+        }
+    }
+
+    /// Pull-then-push against `/memory/profile`. No claim lock here: this shares
+    /// whatever this device's OWN existing consolidation (`AgentRuntime.consolidateMemoriesIfDue`,
+    /// unchanged, still watchdog-tick-driven and 24h-floored for agents that can run it
+    /// locally) already computed — it never decides to spend a fresh round of model
+    /// tokens on a new summary itself, so it never needs to become "the active runner"
+    /// the lock exists to arbitrate. Today only the daemon's own heartbeat-driven
+    /// compaction (Part B) does that; a device with no locally-runnable agent (Levi's
+    /// current setup: one cloud-hosted agent) still benefits fully from the pull half.
+    func syncCumulativeProfile() async {
+        guard case .found(let remote) = await fetchSharedProfile() else { return }
+        pullCumulativeProfileIfNewer(remote)
+        await pushCumulativeProfileIfNewer()
+    }
+
+    private struct SharedProfile {
+        let content: String
+        let updatedAt: Date?
+    }
+
+    private enum SharedProfileOutcome {
+        case found(SharedProfile)
+        case failed
+    }
+
+    private func fetchSharedProfile() async -> SharedProfileOutcome {
+        guard let httpRequest = request(path: "/memory/profile", method: "GET") else { return .failed }
+        do {
+            let (data, response) = try await transport(httpRequest)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else {
+                registerFailure(agentID: Self.profileAuditID, "[memory] profile read failed")
+                return .failed
+            }
+            let updatedAt = (object["updatedAt"] as? String).flatMap { Self.parseISO($0) }
+            return .found(SharedProfile(content: object["content"] as? String ?? "", updatedAt: updatedAt))
+        } catch {
+            registerFailure(agentID: Self.profileAuditID, "[memory] profile read failed: could not reach the control plane")
+            return .failed
+        }
+    }
+
+    /// Sentinel id `audit` is called with for profile-sync lines — there's no single
+    /// owning agent for a cross-agent document, so this can't route into one runtime's
+    /// trail the way episodic sync failures do; `SessionManager` simply won't find a
+    /// live runtime for it and the line is dropped, same as any agent with no local
+    /// runtime today.
+    private static let profileAuditID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+
+    private func pullCumulativeProfileIfNewer(_ remote: SharedProfile) {
+        guard let remoteUpdatedAt = remote.updatedAt, !remote.content.isEmpty else { return }
+        let kind = MemoryKind.cumulative.rawValue
+        let descriptor = FetchDescriptor<AgentMemory>(
+            predicate: #Predicate<AgentMemory> { $0.kindRaw == kind },
+            sortBy: [SortDescriptor(\AgentMemory.createdAt, order: .forward)]
+        )
+        let existing = (try? context.fetch(descriptor))?.first
+        guard existing == nil || existing!.updatedAt < remoteUpdatedAt else { return }
+
+        let record = existing ?? AgentMemory(kind: .cumulative, title: "User profile", tags: "profile")
+        if existing == nil { context.insert(record) }
+        record.content = MemoryRedactor.redact(remote.content)
+        record.updatedAt = remoteUpdatedAt
+        try? context.save()
+    }
+
+    private func pushCumulativeProfileIfNewer() async {
+        let kind = MemoryKind.cumulative.rawValue
+        let descriptor = FetchDescriptor<AgentMemory>(
+            predicate: #Predicate<AgentMemory> { $0.kindRaw == kind },
+            sortBy: [SortDescriptor(\AgentMemory.createdAt, order: .forward)]
+        )
+        guard let local = (try? context.fetch(descriptor))?.first, !local.content.isEmpty else { return }
+        let watermark = defaults.object(forKey: Self.lastPushedProfileKey) as? Date ?? .distantPast
+        guard local.updatedAt > watermark else { return }
+
+        guard var httpRequest = request(path: "/memory/profile", method: "PUT") else { return }
+        httpRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let body = try? JSONSerialization.data(withJSONObject: ["content": local.content]) else { return }
+        httpRequest.httpBody = body
+        do {
+            let (_, response) = try await transport(httpRequest)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                registerFailure(agentID: Self.profileAuditID, "[memory] profile push failed")
+                return
+            }
+            defaults.set(local.updatedAt, forKey: Self.lastPushedProfileKey)
+        } catch {
+            registerFailure(agentID: Self.profileAuditID, "[memory] profile push failed: could not reach the control plane")
+        }
     }
 
     // MARK: - Ledger id <-> local id

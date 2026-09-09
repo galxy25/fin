@@ -49,6 +49,11 @@ final class SessionManager: ObservableObject {
             if isAppActive {
                 startWatchdog()
                 directiveChannel.appDidBecomeActive()
+                // "Compaction should happen by the app whenever I open it" — pulls the
+                // shared cumulative profile (fixes a stale local copy immediately on
+                // open) and opportunistically shares this device's own, ceilinged
+                // inside the service at 15 minutes.
+                memorySyncService?.compactCumulativeProfileIfDue()
             } else {
                 stopWatchdog()
                 directiveChannel.appDidResignActive()
