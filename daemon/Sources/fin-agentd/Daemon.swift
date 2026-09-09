@@ -282,6 +282,10 @@ final class Daemon {
     private var conversationDigest = ""
     private var conversationTitle = ""
     nonisolated static let maxDigestCharacters = 4000
+    /// When the goals ledger most recently had zero live (open/active) goals — see
+    /// `statusSnapshot`, which maintains this and reports it as the control plane's
+    /// idle-sweep timer, independent of `lastTurnAt`'s own churn from mere heartbeats.
+    private var noOpenGoalsSince: Date?
     /// Owns the on-disk goals ledger. Always constructed (there is always a state
     /// directory to keep it in) — `goal_upsert`/`goal_log` are advertised whenever this
     /// is non-nil, which today is unconditional, matching `composedHeartbeatPrompt`
@@ -966,7 +970,7 @@ final class Daemon {
                     // work arrives.
                     if handleTaskComplete() {
                         log("TASK COMPLETE detected — shutting down.")
-                        await supervision?.putStatus(statusSnapshot(state: "task-complete"))
+                        await supervision?.putStatus(await statusSnapshot(state: "task-complete"))
                         shutdown(exitCode: 0)
                         // Nothing may run past shutdown — in particular not the status
                         // PUT below, which would nondeterministically overwrite
@@ -1000,7 +1004,7 @@ final class Daemon {
 
             // Status and the whole transcript go up after every turn, then again after
             // each poll below.
-            await supervision?.putStatus(statusSnapshot(state: idleStateName))
+            await supervision?.putStatus(await statusSnapshot(state: idleStateName))
             await transcript?.flush()
 
             // Wait for the next trigger: a supervision directive or inbox message, or a
@@ -1012,7 +1016,7 @@ final class Daemon {
             while !shuttingDown {
                 if let supervision, supervision.pollIsDue {
                     let pending = await supervision.poll()
-                    await supervision.putStatus(statusSnapshot(state: idleStateName))
+                    await supervision.putStatus(await statusSnapshot(state: idleStateName))
                     if let first = pending.first {
                         nextDirective = first
                         break
@@ -1188,13 +1192,40 @@ final class Daemon {
         transcript?.record(event)
     }
 
-    private func statusSnapshot(state: String) -> DaemonStatusSnapshot {
-        DaemonStatusSnapshot(
+    private func statusSnapshot(state: String) async -> DaemonStatusSnapshot {
+        let hasOpenGoals: Bool?
+        if let goalsLedger {
+            let goals = await goalsLedger.document.goals
+            hasOpenGoals = goals.contains { $0.state.isLive }
+        } else {
+            hasOpenGoals = nil
+        }
+        noOpenGoalsSince = Self.nextNoOpenGoalsSince(
+            hasOpenGoals: hasOpenGoals, previous: noOpenGoalsSince, now: Date()
+        )
+        return DaemonStatusSnapshot(
             state: state,
             lastTurnAt: lastTurnAt,
             lastAssistantPreview: lastAssistantPreview,
-            lastError: lastError
+            lastError: lastError,
+            hasOpenGoals: hasOpenGoals,
+            noOpenGoalsSince: noOpenGoalsSince
         )
+    }
+
+    /// Pure state transition for the sweep's cost-savings timer, internal (not
+    /// private) so tests can drive it directly: held steady across heartbeats once
+    /// goals go empty (never refreshed by mere reflection the way `last_turn_at` is —
+    /// see `DaemonStatusSnapshot.noOpenGoalsSince`'s own doc comment), cleared the
+    /// moment a goal reopens, and left untouched when goal state is unknown (no
+    /// ledger loaded) so an unrelated caller can't accidentally start or stop the
+    /// timer on its behalf.
+    nonisolated static func nextNoOpenGoalsSince(hasOpenGoals: Bool?, previous: Date?, now: Date) -> Date? {
+        switch hasOpenGoals {
+        case true: return nil
+        case false: return previous ?? now
+        case nil: return previous
+        }
     }
 
     func shutdown(exitCode: Int32) {

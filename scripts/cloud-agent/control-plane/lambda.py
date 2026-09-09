@@ -1371,11 +1371,23 @@ def _sweep_verdict(worker, now):
 
     if status.get("state") in IDLE_STATES:
         # updated_at cannot carry idleness on its own — a healthy idle daemon
-        # refreshes it every poll — so the clock runs from the last real turn,
-        # or from launch for a worker that has never taken one.
-        since = _parse_iso(status.get("last_turn_at")) or launched
+        # refreshes it every poll — so the clock normally runs from the last real
+        # turn, or from launch for a worker that has never taken one. But a daemon
+        # with an armed heartbeat and nothing left to pursue keeps calling that
+        # timer forward too — every reflective beat, empty or not, still stamps
+        # last_turn_at — so cost never stops accruing for a worker that has quietly
+        # run out of mission. When the daemon reports has_open_goals == False, use
+        # no_goals_since instead: it holds steady across heartbeats until a goal
+        # reopens, so idle time actually accumulates. Absent (older daemon, or no
+        # goals ledger loaded) falls back to the original last_turn_at behavior.
+        if status.get("has_open_goals") is False:
+            since = _parse_iso(status.get("no_goals_since")) or launched
+            reason = "no open goals since {}"
+        else:
+            since = _parse_iso(status.get("last_turn_at")) or launched
+            reason = str(status.get("state")) + " since {}"
         if now - since > idle:
-            return "{} since {}".format(status.get("state"), _iso(since))
+            return reason.format(_iso(since))
 
     return None
 

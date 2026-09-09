@@ -1963,6 +1963,29 @@ final class DaemonDirectiveClientTests: XCTestCase {
         XCTAssertTrue(object["last_error"] is NSNull, "last_error must be present but null")
     }
 
+    func testStatusBodyCarriesHasOpenGoalsAndNoGoalsSince() throws {
+        let client = makeClient(fetch: { _ in (Data(), self.response(200)) })
+        let since = Date(timeIntervalSince1970: 1_756_400_000)
+        let body = client.statusBody(DaemonStatusSnapshot(
+            state: "idle", hasOpenGoals: false, noOpenGoalsSince: since
+        ))
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["has_open_goals"] as? Bool, false)
+        XCTAssertEqual(object["no_goals_since"] as? String, ISO8601DateFormatter().string(from: since))
+    }
+
+    func testStatusBodyDefaultsHasOpenGoalsAndNoGoalsSinceToNull() throws {
+        let client = makeClient(fetch: { _ in (Data(), self.response(200)) })
+        let body = client.statusBody(DaemonStatusSnapshot(state: "idle"))
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any]
+        )
+        XCTAssertTrue(object["has_open_goals"] is NSNull, "no goals ledger loaded must read as null, not false")
+        XCTAssertTrue(object["no_goals_since"] is NSNull)
+    }
+
     func testPutStatusSendsAJSONPutToTheStatusURL() async throws {
         var putRequests: [URLRequest] = []
         let client = makeClient(

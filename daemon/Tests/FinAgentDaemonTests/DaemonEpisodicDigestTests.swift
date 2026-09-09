@@ -42,3 +42,31 @@ final class DaemonEpisodicDigestTests: XCTestCase {
         XCTAssertTrue(digest.contains("line one line two"))
     }
 }
+
+/// `Daemon.nextNoOpenGoalsSince` — the pure state transition behind the control
+/// plane's cost-savings sweep signal: a timer that starts the moment the goals ledger
+/// goes empty and holds steady across further heartbeats (never refreshed by mere
+/// reflection the way `last_turn_at` is), so an idle worker with nothing left to
+/// pursue actually accumulates idle time instead of looking perpetually "active."
+final class DaemonNoOpenGoalsSinceTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_757_000_000)
+    private let earlier = Date(timeIntervalSince1970: 1_756_999_000)
+
+    func testGoalsOpenClearsTheTimer() {
+        XCTAssertNil(Daemon.nextNoOpenGoalsSince(hasOpenGoals: true, previous: earlier, now: now))
+    }
+
+    func testGoalsFirstGoingEmptyStartsTheTimerAtNow() {
+        XCTAssertEqual(Daemon.nextNoOpenGoalsSince(hasOpenGoals: false, previous: nil, now: now), now)
+    }
+
+    func testGoalsStayingEmptyHoldsTheExistingTimerSteady() {
+        XCTAssertEqual(Daemon.nextNoOpenGoalsSince(hasOpenGoals: false, previous: earlier, now: now), earlier,
+                       "a heartbeat with nothing to do must not push the timer forward")
+    }
+
+    func testUnknownGoalsStateLeavesWhateverTimerAlreadyExistedUntouched() {
+        XCTAssertEqual(Daemon.nextNoOpenGoalsSince(hasOpenGoals: nil, previous: earlier, now: now), earlier)
+        XCTAssertNil(Daemon.nextNoOpenGoalsSince(hasOpenGoals: nil, previous: nil, now: now))
+    }
+}

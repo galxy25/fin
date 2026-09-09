@@ -88,6 +88,18 @@ struct DaemonStatusSnapshot {
     var lastAssistantPreview: String?
     /// The most recent turn failure, if any — the status document's `last_error`.
     var lastError: String?
+    /// Whether the goals ledger has any `open`/`active` goal right now — cost-savings
+    /// signal for the control plane's idle sweep (`_sweep_verdict`): a worker whose
+    /// heartbeat keeps firing with nothing left to pursue must not look "active" just
+    /// because `last_turn_at` keeps refreshing on pure reflection. Nil for a daemon
+    /// with no goals ledger loaded at all (load failure, or the field predates an
+    /// older daemon version) — the sweep falls back to its previous behavior then.
+    var hasOpenGoals: Bool?
+    /// When `hasOpenGoals` most recently became false, held steady across further
+    /// heartbeats until a goal reopens — the timer the sweep actually measures against,
+    /// since `last_turn_at` itself is refreshed by every heartbeat regardless of
+    /// whether it accomplished anything.
+    var noOpenGoalsSince: Date?
 }
 
 /// One polled document: its URL, ETag, last good parse, and whether the most recent
@@ -724,6 +736,8 @@ final class DaemonDirectiveClient {
             "last_turn_at": snapshot.lastTurnAt.map(iso.string(from:)) as Any? ?? NSNull(),
             "last_assistant_preview": preview as Any? ?? NSNull(),
             "last_error": snapshot.lastError as Any? ?? NSNull(),
+            "has_open_goals": snapshot.hasOpenGoals as Any? ?? NSNull(),
+            "no_goals_since": snapshot.noOpenGoalsSince.map(iso.string(from:)) as Any? ?? NSNull(),
             "updated_at": iso.string(from: now),
         ]
         let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
