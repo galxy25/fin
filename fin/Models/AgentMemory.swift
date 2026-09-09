@@ -42,6 +42,13 @@ final class AgentMemory {
     var consolidatedAt: Date?
     var createdAt: Date = Date()
     var updatedAt: Date = Date()
+    /// `DeviceIdentity.short` of the device that authored this row, or nil for a
+    /// record predating this field. `AgentMemorySyncService` only pushes rows whose
+    /// origin matches THIS device to the control plane's `/memory` document — so a
+    /// pulled-then-re-pushed round trip never happens and each device is provably
+    /// the source of truth for what it sends up. Nil also covers rows pulled from a
+    /// daemon that predates the field; those stay pull-only, never re-pushed.
+    var originDeviceID8: String?
 
     var kind: MemoryKind {
         get { MemoryKind(rawValue: kindRaw) ?? .episodic }

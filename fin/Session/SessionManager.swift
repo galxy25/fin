@@ -87,6 +87,14 @@ final class SessionManager: ObservableObject {
     /// explicit watchdog tick — its own CloudKit-import observation covers the rest.
     var relayApplier: AgentRelayApplier?
 
+    /// Keeps local `AgentMemory` and the control plane's `/memory` document in sync for
+    /// agents hosted here. Created by `FinApp` for the same ModelContext-ownership reason
+    /// as `relayApplier`, and poked at the same two moments: turn finish (below) and every
+    /// watchdog pass (`runWatchdogPass`). Agents hosted elsewhere are synced by
+    /// `AgentRemoteConsoleView` instead — this device has no live runtime for those to
+    /// hang a trigger off of.
+    var memorySyncService: AgentMemorySyncService?
+
     /// Whether an agent's live runtime is hosted on this device right now — the
     /// notification-tap router's fork between the normal console and the
     /// read-only remote conversation view.
@@ -163,6 +171,14 @@ final class SessionManager: ObservableObject {
                 sessionConnected: sessions[serverID]?.state == .connected
             )
         }
+    }
+
+    /// The live runtime hosting `agentID` on this device, if any — how
+    /// `memorySyncService`'s audit lines find their way into the agent's own visible
+    /// trail (`AgentRuntime.recordSupervisionNotice`), mirroring how `relayTargets`
+    /// looks runtimes up for the relay applier.
+    func runtime(forAgentID agentID: UUID) -> AgentRuntime? {
+        agentRuntimes.values.first { $0.agent.id == agentID }
     }
 
     /// One run groups this launch's lifecycle lines, ordered by a shared sequence.
@@ -372,6 +388,10 @@ final class SessionManager: ObservableObject {
             // A finished turn is the moment a relay message deferred behind a busy
             // runtime becomes applicable.
             self?.relayApplier?.applyPending()
+            // Also the moment a fresh remember (explicit or auto-digest) exists to
+            // push, and the natural cadence to pull whatever the daemon learned
+            // meanwhile.
+            self?.memorySyncService?.syncIfDue(agentID: agent.id, agentName: agent.name)
         }
         agentRuntimes[session.id] = runtime
         return runtime
@@ -438,6 +458,7 @@ final class SessionManager: ObservableObject {
             if !runtime.watchdogTick(isExplicit: isExplicit) {
                 runtime.consolidateIfDailyFloorDue()
             }
+            memorySyncService?.syncIfDue(agentID: runtime.agent.id, agentName: runtime.agent.name)
         }
     }
 

@@ -64,6 +64,9 @@ final class MemoryStore {
                 content: safeContent,
                 tags: tags
             )
+            // This device authored it — `AgentMemorySyncService` only ever pushes rows
+            // stamped with its own id, so a pulled-then-re-pushed round trip never happens.
+            record.originDeviceID8 = DeviceIdentity.short
             context.insert(record)
         }
         let saved = (try? context.save()) != nil

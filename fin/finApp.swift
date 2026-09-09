@@ -296,6 +296,15 @@ struct FinApp: App {
         manager.relayApplier = relayApplier
         relayApplier.sweepExpiredCrossDeviceRecords()
 
+        // Memory sync: same ModelContext-ownership split as relayApplier above. Audit
+        // lines land in whichever runtime is actually hosting the agent, same as
+        // DaemonMemoryClient's failures land in the daemon's own log.
+        let memorySync = AgentMemorySyncService(context: context)
+        memorySync.audit = { [weak manager] agentID, line in
+            manager?.runtime(forAgentID: agentID)?.recordSupervisionNotice(line)
+        }
+        manager.memorySyncService = memorySync
+
         // Cross-device push subscriptions: idempotent refresh once the CloudKit
         // account answers. Failures land in the audit trail (and iCloud mirror) —
         // a silent zero-subscription outage cost a full debug cycle.

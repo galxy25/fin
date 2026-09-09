@@ -41,6 +41,14 @@ struct AgentRemoteConsoleView: View {
     @State private var isStartingWorker = false
     @State private var workerOutcome: CloudWorkerClient.Outcome?
 
+    /// This device hosts no runtime for the agent shown here (that's the whole point
+    /// of this screen), so `SessionManager`'s turn-finish/watchdog triggers never fire
+    /// for it — this view's own 10s refresh loop is the only cadence available to keep
+    /// its memory synced too. View-owned rather than shared: `AgentMemorySyncService`'s
+    /// per-agent pacing lives in-memory, so a fresh instance per view just means the
+    /// first sync isn't throttled — harmless.
+    @State private var memorySync: AgentMemorySyncService?
+
     struct CloudPendingMessage: Identifiable, Equatable {
         let id: UUID
         let text: String
@@ -94,12 +102,17 @@ struct AgentRemoteConsoleView: View {
             // the in-context moment to ask for notification permission on a device
             // that has never submitted a local prompt.
             AgentNotificationService.shared.requestAuthorizationIfNeeded()
+            if memorySync == nil {
+                memorySync = AgentMemorySyncService(context: modelContext)
+            }
             await refresh()
+            memorySync?.syncIfDue(agentID: agentID, agentName: agentName)
             // Auto-refresh while visible; cancelled with the view.
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(10))
                 guard !Task.isCancelled else { return }
                 await refresh()
+                memorySync?.syncIfDue(agentID: agentID, agentName: agentName)
             }
         }
     }
