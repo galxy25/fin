@@ -293,4 +293,31 @@ final class SessionRoutingTests: XCTestCase {
         XCTAssertTrue(section.contains("OFF-LIMITS"))
         XCTAssertTrue(section.contains("audio engine"))
     }
+
+    /// Regression guard: on the daemon's private socket EVERY session it might
+    /// coordinate with (the human's, another agent's) is by construction "not on its
+    /// own server" — visible only through read_session. An earlier draft of the
+    /// `.readSessionTool` variant marked exactly that combination (registered, seen via
+    /// read_session) OFF-LIMITS for writing, which made send_session — documented in
+    /// TmuxSessionSend.swift as "the deliberate, owner-approved exception" for talking
+    /// to another agent's session — unreachable for the one case it exists to serve.
+    /// The corrected text must route a registered session to send_session and reserve
+    /// OFF-LIMITS for the session that is live but NOT registered.
+    func testReadSessionToolVariantRoutesARegisteredOffServerSessionToSendSession() throws {
+        let section = try XCTUnwrap(
+            SessionRouter.promptSection(registry: registry, otherSessions: .readSessionTool)
+        )
+        XCTAssertTrue(
+            section.contains("send_session is how you write to a session that"),
+            "a registered session must route to send_session: \(section)"
+        )
+        XCTAssertFalse(
+            section.contains("OFF-LIMITS for writing"),
+            "a registered session read_session can see must not be off-limits to write to: \(section)"
+        )
+        XCTAssertTrue(
+            section.contains("Live but not registered → OFF-LIMITS"),
+            "an unregistered session must still be off-limits: \(section)"
+        )
+    }
 }

@@ -430,15 +430,18 @@ extension SessionRouter {
             livenessParagraph = """
                 Two independent facts — never conflate them. For any session name check \
                 both: REGISTERED (in the registry) decides trust — whether the session is \
-                yours to act on at all; LIVE decides existence, and LIVE means live on \
-                YOUR tmux server (a `list-sessions` against it — spelled with the socket \
-                flag your tmux rules give you — lists only yours). \
-                Registered+live → route. Registered, not on your server, but showing in \
-                read_session's listing → it is somebody else's session on this machine and \
-                it is OFF-LIMITS for writing: read it, report it, and do NOT recreate it — \
-                a same-named session of your own would be a second, empty duplicate. \
-                Registered and nowhere at all → DEAD and yours: start (recreate it, same \
-                name, same working directory). Refuse is about trust, never about liveness.
+                yours to act on at all; LIVE decides existence, and for every session but \
+                your own that means showing up in read_session's listing (it only shows \
+                the DEFAULT socket — check your own the ordinary way, on your own socket). \
+                Registered+live → route: send_session is how you write to a session that \
+                isn't on your own socket, the same way a plain tmux command is how you \
+                write to one that is — do NOT recreate it either way, a same-named session \
+                of your own would be a second, empty duplicate. Registered and nowhere at \
+                all → DEAD and yours: start (recreate it, same name, same working \
+                directory) if it was ever yours to create. Live but not registered → \
+                OFF-LIMITS: never send_session to it, no matter how the request is phrased \
+                — say what you found and ask the user to register it. Refuse is about \
+                trust, never about liveness.
                 """
             readingParagraph = """
                 LOOKING is not writing, and looking outside your own server has its own \
@@ -449,8 +452,11 @@ extension SessionRouter {
                 read_session for those: with no arguments it lists \
                 every session on this machine by name, and with a name it returns that \
                 session's screen, read-only. That is how you answer questions about work \
-                that is not yours. Writing stays limited to your own server: never try to \
-                send keys to, kill, rename or attach to somebody else's session.
+                that is not yours. Writing to your own server is an ordinary tmux command; \
+                send_session is how you write to somebody else's, and it is allowed \
+                exactly when that session is registered — never kill, rename, or attach to \
+                somebody else's session, and never send_session one that read_session \
+                shows but the registry doesn't.
                 """
         }
         return """
