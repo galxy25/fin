@@ -108,6 +108,54 @@ final class DaemonMemoryClient {
         }
     }
 
+    /// POST /memory — upserts the ONE growing episodic record for a conversation, keyed
+    /// by a STABLE id derived from `id` (mirrors `AgentMemorySyncService.ledgerID(forLocalID:)`
+    /// on the app side) so repeated calls for the same conversation update the same
+    /// server-side entry instead of accumulating one per call — unlike `remember`'s
+    /// fresh-id-per-call shape, which is right for the model's own explicit, individually
+    /// distinct facts. `startedAt` should be the conversation's own fixed start time, not
+    /// "now" — the upsert replaces the whole entry each call, so a caller that re-sent
+    /// "now" every time would make `createdAt` drift forward on every update.
+    func rememberConversation(
+        id: UUID, startedAt: Date, title: String, content: String, tags: String?
+    ) async -> AgentRememberOutcome {
+        guard var httpRequest = request(path: "/memory", method: "POST") else {
+            return .failed("control plane URL is not configured")
+        }
+        httpRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let formatter = ISO8601DateFormatter()
+        var object: [String: Any] = [
+            "agent": agentName,
+            "id": "m-\(id.uuidString.lowercased())",
+            "kind": "episodic",
+            "title": title,
+            "content": content,
+            "createdAt": formatter.string(from: startedAt),
+            "updatedAt": formatter.string(from: Date()),
+            "originDevice8": originDeviceID8,
+        ]
+        if let agentID { object["agentId"] = agentID.uuidString }
+        let trimmedTags = tags?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedTags.isEmpty { object["tags"] = trimmedTags }
+        guard let body = try? JSONSerialization.data(withJSONObject: object) else {
+            return .failed("could not encode the memory entry")
+        }
+        httpRequest.httpBody = body
+        do {
+            let (_, response) = try await transport(httpRequest)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                registerFailure("[memory] conversation digest failed: HTTP \(status)")
+                return .failed("control plane returned HTTP \(status)")
+            }
+            return .saved
+        } catch {
+            let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            registerFailure("[memory] conversation digest failed: \(text.prefix(200))")
+            return .failed("could not reach the control plane")
+        }
+    }
+
     /// GET /memory?agent= — fetches the whole document, then filters/sorts/caps
     /// exactly as `MemoryStore.searchMemories` does app-side: case-insensitive
     /// substring match across title/content/tags when `query` is non-empty, else

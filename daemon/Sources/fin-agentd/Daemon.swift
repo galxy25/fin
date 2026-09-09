@@ -271,6 +271,17 @@ final class Daemon {
     /// this daemon's own prompt-injection cache fresh; nil when the config has no
     /// `controlPlane` block — same gate as the other memory-adjacent clients.
     private var memoryConsolidator: DaemonMemoryConsolidator?
+    /// Stable for this whole process run — every automatically-recorded turn folds
+    /// into the SAME growing episodic entry via a deterministic ledger id
+    /// (`DaemonMemoryClient.rememberConversation`), mirroring `AgentRuntime`'s
+    /// per-conversation upsert (`MemoryStore.saveEpisodic`), unlike the model's own
+    /// explicit `remember` tool calls, which mint a fresh entry each time on purpose —
+    /// each one is a distinct fact, not a running digest.
+    private let conversationID = UUID()
+    private let conversationStartedAt = Date()
+    private var conversationDigest = ""
+    private var conversationTitle = ""
+    nonisolated static let maxDigestCharacters = 4000
     /// Owns the on-disk goals ledger. Always constructed (there is always a state
     /// directory to keep it in) — `goal_upsert`/`goal_log` are advertised whenever this
     /// is non-nil, which today is unconditional, matching `composedHeartbeatPrompt`
@@ -926,6 +937,14 @@ final class Daemon {
         /// (markApplied ran before submit; at-most-once is intended).
         var inFlightDirectiveID: String?
 
+        // The user-facing text behind the outcome about to be handled — set before
+        // every task/directive submit, nil before a heartbeat one, so `.answered`
+        // below can tell a real turn from a reflection tick without recording either
+        // the model's own synthetic "[heartbeat] ..." prompt or its answer to it as
+        // episodic memory (mirrors AgentRuntime.runHeartbeatTurn() never calling
+        // recordTurnInEpisodicMemory — only a genuinely submitted message does there).
+        var pendingUserMessageForDigest: String? = config.task
+
         log("submitting task: \(config.task)")
         var outcome = await engine.submit(config.task)
 
@@ -936,6 +955,9 @@ final class Daemon {
                 lastTurnAt = Date()
                 lastAssistantPreview = String(text.prefix(200))
                 log("agent: \(text)")
+                if let userMessage = pendingUserMessageForDigest {
+                    recordTurnInEpisodicMemory(userMessage: userMessage, answer: text)
+                }
                 if AgentTurnLogic.containsTaskComplete(text) {
                     notify(event: "task-complete", message: text)
                     // Resident or not, the supervisor's next status read says
@@ -1018,16 +1040,61 @@ final class Daemon {
                 let text = (directive.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 log("applying directive \(directive.id): \(text)")
                 inFlightDirectiveID = directive.id
+                pendingUserMessageForDigest = text
                 outcome = await engine.submit(text)
                 continue
             }
 
             log("heartbeat")
             inFlightDirectiveID = nil
+            pendingUserMessageForDigest = nil
             outcome = await engine.submit(
                 Self.composedHeartbeatPrompt(goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath))
             )
         }
+    }
+
+    /// Auto-saves this run's episodic memory after each genuinely submitted (task or
+    /// directive-driven) turn — never a heartbeat's own reflection — so a cloud-hosted
+    /// agent's memory keeps flowing from ordinary conversation the same way a locally-
+    /// hosted one's does, without depending on the model remembering to call the
+    /// `remember` tool itself. Mirrors `AgentRuntime.recordTurnInEpisodicMemory` closely
+    /// enough to share its digest shape, not its code — that one lives in the app target.
+    private func recordTurnInEpisodicMemory(userMessage: String, answer: String) {
+        guard let memoryClient else { return }
+        conversationDigest = Self.appendedDigest(conversationDigest, userMessage: userMessage, answer: answer)
+        if conversationTitle.isEmpty { conversationTitle = Self.truncated(userMessage, to: 80) }
+        let id = conversationID
+        let startedAt = conversationStartedAt
+        let title = conversationTitle
+        let content = conversationDigest
+        Task {
+            _ = await memoryClient.rememberConversation(
+                id: id, startedAt: startedAt, title: title, content: content, tags: "auto,conversation"
+            )
+        }
+    }
+
+    /// Pure digest-growth step, internal (not private) so tests can drive it directly:
+    /// appends one "Q: ... / A: ..." line, trimming whole oldest lines first to stay
+    /// under `maxDigestCharacters` — same policy `AgentRuntime.appendToDigest` uses
+    /// app-side.
+    nonisolated static func appendedDigest(_ existing: String, userMessage: String, answer: String) -> String {
+        let line = "Q: \(truncated(userMessage, to: 200)) / A: \(truncated(answer, to: 300))"
+        var digest = existing.isEmpty ? line : existing + "\n" + line
+        while digest.count > maxDigestCharacters {
+            guard let newline = digest.firstIndex(of: "\n") else {
+                digest = String(digest.suffix(maxDigestCharacters))
+                break
+            }
+            digest.removeSubrange(digest.startIndex...newline)
+        }
+        return digest
+    }
+
+    private nonisolated static func truncated(_ text: String, to limit: Int) -> String {
+        let flattened = text.replacingOccurrences(of: "\n", with: " ")
+        return flattened.count <= limit ? flattened : String(flattened.prefix(limit)) + "…"
     }
 
     /// The monitor tool's start path (also the directive channel's `arm_monitor`).

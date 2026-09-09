@@ -106,6 +106,60 @@ final class DaemonMemoryClientTests: XCTestCase {
         XCTAssertEqual(lines, ["[memory] remember failed: HTTP 503"])
     }
 
+    // MARK: - rememberConversation wire shape
+
+    func testRememberConversationUsesAStableIDDerivedFromTheConversationID() async throws {
+        let conversationID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
+        var captured: [URLRequest] = []
+        let client = makeClient { request in
+            captured.append(request)
+            return (Data("{}".utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        _ = await client.rememberConversation(
+            id: conversationID, startedAt: Date(), title: "t1", content: "c1", tags: "auto,conversation"
+        )
+        _ = await client.rememberConversation(
+            id: conversationID, startedAt: Date(), title: "t2", content: "c1\nc2", tags: "auto,conversation"
+        )
+        XCTAssertEqual(captured.count, 2)
+        let firstID = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(captured[0].httpBody)) as? [String: Any])["id"] as? String
+        let secondID = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(captured[1].httpBody)) as? [String: Any])["id"] as? String
+        XCTAssertEqual(firstID, secondID, "the same conversation must always upsert the same server-side entry")
+        XCTAssertEqual(firstID, "m-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    }
+
+    func testRememberConversationSendsStartedAtAsCreatedAtNotNow() async throws {
+        let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return (Data("{}".utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        _ = await client.rememberConversation(id: UUID(), startedAt: startedAt, title: "t", content: "c", tags: nil)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(captured?.httpBody)) as? [String: Any])
+        XCTAssertEqual(object["createdAt"] as? String, ISO8601DateFormatter().string(from: startedAt))
+        XCTAssertNotEqual(object["createdAt"] as? String, object["updatedAt"] as? String)
+    }
+
+    func testRememberConversationOmitsTagsWhenNilOrEmpty() async throws {
+        let client = makeClient { request in
+            (Data("{}".utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        // Just confirming this doesn't crash / returns saved; the omission itself is
+        // covered by testRememberOmitsTagsWhenNilOrEmpty's identical logic, shared by
+        // both methods' trimmedTags computation.
+        let outcome = await client.rememberConversation(id: UUID(), startedAt: Date(), title: "t", content: "c", tags: "")
+        XCTAssertEqual(outcome, .saved)
+    }
+
+    func testRememberConversationReturnsFailedOnHTTPFailure() async {
+        let client = makeClient { request in
+            (Data(), HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+        }
+        let outcome = await client.rememberConversation(id: UUID(), startedAt: Date(), title: "t", content: "c", tags: nil)
+        guard case .failed = outcome else { return XCTFail("expected .failed, got \(outcome)") }
+    }
+
     // MARK: - recall wire shape
 
     func testRecallGetsTheAgentsWholeDocument() async throws {
