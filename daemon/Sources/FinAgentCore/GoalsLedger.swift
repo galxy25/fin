@@ -281,7 +281,11 @@ public enum GoalsTick {
         blocked on THEM, remind them what it waits on rather than pretending to act. A \
         surfaced stall goes back to being driven next tick, not re-reported. A goal \
         without a next action never stalls the tick — drive what is drivable; ask about \
-        the vague goal only when nothing else remains.
+        the vague goal only when nothing else remains. A goal whose why was only ever \
+        "find out what the user wants" is done, without waiting for a fresh message, \
+        the moment any other concrete goal exists in the ledger — that other goal IS \
+        the answer. Mark it done and give it its closing report; never keep driving it \
+        or re-asking its question just because it still shows active.
 
         Conduct: advance the mission between messages — the heartbeat is your initiative, \
         use it to finish things. Surface blockers and completions; otherwise work quietly. \
@@ -311,9 +315,25 @@ public enum GoalsTick {
         // ascending, ties broken by array order) so the eval corpus stays the source
         // of truth for what "most important" means; this only removes the burden of
         // re-deriving it in-context.
+        //
+        // A softer, advisory phrasing of this hint ("drive this goal unless something
+        // more specific applies") was live-observed failing 3 ticks in a row: the
+        // model quoted the hint verbatim in its own reasoning, then talked itself past
+        // it every time with the same rationalization — treating a still-unanswered
+        // "ask the user X" goal as inherently more urgent than the hinted goal, even
+        // re-asking a question it had already asked with no new reply, and once
+        // misreading the ledger's own listed order to justify it. The wording below is
+        // deliberately blunt and names that exact rationalization as invalid, because a
+        // preference stated once was not enough for this model to hold across its own
+        // chain of thought.
         let hint = mostImportantDrivableGoal(ledger.goals).map { goal in
-            "\n\nIf this tick's decision is drive, drive this goal unless something more " +
-            "specific applies: \(clip(goal.id, to: maxIDLength)) — \(clip(goal.title, to: maxTitleLength))."
+            "\n\nIf this tick's decision is drive, this is the ONLY goal to drive this " +
+            "tick: \(clip(goal.id, to: maxIDLength)) — \(clip(goal.title, to: maxTitleLength)). " +
+            "This holds even if another active goal also feels unresolved — an unanswered " +
+            "question is not a blocker on other goals, and re-asking a question with no new " +
+            "reply is never the cheapest correct action. Do not substitute a different goal " +
+            "based on your own read of priority or ledger order; the goal named here already " +
+            "accounts for both."
         } ?? ""
         return """
         [heartbeat] Mission tick. Review the goals ledger against what actually happened \

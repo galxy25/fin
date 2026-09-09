@@ -336,7 +336,7 @@ final class GoalsLedgerTests: XCTestCase {
 
     func testHeartbeatPromptIncludesTheDriveHint() throws {
         let tick = try XCTUnwrap(GoalsTick.heartbeatPrompt(ledger: ledger))
-        XCTAssertTrue(tick.contains("If this tick's decision is drive, drive this goal"))
+        XCTAssertTrue(tick.contains("If this tick's decision is drive, this is the ONLY goal to drive"))
         XCTAssertTrue(tick.contains("g-voice-intent — Ship the voice intent flow"))
     }
 

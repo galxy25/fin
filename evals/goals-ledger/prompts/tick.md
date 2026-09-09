@@ -51,6 +51,11 @@ ledger is the durable record, the conversation is not.
 4. A surfaced stall goes back to being driven next tick, not re-reported.
 5. A goal without a `next_action` never stalls the tick — drive what is
    drivable; ask about the vague goal only when nothing else remains.
+6. A goal whose `why` was only ever "find out what the user wants" is done,
+   without waiting for a fresh message, the moment any other concrete goal
+   exists in the ledger — that other goal IS the answer. Mark it done and
+   give it its closing report; never keep driving it or re-asking its
+   question just because it still shows `active`.
 
 **Conduct:** advance the mission between messages — the heartbeat is your
 initiative, use it to finish things. Surface blockers and completions;
