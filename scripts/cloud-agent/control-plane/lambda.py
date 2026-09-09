@@ -1661,6 +1661,129 @@ def get_memory(event):
     return _response(200, {"agent": agent, "entries": entries})
 
 
+# --- cumulative profile (one shared, cross-agent summary) --------------------
+#
+# The single distilled "who is this user" digest — tasks, goals, preferences,
+# style — injected into every agent's system prompt and shown in the app's
+# memory view. Unlike the per-agent episodic document above, there is exactly
+# ONE of these per account: cross-agent and cross-device, so a fact learned on
+# the client and one learned by a cloud-hosted agent converge on the same
+# profile. "S3 as source of truth" applies here too — this document, plus the
+# claim lock below, is what lets the client and cloud agents coordinate who
+# actually runs the (model-driven, so not-cheap) compaction pass.
+
+PROFILE_KEY = "fin/memory/_profile.json"
+PROFILE_LOCK_KEY = "fin/memory/_profile.lock"
+MAX_PROFILE_BYTES = 4 * 1024
+LOCK_STALE_AFTER_SECONDS = 5 * 60
+
+
+def get_memory_profile(event):
+    """GET /memory/profile — the shared cumulative profile. Absent is a valid,
+    common state (nothing consolidated yet), not an error."""
+    try:
+        raw = S3.get_object(Bucket=BUCKET, Key=PROFILE_KEY)["Body"].read()
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NoSuchBucket", "AccessDenied"):
+            return _response(200, {"content": "", "updatedAt": None})
+        raise
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        document = None
+    if not isinstance(document, dict):
+        return _response(200, {"content": "", "updatedAt": None})
+    return _response(200, {
+        "content": document.get("content") or "",
+        "updatedAt": document.get("updatedAt"),
+    })
+
+
+def put_memory_profile(event):
+    """PUT /memory/profile — {"content"} replaces the profile wholesale. Last-writer-
+    wins, same accepted risk `put_memory_entry` already documents — the claim lock
+    keeps concurrent COMPACTION passes from racing, but a plain profile write outside
+    that flow (rare) can still land at any time."""
+    body = _body(event)
+    content = body.get("content")
+    if not isinstance(content, str):
+        raise ApiError(400, "content must be a string")
+    if len(content.encode("utf-8")) > MAX_PROFILE_BYTES:
+        raise ApiError(400, "content exceeds {} bytes".format(MAX_PROFILE_BYTES))
+    document = {"content": content, "updatedAt": _iso(_now())}
+    S3.put_object(
+        Bucket=BUCKET, Key=PROFILE_KEY,
+        Body=json.dumps(document, sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+    )
+    return _response(200, document)
+
+
+def _read_profile_lock():
+    try:
+        raw = S3.get_object(Bucket=BUCKET, Key=PROFILE_LOCK_KEY)["Body"].read()
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NoSuchBucket", "AccessDenied"):
+            return None
+        raise
+    try:
+        lock = json.loads(raw)
+    except ValueError:
+        return None
+    return lock if isinstance(lock, dict) else None
+
+
+def claim_memory_profile_lock(event):
+    """PUT /memory/profile/lock — {"holder"}. Atomic claim via conditional PUT
+    (IfNoneMatch, same primitive `_provision_config` already uses for config
+    auto-provisioning); a claim that loses the race is told who holds it, and may
+    retry once the holder's claim is older than LOCK_STALE_AFTER_SECONDS —
+    compaction is low-stakes (a slightly-stale summary, never data loss), so a
+    crashed or slow holder must not wedge every other runner forever."""
+    body = _body(event)
+    holder = str(body.get("holder") or "").strip()
+    if not holder:
+        raise ApiError(400, "holder must be a non-empty string")
+    document = {"holder": holder, "claimedAt": _iso(_now())}
+    encoded = json.dumps(document, sort_keys=True).encode("utf-8")
+    try:
+        S3.put_object(
+            Bucket=BUCKET, Key=PROFILE_LOCK_KEY, Body=encoded,
+            ContentType="application/json", IfNoneMatch="*",
+        )
+        return _response(200, document)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("PreconditionFailed", "ConditionalRequestConflict"):
+            raise
+
+    existing = _read_profile_lock()
+    claimed_at = existing and _parse_iso(existing.get("claimedAt"))
+    if claimed_at is not None and (_now() - claimed_at).total_seconds() > LOCK_STALE_AFTER_SECONDS:
+        # Stale — reclaim unconditionally. A second caller racing THIS reclaim is
+        # the same accepted last-writer-wins risk as everywhere else in this file,
+        # narrowed to the rare case of two callers both waiting out the same TTL.
+        S3.put_object(
+            Bucket=BUCKET, Key=PROFILE_LOCK_KEY, Body=encoded, ContentType="application/json",
+        )
+        return _response(200, document)
+    raise ApiError(409, "locked by {}".format((existing or {}).get("holder") or "another runner"))
+
+
+def release_memory_profile_lock(event):
+    """DELETE /memory/profile/lock — unconditional; called by whoever finishes
+    (success or failure) so the next attempt doesn't wait out the full TTL."""
+    try:
+        S3.delete_object(Bucket=BUCKET, Key=PROFILE_LOCK_KEY)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("404", "NoSuchKey", "NoSuchBucket"):
+            raise
+    return _response(200, {"released": True})
+
+
 # --- artifacts (per-account plain-text file store) ----------------------------
 #
 # "a second filesystem apart from the iOS native one" — one flat, agent-
@@ -1787,6 +1910,14 @@ def _route(event):
         return put_memory_entry(event)
     if method == "GET" and parts == ["memory"]:
         return get_memory(event)
+    if method == "PUT" and parts == ["memory", "profile", "lock"]:
+        return claim_memory_profile_lock(event)
+    if method == "DELETE" and parts == ["memory", "profile", "lock"]:
+        return release_memory_profile_lock(event)
+    if method == "GET" and parts == ["memory", "profile"]:
+        return get_memory_profile(event)
+    if method == "PUT" and parts == ["memory", "profile"]:
+        return put_memory_profile(event)
     if method == "GET" and parts == ["artifacts"]:
         return list_artifacts(event)
     if method == "GET" and len(parts) >= 2 and parts[0] == "artifacts":

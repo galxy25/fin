@@ -214,6 +214,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Resource": "arn:aws:s3:::$BUCKET/fin/memory/*"
     },
     {
+      "Sid": "MemoryProfileLockDelete",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::$BUCKET/fin/memory/_profile.lock"
+    },
+    {
       "Sid": "ArtifactsReadWrite",
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:DeleteObject"],
@@ -407,6 +413,10 @@ PUT /transcript-chunk
 GET /transcript-chunks
 POST /memory
 GET /memory
+PUT /memory/profile
+GET /memory/profile
+PUT /memory/profile/lock
+DELETE /memory/profile/lock
 GET /artifacts
 GET /artifacts/{path+}
 PUT /artifacts/{path+}
