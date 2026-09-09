@@ -963,19 +963,37 @@ final class Daemon {
                     recordTurnInEpisodicMemory(userMessage: userMessage, answer: text)
                 }
                 if AgentTurnLogic.containsTaskComplete(text) {
-                    notify(event: "task-complete", message: text)
-                    // Resident or not, the supervisor's next status read says
-                    // "task-complete": on the exit path from the PUT here, on the
-                    // resident path because `idleStateName` holds that state until new
-                    // work arrives.
-                    if handleTaskComplete() {
-                        log("TASK COMPLETE detected — shutting down.")
-                        await supervision?.putStatus(await statusSnapshot(state: "task-complete"))
-                        shutdown(exitCode: 0)
-                        // Nothing may run past shutdown — in particular not the status
-                        // PUT below, which would nondeterministically overwrite
-                        // "task-complete" as the supervisor's last-seen state.
-                        continue
+                    let ledgerGoals = await goalsLedger?.document.goals
+                    if Self.taskCompleteIsTrustworthy(goals: ledgerGoals) {
+                        notify(event: "task-complete", message: text)
+                        // Resident or not, the supervisor's next status read says
+                        // "task-complete": on the exit path from the PUT here, on the
+                        // resident path because `idleStateName` holds that state until new
+                        // work arrives.
+                        if handleTaskComplete() {
+                            log("TASK COMPLETE detected — shutting down.")
+                            await supervision?.putStatus(await statusSnapshot(state: "task-complete"))
+                            shutdown(exitCode: 0)
+                            // Nothing may run past shutdown — in particular not the status
+                            // PUT below, which would nondeterministically overwrite
+                            // "task-complete" as the supervisor's last-seen state.
+                            continue
+                        }
+                    } else {
+                        // A live failure showed the model saying TASK COMPLETE mid-way
+                        // through driving an explicitly ongoing "monitor X" goal — reading
+                        // its own "I finished reporting this" as license to end the whole
+                        // mission, even though the ledger it had just read said otherwise.
+                        // The ledger's own rule ("only if EVERY goal is done and closed
+                        // out") is stated in the prompt, but a prompt rule is advisory; a
+                        // false positive here would silently kill the heartbeat a real,
+                        // still-open goal depends on, so the ledger — not the model's word
+                        // — gets the deciding vote. Falls through to the ordinary
+                        // status-PUT/wait-for-next-beat code below, same as if the phrase
+                        // had never appeared.
+                        let line = "[monitor] ignored TASK COMPLETE — the goals ledger still has open work"
+                        log(line)
+                        record(AgentAuditEvent(kind: "notice", text: line))
                     }
                 }
             case .failed(let message):
@@ -1156,6 +1174,16 @@ final class Daemon {
         log(line)
         record(AgentAuditEvent(kind: "notice", text: line))
         return false
+    }
+
+    /// Whether a model's TASK COMPLETE claim should actually be honored. Pure and
+    /// separately testable, mirroring the ledger's own prose rule exactly ("only if
+    /// EVERY goal in the ledger is done and closed out, end with TASK COMPLETE") — with
+    /// no ledger at all, there is nothing to contradict the claim, so it is trusted as
+    /// it always was before goals existed.
+    nonisolated static func taskCompleteIsTrustworthy(goals: [Goal]?) -> Bool {
+        guard let goals else { return true }
+        return goals.allSatisfy { $0.state == .done }
     }
 
     /// Lifts both pauses — request_input's and stayResident's completion gate. Either is

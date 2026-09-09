@@ -204,6 +204,48 @@ final class DaemonResidencyTests: XCTestCase {
     }
 }
 
+// MARK: - TASK COMPLETE trustworthiness
+
+/// A live failure: the model said TASK COMPLETE mid-way through driving an explicitly
+/// active "monitor X" goal — reading its own "I finished reporting this" as license to
+/// end the whole mission, even though the ledger it had just read said otherwise. The
+/// ledger's own rule is stated in the prompt ("only if EVERY goal is done and closed
+/// out"), but that is advisory; `taskCompleteIsTrustworthy` is the deterministic check
+/// that decides for real, so a prompt-following slip can no longer suspend or exit the
+/// daemon out from under a goal the user still wants driven.
+final class DaemonTaskCompleteTrustworthinessTests: XCTestCase {
+    private func goal(_ state: GoalState) -> Goal {
+        Goal(id: "g-1", title: "t", state: state, priority: 1, nextAction: "n")
+    }
+
+    func testNoLedgerTrustsTheClaim() {
+        XCTAssertTrue(Daemon.taskCompleteIsTrustworthy(goals: nil))
+    }
+
+    func testEveryGoalDoneTrustsTheClaim() {
+        XCTAssertTrue(Daemon.taskCompleteIsTrustworthy(goals: [goal(.done), goal(.done)]))
+    }
+
+    func testEmptyLedgerTrustsTheClaim() {
+        XCTAssertTrue(Daemon.taskCompleteIsTrustworthy(goals: []))
+    }
+
+    func testAnyActiveGoalDistrustsTheClaim() {
+        XCTAssertFalse(Daemon.taskCompleteIsTrustworthy(goals: [goal(.done), goal(.active)]))
+    }
+
+    func testAnOpenGoalDistrustsTheClaim() {
+        XCTAssertFalse(Daemon.taskCompleteIsTrustworthy(goals: [goal(.open)]))
+    }
+
+    /// Blocked is not "live" for the idle-sweep cost signal, but it is still not DONE —
+    /// the mission is not finished just because a goal is quietly waiting on something,
+    /// so this must distrust the claim the same as active or open.
+    func testABlockedGoalDistrustsTheClaim() {
+        XCTAssertFalse(Daemon.taskCompleteIsTrustworthy(goals: [goal(.blocked)]))
+    }
+}
+
 // MARK: - Directive client
 
 @MainActor
