@@ -224,6 +224,17 @@ final class GoalsLedgerTests: XCTestCase {
         XCTAssertTrue(section.contains("owes its closing report"))
     }
 
+    /// A live failure showed Fin only ever reading another agent's session and relaying
+    /// to the user, never writing to it — send_session was allowed but nothing told the
+    /// model coordinating with a goal's own registered session was a default, standing
+    /// behavior rather than something that had to be spelled out per goal.
+    func testPromptSectionTellsTheModelToCoordinateWithOtherSessionsNotJustReadThem() throws {
+        let section = try XCTUnwrap(GoalsTick.promptSection(ledger: ledger))
+        XCTAssertTrue(section.contains("is not read-only"))
+        XCTAssertTrue(section.contains("send_session it, then read_session on a later tick"))
+        XCTAssertTrue(section.contains("Send it once, then wait"))
+    }
+
     func testTickHeartbeatPromptIsNilForEmptyLedger() {
         XCTAssertNil(GoalsTick.heartbeatPrompt(ledger: LedgerDocument()))
     }
