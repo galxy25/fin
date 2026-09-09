@@ -288,4 +288,65 @@ final class GoalsLedgerTests: XCTestCase {
         XCTAssertFalse(tick.contains(giantWhy))
         XCTAssertLessThan(tick.count, 32_000)
     }
+
+    // MARK: - drive recommendation
+
+    /// Regression case for a live failure: two equal-priority active goals, the tick
+    /// repeatedly chose to drive the later-created one instead of the earlier one the
+    /// stated "priority, then ledger order" rule requires — a small local model not
+    /// reliably self-applying prose it was given. `mostImportantDrivableGoal` computes
+    /// the answer instead of leaving it to in-context reasoning.
+    func testMostImportantDrivableGoalBreaksTiesByLedgerOrderNotCreationTime() {
+        let earlier = Goal(id: "g-monitor", title: "Monitor fin session", state: .active,
+                           priority: 1, nextAction: "Monitor the fin session for progress.")
+        let later = Goal(id: "g-initial-setup", title: "Initial Goal Discovery", state: .active,
+                         priority: 1, nextAction: "Ask the user for the primary task.")
+        let goal = GoalsTick.mostImportantDrivableGoal([earlier, later])
+        XCTAssertEqual(goal?.id, "g-monitor", "earlier ledger position wins a same-priority tie")
+    }
+
+    func testMostImportantDrivableGoalPrefersHigherPriority() {
+        let low = Goal(id: "g-low", title: "Low priority", state: .active, priority: 3, nextAction: "do it")
+        let high = Goal(id: "g-high", title: "High priority", state: .active, priority: 1, nextAction: "do it")
+        // Ledger order deliberately puts the lower-priority goal first — priority wins anyway.
+        let goal = GoalsTick.mostImportantDrivableGoal([low, high])
+        XCTAssertEqual(goal?.id, "g-high")
+    }
+
+    func testMostImportantDrivableGoalSkipsGoalsWithNoNextAction() {
+        let vague = Goal(id: "g-vague", title: "No next action", state: .active, priority: 1)
+        let concrete = Goal(id: "g-concrete", title: "Has one", state: .active, priority: 2, nextAction: "do it")
+        let goal = GoalsTick.mostImportantDrivableGoal([vague, concrete])
+        XCTAssertEqual(goal?.id, "g-concrete", "a goal without a next_action is never drivable, whatever its priority")
+    }
+
+    func testMostImportantDrivableGoalPromotesOpenOnlyWhenNoActiveQualifies() {
+        let openGoal = Goal(id: "g-open", title: "Open", state: .open, priority: 1, nextAction: "start it")
+        let activeVague = Goal(id: "g-active-vague", title: "Active but vague", state: .active, priority: 1)
+        let goal = GoalsTick.mostImportantDrivableGoal([activeVague, openGoal])
+        XCTAssertEqual(goal?.id, "g-open", "no active goal has a next_action, so the open one promotes")
+    }
+
+    func testMostImportantDrivableGoalIgnoresBlockedAndDoneGoals() {
+        let blocked = Goal(id: "g-blocked", title: "Blocked", state: .blocked, priority: 1,
+                           nextAction: "wait", blockedOn: "someone")
+        let done = Goal(id: "g-done", title: "Done", state: .done, priority: 1, nextAction: "n/a")
+        XCTAssertNil(GoalsTick.mostImportantDrivableGoal([blocked, done]))
+    }
+
+    func testHeartbeatPromptIncludesTheDriveHint() throws {
+        let tick = try XCTUnwrap(GoalsTick.heartbeatPrompt(ledger: ledger))
+        XCTAssertTrue(tick.contains("If this tick's decision is drive, drive this goal"))
+        XCTAssertTrue(tick.contains("g-voice-intent — Ship the voice intent flow"))
+    }
+
+    func testHeartbeatPromptOmitsTheHintWhenNothingIsDrivable() throws {
+        // Every goal blocked or done — nothing left to drive.
+        let document = LedgerDocument(goals: [
+            Goal(id: "g-blocked", title: "Blocked", state: .blocked, blockedOn: "someone"),
+            Goal(id: "g-done", title: "Done", state: .done),
+        ])
+        let tick = try XCTUnwrap(GoalsTick.heartbeatPrompt(ledger: document))
+        XCTAssertFalse(tick.contains("If this tick's decision is drive"))
+    }
 }

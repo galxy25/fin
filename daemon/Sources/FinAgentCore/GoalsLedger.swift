@@ -303,6 +303,18 @@ public enum GoalsTick {
     /// that closes the goal out.
     public static func heartbeatPrompt(ledger: LedgerDocument) -> String? {
         guard !ledger.isEmpty else { return nil }
+        // Computed, not left to the model: a live failure showed the tick repeatedly
+        // choosing to drive a lower-priority, later-created goal over an earlier,
+        // equal-priority one — "priority, then ledger order" stated in prose, but not
+        // reliably self-applied by a small local model every tick. Mirrors
+        // evals/goals-ledger/policy_baseline.py's `_by_priority` exactly (priority
+        // ascending, ties broken by array order) so the eval corpus stays the source
+        // of truth for what "most important" means; this only removes the burden of
+        // re-deriving it in-context.
+        let hint = mostImportantDrivableGoal(ledger.goals).map { goal in
+            "\n\nIf this tick's decision is drive, drive this goal unless something more " +
+            "specific applies: \(clip(goal.id, to: maxIDLength)) — \(clip(goal.title, to: maxTitleLength))."
+        } ?? ""
         return """
         [heartbeat] Mission tick. Review the goals ledger against what actually happened \
         since the last tick, then make exactly ONE decision — ingest, drive, report, idle, \
@@ -310,7 +322,7 @@ public enum GoalsTick {
         instructions.
 
         Ledger now:
-        \(renderGoals(ledger))
+        \(renderGoals(ledger))\(hint)
 
         Emit the decision as JSON — {"decision": "ingest|drive|report|idle|clarify", \
         "goal_id"?: "<id or null for a new goal>", "message_id"?: "<inbox id>", "reason": \
@@ -318,6 +330,25 @@ public enum GoalsTick {
         input to drive, and call request_input when a report or clarify needs the user. \
         Only if EVERY goal in the ledger is done and closed out, end with TASK COMPLETE.
         """
+    }
+
+    /// The goal a `drive` decision should act on right now: highest priority (1 =
+    /// highest) among `active` goals carrying a `next_action`, ties broken by ledger
+    /// order; `open` goals are only considered when no `active` one qualifies (the
+    /// same active-before-open promotion `policy_baseline.py` uses). Nil when nothing
+    /// is drivable — the prompt then omits the hint entirely rather than naming
+    /// nothing, matching every other strictly-additive section here.
+    static func mostImportantDrivableGoal(_ goals: [Goal]) -> Goal? {
+        let indexed = Array(goals.enumerated())
+        for state in [GoalState.active, GoalState.open] {
+            let drivable = indexed.filter {
+                $0.element.state == state && !($0.element.nextAction ?? "").isEmpty
+            }
+            if let best = drivable.min(by: { ($0.element.priority, $0.offset) < ($1.element.priority, $1.offset) }) {
+                return best.element
+            }
+        }
+        return nil
     }
 
     /// Render bounds. The ledger is unbounded (user-editable, append-forever), but the
