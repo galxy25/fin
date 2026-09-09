@@ -66,13 +66,13 @@ final class DaemonTranscriptUplinkTests: XCTestCase {
         maxLines: Int = 2000,
         agentID: UUID? = nil,
         audit: @escaping (String) -> Void = { _ in },
-        put: @escaping (URLRequest) async throws -> URLResponse = { _ in
-            HTTPURLResponse(url: URL(string: "https://bucket.example/transcript.jsonl")!,
-                            statusCode: 200, httpVersion: nil, headerFields: nil)!
+        put: @escaping (URLRequest) async throws -> URLResponse = { request in
+            HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
         }
     ) -> DaemonTranscriptUplink {
         DaemonTranscriptUplink(
-            putURL: "https://bucket.example/transcript.jsonl",
+            endpointURL: "https://cp.example",
+            token: "cp-token-123",
             flushSeconds: flushSeconds,
             maxLines: maxLines,
             runID: runID,
@@ -167,7 +167,7 @@ final class DaemonTranscriptUplinkTests: XCTestCase {
 
     func testMissingAgentIDStillEmitsTheKey() throws {
         let uplink = DaemonTranscriptUplink(
-            putURL: "https://bucket.example/transcript.jsonl",
+            endpointURL: "https://cp.example", token: "t",
             flushSeconds: 15, maxLines: 10, runID: runID, agentID: nil,
             agentName: "Agent", server: "h", modelIdentifier: "m", temperature: 0.2
         )
@@ -225,9 +225,60 @@ final class DaemonTranscriptUplinkTests: XCTestCase {
                        ["line 1", "line 2", "line 3"])
     }
 
+    // MARK: - Hour chunking
+
+    func testHourKeyMatchesTheLambdaSideRegex() {
+        let date = Date(timeIntervalSince1970: 1_757_372_400) // 2025-09-08T23:00:00Z-ish, exact value irrelevant
+        let key = DaemonTranscriptUplink.hourKey(for: date)
+        XCTAssertTrue(key.range(of: #"^\d{4}-\d{2}-\d{2}T\d{2}$"#, options: .regularExpression) != nil,
+                      "got \(key) — must match lambda.py's TRANSCRIPT_HOUR")
+    }
+
+    /// The whole point of chunking: an event whose hour differs from the currently
+    /// accumulating one flushes the COMPLETED hour under its own key first, then starts a
+    /// fresh `lines` array for the new hour — never mixes two hours into one chunk, and
+    /// never silently drops the completed hour's lines.
+    func testCrossingAnHourBoundaryFlushesTheCompletedHourThenStartsFresh() async throws {
+        var requests: [URLRequest] = []
+        let uplink = makeUplink(put: { request in
+            requests.append(request)
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        })
+
+        var first = AgentAuditEvent(kind: "notice", text: "in hour one")
+        first.timestamp = Date(timeIntervalSince1970: 1_757_372_400) // some hour H
+        uplink.record(first)
+        XCTAssertEqual(uplink.currentHour, DaemonTranscriptUplink.hourKey(for: first.timestamp))
+
+        var second = AgentAuditEvent(kind: "notice", text: "in hour two")
+        second.timestamp = first.timestamp.addingTimeInterval(3600) // hour H+1
+        uplink.record(second)
+
+        // The boundary crossing's flush is a fire-and-forget Task; give it a moment.
+        let deadline = Date().addingTimeInterval(2)
+        while requests.isEmpty, Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        let request = try XCTUnwrap(requests.first, "the completed hour must flush without an explicit flush() call")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(object["hour"] as? String, DaemonTranscriptUplink.hourKey(for: first.timestamp),
+                       "the FIRST (completed) hour, not the one that just started")
+        let flushedLines = try XCTUnwrap(object["lines"] as? [String])
+        XCTAssertEqual(flushedLines.compactMap { MirrorReaderContract.decode($0)?.text }, ["in hour one"],
+                       "only hour one's line — hour two's must not leak into this chunk")
+
+        // The new hour's line stays live, uncommitted, ready for its own eventual flush.
+        XCTAssertEqual(uplink.currentHour, DaemonTranscriptUplink.hourKey(for: second.timestamp))
+        XCTAssertEqual(uplink.lines.compactMap { MirrorReaderContract.decode($0)?.text }, ["in hour two"])
+    }
+
     // MARK: - Flushing
 
-    func testFlushPutsTheWholeDocumentAsJSON() async throws {
+    func testFlushPutsTheChunkToTheControlPlane() async throws {
         var requests: [URLRequest] = []
         let uplink = makeUplink(put: { request in
             requests.append(request)
@@ -240,13 +291,17 @@ final class DaemonTranscriptUplinkTests: XCTestCase {
 
         let request = try XCTUnwrap(requests.first)
         XCTAssertEqual(request.httpMethod, "PUT")
-        XCTAssertEqual(request.url?.absoluteString, "https://bucket.example/transcript.jsonl")
+        XCTAssertEqual(request.url?.absoluteString, "https://cp.example/transcript-chunk")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "authorization"), "Bearer cp-token-123")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
-        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
-        XCTAssertEqual(body.components(separatedBy: "\n").count, 2)
-        XCTAssertEqual(body.components(separatedBy: "\n").compactMap {
-            MirrorReaderContract.decode($0)?.text
-        }, ["one", "two"])
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(object["agent"] as? String, "fin-agentd-1")
+        XCTAssertEqual(object["hour"] as? String, DaemonTranscriptUplink.hourKey(for: Date()))
+        let lines = try XCTUnwrap(object["lines"] as? [String])
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(lines.compactMap { MirrorReaderContract.decode($0)?.text }, ["one", "two"])
     }
 
     func testFlushIsSkippedWhenNothingChanged() async {

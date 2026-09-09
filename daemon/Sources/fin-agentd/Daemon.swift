@@ -146,14 +146,16 @@ struct DaemonConfig: Decodable {
         var token: String
     }
 
-    /// The cloud transcript the iOS app renders for a remote agent. Present = the daemon
-    /// keeps a redacted rolling copy of its audit trail and PUTs it whole; absent = off.
+    /// The cloud transcript the iOS app renders for a remote agent: hourly S3 chunks
+    /// POSTed through the control-plane relay (see `DaemonTranscriptUplink`) — gated on
+    /// `controlPlane` existing, since that's where the endpoint/token this now needs
+    /// come from. This block, when present, only tunes flush cadence and the per-hour
+    /// line cap; it carries no URL of its own (a chunk's S3 key is derived server-side
+    /// from the agent name and the event's own hour, not a presigned URL minted here).
     struct TranscriptConfig: Decodable {
-        /// PUT target for the whole document.
-        var putURL: String
         /// Ceiling on mid-turn PUTs; defaults to 15 seconds.
         var flushSeconds: Int?
-        /// Ring size; defaults to 2000 lines.
+        /// Per-hour-chunk line cap; defaults to 2000 lines.
         var maxLines: Int?
     }
 
@@ -428,11 +430,12 @@ final class Daemon {
         // Already validated by `DaemonConfig.load`; a nil here is an absent field.
         let parsedAgentID = try? config.parsedAgentID()
         self.agentID = parsedAgentID
-        if let block = config.transcript {
+        if let block = config.controlPlane {
             self.transcript = DaemonTranscriptUplink(
-                putURL: block.putURL,
-                flushSeconds: block.flushSeconds ?? DaemonConfig.defaultTranscriptFlushSeconds,
-                maxLines: block.maxLines ?? DaemonConfig.defaultTranscriptMaxLines,
+                endpointURL: block.endpointURL,
+                token: block.token,
+                flushSeconds: config.transcript?.flushSeconds ?? DaemonConfig.defaultTranscriptFlushSeconds,
+                maxLines: config.transcript?.maxLines ?? DaemonConfig.defaultTranscriptMaxLines,
                 agentID: parsedAgentID,
                 agentName: config.supervision?.agentName ?? "Agent",
                 server: config.server.host,
@@ -789,7 +792,7 @@ final class Daemon {
         }
 
         if let uplink = transcript {
-            log("cloud transcript enabled: last \(uplink.maxLines) lines, "
+            log("cloud transcript enabled: hourly chunks, up to \(uplink.maxLines) lines each, "
                 + "flushed at most every \(uplink.flushSeconds)s")
         }
         if let block = config.controlPlane {

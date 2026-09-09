@@ -86,7 +86,7 @@ final class DaemonSupervisionTests: XCTestCase {
             "inboxURL": "https://bucket.example/inbox.json",
             "agentName": "fin-agentd-1"
           },
-          "transcript": {"putURL": "https://bucket.example/transcript.jsonl"}
+          "transcript": {"flushSeconds": 30}
         }
         """
         let config = try JSONDecoder().decode(DaemonConfig.self, from: Data(json.utf8))
@@ -96,8 +96,7 @@ final class DaemonSupervisionTests: XCTestCase {
                        "3F2504E0-4F89-11D3-9A0C-0305E82C3301")
         XCTAssertEqual(config.supervision?.inboxURL, "https://bucket.example/inbox.json")
         let transcript = try XCTUnwrap(config.transcript)
-        XCTAssertEqual(transcript.putURL, "https://bucket.example/transcript.jsonl")
-        XCTAssertNil(transcript.flushSeconds, "the daemon defaults this to 15")
+        XCTAssertEqual(transcript.flushSeconds, 30)
         XCTAssertNil(transcript.maxLines, "the daemon defaults this to 2000")
     }
 
