@@ -102,6 +102,24 @@ final class SessionManager: ObservableObject {
         agentRuntimes.values.contains { $0.agent.id == agentID }
     }
 
+    /// An armed monitor whose home device is some other install AND no live runtime
+    /// here: only then is the conversation provably elsewhere. The local-runtime check
+    /// closes the applier's sender-side hole — a device holding its own live runtime
+    /// for the agent must not offer the remote composer, whose relayed message would be
+    /// injected into THIS device's separate transcript rather than the conversation the
+    /// view displays. Shared by `AgentListView`'s swipe action and `AgentHubView`'s
+    /// row, both of which need the identical answer to "does a Remote entry belong here."
+    func isRemotelyHosted(_ agent: Agent) -> Bool {
+        // A cloud-hosted agent is remote by definition — no device ever holds
+        // its runtime, so the residence checks below don't apply.
+        if !agent.hostsLocally { return true }
+        // Armed-here means the conversation is (or resumes) local; anything
+        // else without a live local runtime is viewable remotely.
+        if hasLiveRuntime(agentID: agent.id) { return false }
+        if agent.monitoringArmed, agent.monitoringDeviceID == DeviceIdentity.id { return false }
+        return true
+    }
+
     /// Where a notification tap (or queued `pendingAgentOpen`) routes.
     enum AgentNotificationRoute {
         /// Open — or keep queued until it can open — the local console; the

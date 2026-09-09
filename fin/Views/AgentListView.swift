@@ -3,44 +3,18 @@ import SwiftData
 
 struct AgentListView: View {
     @Environment(\.modelContext) private var modelContext
-    @EnvironmentObject private var sessionManager: SessionManager
     @Query(sort: \Agent.createdAt) private var agents: [Agent]
 
     var body: some View {
         List {
             ForEach(agents) { agent in
-                // One NavigationLink per row, with the log reachable from a swipe action.
-                // Two links in a single row is unsupported by List and mis-routes taps.
+                // The row's single tap target is the per-agent hub — settings, logs,
+                // memory, remote conversation, and artifacts are all one tap away from
+                // there instead of behind a leading-swipe secret.
                 NavigationLink {
-                    AgentEditView(agent: agent)
+                    AgentHubView(agent: agent)
                 } label: {
                     AgentRow(agent: agent)
-                }
-                .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                    NavigationLink {
-                        AgentLogView(agent: agent)
-                    } label: {
-                        Label("Logs", systemImage: "list.bullet.rectangle")
-                    }
-                    .tint(.indigo)
-                    NavigationLink {
-                        AgentMemoryView(agent: agent)
-                    } label: {
-                        Label("Memory", systemImage: "brain")
-                    }
-                    .tint(.teal)
-                    // Whenever this device holds no live runtime: the mirror
-                    // view and relay compose work regardless of arming, and
-                    // requiring armed-elsewhere left unarmed conversations
-                    // unreachable from other devices (live UX failure).
-                    if isRemotelyHosted(agent) {
-                        NavigationLink {
-                            AgentRemoteConsoleView(agent: agent)
-                        } label: {
-                            Label("Remote", systemImage: "antenna.radiowaves.left.and.right")
-                        }
-                        .tint(.blue)
-                    }
                 }
             }
             .onDelete { offsets in
@@ -86,23 +60,6 @@ struct AgentListView: View {
                 agent.upgradeHeartbeatDefaultIfNeeded()
             }
         }
-    }
-
-    /// An armed monitor whose home device is some other install AND no live
-    /// runtime here: only then is the conversation provably elsewhere. The
-    /// local-runtime check closes the applier's sender-side hole — a device
-    /// holding its own live runtime for the agent must not offer the remote
-    /// composer, whose relayed message would be injected into THIS device's
-    /// separate transcript rather than the conversation the view displays.
-    private func isRemotelyHosted(_ agent: Agent) -> Bool {
-        // A cloud-hosted agent is remote by definition — no device ever holds
-        // its runtime, so the residence checks below don't apply.
-        if !agent.hostsLocally { return true }
-        // Armed-here means the conversation is (or resumes) local; anything
-        // else without a live local runtime is viewable remotely.
-        if sessionManager.hasLiveRuntime(agentID: agent.id) { return false }
-        if agent.monitoringArmed, agent.monitoringDeviceID == DeviceIdentity.id { return false }
-        return true
     }
 
     /// Ships one agent named Fin that works out of the box on capable hardware — Apple's

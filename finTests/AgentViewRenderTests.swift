@@ -392,7 +392,9 @@ final class AgentViewRenderTests: XCTestCase {
         )
     }
 
-    /// The agent list's remotely-hosted row variant, with the Remote swipe affordance path built.
+    /// The agent list's remotely-hosted row variant — `AgentHubView` (not the list row
+    /// itself) is what branches on hosting mode now, but this still renders the list
+    /// with a genuinely remote agent's data shape.
     func testRendersAgentListWithRemotelyHostedAgent() throws {
         let container = try makeContainer()
         let agent = Agent(name: "Fin", modelIdentifier: "test-model")
@@ -406,6 +408,65 @@ final class AgentViewRenderTests: XCTestCase {
                 .modelContainer(container)
                 .environmentObject(SessionManager())
         )
+    }
+
+    /// The hub's local-hosting variant: Settings, Logs, Memory, Artifacts — no Remote row.
+    func testRendersAgentHubForALocallyHostedAgent() throws {
+        let container = try makeContainer()
+        let agent = Agent(name: "Fin", modelIdentifier: "test-model")
+        container.mainContext.insert(agent)
+        try container.mainContext.save()
+
+        render(
+            NavigationStack { AgentHubView(agent: agent) }
+                .modelContainer(container)
+                .environmentObject(SessionManager())
+        )
+    }
+
+    /// The hub's remotely-hosted variant: the same rows plus Remote.
+    func testRendersAgentHubForARemotelyHostedAgent() throws {
+        let container = try makeContainer()
+        let agent = Agent(name: "Fin", modelIdentifier: "test-model")
+        agent.monitoringArmed = true
+        agent.monitoringDeviceID = "not-\(DeviceIdentity.id)"
+        container.mainContext.insert(agent)
+        try container.mainContext.save()
+
+        render(
+            NavigationStack { AgentHubView(agent: agent) }
+                .modelContainer(container)
+                .environmentObject(SessionManager())
+        )
+    }
+
+    /// Without a control plane configured — the common first-run state — the browser
+    /// renders its "not configured" state rather than attempting a real network call.
+    func testRendersArtifactsBrowserWithoutAControlPlane() throws {
+        let endpoint = CloudControlPlaneConfig.endpointURL
+        let token = CloudControlPlaneConfig.token
+        CloudControlPlaneConfig.setEndpointURL("")
+        CloudControlPlaneConfig.setToken("")
+        defer {
+            CloudControlPlaneConfig.setEndpointURL(endpoint)
+            CloudControlPlaneConfig.setToken(token)
+        }
+
+        render(NavigationStack { ArtifactsView() })
+    }
+
+    /// Same not-configured state, one level deeper — the detail editor for one path.
+    func testRendersArtifactDetailWithoutAControlPlane() throws {
+        let endpoint = CloudControlPlaneConfig.endpointURL
+        let token = CloudControlPlaneConfig.token
+        CloudControlPlaneConfig.setEndpointURL("")
+        CloudControlPlaneConfig.setToken("")
+        defer {
+            CloudControlPlaneConfig.setEndpointURL(endpoint)
+            CloudControlPlaneConfig.setToken(token)
+        }
+
+        render(NavigationStack { ArtifactDetailView(path: "notes/todo.txt") })
     }
 
     func testRendersHomeViewAcrossAllTabs() throws {
