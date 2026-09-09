@@ -49,47 +49,83 @@ enum CloudAgentChannel {
             ?? Data("{\"version\":1,\"directives\":[]}".utf8)
     }
 
-    /// The harness's rolling transcript for one agent, auto-refreshing the presigned
-    /// URL when it is missing or expired (a fresh vend before the request) and once
-    /// more if the GET still comes back 403 (a URL that died before its stated expiry).
-    /// The refresh goes through the control plane (`PresignedURLService`); with no
-    /// control plane configured this collapses to a single attempt against whatever URL
-    /// is stored, exactly as before — the manual paste stays a working fallback.
+    /// The harness's rolling transcript for one agent: the latest hourly chunk merged
+    /// with the previous hour's (when one exists), through the control plane's
+    /// authenticated `/transcript-chunks` route — same bearer-token relay `/memory` and
+    /// `/notify` use, no presigned URL. `fin-agentd` stopped writing the old rolling
+    /// presigned-URL object once it moved to hourly S3 chunks (`DaemonTranscriptUplink`);
+    /// this follows it. `agentID` stays in the signature for source compatibility with
+    /// existing callers — the route itself keys by name, like every other control-plane
+    /// document.
     static func fetchTranscript(agentID: UUID, agentName: String) async -> [AgentMirrorRecord] {
-        if CloudControlPlaneConfig.isConfigured, CloudAgentConfig.needsRefresh(agentID: agentID) {
-            await PresignedURLService.refreshCloudAgentURLs(agentID: agentID, agentName: agentName)
-        }
-        let (records, status) = await fetchTranscriptOnce(
-            urlString: CloudAgentConfig.transcriptURL(agentID: agentID)
-        )
-        if status == 403 || status == 401, CloudControlPlaneConfig.isConfigured,
-           await PresignedURLService.refreshCloudAgentURLs(agentID: agentID, agentName: agentName) {
-            return await fetchTranscriptOnce(
-                urlString: CloudAgentConfig.transcriptURL(agentID: agentID)
-            ).records
-        }
-        return records
+        await fetchTranscriptChunks(agentName: agentName).records
     }
 
-    /// One transcript GET. Returns the parsed records and the HTTP status (nil on a
-    /// transport failure) so the caller can tell a 403/expired URL from a genuinely
-    /// empty transcript — the raw fetch stays total, returning [] on anything but a
-    /// 200. A 304 never happens (no ETag caching here): the file is small by
-    /// construction (the harness caps its line count) and the view polls at 10s.
-    static func fetchTranscriptOnce(
-        urlString: String
-    ) async -> (records: [AgentMirrorRecord], status: Int?) {
-        guard let url = URL(string: urlString), !urlString.isEmpty else { return ([], nil) }
+    /// One page of the chunked transcript: every known hour key (oldest first — what
+    /// `AgentRemoteConsoleView`'s "load earlier" affordance pages through) plus merged
+    /// records for one window. Omitting `hour` fetches the latest chunk, merged with the
+    /// previous hour's when one exists — Levi's "always quickly load the recent
+    /// conversation" without a visible shrink right after an hour boundary; passing an
+    /// explicit `hour` fetches exactly that one chunk, for paging further back.
+    struct TranscriptChunksPage {
+        let hours: [String]
+        let records: [AgentMirrorRecord]
+    }
+
+    static func fetchTranscriptChunks(agentName: String, hour: String? = nil) async -> TranscriptChunksPage {
+        guard CloudControlPlaneConfig.isConfigured,
+              let first = await fetchTranscriptChunksOnce(agentName: agentName, hour: hour)
+        else { return TranscriptChunksPage(hours: [], records: []) }
+
+        guard hour == nil, let latestHour = first.chunkHour,
+              let index = first.hours.firstIndex(of: latestHour), index > 0
+        else {
+            return TranscriptChunksPage(hours: first.hours, records: first.records)
+        }
+        guard let previous = await fetchTranscriptChunksOnce(agentName: agentName, hour: first.hours[index - 1])
+        else {
+            return TranscriptChunksPage(hours: first.hours, records: first.records)
+        }
+        return TranscriptChunksPage(
+            hours: first.hours,
+            records: AgentMirrorReader.merge([first.records, previous.records])
+        )
+    }
+
+    private struct RawTranscriptChunksResponse {
+        let hours: [String]
+        let chunkHour: String?
+        let records: [AgentMirrorRecord]
+    }
+
+    /// One `/transcript-chunks` GET. Total: returns nil on anything short of a decodable
+    /// 200, never partial/garbage data.
+    private static func fetchTranscriptChunksOnce(agentName: String, hour: String?) async -> RawTranscriptChunksResponse? {
+        var base = CloudControlPlaneConfig.endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while base.hasSuffix("/") { base.removeLast() }
+        guard !base.isEmpty,
+              let encodedName = agentName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
+        else { return nil }
+        var path = "/transcript-chunks?agent=\(encodedName)"
+        if let hour, let encodedHour = hour.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            path += "&hour=\(encodedHour)"
+        }
+        guard let url = URL(string: base + path) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
-        guard let (data, response) = try? await URLSession.shared.data(for: request) else {
-            return ([], nil)
-        }
-        let status = (response as? HTTPURLResponse)?.statusCode
-        guard status == 200, let content = String(data: data, encoding: .utf8) else {
-            return ([], status)
-        }
-        return (AgentMirrorReader.parseLines(content), status)
+        request.setValue("Bearer \(CloudControlPlaneConfig.token)", forHTTPHeaderField: "authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return nil }
+        let hours = (object["hours"] as? [String]) ?? []
+        let chunk = object["chunk"] as? [String: Any]
+        let lines = (chunk?["lines"] as? [String]) ?? []
+        return RawTranscriptChunksResponse(
+            hours: hours,
+            chunkHour: chunk?["hour"] as? String,
+            records: AgentMirrorReader.parseLines(lines.joined(separator: "\n"))
+        )
     }
 
     /// Delivers one user message to an agent's inbox, auto-refreshing the presigned

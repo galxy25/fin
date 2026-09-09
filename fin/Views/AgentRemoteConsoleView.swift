@@ -29,6 +29,22 @@ struct AgentRemoteConsoleView: View {
     @State private var isRefreshing = false
     @State private var draft = ""
 
+    /// Cloud-hosted only, "load earlier" support. `latestWindowRecords` is whatever the
+    /// periodic refresh's default fetch returns (the latest hour, merged with the
+    /// previous one when it exists — see `CloudAgentChannel.fetchTranscriptChunks`);
+    /// `earlierRecords` accumulates hours paged in explicitly, oldest-fetched merged in
+    /// first. `records` is always `merge([earlierRecords, latestWindowRecords])` —
+    /// recomputed after either changes, so a periodic refresh never undoes paging.
+    @State private var latestWindowRecords: [AgentMirrorRecord] = []
+    @State private var earlierRecords: [AgentMirrorRecord] = []
+    /// The full set of hour keys the control plane knows about for this agent, oldest
+    /// first (as the route returns them) — what "load earlier" pages backward through.
+    @State private var allTranscriptHours: [String] = []
+    /// Index into `allTranscriptHours` of the oldest hour already represented in
+    /// `latestWindowRecords`/`earlierRecords`. nil until the first successful fetch.
+    @State private var oldestLoadedHourIndex: Int?
+    @State private var isLoadingEarlier = false
+
     /// This device's in-flight inbox messages (cloud agents only): state lives in
     /// the view because inbox sends are plain S3 PUTs with no synced record — the
     /// transcript itself is the durable confirmation, exactly like the relay
@@ -199,6 +215,9 @@ struct AgentRemoteConsoleView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
+                    if hasEarlierTranscriptHours {
+                        loadEarlierButton
+                    }
                     if records.isEmpty {
                         emptyState
                     }
@@ -242,13 +261,12 @@ struct AgentRemoteConsoleView: View {
     /// as "syncing" — with the honest caveat for the case that never fills in.
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if isCloudHosted, CloudAgentConfig.transcriptURL(agentID: agentID).isEmpty,
-               !CloudControlPlaneConfig.isConfigured {
-                // Not a syncing problem and nothing to auto-vend from — the control
-                // plane is unset, so a hand-pasted URL is the only source.
-                Label("No transcript URL configured", systemImage: "cloud.slash")
+            if isCloudHosted, !CloudControlPlaneConfig.isConfigured {
+                // Not a syncing problem — the control plane is what the harness's
+                // transcript chunks are fetched through; nothing to read without it.
+                Label("Control plane not configured", systemImage: "cloud.slash")
                     .font(.headline)
-                Text("Paste the harness's Transcript URL in this agent's Hosting settings, or set the control plane so Fin can fetch it automatically.")
+                Text("Set the control plane in this agent's Hosting settings so Fin can fetch the harness's transcript.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -271,6 +289,25 @@ struct AgentRemoteConsoleView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+        }
+        .padding(.bottom, 4)
+    }
+
+    private var loadEarlierButton: some View {
+        HStack {
+            Spacer(minLength: 0)
+            Button {
+                loadEarlier()
+            } label: {
+                if isLoadingEarlier {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Label("Load earlier", systemImage: "arrow.up.circle")
+                        .font(.caption)
+                }
+            }
+            .disabled(isLoadingEarlier)
+            Spacer(minLength: 0)
         }
         .padding(.bottom, 4)
     }
@@ -597,9 +634,17 @@ struct AgentRemoteConsoleView: View {
         defer { isRefreshing = false }
         let loaded: [AgentMirrorRecord]
         if isCloudHosted {
-            loaded = await CloudAgentChannel.fetchTranscript(
-                agentID: agentID, agentName: agentName
-            )
+            let page = await CloudAgentChannel.fetchTranscriptChunks(agentName: agentName)
+            allTranscriptHours = page.hours
+            latestWindowRecords = page.records
+            if oldestLoadedHourIndex == nil {
+                // First successful fetch: the default window covers the latest hour,
+                // merged with the previous one when it exists — record which of
+                // `allTranscriptHours` that oldest-covered hour is, so "load earlier"
+                // knows where to page from next.
+                oldestLoadedHourIndex = Self.initialOldestLoadedHourIndex(hourCount: page.hours.count)
+            }
+            loaded = AgentMirrorReader.merge([earlierRecords, latestWindowRecords])
         } else {
             let reader = self.reader
             let name = agentName
@@ -618,5 +663,44 @@ struct AgentRemoteConsoleView: View {
         // reason the agent is waiting.
         records = loaded.filter { $0.kind != .notice }
         hasLoaded = true
+    }
+
+    /// The default fetch's oldest-covered-hour index into an hour list of `hourCount`
+    /// entries: the default window covers the latest hour, merged with the previous one
+    /// when it exists (see `CloudAgentChannel.fetchTranscriptChunks`). Pure so the
+    /// boundary (0 or 1 known hour) is directly testable.
+    static func initialOldestLoadedHourIndex(hourCount: Int) -> Int {
+        max(0, hourCount - 2)
+    }
+
+    /// Whether an hour older than `oldestLoadedHourIndex` exists to page into. Pure so
+    /// the nil/zero boundary is directly testable without constructing the view.
+    static func hasEarlierHour(oldestLoadedHourIndex: Int?) -> Bool {
+        guard let index = oldestLoadedHourIndex else { return false }
+        return index > 0
+    }
+
+    private var hasEarlierTranscriptHours: Bool {
+        isCloudHosted && Self.hasEarlierHour(oldestLoadedHourIndex: oldestLoadedHourIndex)
+    }
+
+    /// Pages in the next-older hour chunk, merges it into `earlierRecords`, and
+    /// recomputes `records` immediately — no need to wait for the next periodic poll.
+    private func loadEarlier() {
+        guard !isLoadingEarlier, Self.hasEarlierHour(oldestLoadedHourIndex: oldestLoadedHourIndex),
+              let index = oldestLoadedHourIndex
+        else { return }
+        isLoadingEarlier = true
+        let targetIndex = index - 1
+        let targetHour = allTranscriptHours[targetIndex]
+        let name = agentName
+        Task {
+            defer { isLoadingEarlier = false }
+            let page = await CloudAgentChannel.fetchTranscriptChunks(agentName: name, hour: targetHour)
+            earlierRecords = AgentMirrorReader.merge([page.records, earlierRecords])
+            oldestLoadedHourIndex = targetIndex
+            records = AgentMirrorReader.merge([earlierRecords, latestWindowRecords])
+                .filter { $0.kind != .notice }
+        }
     }
 }

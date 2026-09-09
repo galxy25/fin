@@ -91,11 +91,10 @@ struct AgentEditView: View {
                 }
             }
             if agent.hostingMode == .cloud {
-                cloudURLField(
-                    label: "Transcript URL (GET)",
-                    get: { CloudAgentConfig.transcriptURL(agentID: agent.id) },
-                    set: { CloudAgentConfig.setTranscriptURL($0, agentID: agent.id) }
-                )
+                // No "Transcript URL" field: the transcript now reads through the
+                // control plane's chunked /transcript-chunks route (CloudAgentChannel),
+                // same as the two control plane fields below — nothing left that reads
+                // a manually pasted transcript URL.
                 cloudURLField(
                     label: "Inbox URL (GET)",
                     get: { CloudAgentConfig.inboxGetURL(agentID: agent.id) },

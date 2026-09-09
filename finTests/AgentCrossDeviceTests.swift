@@ -1147,6 +1147,25 @@ final class AgentCrossDeviceTests: XCTestCase {
         ))
     }
 
+    // MARK: - Transcript chunk paging
+
+    func testInitialOldestLoadedHourIndexCoversTheLatestAndPreviousHour() {
+        // Two or more known hours: the default fetch merges the latest with the one
+        // right before it, so the oldest COVERED hour is the second-to-last.
+        XCTAssertEqual(AgentRemoteConsoleView.initialOldestLoadedHourIndex(hourCount: 5), 3)
+        XCTAssertEqual(AgentRemoteConsoleView.initialOldestLoadedHourIndex(hourCount: 2), 0)
+        // Only one hour exists at all — nothing before it to have covered.
+        XCTAssertEqual(AgentRemoteConsoleView.initialOldestLoadedHourIndex(hourCount: 1), 0)
+        // No hours yet (a conversation with no chunks): must not go negative.
+        XCTAssertEqual(AgentRemoteConsoleView.initialOldestLoadedHourIndex(hourCount: 0), 0)
+    }
+
+    func testHasEarlierHourIsFalseUntilThereIsSomethingOlderThanWhatsLoaded() {
+        XCTAssertFalse(AgentRemoteConsoleView.hasEarlierHour(oldestLoadedHourIndex: nil), "nothing loaded yet")
+        XCTAssertFalse(AgentRemoteConsoleView.hasEarlierHour(oldestLoadedHourIndex: 0), "already at the oldest known hour")
+        XCTAssertTrue(AgentRemoteConsoleView.hasEarlierHour(oldestLoadedHourIndex: 1), "an hour before index 1 exists to page into")
+    }
+
     // MARK: - Mirror reader
 
     private func mirrorLine(
