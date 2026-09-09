@@ -267,6 +267,10 @@ final class Daemon {
     /// The artifacts filesystem client; nil when the config has no `controlPlane`
     /// block — same gate as `notifyClient`/`memoryClient`.
     private var artifactClient: DaemonArtifactClient?
+    /// Periodically folds episodic memory into the shared cumulative profile and keeps
+    /// this daemon's own prompt-injection cache fresh; nil when the config has no
+    /// `controlPlane` block — same gate as the other memory-adjacent clients.
+    private var memoryConsolidator: DaemonMemoryConsolidator?
     /// Owns the on-disk goals ledger. Always constructed (there is always a state
     /// directory to keep it in) — `goal_upsert`/`goal_log` are advertised whenever this
     /// is non-nil, which today is unconditional, matching `composedHeartbeatPrompt`
@@ -374,6 +378,7 @@ final class Daemon {
         base: String,
         registryFileURL: URL,
         goalsLedgerFileURL: URL? = nil,
+        profileFileURL: URL? = nil,
         notifyAvailable: Bool = false,
         tmuxGuard: TmuxSendGuard = .unenforced
     ) -> String {
@@ -401,6 +406,20 @@ final class Daemon {
            let ledger = LedgerDocument.loadIfPresent(at: goalsLedgerFileURL),
            let section = GoalsTick.promptSection(ledger: ledger) {
             prompt += "\n\n" + section
+        }
+        // The shared cumulative profile `DaemonMemoryConsolidator` keeps cached
+        // locally — same strictly-additive discipline: a fresh install with nothing
+        // consolidated yet (no file, or an empty one) keeps a byte-identical prompt.
+        // Capped the same as the app's endpoint path (`AgentRuntime`'s non-on-device
+        // cap) — the daemon always talks to an OpenAI-compatible endpoint.
+        if let profileFileURL,
+           let cached = try? String(contentsOf: profileFileURL, encoding: .utf8) {
+            let trimmed = cached.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                let capped = trimmed.count > 1200 ? "…" + String(trimmed.suffix(1200)) : trimmed
+                prompt += "\n\nUser profile (from accumulated memory):\n\(capped)\n"
+                    + "Use remember to save important new facts; use recall to look up past context."
+            }
         }
         // Strictly additive, and ONLY when a push channel exists: a headless daemon with
         // no control plane and no shell hook keeps a byte-identical prompt, so the model
@@ -486,6 +505,18 @@ final class Daemon {
         URL(fileURLWithPath: auditLogPath)
             .deletingLastPathComponent()
             .appendingPathComponent(LedgerDocument.standardFileName)
+            .path
+    }
+
+    /// A local cache of the shared cumulative profile (`/memory/profile`), same sibling-
+    /// file directory as the goals ledger and routing registry. `composedSystemPrompt`
+    /// is `nonisolated static` and reads local files synchronously, so it can't fetch
+    /// the profile live at prompt-composition time — `DaemonMemoryConsolidator` keeps
+    /// this file refreshed on its own cadence instead.
+    private var profileCachePath: String {
+        URL(fileURLWithPath: auditLogPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("fin-agentd-profile.txt")
             .path
     }
 
@@ -669,6 +700,7 @@ final class Daemon {
             base: basePrompt,
             registryFileURL: URL(fileURLWithPath: routingRegistryPath),
             goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath),
+            profileFileURL: URL(fileURLWithPath: profileCachePath),
             // The notify tool has a live channel exactly when a control-plane block or a
             // shell hook is configured; only then does the persona guidance appear.
             notifyAvailable: config.controlPlane != nil || (config.notifyCommand.map { !$0.isEmpty } ?? false),
@@ -867,6 +899,25 @@ final class Daemon {
                 await artifacts.delete(path: path)
             }
             log("artifacts filesystem enabled: control plane /artifacts")
+
+            // Periodic compaction of episodic memory into the shared cumulative
+            // profile, plus keeping this daemon's own system-prompt cache fresh —
+            // "for cloud agents we need... memory cumulative workflows too."
+            memoryConsolidator = DaemonMemoryConsolidator(
+                memory: memory,
+                cacheFileURL: URL(fileURLWithPath: profileCachePath),
+                holder: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
+                endpointURL: config.agent.endpointURL,
+                modelIdentifier: config.agent.modelIdentifier,
+                apiKey: config.agent.apiKey,
+                temperature: config.agent.temperature ?? 0.2,
+                maxOutputTokens: config.agent.maxOutputTokens ?? 640,
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                }
+            )
+            log("profile compaction enabled: control plane /memory/profile, cache at \(profileCachePath)")
         }
 
         var consecutiveFailures = 0
@@ -946,6 +997,7 @@ final class Daemon {
                     }
                 }
                 await transcript?.flushIfDue()
+                memoryConsolidator?.tickIfDue()
                 if heartbeatEnabled, !beatsAreSuspended, Date() >= beatAt { break }
                 try? await Task.sleep(for: .milliseconds(250))
             }

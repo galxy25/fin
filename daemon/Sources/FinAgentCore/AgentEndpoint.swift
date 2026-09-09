@@ -82,6 +82,39 @@ enum AgentEndpointError: LocalizedError {
 /// `finish_reason` on the terminal chunk recently. A tool-driven loop gains little
 /// from token-by-token rendering and loses a lot of reliability, so every turn here is
 /// a single request/response.
+/// A narrow, PUBLIC entry point for callers outside this module that need one raw,
+/// tool-free completion — no transcript, no turn loop, no tool-calling roster. Exists
+/// because `AgentEndpointClient`/`AgentMessage` stay internal on purpose (the app sees
+/// them only because `project.yml` compiles this file's source directly into its own
+/// module; `fin-agentd` genuinely imports `FinAgentCore` as a separate library and
+/// can't reach internal types across that boundary) — `fin-agentd`'s memory
+/// consolidator (`DaemonMemoryConsolidator`) is the first cross-module caller, and
+/// widening the whole client's surface for one call site isn't worth it. Callers
+/// WITHIN this module (e.g. `AgentTurnEngine`) should keep using `AgentEndpointClient`
+/// directly, not this wrapper.
+public func rawCompletion(
+    instruction: String,
+    input: String,
+    endpointURL: String,
+    model: String,
+    apiKey: String?,
+    temperature: Double,
+    maxOutputTokens: Int
+) async throws -> String {
+    let client = AgentEndpointClient(
+        baseURL: endpointURL, model: model, apiKey: apiKey,
+        temperature: temperature, maxOutputTokens: maxOutputTokens
+    )
+    let completion = try await client.complete(
+        messages: [
+            AgentMessage(role: .system, text: instruction),
+            AgentMessage(role: .user, text: input),
+        ],
+        tools: []
+    )
+    return completion.text
+}
+
 struct AgentEndpointClient {
     let baseURL: String
     let model: String

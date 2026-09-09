@@ -187,4 +187,147 @@ final class DaemonMemoryClientTests: XCTestCase {
         XCTAssertEqual(DaemonMemoryClient.search(document: Data("not json".utf8), query: ""), [])
         XCTAssertEqual(DaemonMemoryClient.search(document: Data("{}".utf8), query: ""), [])
     }
+
+    // MARK: - episodicEntriesSince wire shape + pure sort/cap
+
+    func testEpisodicEntriesSinceOmitsSinceParamWhenNil() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return (Data(#"{"entries":[]}"#.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        _ = await client.episodicEntriesSince(nil, limit: 10)
+        XCTAssertEqual(captured?.url?.absoluteString, "https://cp.example/memory?agent=Nimbus")
+    }
+
+    func testEpisodicEntriesSinceIncludesSinceParamWhenGiven() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return (Data(#"{"entries":[]}"#.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let since = Date(timeIntervalSince1970: 1_757_000_000)
+        _ = await client.episodicEntriesSince(since, limit: 10)
+        let url = try XCTUnwrap(captured?.url?.absoluteString)
+        XCTAssertTrue(url.hasPrefix("https://cp.example/memory?agent=Nimbus&since="), "got: \(url)")
+    }
+
+    func testEpisodicEntriesSinceReturnsFailedOnHTTPFailure() async {
+        let client = makeClient { request in
+            (Data(), HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+        }
+        let outcome = await client.episodicEntriesSince(nil, limit: 10)
+        guard case .failed = outcome else { return XCTFail("expected .failed, got \(outcome)") }
+    }
+
+    func testEntriesSinceSortsNewestFirstAndCaps() {
+        let entries = (1...5).map {
+            (id: "m-\($0)", title: "t\($0)", content: "c", tags: "",
+             updatedAt: String(format: "2026-09-08T%02d:00:00Z", $0))
+        }
+        let hits = DaemonMemoryClient.entriesSince(document: document(entries), limit: 3)
+        XCTAssertEqual(hits.map(\.title), ["t5", "t4", "t3"])
+    }
+
+    func testEntriesSinceToleratesAMalformedDocument() {
+        XCTAssertEqual(DaemonMemoryClient.entriesSince(document: Data("not json".utf8), limit: 10), [])
+    }
+
+    // MARK: - profile wire shape
+
+    func testReadProfileParsesContentAndUpdatedAt() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return (Data(#"{"content":"likes concise replies","updatedAt":"2026-09-08T20:00:00Z"}"#.utf8),
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let outcome = await client.readProfile()
+        XCTAssertEqual(captured?.url?.absoluteString, "https://cp.example/memory/profile")
+        XCTAssertEqual(captured?.httpMethod, "GET")
+        guard case .found(let profile) = outcome else { return XCTFail("expected .found, got \(outcome)") }
+        XCTAssertEqual(profile.content, "likes concise replies")
+        XCTAssertNotNil(profile.updatedAt)
+    }
+
+    func testReadProfileHandlesAbsentProfileAsEmptyFound() async {
+        let client = makeClient { request in
+            (Data(#"{"content":"","updatedAt":null}"#.utf8),
+             HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let outcome = await client.readProfile()
+        guard case .found(let profile) = outcome else { return XCTFail("expected .found, got \(outcome)") }
+        XCTAssertEqual(profile.content, "")
+        XCTAssertNil(profile.updatedAt)
+    }
+
+    func testWriteProfilePutsTheContentContract() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return (Data(#"{"content":"x","updatedAt":"2026-09-08T20:00:00Z"}"#.utf8),
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let outcome = await client.writeProfile("distilled profile text")
+        XCTAssertEqual(outcome, .saved)
+        let request = try XCTUnwrap(captured)
+        XCTAssertEqual(request.url?.absoluteString, "https://cp.example/memory/profile")
+        XCTAssertEqual(request.httpMethod, "PUT")
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertEqual(object["content"] as? String, "distilled profile text")
+    }
+
+    func testWriteProfileReturnsFailedOnHTTPFailure() async {
+        let client = makeClient { request in
+            (Data(), HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+        }
+        let outcome = await client.writeProfile("x")
+        guard case .failed = outcome else { return XCTFail("expected .failed, got \(outcome)") }
+    }
+
+    // MARK: - profile lock wire shape
+
+    func testClaimProfileLockPutsTheHolderContract() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return (Data(#"{"holder":"device-abcd1234","claimedAt":"2026-09-08T20:00:00Z"}"#.utf8),
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let outcome = await client.claimProfileLock(holder: "device-abcd1234")
+        XCTAssertEqual(outcome, .claimed)
+        let request = try XCTUnwrap(captured)
+        XCTAssertEqual(request.url?.absoluteString, "https://cp.example/memory/profile/lock")
+        XCTAssertEqual(request.httpMethod, "PUT")
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertEqual(object["holder"] as? String, "device-abcd1234")
+    }
+
+    func testClaimProfileLockReturnsLockedWithHolderOn409() async {
+        let client = makeClient { request in
+            (Data(#"{"error":"locked by other-device"}"#.utf8),
+             HTTPURLResponse(url: request.url!, statusCode: 409, httpVersion: nil, headerFields: nil)!)
+        }
+        let outcome = await client.claimProfileLock(holder: "me")
+        XCTAssertEqual(outcome, .locked(holder: "locked by other-device"))
+    }
+
+    func testClaimProfileLockReturnsFailedOnOtherHTTPFailure() async {
+        let client = makeClient { request in
+            (Data(), HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+        }
+        let outcome = await client.claimProfileLock(holder: "me")
+        guard case .failed = outcome else { return XCTFail("expected .failed, got \(outcome)") }
+    }
+
+    func testReleaseProfileLockHitsTheLockPathWithDelete() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return (Data(#"{"released":true}"#.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        await client.releaseProfileLock()
+        XCTAssertEqual(captured?.url?.absoluteString, "https://cp.example/memory/profile/lock")
+        XCTAssertEqual(captured?.httpMethod, "DELETE")
+    }
 }

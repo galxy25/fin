@@ -161,6 +161,170 @@ final class DaemonMemoryClient {
         }
     }
 
+    // MARK: - Compaction: episodic entries since a cutoff
+
+    /// GET /memory?agent=&since= — every entry updated at or after `since` (nil = the
+    /// whole document), newest first, capped at `limit`. Distinct from `recall`: this
+    /// has no keyword filter and no hardcoded cap, since `DaemonMemoryConsolidator`
+    /// wants "what's new since the profile was last written," not a search result.
+    func episodicEntriesSince(_ since: Date?, limit: Int) async -> AgentRecallOutcome {
+        var path = "/memory?agent=\(agentName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? agentName)"
+        if let since {
+            let stamp = ISO8601DateFormatter().string(from: since)
+            path += "&since=\(stamp.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? stamp)"
+        }
+        guard let httpRequest = request(path: path, method: "GET") else {
+            return .failed("control plane URL is not configured")
+        }
+        do {
+            let (data, response) = try await transport(httpRequest)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                registerFailure("[memory] episodic-since fetch failed: HTTP \(status)")
+                return .failed("control plane returned HTTP \(status)")
+            }
+            return .found(Self.entriesSince(document: data, limit: limit))
+        } catch {
+            let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            registerFailure("[memory] episodic-since fetch failed: \(text.prefix(200))")
+            return .failed("could not reach the control plane")
+        }
+    }
+
+    /// The pure half of `episodicEntriesSince`: parse `{"entries": [...]}`, sort newest
+    /// first, cap. The server already filtered by `since`; this only sorts/caps.
+    static func entriesSince(document data: Data, limit: Int) -> [AgentRecallHit] {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let entries = object["entries"] as? [[String: Any]]
+        else { return [] }
+        let sorted = entries.sorted { lhs, rhs in
+            ((lhs["updatedAt"] as? String) ?? "") > ((rhs["updatedAt"] as? String) ?? "")
+        }
+        return sorted.prefix(max(0, limit)).map { entry in
+            AgentRecallHit(
+                title: entry["title"] as? String ?? "",
+                content: entry["content"] as? String ?? ""
+            )
+        }
+    }
+
+    // MARK: - Compaction: the shared cumulative profile
+
+    struct ProfileDocument: Equatable {
+        var content: String
+        var updatedAt: Date?
+    }
+
+    enum ProfileReadOutcome: Equatable {
+        case found(ProfileDocument)
+        case failed(String)
+    }
+
+    enum ProfileWriteOutcome: Equatable {
+        case saved
+        case failed(String)
+    }
+
+    /// GET /memory/profile — the single, cross-agent cumulative summary; absent is
+    /// `.found` with empty content, not a failure (nothing consolidated yet).
+    func readProfile() async -> ProfileReadOutcome {
+        guard let httpRequest = request(path: "/memory/profile", method: "GET") else {
+            return .failed("control plane URL is not configured")
+        }
+        do {
+            let (data, response) = try await transport(httpRequest)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                registerFailure("[memory] profile read failed: HTTP \(status)")
+                return .failed("control plane returned HTTP \(status)")
+            }
+            guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                return .failed("the control plane's response was not the expected shape")
+            }
+            let updatedAt = (object["updatedAt"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+            return .found(ProfileDocument(content: object["content"] as? String ?? "", updatedAt: updatedAt))
+        } catch {
+            let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            registerFailure("[memory] profile read failed: \(text.prefix(200))")
+            return .failed("could not reach the control plane")
+        }
+    }
+
+    /// PUT /memory/profile — wholesale replace.
+    func writeProfile(_ content: String) async -> ProfileWriteOutcome {
+        guard var httpRequest = request(path: "/memory/profile", method: "PUT") else {
+            return .failed("control plane URL is not configured")
+        }
+        httpRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let body = try? JSONSerialization.data(withJSONObject: ["content": content]) else {
+            return .failed("could not encode the profile")
+        }
+        httpRequest.httpBody = body
+        do {
+            let (_, response) = try await transport(httpRequest)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                registerFailure("[memory] profile write failed: HTTP \(status)")
+                return .failed("control plane returned HTTP \(status)")
+            }
+            return .saved
+        } catch {
+            let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            registerFailure("[memory] profile write failed: \(text.prefix(200))")
+            return .failed("could not reach the control plane")
+        }
+    }
+
+    // MARK: - Compaction: the claim lock
+
+    enum LockOutcome: Equatable {
+        case claimed
+        /// Another holder has the lock and it isn't stale yet.
+        case locked(holder: String)
+        case failed(String)
+    }
+
+    /// PUT /memory/profile/lock — atomic claim, or a stale-lock reclaim, or word of who
+    /// currently holds it. `holder` should uniquely identify this daemon process
+    /// (`originDeviceID8` is what every other control-plane call here already uses).
+    func claimProfileLock(holder: String) async -> LockOutcome {
+        guard var httpRequest = request(path: "/memory/profile/lock", method: "PUT") else {
+            return .failed("control plane URL is not configured")
+        }
+        httpRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let body = try? JSONSerialization.data(withJSONObject: ["holder": holder]) else {
+            return .failed("could not encode the lock claim")
+        }
+        httpRequest.httpBody = body
+        do {
+            let (data, response) = try await transport(httpRequest)
+            guard let http = response as? HTTPURLResponse else {
+                registerFailure("[memory] lock claim failed: no HTTP response")
+                return .failed("no response from the control plane")
+            }
+            if http.statusCode == 409 {
+                let currentHolder = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+                return .locked(holder: currentHolder ?? "another runner")
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                registerFailure("[memory] lock claim failed: HTTP \(http.statusCode)")
+                return .failed("control plane returned HTTP \(http.statusCode)")
+            }
+            return .claimed
+        } catch {
+            let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            registerFailure("[memory] lock claim failed: \(text.prefix(200))")
+            return .failed("could not reach the control plane")
+        }
+    }
+
+    /// DELETE /memory/profile/lock — unconditional; call after every claimed attempt,
+    /// success or failure, so the next runner doesn't wait out the stale-reclaim TTL.
+    func releaseProfileLock() async {
+        guard let httpRequest = request(path: "/memory/profile/lock", method: "DELETE") else { return }
+        _ = try? await transport(httpRequest)
+    }
+
     private func registerFailure(_ message: String) {
         let now = Date()
         if let last = lastFailureAuditAt[message],
