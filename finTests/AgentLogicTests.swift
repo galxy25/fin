@@ -458,6 +458,12 @@ final class AgentLogicTests: XCTestCase {
         runtime.transcript.messages.first(where: { $0.role == .system })?.text
     }
 
+    /// "BASE PROMPT" with nothing else wired: `composeSystemPrompt` always appends the
+    /// notify persona in the app (the local-notification delivery surface it needs is
+    /// always present — see the doc comment there), so this — not the bare base prompt
+    /// — is the true "nothing extra wired" baseline these bootstrap-contract tests want.
+    private static let basePromptWithNoOtherSections = "BASE PROMPT\n\n" + AgentToolSpec.notifyPersonaGuidance
+
     /// Bootstrap contract: with no registry file on disk, a runtime wired exactly like
     /// finApp wires it (readRoutingRegistry → loadIfPresent) composes a system prompt
     /// byte-identical to a runtime with no routing wired at all.
@@ -480,7 +486,7 @@ final class AgentLogicTests: XCTestCase {
             session: TerminalSession(serverID: UUID()),
             serverName: "box"
         )
-        XCTAssertEqual(systemPrompt(of: wired), "BASE PROMPT")
+        XCTAssertEqual(systemPrompt(of: wired), Self.basePromptWithNoOtherSections)
         XCTAssertEqual(systemPrompt(of: wired), systemPrompt(of: unwired))
     }
 
@@ -505,7 +511,7 @@ final class AgentLogicTests: XCTestCase {
             memory: access
         )
         // No file at init → no routing section yet.
-        XCTAssertEqual(systemPrompt(of: runtime), "BASE PROMPT")
+        XCTAssertEqual(systemPrompt(of: runtime), Self.basePromptWithNoOtherSections)
 
         try JSONEncoder().encode(RegistryDocument(sessions: [
             SessionRegistration(session: "fin", cwd: "~/forges/levi/fin", tasks: ["fin", "widget"]),
@@ -558,7 +564,7 @@ final class AgentLogicTests: XCTestCase {
             session: TerminalSession(serverID: UUID()),
             serverName: "box"
         )
-        XCTAssertEqual(systemPrompt(of: wired), "BASE PROMPT")
+        XCTAssertEqual(systemPrompt(of: wired), Self.basePromptWithNoOtherSections)
         XCTAssertEqual(systemPrompt(of: wired), systemPrompt(of: unwired))
     }
 
@@ -586,7 +592,7 @@ final class AgentLogicTests: XCTestCase {
             memory: access
         )
         // No files at init → no mission section yet.
-        XCTAssertEqual(systemPrompt(of: runtime), "BASE PROMPT")
+        XCTAssertEqual(systemPrompt(of: runtime), Self.basePromptWithNoOtherSections)
 
         try JSONEncoder().encode(LedgerDocument(goals: [
             Goal(id: "g-voice-intent", title: "Ship the voice intent flow", state: .active),
@@ -1708,10 +1714,14 @@ final class AgentLogicTests: XCTestCase {
     private func makeArmableRuntime(
         heartbeatSeconds: Int = 60,
         history: [AgentMessage] = [AgentMessage(role: .user, text: "watch the build")],
-        log: @escaping (AgentLogRecord) -> Void = { _ in }
+        log: @escaping (AgentLogRecord) -> Void = { _ in },
+        deliveredWrites: Bool = false
     ) -> (runtime: AgentRuntime, agent: Agent) {
         let session = TerminalSession(serverID: UUID())
         session.simulateConnectedStateForTesting()
+        if deliveredWrites {
+            session.simulateDeliveredWritesForTesting()
+        }
         let agent = Agent(
             name: "Fin",
             provider: .openAICompatible,
@@ -1949,7 +1959,7 @@ final class AgentLogicTests: XCTestCase {
         )
 
         // Delivered into a connected session: the signal stamps.
-        let (delivered, _) = makeArmableRuntime()
+        let (delivered, _) = makeArmableRuntime(deliveredWrites: true)
         _ = await delivered.executeSendInput(
             input: "echo hi\n", awaitOutputSeconds: 1, rawArguments: "{}"
         )

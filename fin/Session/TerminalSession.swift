@@ -60,6 +60,18 @@ final class TerminalSession: ObservableObject, Identifiable {
     func simulateConnectedStateForTesting() {
         state = .connected
     }
+
+    /// Separate, explicit opt-in seam: `simulateConnectedStateForTesting()` deliberately
+    /// leaves `stdinWriter` nil, so `state == .connected` alone is never enough for a
+    /// write to succeed (`TerminalSessionSendTests.testSendStillFailsWhenStateSaysConnectedButNoWriterExists`
+    /// guards exactly this). A test that needs a write to actually resolve delivered —
+    /// e.g. proving `AgentRuntime`'s "confirmed, not merely attempted" delivery signal —
+    /// calls this too, on top of the connected-state seam, never instead of it.
+    func simulateDeliveredWritesForTesting() {
+        simulatedWriteOutcome = true
+    }
+
+    private var simulatedWriteOutcome: Bool?
     #endif
     #if os(iOS) || os(visionOS)
     /// Whether the on-screen keyboard (and its accessory row) is currently showing.
@@ -224,11 +236,24 @@ final class TerminalSession: ObservableObject, Identifiable {
     func send(bytes: [UInt8]) -> Task<Bool, Never> {
         let writer = stdinWriter
         let previousWrite = writeChain
+        #if DEBUG
+        let simulatedOutcome = simulatedWriteOutcome
+        #endif
         let thisWrite = Task<Bool, Never> {
             // Always wait for whatever was queued before this — regardless of ITS
             // outcome — so the actual writes stay strictly ordered even when this call
             // (or an earlier one) turns out to have nothing to send to.
             await previousWrite?.value
+            #if DEBUG
+            if let simulatedOutcome {
+                if simulatedOutcome {
+                    self.eventLog.recordInput(bytes)
+                } else {
+                    self.lastError = "Input was not sent: simulated failure."
+                }
+                return simulatedOutcome
+            }
+            #endif
             guard let writer else {
                 self.lastError = "Input was not sent: the terminal session is not connected."
                 return false
