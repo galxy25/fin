@@ -202,6 +202,24 @@ cat > "$BUILD/policy.json" <<JSON
       "Resource": "arn:aws:s3:::$BUCKET/fin/agentd/*.json"
     },
     {
+      "Sid": "TranscriptChunksWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::$BUCKET/fin/transcripts/*"
+    },
+    {
+      "Sid": "MemoryJournalWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::$BUCKET/fin/memory/*"
+    },
+    {
+      "Sid": "ArtifactsReadWrite",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::$BUCKET/fin/artifacts/*"
+    },
+    {
       "Sid": "ModelFactoryIngest",
       "Effect": "Allow",
       "Action": "s3:PutObject",
@@ -385,6 +403,14 @@ GET /secrets
 DELETE /secrets/{service}
 PUT /device-tokens
 POST /notify
+PUT /transcript-chunk
+GET /transcript-chunks
+POST /memory
+GET /memory
+GET /artifacts
+GET /artifacts/{path+}
+PUT /artifacts/{path+}
+DELETE /artifacts/{path+}
 ROUTES
 
 if ! aws apigatewayv2 get-stage --api-id "$API_ID" --stage-name '$default' >/dev/null 2>&1; then
