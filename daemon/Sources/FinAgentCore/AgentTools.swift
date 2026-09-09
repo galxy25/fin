@@ -60,9 +60,8 @@ public struct AgentToolSpec {
                     "description": "How long to wait for the terminal's response, in seconds. "
                         + "The tool returns as soon as output settles, so a generous value costs "
                         + "nothing when the response is fast. Pick it from what you sent: ~5 for "
-                        + "an ordinary shell command, 30-120 when asking another agent or a "
-                        + "long-running program a question that takes time to answer. Omit for "
-                        + "the default (5).",
+                        + "an ordinary shell command, 30-120 for a long-running program that "
+                        + "takes time to answer. Omit for the default (5).",
                 ],
             ],
             "required": ["input"],

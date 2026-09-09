@@ -109,7 +109,7 @@ struct ReadTerminalArguments {
 struct SendInputArguments {
     @Guide(description: "The literal command text to type. Return is pressed for you — no trailing newline needed.")
     var input: String
-    @Guide(description: "Seconds to wait for the terminal's response. Returns as soon as output settles, so a generous value costs nothing. Use 0 for the default (5) for ordinary shell commands; 30-120 when asking another agent or a long-running program a question.")
+    @Guide(description: "Seconds to wait for the terminal's response. Returns as soon as output settles, so a generous value costs nothing. Use 0 for the default (5) for ordinary shell commands; 30-120 for a long-running program that takes time to answer.")
     var awaitOutputSeconds: Int
 }
 
