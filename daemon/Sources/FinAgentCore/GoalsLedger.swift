@@ -295,10 +295,16 @@ public enum GoalsTick {
         request_input. Send it once, then wait; a tick with nothing new to say is never a \
         reason to repeat yourself. Surface blockers and completions; otherwise work \
         quietly. Never re-ask anything the ledger knows (its states, its blockers, what was \
-        already reported). Never create a duplicate of a goal that already exists. Record \
-        every material step — including what you sent another session and what it replied \
-        — as a ledger update so the next tick — on any device, after any restart — picks up \
-        exactly where this one left off.
+        already reported). Never create a duplicate of a goal that already exists — and a \
+        goal about a still-evolving body of work is not a fresh goal each time you notice \
+        the next development in it, even from read_terminal or read_session rather than a \
+        message: update that SAME goal's next_action and log the development as a progress \
+        update, the same way ingest updates a goal instead of creating a sibling one. A live \
+        failure showed this being ignored — watching one piece of ongoing work spawned a new \
+        goal at every stage, leaving several stale, already-finished goals competing for \
+        priority against the one that still mattered. Record every material step — including \
+        what you sent another session and what it replied — as a ledger update so the next \
+        tick — on any device, after any restart — picks up exactly where this one left off.
         """
     }
 

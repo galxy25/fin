@@ -235,6 +235,16 @@ final class GoalsLedgerTests: XCTestCase {
         XCTAssertTrue(section.contains("Send it once, then wait"))
     }
 
+    /// A live failure: Fin watched one body of ongoing work (via read_terminal/
+    /// read_session, not a message) and spawned a fresh goal at every new development
+    /// in it instead of updating the same goal — left 7 overlapping active goals
+    /// competing every tick, several describing stages that had already finished.
+    func testPromptSectionSaysToUpdateAGoalAboutEvolvingWorkNotSpawnASiblingOne() throws {
+        let section = try XCTUnwrap(GoalsTick.promptSection(ledger: ledger))
+        XCTAssertTrue(section.contains("a goal about a still-evolving body of work is not a fresh goal"))
+        XCTAssertTrue(section.contains("even from read_terminal or read_session rather than a message"))
+    }
+
     func testTickHeartbeatPromptIsNilForEmptyLedger() {
         XCTAssertNil(GoalsTick.heartbeatPrompt(ledger: LedgerDocument()))
     }
