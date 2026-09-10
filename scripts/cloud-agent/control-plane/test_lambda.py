@@ -143,18 +143,18 @@ class AlreadyNotifiedTests(unittest.TestCase):
 
     def test_no_marker_means_not_yet_notified(self):
         lam._read_lock = lambda key: None
-        self.assertFalse(lam._already_notified("Nimbus", NOW))
+        self.assertFalse(lam._already_notified("user-1", "Nimbus", NOW))
 
     def test_marker_for_the_same_message_suppresses_a_repeat(self):
         touched = NOW - timedelta(hours=100)
         lam._read_lock = lambda key: {"forLastModified": _iso(touched)}
-        self.assertTrue(lam._already_notified("Nimbus", touched))
+        self.assertTrue(lam._already_notified("user-1", "Nimbus", touched))
 
     def test_a_newer_message_since_the_marker_notifies_again(self):
         old_touch = NOW - timedelta(hours=200)
         lam._read_lock = lambda key: {"forLastModified": _iso(old_touch)}
         new_touch = NOW - timedelta(hours=80)
-        self.assertFalse(lam._already_notified("Nimbus", new_touch))
+        self.assertFalse(lam._already_notified("user-1", "Nimbus", new_touch))
 
 
 def _b64url_uint(value):
@@ -341,6 +341,104 @@ class GetOrCreateUserTests(unittest.TestCase):
         a = lam._get_or_create_user("apple-sub-3")
         b = lam._get_or_create_user("apple-sub-4")
         self.assertNotEqual(a, b)
+
+
+class DeleteWorkerOwnershipTests(unittest.TestCase):
+    """The live IDOR this multi-tenancy pass fixed: delete_worker used to
+    terminate any worker by id with no ownership check at all. Pinned
+    directly, not just hand-curled, because a regression here is a real
+    any-user-can-kill-any-other-users-instance bug, not just a data leak."""
+
+    class _FakeTable:
+        def __init__(self, item):
+            self._item = item
+
+        def get_item(self, Key):
+            if self._item and Key["workerId"] == self._item["workerId"]:
+                return {"Item": self._item}
+            return {}
+
+    def setUp(self):
+        self._orig_table = lam.TABLE
+
+    def tearDown(self):
+        lam.TABLE = self._orig_table
+
+    def test_someone_elses_worker_404s_not_403(self):
+        # 404, not 403 — never confirm existence to a caller who shouldn't
+        # know about it, same reasoning as every other ownership check here.
+        lam.TABLE = self._FakeTable({"workerId": "w1", "userId": "owner-a", "status": "live"})
+        event = {"_userId": "attacker-b"}
+        with self.assertRaises(lam.ApiError) as ctx:
+            lam.delete_worker(event, "w1")
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_a_worker_with_no_userid_at_all_is_not_deletable_by_anyone(self):
+        # Legacy-fallback-era records with no userId must not be treated as
+        # "ownerless, anyone may act on it."
+        lam.TABLE = self._FakeTable({"workerId": "w2", "status": "live"})
+        with self.assertRaises(lam.ApiError) as ctx:
+            lam.delete_worker({"_userId": "someone"}, "w2")
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_a_nonexistent_worker_id_404s(self):
+        lam.TABLE = self._FakeTable(None)
+        with self.assertRaises(lam.ApiError) as ctx:
+            lam.delete_worker({"_userId": "owner-a"}, "no-such-worker")
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_the_owner_can_fetch_an_already_terminated_worker(self):
+        # No EC2 call on this path (already terminated) — safe to exercise
+        # without stubbing EC2, and confirms the ownership check doesn't
+        # false-reject the actual owner.
+        lam.TABLE = self._FakeTable({"workerId": "w3", "userId": "owner-a", "status": "terminated"})
+        response = lam.delete_worker({"_userId": "owner-a"}, "w3")
+        self.assertEqual(response["statusCode"], 200)
+
+
+class WorkerListingScopingTests(unittest.TestCase):
+    """list_workers/usage used to scan every user's records unfiltered — the
+    fix is a FilterExpression on userId; pinned by capturing what actually
+    gets sent to DynamoDB rather than trusting the code reads right."""
+
+    class _FakeTable:
+        def __init__(self):
+            self.scan_calls = []
+
+        def scan(self, **kwargs):
+            self.scan_calls.append(kwargs)
+            return {"Items": []}
+
+    def setUp(self):
+        self._orig_table = lam.TABLE
+        lam.TABLE = self._FakeTable()
+
+    def tearDown(self):
+        lam.TABLE = self._orig_table
+
+    def test_list_workers_scopes_the_scan_to_the_caller(self):
+        lam.list_workers({"_userId": "user-x"})
+        self.assertEqual(len(lam.TABLE.scan_calls), 1)
+        call = lam.TABLE.scan_calls[0]
+        self.assertEqual(call["ExpressionAttributeValues"][":user"], "user-x")
+        self.assertIn("userId", call["FilterExpression"])
+
+    def test_usage_scopes_the_scan_to_the_caller(self):
+        lam.usage({"_userId": "user-y"})
+        self.assertEqual(len(lam.TABLE.scan_calls), 1)
+        call = lam.TABLE.scan_calls[0]
+        self.assertEqual(call["ExpressionAttributeValues"][":user"], "user-y")
+        self.assertIn("userId", call["FilterExpression"])
+
+    def test_live_workers_with_no_user_id_scans_unfiltered_for_the_schedules(self):
+        lam._live_workers()
+        call = lam.TABLE.scan_calls[0]
+        self.assertNotIn(":user", call["ExpressionAttributeValues"])
+
+    def test_live_workers_with_a_user_id_scopes_the_scan(self):
+        lam._live_workers("user-z")
+        call = lam.TABLE.scan_calls[0]
+        self.assertEqual(call["ExpressionAttributeValues"][":user"], "user-z")
 
 
 if __name__ == "__main__":

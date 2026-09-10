@@ -58,23 +58,35 @@ LOG.setLevel(logging.INFO)
 
 REGION = "us-west-2"
 BUCKET = "fin-agent-directives-011183829623"
+# Every per-user object lives under users/{user}/... — {user} is always our
+# own userId (fin-users' uuid4), never Apple's `sub` or anything client-
+# supplied; every route resolves it from event["_userId"] (set by
+# _authorize) and threads it in here, never trusts a request body/path value
+# for it. Two keys are deliberately account-wide, not per-user data, and stay
+# unprefixed: BINARY_KEY (the harness binary itself) and TEMPLATE_KEY (the
+# operator's config template, instantiated per-agent on first launch).
 BINARY_KEY = "fin/agentd/fin-agentd"
-CONFIG_KEY = "fin/agentd/{agent}.json"
-STATUS_KEY = "fin/status-{agent}.json"
-INBOX_KEY = "fin/inbox/{agent}.json"
-INBOX_LOCK_KEY = "fin/inbox/{agent}.lock"
-TRANSCRIPT_KEY = "fin/transcripts/{agent}.jsonl"
+CONFIG_KEY = "users/{user}/fin/agentd/{agent}.json"
+STATUS_KEY = "users/{user}/fin/status-{agent}.json"
+INBOX_KEY = "users/{user}/fin/inbox/{agent}.json"
+INBOX_LOCK_KEY = "users/{user}/fin/inbox/{agent}.lock"
+TRANSCRIPT_KEY = "users/{user}/fin/transcripts/{agent}.jsonl"
 # Hourly chunks, distinct from TRANSCRIPT_KEY above — see "cloud transcript
 # (hourly S3 chunks)" below for why this exists alongside the rolling object.
-TRANSCRIPT_CHUNK_KEY = "fin/transcripts/{agent}/{hour}.jsonl"
-MEMORY_KEY = "fin/memory/{agent}.json"
-ARTIFACT_PREFIX = "fin/artifacts/"
+TRANSCRIPT_CHUNK_KEY = "users/{user}/fin/transcripts/{agent}/{hour}.jsonl"
+MEMORY_KEY = "users/{user}/fin/memory/{agent}.json"
+
+
+def _artifact_prefix(user_id):
+    return "users/{}/fin/artifacts/".format(user_id)
+
 
 # Auto-provisioning: when POST /workers finds no config for an agent, it
 # instantiates this template — the hand-provisioned config shape with every
 # per-agent value replaced by a {{PLACEHOLDER}} token. The operator generates it
 # from a live config with scripts/cloud-agent/make-config-template.sh (S3 to S3,
-# so the shared LLM bearer token inside never lands in git).
+# so the shared LLM bearer token inside never lands in git). Account-wide on
+# purpose: one template seeds every user's first launch.
 TEMPLATE_KEY = "fin/agentd/_template.json"
 
 # Presign lifetime for the supervision/transcript URLs baked into an
@@ -84,10 +96,13 @@ TEMPLATE_KEY = "fin/agentd/_template.json"
 # hand-provisioned config. See "Auto-provisioning" in control-plane/README.md.
 TEMPLATE_URL_TTL_SECONDS = 7 * 24 * 3600
 
-# The app-wide supervision channel: two objects with no agent slug — the directive
-# document the app reads and the supervision status the app writes back.
-SUPERVISION_DIRECTIVE_KEY = "fin/directives.json"
-SUPERVISION_STATUS_KEY = "fin/status.json"
+# The per-user supervision channel: two objects with no agent slug — the
+# directive document the app reads and the supervision status the app writes
+# back. Used to be account-wide (a single pair of objects for everyone); with
+# more than one user that would merge every user's directives into one
+# object — silent data corruption, not just a leak — so these are per-user too.
+SUPERVISION_DIRECTIVE_KEY = "users/{user}/fin/directives.json"
+SUPERVISION_STATUS_KEY = "users/{user}/fin/status.json"
 
 
 def _key_slug(agent):
@@ -148,11 +163,13 @@ AGENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 DEVICE_ID8 = re.compile(r"^[0-9a-f]{8}$")
 
 # --- service-credential store (Secrets Manager) ------------------------------
-# Secrets live at fin/service-creds/<agentScope>/<service>. The scope is the
-# agent's key slug (lowercased display name), or the reserved scope "shared",
-# which every worker may read — and which POST /workers refuses as an agent
-# name so the two can never collide.
-SECRET_PREFIX = "fin/service-creds"
+# Secrets live at users/<user>/fin/service-creds/<agentScope>/<service>. The
+# scope is the agent's key slug (lowercased display name), or the reserved
+# scope "shared", which every one of THAT USER's workers may read — and
+# which POST /workers refuses as an agent name so the two can never collide.
+# Per-user like everything else here: one user's "shared" scope never reaches
+# another's secrets.
+SECRET_PREFIX = "users/{user}/fin/service-creds"
 SECRET_SCOPE_SHARED = "shared"
 SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 SECRET_KINDS = ("app-password", "oauth", "api-key", "password")
@@ -581,17 +598,28 @@ def _scan(table=None, **kwargs):
     return items
 
 
-def _live_workers():
+def _live_workers(user_id=None):
+    """All live workers, or (whenever the caller has a userId to scope to —
+    every route handler except the wake/sweep schedules, which iterate over
+    every user themselves) just one user's. `user_id=None` is deliberately
+    still available for the schedules; every HTTP route MUST pass one."""
+    if user_id is None:
+        return _scan(
+            FilterExpression="#s = :live",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":live": "live"},
+        )
     return _scan(
-        FilterExpression="#s = :live",
+        FilterExpression="#s = :live AND userId = :user",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":live": "live"},
+        ExpressionAttributeValues={":live": "live", ":user": user_id},
     )
 
 
-def _record(worker_id, agent, instance_id, instance_type, launched_at, idle_minutes, managed, browser=False):
+def _record(worker_id, user_id, agent, instance_id, instance_type, launched_at, idle_minutes, managed, browser=False):
     item = {
         "workerId": worker_id,
+        "userId": user_id,
         "agent": agent,
         "instanceId": instance_id,
         "instanceType": instance_type,
@@ -699,7 +727,7 @@ def _fill_placeholders(node, values):
     return node
 
 
-def _provision_config(agent, config_key):
+def _provision_config(user_id, agent, config_key):
     """Instantiates the template as this agent's daemon config, so any agent the
     app names just works instead of refusing agents nobody hand-provisioned.
     Never overwrites: the caller only lands here on a head-check miss, and the
@@ -740,10 +768,10 @@ def _provision_config(agent, config_key):
         # deviceToken8 is the 8-char device stamp in its status uplink.
         "{{AGENT_ID}}": str(uuid.uuid4()).upper(),
         "{{DEVICE_TOKEN8}}": uuid.uuid4().hex[:8],
-        "{{DIRECTIVE_GET_URL}}": sign("get_object", SUPERVISION_DIRECTIVE_KEY),
-        "{{STATUS_PUT_URL}}": sign("put_object", STATUS_KEY.format(agent=slug)),
-        "{{INBOX_GET_URL}}": sign("get_object", INBOX_KEY.format(agent=slug)),
-        "{{TRANSCRIPT_PUT_URL}}": sign("put_object", TRANSCRIPT_KEY.format(agent=slug)),
+        "{{DIRECTIVE_GET_URL}}": sign("get_object", SUPERVISION_DIRECTIVE_KEY.format(user=user_id)),
+        "{{STATUS_PUT_URL}}": sign("put_object", STATUS_KEY.format(user=user_id, agent=slug)),
+        "{{INBOX_GET_URL}}": sign("get_object", INBOX_KEY.format(user=user_id, agent=slug)),
+        "{{TRANSCRIPT_PUT_URL}}": sign("put_object", TRANSCRIPT_KEY.format(user=user_id, agent=slug)),
     })
     # fin-agentd 1.4.1 seeds the inbox as history on a first run unless the config
     # says the launcher emptied the inbox first — create_worker does, right before
@@ -778,7 +806,7 @@ def _provision_config(agent, config_key):
 # --- routes ------------------------------------------------------------------
 
 
-def _launch_worker(agent, instance_type, idle_minutes, browser, now, clear_inbox=True):
+def _launch_worker(user_id, agent, instance_type, idle_minutes, browser, now, clear_inbox=True):
     """The actual EC2 launch, shared by the explicit `POST /workers` route and
     the automatic wake sweep below. Callers own their own pre-checks (agent
     validation, the 409-on-already-live reconciliation) — this just launches
@@ -792,7 +820,7 @@ def _launch_worker(agent, instance_type, idle_minutes, browser, now, clear_inbox
     sitting unanswered, so wiping it on the way up would defeat the whole
     point of waking at all.
     """
-    config_key = CONFIG_KEY.format(agent=_key_slug(agent))
+    config_key = CONFIG_KEY.format(user=user_id, agent=_key_slug(agent))
     try:
         S3.head_object(Bucket=BUCKET, Key=config_key)
     except ClientError as exc:
@@ -801,7 +829,7 @@ def _launch_worker(agent, instance_type, idle_minutes, browser, now, clear_inbox
             raise
         # No hand-provisioned config: instantiate the template so the launch
         # proceeds (400s only when the template is missing too).
-        _provision_config(agent, config_key)
+        _provision_config(user_id, agent, config_key)
 
     user_data = USER_DATA.format(
         binary_url=S3.generate_presigned_url(
@@ -821,7 +849,7 @@ def _launch_worker(agent, instance_type, idle_minutes, browser, now, clear_inbox
     if clear_inbox:
         S3.put_object(
             Bucket=BUCKET,
-            Key=INBOX_KEY.format(agent=_key_slug(agent)),
+            Key=INBOX_KEY.format(user=user_id, agent=_key_slug(agent)),
             Body=b'{"version":1,"directives":[]}',
             ContentType="application/json",
         )
@@ -829,6 +857,7 @@ def _launch_worker(agent, instance_type, idle_minutes, browser, now, clear_inbox
     tags = [
         {"Key": "Name", "Value": "fin-agent-{}".format(agent)},
         {"Key": "fin-agent", "Value": agent},
+        {"Key": "fin-user", "Value": user_id},
         {"Key": "fin-managed", "Value": "control-plane"},
         {"Key": "fin-idle-minutes", "Value": str(idle_minutes)},
     ]
@@ -849,7 +878,7 @@ def _launch_worker(agent, instance_type, idle_minutes, browser, now, clear_inbox
 
     worker_id = str(uuid.uuid4())
     launched_at = _iso(instance.get("LaunchTime") or now)
-    _record(worker_id, agent, instance["InstanceId"], instance_type, launched_at, idle_minutes, "control-plane", browser)
+    _record(worker_id, user_id, agent, instance["InstanceId"], instance_type, launched_at, idle_minutes, "control-plane", browser)
     return {
         "workerId": worker_id,
         "instanceId": instance["InstanceId"],
@@ -891,8 +920,9 @@ def create_worker(event):
     if not 1 <= idle_minutes <= MAX_IDLE_MINUTES:
         raise ApiError(400, "idleMinutes must be between 1 and {}".format(MAX_IDLE_MINUTES))
 
+    user_id = event["_userId"]
     now = _now()
-    existing = [w for w in _live_workers() if w.get("agent") == agent]
+    existing = [w for w in _live_workers(user_id) if w.get("agent") == agent]
     if existing:
         # A record can outlive its instance (terminate.sh, console, spot of bad
         # luck). Reconcile before refusing, or one dead row blocks the agent.
@@ -907,21 +937,25 @@ def create_worker(event):
         if alive:
             raise ApiError(409, "agent {} already has a live worker ({})".format(agent, alive[0]["workerId"]))
 
-    result = _launch_worker(agent, instance_type, idle_minutes, browser, now, clear_inbox=True)
+    result = _launch_worker(user_id, agent, instance_type, idle_minutes, browser, now, clear_inbox=True)
     LOG.info("launched %s for agent %s (%s%s)", result["instanceId"], agent, instance_type, ", browser" if browser else "")
     return _response(201, result)
 
 
-def list_workers(_event):
+def list_workers(event):
     now = _now()
-    workers = _scan()
+    workers = _scan(FilterExpression="userId = :user", ExpressionAttributeValues={":user": event["_userId"]})
     workers.sort(key=lambda w: str(w.get("launchedAt") or ""), reverse=True)
     return _response(200, {"workers": [_decorate(w, now) for w in workers[:MAX_LIST_ITEMS]]})
 
 
-def delete_worker(_event, worker_id):
+def delete_worker(event, worker_id):
     worker = TABLE.get_item(Key={"workerId": worker_id}).get("Item")
-    if not worker:
+    # 404, not 403, on someone else's worker — same "don't confirm existence
+    # to a caller who shouldn't know about it" reasoning as every other
+    # ownership check here. This was a live IDOR before: any authenticated
+    # caller could terminate any worker, since nothing checked userId at all.
+    if not worker or worker.get("userId") != event["_userId"]:
         raise ApiError(404, "no worker {}".format(worker_id))
     if worker.get("status") == "terminated":
         return _response(200, _decorate(worker, _now()))
@@ -930,10 +964,10 @@ def delete_worker(_event, worker_id):
     return _response(200, _decorate(final, _now()))
 
 
-def usage(_event):
+def usage(event):
     now = _now()
     by_agent, by_type, unpriced = {}, {}, set()
-    for worker in _scan():
+    for worker in _scan(FilterExpression="userId = :user", ExpressionAttributeValues={":user": event["_userId"]}):
         hours = _uptime_seconds(worker, now) / 3600.0
         instance_type = str(worker.get("instanceType") or "unknown")
         rate = PRICE_USD_PER_HOUR.get(instance_type)
@@ -1017,20 +1051,21 @@ def presign(event):
             raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
         slug = _key_slug(agent)
 
+    user_id = event["_userId"]
     urls = {}
     for kind in kinds:
         if kind == "transcript":
-            urls["transcriptGet"] = _presign("get_object", TRANSCRIPT_KEY.format(agent=slug))
+            urls["transcriptGet"] = _presign("get_object", TRANSCRIPT_KEY.format(user=user_id, agent=slug))
         elif kind == "inbox":
-            inbox_key = INBOX_KEY.format(agent=slug)
+            inbox_key = INBOX_KEY.format(user=user_id, agent=slug)
             urls["inboxGet"] = _presign("get_object", inbox_key)
             urls["inboxPut"] = _presign("put_object", inbox_key)
         elif kind == "status":
-            urls["statusGet"] = _presign("get_object", STATUS_KEY.format(agent=slug))
+            urls["statusGet"] = _presign("get_object", STATUS_KEY.format(user=user_id, agent=slug))
         elif kind == "supervisionDirective":
-            urls["supervisionDirectiveGet"] = _presign("get_object", SUPERVISION_DIRECTIVE_KEY)
+            urls["supervisionDirectiveGet"] = _presign("get_object", SUPERVISION_DIRECTIVE_KEY.format(user=user_id))
         elif kind == "supervisionStatus":
-            urls["supervisionStatusPut"] = _presign("put_object", SUPERVISION_STATUS_KEY)
+            urls["supervisionStatusPut"] = _presign("put_object", SUPERVISION_STATUS_KEY.format(user=user_id))
 
     now = _now()
     return _response(200, {
@@ -1247,9 +1282,9 @@ def put_device_token(event):
     device_name = (device_name or "").strip()[:MAX_DEVICE_NAME_LENGTH]
 
     updated_at = _iso(_now())
-    names = {"#platform": "platform", "#updated": "updatedAt", "#name": "deviceName"}
-    values = {":platform": platform, ":updated": updated_at}
-    expression = "SET #platform = :platform, #updated = :updated"
+    names = {"#platform": "platform", "#updated": "updatedAt", "#name": "deviceName", "#user": "userId"}
+    values = {":platform": platform, ":updated": updated_at, ":user": event["_userId"]}
+    expression = "SET #platform = :platform, #updated = :updated, #user = :user"
     if device_name:
         expression += ", #name = :name"
         values[":name"] = device_name
@@ -1307,7 +1342,14 @@ def notify(event):
     if not DEVICE_ID8.match(origin_device_id8):
         origin_device_id8 = ""
 
-    rows = _scan(table=DEVICE_TOKENS_TABLE)
+    # Was unscoped — every registered device token, account-wide — a real
+    # cross-tenant push leak once there is more than one user. Every device
+    # token is stamped with its owner's userId by put_device_token now.
+    rows = _scan(
+        table=DEVICE_TOKENS_TABLE,
+        FilterExpression="userId = :user",
+        ExpressionAttributeValues={":user": event["_userId"]},
+    )
     if not rows:
         return _response(200, {
             "delivered": 0, "failed": 0, "removed": 0,
@@ -1400,8 +1442,8 @@ def _require_service(service):
         raise ApiError(400, "service must match [a-z0-9][a-z0-9-]{0,39}")
 
 
-def _secret_name(scope, service):
-    return "{}/{}/{}".format(SECRET_PREFIX, scope, service)
+def _secret_name(user_id, scope, service):
+    return "{}/{}/{}".format(SECRET_PREFIX.format(user=user_id), scope, service)
 
 
 def put_secret(event, service):
@@ -1441,7 +1483,7 @@ def put_secret(event, service):
     if len(secret_string.encode("utf-8")) > MAX_SECRET_BYTES:
         raise ApiError(400, "secret exceeds {} bytes".format(MAX_SECRET_BYTES))
 
-    name = _secret_name(scope, service)
+    name = _secret_name(event["_userId"], scope, service)
     tags = [
         {"Key": "fin-scope", "Value": scope},
         {"Key": "fin-service", "Value": service},
@@ -1484,7 +1526,7 @@ def list_secrets(event):
     """Metadata only — names, tags, and timestamps; never a value (the role
     could not fetch one even if this code tried)."""
     params = event.get("queryStringParameters") or {}
-    prefix = SECRET_PREFIX + "/"
+    prefix = SECRET_PREFIX.format(user=event["_userId"]) + "/"
     requested_scope = str(params.get("agentScope") or "").strip()
     if requested_scope:
         prefix += _secret_scope(requested_scope) + "/"
@@ -1507,10 +1549,14 @@ def list_secrets(event):
     secrets = []
     for entry in entries[:MAX_LIST_ITEMS]:
         tags = {t.get("Key"): t.get("Value") for t in entry.get("Tags") or []}
+        # users/{user}/fin/service-creds/{scope}/{service} — service and scope
+        # are the last two segments; tags are the primary source (set by
+        # put_secret on every write), this is only a fallback for an entry
+        # somehow missing them.
         name_parts = str(entry.get("Name") or "").split("/")
         row = {
-            "service": tags.get("fin-service") or (name_parts[3] if len(name_parts) > 3 else ""),
-            "agentScope": tags.get("fin-scope") or (name_parts[2] if len(name_parts) > 2 else ""),
+            "service": tags.get("fin-service") or (name_parts[-1] if len(name_parts) > 1 else ""),
+            "agentScope": tags.get("fin-scope") or (name_parts[-2] if len(name_parts) > 2 else ""),
             "kind": tags.get("fin-kind") or "password",
             "label": entry.get("Description") or "",
             "lastUpdated": _iso(entry["LastChangedDate"]) if entry.get("LastChangedDate") else None,
@@ -1529,7 +1575,7 @@ def delete_secret(event, service):
     _require_service(service)
     params = event.get("queryStringParameters") or {}
     scope = _secret_scope(params.get("agentScope"))
-    name = _secret_name(scope, service)
+    name = _secret_name(event["_userId"], scope, service)
     try:
         deletion = SECRETS.delete_secret(
             SecretId=name, RecoveryWindowInDays=SECRET_RECOVERY_DAYS
@@ -1554,10 +1600,10 @@ def delete_secret(event, service):
 # --- sweep -------------------------------------------------------------------
 
 
-def _read_status(agent):
+def _read_status(user_id, agent):
     """The agent's status document, or None when it is missing or unparseable."""
     try:
-        raw = S3.get_object(Bucket=BUCKET, Key=STATUS_KEY.format(agent=_key_slug(agent)))["Body"].read()
+        raw = S3.get_object(Bucket=BUCKET, Key=STATUS_KEY.format(user=user_id, agent=_key_slug(agent)))["Body"].read()
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in ("404", "NoSuchKey", "NoSuchBucket", "AccessDenied"):
@@ -1576,7 +1622,7 @@ def _sweep_verdict(worker, now):
     idle = timedelta(minutes=int(worker.get("idleMinutes") or DEFAULT_IDLE_MINUTES))
     launched = _parse_iso(worker.get("launchedAt")) or now
 
-    status = _read_status(str(worker.get("agent") or ""))
+    status = _read_status(str(worker.get("userId") or ""), str(worker.get("agent") or ""))
     if status is None:
         if now - launched < timedelta(minutes=BOOT_GRACE_MINUTES):
             return None
@@ -1612,7 +1658,11 @@ def _sweep_verdict(worker, now):
 
 
 def _adopt(now, known_instance_ids):
-    """Gives hand-launched instances a record so the sweep can reach them too."""
+    """Gives hand-launched instances a record so the sweep can reach them too.
+    An instance from before multi-tenancy (or launched by hand without a
+    fin-user tag) has no owner we can safely infer — adopting it under a
+    guessed userId would let it read/write into the wrong prefix — so it's
+    skipped and logged instead, for a human to sort out via the console."""
     adopted = []
     pages = EC2.get_paginator("describe_instances").paginate(
         Filters=[
@@ -1626,9 +1676,14 @@ def _adopt(now, known_instance_ids):
                 instance_id = instance["InstanceId"]
                 if instance_id in known_instance_ids:
                     continue
+                user_id = _tag(instance, "fin-user")
+                if not user_id:
+                    LOG.warning("skipping adoption of %s: no fin-user tag, owner unknown", instance_id)
+                    continue
                 idle_tag = _tag(instance, "fin-idle-minutes")
                 worker = _record(
                     str(uuid.uuid4()),
+                    user_id,
                     _tag(instance, "fin-agent") or "unknown",
                     instance_id,
                     instance.get("InstanceType", "unknown"),
@@ -1637,7 +1692,7 @@ def _adopt(now, known_instance_ids):
                     "adopted",
                 )
                 adopted.append(worker)
-                LOG.info("adopted %s for agent %s", instance_id, worker["agent"])
+                LOG.info("adopted %s for agent %s (user %s)", instance_id, worker["agent"], user_id)
     return adopted
 
 
@@ -1713,13 +1768,13 @@ def put_transcript_chunk(event):
     encoded = "\n".join(lines).encode("utf-8")
     if len(encoded) > MAX_TRANSCRIPT_CHUNK_BYTES:
         raise ApiError(413, "chunk exceeds {} bytes".format(MAX_TRANSCRIPT_CHUNK_BYTES))
-    key = TRANSCRIPT_CHUNK_KEY.format(agent=_key_slug(agent), hour=hour)
+    key = TRANSCRIPT_CHUNK_KEY.format(user=event["_userId"], agent=_key_slug(agent), hour=hour)
     S3.put_object(Bucket=BUCKET, Key=key, Body=encoded, ContentType="application/json")
     return _response(200, {"agent": agent, "hour": hour, "lines": len(lines)})
 
 
-def _list_transcript_hours(agent):
-    prefix = "fin/transcripts/{}/".format(_key_slug(agent))
+def _list_transcript_hours(user_id, agent):
+    prefix = "users/{}/fin/transcripts/{}/".format(user_id, _key_slug(agent))
     hours, token = [], None
     while True:
         kwargs = {"Bucket": BUCKET, "Prefix": prefix, "MaxKeys": 1000}
@@ -1736,8 +1791,8 @@ def _list_transcript_hours(agent):
     return sorted(hours)
 
 
-def _get_transcript_chunk(agent, hour):
-    key = TRANSCRIPT_CHUNK_KEY.format(agent=_key_slug(agent), hour=hour)
+def _get_transcript_chunk(user_id, agent, hour):
+    key = TRANSCRIPT_CHUNK_KEY.format(user=user_id, agent=_key_slug(agent), hour=hour)
     try:
         raw = S3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
     except ClientError as exc:
@@ -1757,19 +1812,20 @@ def get_transcript_chunks(event):
     agent = str(params.get("agent") or "").strip()
     if not AGENT_NAME.match(agent):
         raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
-    hours = _list_transcript_hours(agent)
+    user_id = event["_userId"]
+    hours = _list_transcript_hours(user_id, agent)
     requested_hour = str(params.get("hour") or "").strip()
     if requested_hour:
         if not TRANSCRIPT_HOUR.match(requested_hour):
             raise ApiError(400, "hour must match yyyy-MM-ddTHH (UTC)")
         return _response(200, {
             "agent": agent, "hours": hours,
-            "chunk": {"hour": requested_hour, "lines": _get_transcript_chunk(agent, requested_hour)},
+            "chunk": {"hour": requested_hour, "lines": _get_transcript_chunk(user_id, agent, requested_hour)},
         })
     latest = hours[-1] if hours else None
     return _response(200, {
         "agent": agent, "hours": hours,
-        "chunk": {"hour": latest, "lines": _get_transcript_chunk(agent, latest)} if latest else None,
+        "chunk": {"hour": latest, "lines": _get_transcript_chunk(user_id, agent, latest)} if latest else None,
     })
 
 
@@ -1788,8 +1844,8 @@ MAX_MEMORY_FIELD_BYTES = 8 * 1024
 MAX_MEMORY_DOC_BYTES = 4 * 1024 * 1024
 
 
-def _read_memory_document(agent):
-    key = MEMORY_KEY.format(agent=_key_slug(agent))
+def _read_memory_document(user_id, agent):
+    key = MEMORY_KEY.format(user=user_id, agent=_key_slug(agent))
     try:
         raw = S3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
     except ClientError as exc:
@@ -1859,7 +1915,7 @@ def put_memory_entry(event):
         "originDevice8": origin_device8, "createdAt": created_at, "updatedAt": updated_at,
     }
 
-    document = _read_memory_document(agent)
+    document = _read_memory_document(event["_userId"], agent)
     entries = [e for e in document["entries"] if e.get("id") != entry_id]
     entries.append(entry)
     entries.sort(key=lambda e: e.get("updatedAt") or "")
@@ -1870,7 +1926,7 @@ def put_memory_entry(event):
     if len(encoded) > MAX_MEMORY_DOC_BYTES:
         raise ApiError(413, "memory document exceeds {} bytes".format(MAX_MEMORY_DOC_BYTES))
     S3.put_object(
-        Bucket=BUCKET, Key=MEMORY_KEY.format(agent=_key_slug(agent)),
+        Bucket=BUCKET, Key=MEMORY_KEY.format(user=event["_userId"], agent=_key_slug(agent)),
         Body=encoded, ContentType="application/json",
     )
     LOG.info("upserted memory entry %s for %s", entry_id, agent)
@@ -1884,7 +1940,7 @@ def get_memory(event):
     agent = str(params.get("agent") or "").strip()
     if not AGENT_NAME.match(agent):
         raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
-    document = _read_memory_document(agent)
+    document = _read_memory_document(event["_userId"], agent)
     since = _parse_iso(params.get("since"))
     entries = document["entries"]
     if since is not None:
@@ -1897,14 +1953,15 @@ def get_memory(event):
 # The single distilled "who is this user" digest — tasks, goals, preferences,
 # style — injected into every agent's system prompt and shown in the app's
 # memory view. Unlike the per-agent episodic document above, there is exactly
-# ONE of these per account: cross-agent and cross-device, so a fact learned on
-# the client and one learned by a cloud-hosted agent converge on the same
-# profile. "S3 as source of truth" applies here too — this document, plus the
-# claim lock below, is what lets the client and cloud agents coordinate who
-# actually runs the (model-driven, so not-cheap) compaction pass.
+# ONE of these per ACCOUNT (not per agent — still per-user): cross-agent and
+# cross-device, so a fact learned on the client and one learned by a
+# cloud-hosted agent converge on the same profile. "S3 as source of truth"
+# applies here too — this document, plus the claim lock below, is what lets
+# the client and cloud agents coordinate who actually runs the (model-driven,
+# so not-cheap) compaction pass.
 
-PROFILE_KEY = "fin/memory/_profile.json"
-PROFILE_LOCK_KEY = "fin/memory/_profile.lock"
+PROFILE_KEY = "users/{user}/fin/memory/_profile.json"
+PROFILE_LOCK_KEY = "users/{user}/fin/memory/_profile.lock"
 MAX_PROFILE_BYTES = 4 * 1024
 LOCK_STALE_AFTER_SECONDS = 5 * 60
 
@@ -1913,7 +1970,7 @@ def get_memory_profile(event):
     """GET /memory/profile — the shared cumulative profile. Absent is a valid,
     common state (nothing consolidated yet), not an error."""
     try:
-        raw = S3.get_object(Bucket=BUCKET, Key=PROFILE_KEY)["Body"].read()
+        raw = S3.get_object(Bucket=BUCKET, Key=PROFILE_KEY.format(user=event["_userId"]))["Body"].read()
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in ("404", "NoSuchKey", "NoSuchBucket", "AccessDenied"):
@@ -1944,7 +2001,7 @@ def put_memory_profile(event):
         raise ApiError(400, "content exceeds {} bytes".format(MAX_PROFILE_BYTES))
     document = {"content": content, "updatedAt": _iso(_now())}
     S3.put_object(
-        Bucket=BUCKET, Key=PROFILE_KEY,
+        Bucket=BUCKET, Key=PROFILE_KEY.format(user=event["_userId"]),
         Body=json.dumps(document, sort_keys=True).encode("utf-8"),
         ContentType="application/json",
     )
@@ -2014,13 +2071,13 @@ def claim_memory_profile_lock(event):
     holder = str(body.get("holder") or "").strip()
     if not holder:
         raise ApiError(400, "holder must be a non-empty string")
-    return _response(200, _claim_lock(PROFILE_LOCK_KEY, holder))
+    return _response(200, _claim_lock(PROFILE_LOCK_KEY.format(user=event["_userId"]), holder))
 
 
 def release_memory_profile_lock(event):
     """DELETE /memory/profile/lock — unconditional; called by whoever finishes
     (success or failure) so the next attempt doesn't wait out the full TTL."""
-    _release_lock(PROFILE_LOCK_KEY)
+    _release_lock(PROFILE_LOCK_KEY.format(user=event["_userId"]))
     return _response(200, {"released": True})
 
 
@@ -2045,13 +2102,14 @@ def claim_inbox_lock(event, agent):
     holder = str(body.get("holder") or "").strip()
     if not holder:
         raise ApiError(400, "holder must be a non-empty string")
-    return _response(200, _claim_lock(INBOX_LOCK_KEY.format(agent=_key_slug(agent)), holder))
+    key = INBOX_LOCK_KEY.format(user=event["_userId"], agent=_key_slug(agent))
+    return _response(200, _claim_lock(key, holder))
 
 
 def release_inbox_lock(event, agent):
     """DELETE /inbox/{agent}/lock — unconditional; call after every claimed
     turn, success or failure, so the next site doesn't wait out the TTL."""
-    _release_lock(INBOX_LOCK_KEY.format(agent=_key_slug(agent)))
+    _release_lock(INBOX_LOCK_KEY.format(user=event["_userId"], agent=_key_slug(agent)))
     return _response(200, {"released": True})
 
 
@@ -2075,7 +2133,7 @@ WAKE_GRACE_MINUTES = 3
 # unattended reply (the whole point, for someone with no spare computer);
 # past it, a human decides whether it's still worth answering.
 WAKE_NOTIFY_CEILING_HOURS = 72
-INBOX_NOTIFIED_KEY = "fin/inbox/{agent}.notified"
+INBOX_NOTIFIED_KEY = "users/{user}/fin/inbox/{agent}.notified"
 
 
 def _lock_is_stale(lock, now):
@@ -2129,20 +2187,28 @@ def _wake_decision(has_live_worker, lock, inbox_last_modified, status, now):
 
 
 def _inbox_candidates():
-    """Every agent with an inbox object, its most-recently-stated agent name
-    (proper case, read from the newest directive's own `agent` field — the
-    filename itself only has the lowercased slug, and DynamoDB's 409 check in
-    `create_worker` compares agent names case-sensitively, so a wake-launched
-    worker recorded under the wrong case would silently let a later manual
-    "Start Worker" tap launch a duplicate) and the object's LastModified.
+    """Every (userId, agent) with an inbox object, the agent's most-recently-
+    stated name (proper case, read from the newest directive's own `agent`
+    field — the filename itself only has the lowercased slug, and DynamoDB's
+    409 check in `create_worker` compares agent names case-sensitively, so a
+    wake-launched worker recorded under the wrong case would silently let a
+    later manual "Start Worker" tap launch a duplicate) and the object's
+    LastModified. userId is parsed straight out of the key path
+    (users/{userId}/fin/inbox/{agent}.json) — this walks every user's inbox,
+    so it's only ever called from the schedule-triggered wake(), never a
+    per-request route (those already have one userId from _authorize).
     """
     candidates = []
     paginator = S3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=BUCKET, Prefix="fin/inbox/"):
+    for page in paginator.paginate(Bucket=BUCKET, Prefix="users/"):
         for obj in page.get("Contents", []):
             key = obj["Key"]
-            if not key.endswith(".json"):
+            if not key.endswith(".json") or "/fin/inbox/" not in key:
                 continue
+            parts = key.split("/")
+            if len(parts) != 5 or parts[0] != "users" or parts[2] != "fin" or parts[3] != "inbox":
+                continue
+            user_id = parts[1]
             try:
                 raw = S3.get_object(Bucket=BUCKET, Key=key)
                 body = raw["Body"].read()
@@ -2162,34 +2228,34 @@ def _inbox_candidates():
                         break
             if not agent:
                 continue
-            candidates.append((agent, last_modified))
+            candidates.append((user_id, agent, last_modified))
     return candidates
 
 
-def _already_notified(agent, inbox_last_modified):
+def _already_notified(user_id, agent, inbox_last_modified):
     """Surfaced once, then sit quiet — the same discipline the Mission
     ledger's own conduct rules already use for a surfaced blocker: a stale
     inbox message that gets one push, not one every minute forever. A NEWER
     message arriving resets this (the marker's own `forLastModified` goes
     stale relative to the fresh inbox timestamp), so a genuinely new stale
     episode still gets its own alert."""
-    marker = _read_lock(INBOX_NOTIFIED_KEY.format(agent=_key_slug(agent)))
+    marker = _read_lock(INBOX_NOTIFIED_KEY.format(user=user_id, agent=_key_slug(agent)))
     if marker is None:
         return False
     notified_for = _parse_iso(marker.get("forLastModified"))
     return notified_for is not None and notified_for >= inbox_last_modified
 
 
-def _mark_notified(agent, inbox_last_modified):
+def _mark_notified(user_id, agent, inbox_last_modified):
     S3.put_object(
-        Bucket=BUCKET, Key=INBOX_NOTIFIED_KEY.format(agent=_key_slug(agent)),
+        Bucket=BUCKET, Key=INBOX_NOTIFIED_KEY.format(user=user_id, agent=_key_slug(agent)),
         Body=json.dumps({"forLastModified": _iso(inbox_last_modified)}, sort_keys=True).encode("utf-8"),
         ContentType="application/json",
     )
 
 
-def _notify_stale_inbox(agent, detail):
-    synthetic_event = {"body": json.dumps({
+def _notify_stale_inbox(user_id, agent, detail):
+    synthetic_event = {"_userId": user_id, "body": json.dumps({
         "title": "{} has an unanswered message".format(agent),
         "body": "{} — open the app to answer it or start a worker by hand.".format(detail),
         "agent": agent,
@@ -2205,26 +2271,28 @@ def _notify_stale_inbox(agent, detail):
 
 def wake(_event=None):
     now = _now()
-    live_agent_slugs = {_key_slug(a) for a in (w.get("agent") for w in _live_workers()) if a}
+    live_worker_keys = {
+        (w.get("userId"), _key_slug(w["agent"])) for w in _live_workers() if w.get("agent") and w.get("userId")
+    }
     checked, launched, notified = [], [], []
-    for agent, last_modified in _inbox_candidates():
+    for user_id, agent, last_modified in _inbox_candidates():
         checked.append(agent)
         try:
             slug = _key_slug(agent)
-            has_live_worker = slug in live_agent_slugs
-            lock = _read_lock(INBOX_LOCK_KEY.format(agent=slug))
-            status = _read_status(agent)
+            has_live_worker = (user_id, slug) in live_worker_keys
+            lock = _read_lock(INBOX_LOCK_KEY.format(user=user_id, agent=slug))
+            status = _read_status(user_id, agent)
             action, detail = _wake_decision(has_live_worker, lock, last_modified, status, now)
             if action == "wake":
                 result = _launch_worker(
-                    agent, DEFAULT_INSTANCE_TYPE, DEFAULT_IDLE_MINUTES, False, now, clear_inbox=False
+                    user_id, agent, DEFAULT_INSTANCE_TYPE, DEFAULT_IDLE_MINUTES, False, now, clear_inbox=False
                 )
                 LOG.info("woke %s for agent %s: %s", result["instanceId"], agent, detail)
                 launched.append({"agent": agent, "instanceId": result["instanceId"], "detail": detail})
             elif action == "notify":
-                if not _already_notified(agent, last_modified):
-                    _notify_stale_inbox(agent, detail)
-                    _mark_notified(agent, last_modified)
+                if not _already_notified(user_id, agent, last_modified):
+                    _notify_stale_inbox(user_id, agent, detail)
+                    _mark_notified(user_id, agent, last_modified)
                     LOG.info("notified about stale inbox for agent %s: %s", agent, detail)
                     notified.append({"agent": agent, "detail": detail})
         except Exception:  # noqa: BLE001 - one agent's failure (EC2 throttled,
@@ -2253,12 +2321,13 @@ def _require_artifact_path(path):
     return path
 
 
-def list_artifacts(_event):
-    """GET /artifacts — every path in the account's artifacts folder, sorted."""
+def list_artifacts(event):
+    """GET /artifacts — every path in the CALLER's artifacts folder, sorted."""
+    prefix = _artifact_prefix(event["_userId"])
     items, token = [], None
     while len(items) < MAX_ARTIFACT_LIST_ITEMS:
         kwargs = {
-            "Bucket": BUCKET, "Prefix": ARTIFACT_PREFIX,
+            "Bucket": BUCKET, "Prefix": prefix,
             "MaxKeys": min(1000, MAX_ARTIFACT_LIST_ITEMS - len(items)),
         }
         if token:
@@ -2266,7 +2335,7 @@ def list_artifacts(_event):
         page = S3.list_objects_v2(**kwargs)
         for entry in page.get("Contents", []):
             items.append({
-                "path": entry["Key"][len(ARTIFACT_PREFIX):],
+                "path": entry["Key"][len(prefix):],
                 "size": entry["Size"],
                 "updatedAt": _iso(entry["LastModified"]),
             })
@@ -2277,10 +2346,10 @@ def list_artifacts(_event):
     return _response(200, {"artifacts": items})
 
 
-def get_artifact(_event, path):
+def get_artifact(event, path):
     _require_artifact_path(path)
     try:
-        obj = S3.get_object(Bucket=BUCKET, Key=ARTIFACT_PREFIX + path)
+        obj = S3.get_object(Bucket=BUCKET, Key=_artifact_prefix(event["_userId"]) + path)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in ("404", "NoSuchKey", "NoSuchBucket"):
@@ -2303,18 +2372,18 @@ def put_artifact(event, path):
     if len(encoded) > MAX_ARTIFACT_BYTES:
         raise ApiError(413, "artifact exceeds {} bytes".format(MAX_ARTIFACT_BYTES))
     S3.put_object(
-        Bucket=BUCKET, Key=ARTIFACT_PREFIX + path,
+        Bucket=BUCKET, Key=_artifact_prefix(event["_userId"]) + path,
         Body=encoded, ContentType="text/plain; charset=utf-8",
     )
     LOG.info("wrote artifact %s (%d bytes)", path, len(encoded))
     return _response(200, {"path": path, "size": len(encoded)})
 
 
-def delete_artifact(_event, path):
+def delete_artifact(event, path):
     _require_artifact_path(path)
     # S3 DELETE is idempotent by construction — no existence check needed, and
     # "already gone" is as successful an outcome as "just deleted" for a DELETE.
-    S3.delete_object(Bucket=BUCKET, Key=ARTIFACT_PREFIX + path)
+    S3.delete_object(Bucket=BUCKET, Key=_artifact_prefix(event["_userId"]) + path)
     LOG.info("deleted artifact %s", path)
     return _response(200, {"path": path, "deleted": True})
 

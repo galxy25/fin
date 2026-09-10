@@ -30,6 +30,18 @@ BUCKET=fin-agent-directives-011183829623
 FACTORY_BUCKET=fin-model-factory-011183829623
 AGENT_ROLE=fin-agent-ssm
 TOKEN_FILE="$HOME/.fin-control-plane-token"
+# The one real account today, before Sign in with Apple's first real user
+# exists: _authorize's legacy-static-token fallback resolves to this fixed
+# userId rather than a bare "anonymous tenant" concept, so the token already
+# in every existing client's config (the daemon's config.json, etc.) keeps
+# working against a REAL per-user prefix throughout the migration. Generated
+# once, persisted here, and — CRITICAL — always re-sent on every deploy: an
+# earlier deploy overwrote the Lambda's whole environment and silently
+# dropped this var (no legacy fallback = every existing bearer-token client
+# gets 401s), which is exactly the live outage this persistence prevents
+# from recurring. Removed in Phase D once every real client has migrated to
+# a genuine Sign in with Apple session.
+LEGACY_USER_ID_FILE="$HOME/.fin-control-plane-legacy-user-id"
 APNS_TEAM_ID="${APNS_TEAM_ID:-EC27UF79GL}"
 APNS_TOPIC="${APNS_TOPIC:-dev.levischoen.fin}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -140,9 +152,11 @@ fi
 # AutoProvisionConfigs is fenced to *.json under fin/agentd/ on purpose: the
 # Lambda instantiates per-agent configs from the template, but it can never
 # replace the fin-agentd binary that lives beside them.
-# SeeMissingAgentObjects (s3:ListBucket, fin/* prefix only) exists so a
-# HeadObject/GetObject of an absent key answers 404/NoSuchKey instead of 403
-# Forbidden — without it the auto-provision head-check can never see a miss.
+# SeeMissingAgentObjects (s3:ListBucket, users/* or fin/agentd/* prefixes
+# only) exists so a HeadObject/GetObject of an absent key answers
+# 404/NoSuchKey instead of 403 Forbidden — without it the auto-provision
+# head-check can never see a miss. Also what lets wake()'s _inbox_candidates
+# list the bare "users/" prefix to discover every user's inbox.
 cat > "$BUILD/policy.json" <<JSON
 {
   "Version": "2012-10-17",
@@ -226,55 +240,58 @@ cat > "$BUILD/policy.json" <<JSON
       "Sid": "AgentObjects",
       "Effect": "Allow",
       "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::$BUCKET/fin/*"
+      "Resource": [
+        "arn:aws:s3:::$BUCKET/users/*/fin/*",
+        "arn:aws:s3:::$BUCKET/fin/agentd/*"
+      ]
     },
     {
       "Sid": "SeeMissingAgentObjects",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::$BUCKET",
-      "Condition": {"StringLike": {"s3:prefix": "fin/*"}}
+      "Condition": {"StringLike": {"s3:prefix": ["users/*", "fin/agentd/*"]}}
     },
     {
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::$BUCKET/fin/inbox/*"
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/inbox/*"
     },
     {
       "Sid": "AutoProvisionConfigs",
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::$BUCKET/fin/agentd/*.json"
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/agentd/*.json"
     },
     {
       "Sid": "TranscriptChunksWrite",
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::$BUCKET/fin/transcripts/*"
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/transcripts/*"
     },
     {
       "Sid": "MemoryJournalWrite",
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::$BUCKET/fin/memory/*"
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/memory/*"
     },
     {
       "Sid": "MemoryProfileLockDelete",
       "Effect": "Allow",
       "Action": "s3:DeleteObject",
-      "Resource": "arn:aws:s3:::$BUCKET/fin/memory/_profile.lock"
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/memory/_profile.lock"
     },
     {
       "Sid": "InboxLockDelete",
       "Effect": "Allow",
       "Action": "s3:DeleteObject",
-      "Resource": "arn:aws:s3:::$BUCKET/fin/inbox/*.lock"
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/inbox/*.lock"
     },
     {
       "Sid": "ArtifactsReadWrite",
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::$BUCKET/fin/artifacts/*"
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/artifacts/*"
     },
     {
       "Sid": "ModelFactoryIngest",
@@ -294,7 +311,7 @@ cat > "$BUILD/policy.json" <<JSON
         "secretsmanager:DeleteSecret",
         "secretsmanager:RestoreSecret"
       ],
-      "Resource": "arn:aws:secretsmanager:$REGION:$ACCOUNT:secret:fin/service-creds/*"
+      "Resource": "arn:aws:secretsmanager:$REGION:$ACCOUNT:secret:users/*/fin/service-creds/*"
     },
     {
       "Sid": "ServiceCredsList",
@@ -327,6 +344,18 @@ else
   echo "==> Generated a new API token and saved it to $TOKEN_FILE (chmod 600)"
 fi
 
+# --- legacy-token userId ------------------------------------------------------
+if [ -s "$LEGACY_USER_ID_FILE" ]; then
+  LEGACY_USER_ID=$(command cat "$LEGACY_USER_ID_FILE")
+else
+  LEGACY_USER_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  (umask 077; printf '%s\n' "$LEGACY_USER_ID" > "$LEGACY_USER_ID_FILE")
+  chmod 600 "$LEGACY_USER_ID_FILE"
+  echo "==> Minted a new legacy-token userId and saved it to $LEGACY_USER_ID_FILE (chmod 600)"
+  echo "    Existing per-user S3 data does NOT move on its own — migrate it by hand if this"
+  echo "    isn't a fresh account (see the plan's Phase C)."
+fi
+
 # --- APNs auth key (optional) ------------------------------------------------
 # The ONE manual prerequisite for push: an APNs auth key, created once at
 # developer.apple.com → Certificates, Identifiers & Profiles → Keys → "+",
@@ -356,12 +385,16 @@ fi
 
 # The token and the .p8 content go to the CLI through a file inside the 0700
 # build dir, never on a command line where ps would show them.
-FIN_CP_TOKEN_VALUE="$TOKEN" APNS_KEY_FILE="$APNS_KEY_FILE" APNS_KEY_ID="$APNS_KEY_ID" \
+FIN_CP_TOKEN_VALUE="$TOKEN" LEGACY_USER_ID_VALUE="$LEGACY_USER_ID" \
+  APNS_KEY_FILE="$APNS_KEY_FILE" APNS_KEY_ID="$APNS_KEY_ID" \
   APNS_TEAM_ID="$APNS_TEAM_ID" APNS_TOPIC="$APNS_TOPIC" \
   python3 - "$BUILD/env.json" <<'PY'
 import json, os, sys
 
-variables = {"FIN_CP_TOKEN": os.environ["FIN_CP_TOKEN_VALUE"]}
+variables = {
+    "FIN_CP_TOKEN": os.environ["FIN_CP_TOKEN_VALUE"],
+    "FIN_CP_LEGACY_USER_ID": os.environ["LEGACY_USER_ID_VALUE"],
+}
 key_file = os.environ.get("APNS_KEY_FILE")
 if key_file:
     with open(key_file) as handle:

@@ -29,5 +29,11 @@
 	     pushes need APNs; macOS spells the key with the full prefix. -->
 	<key>com.apple.developer.aps-environment</key>
 	<string>development</string>
+	<!-- Sign in with Apple: the control plane's real per-user identity (multi-tenancy) —
+	     replaces the single shared bearer token every account used to share. -->
+	<key>com.apple.developer.applesignin</key>
+	<array>
+		<string>Default</string>
+	</array>
 </dict>
 </plist>

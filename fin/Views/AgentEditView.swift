@@ -110,6 +110,7 @@ struct AgentEditView: View {
                     get: { CloudControlPlaneConfig.endpointURL },
                     set: { CloudControlPlaneConfig.setEndpointURL($0) }
                 )
+                AppleSignInButton()
                 cloudURLField(
                     label: "Control Plane Token",
                     get: { CloudControlPlaneConfig.token },
@@ -127,7 +128,10 @@ struct AgentEditView: View {
                     + "Switch back to This Device at any time to restore local hosting. "
                     + "The two control plane fields are device-wide — one control "
                     + "plane launches workers for every cloud agent on this device — "
-                    + "and let the console start a harness on demand."
+                    + "and let the console start a harness on demand. Sign in with "
+                    + "Apple to get your own account's token automatically; the token "
+                    + "field itself stays for pasting it into a non-interactive process "
+                    + "(the resident daemon) that can't sign in on its own."
                 : "This device (or whichever device arms monitoring) runs the "
                     + "conversation loop — the standard path.")
         }

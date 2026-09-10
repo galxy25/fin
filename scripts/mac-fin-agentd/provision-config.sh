@@ -32,6 +32,14 @@ REGION="${FIN_AWS_REGION:-us-west-2}"
 BUCKET="${FIN_BUCKET:-fin-agent-directives-011183829623}"
 EXPIRES="${FIN_PRESIGN_SECONDS:-604800}"
 TOKEN_FILE="${FIN_CONTROL_PLANE_TOKEN_FILE:-$HOME/.fin-control-plane-token}"
+# Multi-tenancy: every S3 key this site reads/writes now lives under
+# users/<userId>/... — same file control-plane/deploy.sh persists and reuses
+# for the legacy-token fallback (see FIN_CP_LEGACY_USER_ID there). This
+# script signs URLs directly with local AWS credentials, bypassing the
+# Lambda's own _authorize/_userId resolution entirely, so it has no other way
+# to know which prefix is "this site's" — a real simplification that holds
+# for today's single-operator reality, not a long-term multi-user answer.
+USER_ID_FILE="${FIN_CP_USER_ID_FILE:-$HOME/.fin-control-plane-legacy-user-id}"
 CONTROL_PLANE_URL="${FIN_CONTROL_PLANE_URL:-https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com}"
 LLM_URL="${FIN_LLM_URL:-http://127.0.0.1:1234/v1}"
 MODEL="${FIN_MODEL:-google/gemma-4-12b-qat}"
@@ -143,6 +151,7 @@ fi
 if [ "$REFRESH" -eq 0 ] || [ "$REFRESH_NEEDS_TOKEN" -eq 1 ]; then
 	[ -s "$TOKEN_FILE" ] || die "control-plane token file missing or empty: $TOKEN_FILE"
 fi
+[ -s "$USER_ID_FILE" ] || die "control-plane userId file missing or empty: $USER_ID_FILE (run control-plane/deploy.sh once first — it mints and persists this)"
 PYTHON="$(find_python)" || die "no python3 with boto3 importable (tried FIN_PYTHON, /usr/bin/python3, Xcode's)"
 
 # --- the work: presign + write, in python so the JSON is never string-assembled ------
@@ -157,6 +166,7 @@ FIN_AWS_REGION="$REGION" \
 FIN_BUCKET="$BUCKET" \
 FIN_PRESIGN_SECONDS="$EXPIRES" \
 FIN_CONTROL_PLANE_TOKEN_FILE="$TOKEN_FILE" \
+FIN_CP_USER_ID_FILE="$USER_ID_FILE" \
 FIN_CONTROL_PLANE_URL="$CONTROL_PLANE_URL" \
 FIN_LLM_URL="$LLM_URL" \
 FIN_MODEL="$MODEL" \
@@ -206,6 +216,11 @@ try:
 except OSError:
     token = ""
 
+with open(env["FIN_CP_USER_ID_FILE"]) as fh:
+    user_id = fh.read().strip()
+if not user_id:
+    sys.exit("error: %s is empty" % env["FIN_CP_USER_ID_FILE"])
+
 # --- presign ------------------------------------------------------------------------
 session = boto3.session.Session(profile_name=profile, region_name=region)
 credentials = session.get_credentials()
@@ -222,10 +237,10 @@ def sign(method, key):
     return s3.generate_presigned_url(method, Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires)
 
 keys = {
-    "directiveURL": ("get_object", "fin/directives.json"),
-    "inboxURL": ("get_object", "fin/inbox/%s.json" % slug),
-    "statusURL": ("put_object", "fin/sites/%s/%s/status.json" % (slug, site8)),
-    "transcriptPutURL": ("put_object", "fin/transcripts/%s.jsonl" % slug),
+    "directiveURL": ("get_object", "users/%s/fin/directives.json" % user_id),
+    "inboxURL": ("get_object", "users/%s/fin/inbox/%s.json" % (user_id, slug)),
+    "statusURL": ("put_object", "users/%s/fin/sites/%s/%s/status.json" % (user_id, slug, site8)),
+    "transcriptPutURL": ("put_object", "users/%s/fin/transcripts/%s.jsonl" % (user_id, slug)),
 }
 signed_at = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
 urls = {name: sign(method, key) for name, (method, key) in keys.items()}
