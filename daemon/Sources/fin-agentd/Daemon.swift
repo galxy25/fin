@@ -528,6 +528,16 @@ final class Daemon {
             .path
     }
 
+    /// The `StallNotifyGate` cooldown marker, same sibling-file directory as everything
+    /// else here. Deliberately NOT the audit log itself — that's append-only and this
+    /// needs a single mutable "last paged at" value read fresh on every stall.
+    private var stallNotifyStatePath: String {
+        URL(fileURLWithPath: auditLogPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("fin-agentd-stall-notify.json")
+            .path
+    }
+
     /// A local cache of the shared cumulative profile (`/memory/profile`), same sibling-
     /// file directory as the goals ledger and routing registry. `composedSystemPrompt`
     /// is `nonisolated static` and reads local files synchronously, so it can't fetch
@@ -1029,7 +1039,20 @@ final class Daemon {
                     record(AgentAuditEvent(kind: "notice", text: line))
                 }
                 if consecutiveFailures >= 5 {
-                    notify(event: "agent-stalled", message: "fin-agentd giving up after 5 consecutive failed turns: \(message)")
+                    // consecutiveFailures is a local var — it does NOT survive the
+                    // process restart `fail()` triggers below. Without this persisted
+                    // cooldown, a launchd `KeepAlive` loop hitting the same root cause
+                    // gets a fresh "free first strike" at 5 failures every restart,
+                    // paging a human every ~17 minutes for as long as the underlying
+                    // failure persists — exactly what happened live on 2026-09-09/10.
+                    let now = Date()
+                    if StallNotifyGate.shouldNotify(
+                        lastNotifiedAt: StallNotifyMarker.lastNotifiedAt(at: stallNotifyStatePath),
+                        now: now
+                    ) {
+                        notify(event: "agent-stalled", message: "fin-agentd giving up after 5 consecutive failed turns: \(message)")
+                        StallNotifyMarker.recordNotified(at: stallNotifyStatePath, now: now)
+                    }
                     await fail("5 consecutive turn failures; last: \(message)")
                 }
             case .toolBudgetExhausted:
