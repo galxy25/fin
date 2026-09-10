@@ -332,14 +332,23 @@ public enum GoalsTick {
         // deliberately blunt and names that exact rationalization as invalid, because a
         // preference stated once was not enough for this model to hold across its own
         // chain of thought.
-        let hint = mostImportantDrivableGoal(ledger.goals).map { goal in
-            "\n\nIf this tick's decision is drive, this is the ONLY goal to drive this " +
-            "tick: \(clip(goal.id, to: maxIDLength)) — \(clip(goal.title, to: maxTitleLength)). " +
-            "This holds even if another active goal also feels unresolved — an unanswered " +
-            "question is not a blocker on other goals, and re-asking a question with no new " +
-            "reply is never the cheapest correct action. Do not substitute a different goal " +
-            "based on your own read of priority or ledger order; the goal named here already " +
-            "accounts for both."
+        // A single multi-line literal, not a chain of `+`-joined ones: a long enough
+        // chain of String `+` operators (this one, with interpolation mixed in) made
+        // the type checker time out in a Release/whole-module build — a known Swift
+        // performance cliff, not a logic issue. One literal with `\` line-continuations
+        // type-checks as a single expression instead of N nested binary operators.
+        let hint = mostImportantDrivableGoal(ledger.goals).map { goal -> String in
+            let id = clip(goal.id, to: maxIDLength)
+            let title = clip(goal.title, to: maxTitleLength)
+            let text = """
+                If this tick's decision is drive, this is the ONLY goal to drive this tick: \
+                \(id) — \(title). This holds even if another active goal also feels unresolved \
+                — an unanswered question is not a blocker on other goals, and re-asking a \
+                question with no new reply is never the cheapest correct action. Do not \
+                substitute a different goal based on your own read of priority or ledger order; \
+                the goal named here already accounts for both.
+                """
+            return "\n\n" + text
         } ?? ""
         return """
         [heartbeat] Mission tick. Review the goals ledger against what actually happened \
