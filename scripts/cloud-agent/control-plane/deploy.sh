@@ -21,6 +21,8 @@ FUNCTION=fin-control-plane
 ROLE=fin-control-plane
 TABLE=fin-cloud-workers
 TOKENS_TABLE=fin-device-tokens
+USERS_TABLE=fin-users
+SESSIONS_TABLE=fin-sessions
 API_NAME=fin-control-plane
 RULE=fin-worker-sweep
 WAKE_RULE=fin-worker-wake
@@ -63,6 +65,36 @@ if ! aws dynamodb describe-table --table-name "$TOKENS_TABLE" >/dev/null 2>&1; t
     --billing-mode PAY_PER_REQUEST >/dev/null
   aws dynamodb wait table-exists --table-name "$TOKENS_TABLE"
   echo "==> Created DynamoDB table $TOKENS_TABLE (on-demand)"
+fi
+
+# Multi-tenancy identity. fin-users maps Apple's stable per-app-per-user `sub`
+# (the hash key — sign-in's only lookup direction) to our own userId, a fresh
+# uuid4 minted on first sign-in so Apple's own identifier never needs to leak
+# into S3 keys or EC2 tags. fin-sessions maps an opaque bearer token to a
+# userId, the same shape $TOKENS_TABLE already uses.
+if ! aws dynamodb describe-table --table-name "$USERS_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$USERS_TABLE" \
+    --attribute-definitions AttributeName=appleSub,AttributeType=S \
+    --key-schema AttributeName=appleSub,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$USERS_TABLE"
+  echo "==> Created DynamoDB table $USERS_TABLE (on-demand)"
+fi
+
+if ! aws dynamodb describe-table --table-name "$SESSIONS_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$SESSIONS_TABLE" \
+    --attribute-definitions AttributeName=token,AttributeType=S \
+    --key-schema AttributeName=token,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$SESSIONS_TABLE"
+  # TTL deletion is best-effort/lazy (up to ~48h late) — _authorize always
+  # checks expiresAt explicitly too, never trusts bare item-presence. This
+  # just keeps the table from growing unbounded.
+  aws dynamodb update-time-to-live --table-name "$SESSIONS_TABLE" \
+    --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
+  echo "==> Created DynamoDB table $SESSIONS_TABLE (on-demand, TTL on ttl)"
 fi
 
 # --- model-factory data lake -------------------------------------------------
@@ -177,6 +209,18 @@ cat > "$BUILD/policy.json" <<JSON
         "dynamodb:Scan"
       ],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$TOKENS_TABLE"
+    },
+    {
+      "Sid": "UserRecords",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$USERS_TABLE"
+    },
+    {
+      "Sid": "SessionRecords",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$SESSIONS_TABLE"
     },
     {
       "Sid": "AgentObjects",
@@ -404,6 +448,7 @@ while read -r ROUTE_KEY; do
     echo "==> Created route $ROUTE_KEY"
   fi
 done <<'ROUTES'
+POST /auth/apple
 POST /workers
 GET /workers
 DELETE /workers/{workerId}

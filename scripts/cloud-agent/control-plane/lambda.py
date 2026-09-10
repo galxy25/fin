@@ -36,12 +36,14 @@ regression in this file cannot leak a value through the API.
 """
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -99,6 +101,13 @@ TABLE_NAME = os.environ.get("FIN_CP_TABLE", "fin-cloud-workers")
 # workers (list_workers scans it whole), so a foreign item shape there would
 # leak into every worker listing. The token is the hash key — dedupe by design.
 DEVICE_TOKENS_TABLE_NAME = os.environ.get("FIN_CP_DEVICE_TOKENS_TABLE", "fin-device-tokens")
+# Multi-tenancy identity: fin-users maps Apple's stable per-app-per-user `sub`
+# to our own userId (a fresh uuid4 — Apple's identifier never needs to leak
+# into S3 keys, EC2 tags, or any other table); fin-sessions maps an opaque
+# bearer token to a userId, the same "the natural lookup key is the hash key"
+# shape DEVICE_TOKENS_TABLE already uses. See _authorize/_verify_apple_identity_token.
+USERS_TABLE_NAME = os.environ.get("FIN_CP_USERS_TABLE", "fin-users")
+SESSIONS_TABLE_NAME = os.environ.get("FIN_CP_SESSIONS_TABLE", "fin-sessions")
 SECURITY_GROUP_NAME = "fin-agent-egress"
 INSTANCE_PROFILE_NAME = "fin-agent-ssm"
 AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
@@ -175,6 +184,8 @@ SECRETS = _SESSION.client("secretsmanager")
 _DYNAMODB = _SESSION.resource("dynamodb")
 TABLE = _DYNAMODB.Table(TABLE_NAME)
 DEVICE_TOKENS_TABLE = _DYNAMODB.Table(DEVICE_TOKENS_TABLE_NAME)
+USERS_TABLE = _DYNAMODB.Table(USERS_TABLE_NAME)
+SESSIONS_TABLE = _DYNAMODB.Table(SESSIONS_TABLE_NAME)
 
 # Byte-for-byte the bootstrap from launch.sh; the two presigned URLs are the only
 # substitutions. Any change to launch.sh's user-data belongs here too —
@@ -335,14 +346,207 @@ def _header(event, name):
     return ""
 
 
+# --- multi-tenant identity -----------------------------------------------
+#
+# Every route used to run for one account under one static shared secret
+# (FIN_CP_TOKEN). Now `_authorize` resolves WHO is calling — attaching
+# `event["_userId"]` — and every route scopes its S3 keys and DynamoDB rows to
+# that id (Phase B). The legacy static token still works during the
+# transition (FIN_CP_LEGACY_USER_ID maps it to one real, already-minted
+# userId — never a separate "anonymous tenant" concept) so nothing already
+# running breaks while sign-in rolls out; removed once every client has a
+# real session (see the plan's Phase D).
+
+APPLE_ISSUER = "https://appleid.apple.com"
+APPLE_AUDIENCE = os.environ.get("APPLE_BUNDLE_ID", "dev.levischoen.fin")
+APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+APPLE_JWKS_CACHE_SECONDS = 24 * 3600
+APPLE_JWKS_REQUEST_TIMEOUT = 10
+# EMSA-PKCS1-v1_5's DigestInfo prefix for SHA-256 (RFC 8017 Appendix A.2.4/
+# RFC 3447) — a fixed constant for every SHA-256 PKCS1v1.5 signature, not
+# Apple-specific.
+_SHA256_DIGESTINFO_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+_SESSION_LIFETIME_SECONDS = 365 * 24 * 3600
+
+_apple_jwks_cache = {"keys": None, "fetched_at": 0.0}
+
+
+def _b64url_decode(segment):
+    padding = "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + padding)
+
+
+def _apple_jwks(now_epoch=None, force_refresh=False):
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    cached = _apple_jwks_cache["keys"]
+    if not force_refresh and cached is not None and now_epoch - _apple_jwks_cache["fetched_at"] < APPLE_JWKS_CACHE_SECONDS:
+        return cached
+    import httpx  # vendored by deploy.sh
+    response = httpx.get(APPLE_JWKS_URL, timeout=APPLE_JWKS_REQUEST_TIMEOUT)
+    response.raise_for_status()
+    keys = response.json().get("keys") or []
+    _apple_jwks_cache.update(keys=keys, fetched_at=now_epoch)
+    return keys
+
+
+def _rsa_pkcs1v15_verify(message, signature, n, e):
+    """RFC 8017 EMSA-PKCS1-v1_5 verify for RS256: PKCS1v1.5 is modular
+    exponentiation (`pow`, stdlib, no library — RSA's public-key operation is
+    literally `pow(signature, e, n)`) against a fixed padding+DigestInfo
+    layout. `message` is the exact bytes that were signed; `signature`/`n`/`e`
+    are big-endian ints. Returns bool, never raises — a verification failure
+    is data, not an error, so a malformed signature can't become a 500."""
+    key_bytes = (n.bit_length() + 7) // 8
+    if not (0 <= signature < n):
+        return False
+    padded = pow(signature, e, n).to_bytes(key_bytes, "big")
+    expected_t = _SHA256_DIGESTINFO_PREFIX + hashlib.sha256(message).digest()
+    ps_len = key_bytes - 3 - len(expected_t)
+    if ps_len < 8:
+        return False
+    expected = b"\x00\x01" + b"\xff" * ps_len + b"\x00" + expected_t
+    return hmac.compare_digest(padded, expected)
+
+
+def _verify_apple_identity_token(identity_token, now=None):
+    """Verifies a Sign in with Apple identity token and returns its `sub`
+    claim (Apple's stable per-app-per-user id). Raises ApiError on any
+    failure — malformed token, unknown signing key, bad signature, wrong
+    issuer/audience, expiry — never returns a claim from an unverified token."""
+    now = _now() if now is None else now
+    parts = (identity_token or "").split(".")
+    if len(parts) != 3:
+        raise ApiError(401, "malformed identity token")
+    header_b64, payload_b64, signature_b64 = parts
+    try:
+        header = json.loads(_b64url_decode(header_b64))
+        payload = json.loads(_b64url_decode(payload_b64))
+        signature = int.from_bytes(_b64url_decode(signature_b64), "big")
+    except (ValueError, TypeError, binascii.Error):
+        raise ApiError(401, "malformed identity token")
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise ApiError(401, "malformed identity token")
+
+    if header.get("alg") != "RS256":
+        raise ApiError(401, "unsupported identity token algorithm")
+    kid = header.get("kid")
+    matching = next((k for k in _apple_jwks() if k.get("kid") == kid), None)
+    if matching is None:
+        # Apple rotates signing keys; one stale cached fetch shouldn't wedge
+        # every sign-in until the next natural refresh.
+        matching = next((k for k in _apple_jwks(force_refresh=True) if k.get("kid") == kid), None)
+    if matching is None:
+        raise ApiError(401, "unknown identity token signing key")
+
+    try:
+        n = int.from_bytes(_b64url_decode(matching["n"]), "big")
+        e = int.from_bytes(_b64url_decode(matching["e"]), "big")
+    except (ValueError, TypeError, KeyError, binascii.Error):
+        raise ApiError(401, "malformed identity token signing key")
+    message = "{}.{}".format(header_b64, payload_b64).encode("ascii")
+    if not _rsa_pkcs1v15_verify(message, signature, n, e):
+        raise ApiError(401, "identity token signature is invalid")
+
+    if payload.get("iss") != APPLE_ISSUER:
+        raise ApiError(401, "identity token has the wrong issuer")
+    if payload.get("aud") != APPLE_AUDIENCE:
+        raise ApiError(401, "identity token has the wrong audience")
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)) or now.timestamp() >= exp:
+        raise ApiError(401, "identity token has expired")
+    sub = payload.get("sub")
+    if not isinstance(sub, str) or not sub:
+        raise ApiError(401, "identity token has no subject")
+    return sub
+
+
+def _get_or_create_user(apple_sub):
+    """fin-users is keyed by appleSub (the only lookup direction sign-in
+    needs); userId is a fresh uuid4 so Apple's own identifier never has to
+    appear in an S3 key or an EC2 tag."""
+    existing = USERS_TABLE.get_item(Key={"appleSub": apple_sub}).get("Item")
+    now = _iso(_now())
+    if existing:
+        USERS_TABLE.update_item(
+            Key={"appleSub": apple_sub},
+            UpdateExpression="SET lastSeenAt = :now",
+            ExpressionAttributeValues={":now": now},
+        )
+        return existing["userId"]
+    user_id = str(uuid.uuid4())
+    USERS_TABLE.put_item(Item={
+        "appleSub": apple_sub, "userId": user_id, "createdAt": now, "lastSeenAt": now,
+    })
+    return user_id
+
+
+def _create_session(user_id):
+    token = secrets.token_hex(32)
+    now = _now()
+    SESSIONS_TABLE.put_item(Item={
+        "token": token,
+        "userId": user_id,
+        "createdAt": _iso(now),
+        "lastSeenAt": _iso(now),
+        "expiresAt": _iso(now + timedelta(seconds=_SESSION_LIFETIME_SECONDS)),
+        # DynamoDB TTL wants epoch seconds; deletion is lazy (up to ~48h late)
+        # so _authorize below still checks expiresAt explicitly — this
+        # attribute only bounds how long an unused row lingers.
+        "ttl": int((now + timedelta(seconds=_SESSION_LIFETIME_SECONDS)).timestamp()),
+    })
+    return token
+
+
+def _read_session(token, now=None):
+    """None for a missing, malformed, or expired session — the caller (only
+    _authorize) turns that into a 401; a lazily-undeleted TTL row past its own
+    expiresAt is treated exactly like a missing one."""
+    now = _now() if now is None else now
+    item = SESSIONS_TABLE.get_item(Key={"token": token}).get("Item")
+    if not item:
+        return None
+    expires_at = _parse_iso(item.get("expiresAt"))
+    if expires_at is None or now >= expires_at:
+        return None
+    return item
+
+
+def auth_apple(event):
+    """POST /auth/apple — {"identityToken"}. The one route that doesn't need
+    a prior bearer token; it's how one is obtained. Never logs the identity
+    token or the minted session token."""
+    body = _body(event)
+    identity_token = body.get("identityToken")
+    if not isinstance(identity_token, str) or not identity_token:
+        raise ApiError(400, "identityToken must be a non-empty string")
+    apple_sub = _verify_apple_identity_token(identity_token)
+    user_id = _get_or_create_user(apple_sub)
+    session_token = _create_session(user_id)
+    return _response(200, {"token": session_token})
+
+
 def _authorize(event):
-    expected = os.environ.get("FIN_CP_TOKEN") or ""
-    if not expected:
-        raise ApiError(500, "control plane token is not configured")
     presented = _header(event, "authorization").strip()
     scheme, _, token = presented.partition(" ")
-    if scheme.lower() != "bearer" or not hmac.compare_digest(token.strip().encode(), expected.encode()):
+    token = token.strip()
+    if scheme.lower() != "bearer" or not token:
         raise ApiError(401, "unauthorized")
+
+    legacy_token = os.environ.get("FIN_CP_TOKEN") or ""
+    legacy_user_id = os.environ.get("FIN_CP_LEGACY_USER_ID") or ""
+    if legacy_token and legacy_user_id and hmac.compare_digest(token.encode(), legacy_token.encode()):
+        event["_userId"] = legacy_user_id
+        return
+
+    session = _read_session(token)
+    if session is None:
+        raise ApiError(401, "unauthorized")
+    event["_userId"] = session["userId"]
+    SESSIONS_TABLE.update_item(
+        Key={"token": token},
+        UpdateExpression="SET lastSeenAt = :now",
+        ExpressionAttributeValues={":now": _iso(_now())},
+    )
 
 
 def _body(event):
@@ -2191,7 +2395,17 @@ def lambda_handler(event, _context=None):
     if event.get("source") == "wake-schedule":
         return wake(event)
 
+    http = (event.get("requestContext") or {}).get("http") or {}
+    method = str(http.get("method") or "").upper()
+    path = str(event.get("rawPath") or http.get("path") or "/").rstrip("/") or "/"
+    is_auth_route = method == "POST" and [p for p in path.split("/") if p] == ["auth", "apple"]
+
     try:
+        if is_auth_route:
+            # The one route with no bearer token to check yet — it's how one
+            # is obtained. Apple's own identity-token verification IS this
+            # route's authorization.
+            return auth_apple(event)
         _authorize(event)
         return _route(event)
     except ApiError as exc:
