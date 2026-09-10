@@ -2254,6 +2254,55 @@ def _mark_notified(user_id, agent, inbox_last_modified):
     )
 
 
+def _merged_last_turn_at(candidates):
+    """Pure: the most recent of any last_turn_at values known for an agent, or
+    None if none are known. Split out from `_known_last_turn_ats` so the
+    actual decision math (which timestamp wins) is unit-testable without S3.
+
+    Why "merge" instead of "the" one status: an agent can be answered by
+    MULTIPLE kinds of site — a cloud-launched EC2 worker (writes the legacy
+    flat STATUS_KEY, see `_provision_config`) or a resident non-cloud site
+    like the owner's Mac daemon (writes `fin/sites/{agent}/{site8}/
+    status.json`, see scripts/mac-fin-agentd/provision-config.sh). The wake
+    sweep must not conclude "nobody has this" just because the source IT
+    happened to check is stale or missing — a live incident (2026-09-10)
+    showed the sweep re-launching a redundant cloud worker for "Fin" every
+    ~10-20 minutes for 10+ hours because it only ever read the flat key
+    (frozen since 04:10, an old device), never noticing the resident Mac site
+    had already answered everything as recently as its own last real turn."""
+    known = [c for c in candidates if c is not None]
+    return max(known) if known else None
+
+
+def _known_last_turn_ats(user_id, agent):
+    """I/O: every last_turn_at this control plane can currently see for
+    (user_id, agent) — the legacy flat status a cloud-launched worker writes
+    (`_read_status`/`STATUS_KEY`), plus every per-site status document under
+    `fin/sites/{agent}/*/status.json` (a resident Mac daemon today; any
+    future non-cloud site the same way). Not unit tested directly — an I/O
+    wrapper verified by hand-curl like every other AWS-touching function in
+    this file (see module docstring); `_merged_last_turn_at` is where the
+    actual decision logic lives and IS unit tested."""
+    values = []
+    legacy = _read_status(user_id, agent)
+    if legacy:
+        values.append(_parse_iso(legacy.get("last_turn_at")))
+    prefix = "users/{}/fin/sites/{}/".format(user_id, _key_slug(agent))
+    paginator = S3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if not obj["Key"].endswith("/status.json"):
+                continue
+            try:
+                raw = S3.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read()
+                site_status = json.loads(raw)
+            except (ClientError, ValueError):
+                continue
+            if isinstance(site_status, dict):
+                values.append(_parse_iso(site_status.get("last_turn_at")))
+    return values
+
+
 def _notify_stale_inbox(user_id, agent, detail):
     synthetic_event = {"_userId": user_id, "body": json.dumps({
         "title": "{} has an unanswered message".format(agent),
@@ -2281,7 +2330,8 @@ def wake(_event=None):
             slug = _key_slug(agent)
             has_live_worker = (user_id, slug) in live_worker_keys
             lock = _read_lock(INBOX_LOCK_KEY.format(user=user_id, agent=slug))
-            status = _read_status(user_id, agent)
+            last_turn_at = _merged_last_turn_at(_known_last_turn_ats(user_id, agent))
+            status = {"last_turn_at": _iso(last_turn_at)} if last_turn_at else None
             action, detail = _wake_decision(has_live_worker, lock, last_modified, status, now)
             if action == "wake":
                 result = _launch_worker(

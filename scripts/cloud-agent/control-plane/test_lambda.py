@@ -129,6 +129,43 @@ class WakeDecisionTests(unittest.TestCase):
         self.assertIsNone(action)
 
 
+class MergedLastTurnAtTests(unittest.TestCase):
+    """`_merged_last_turn_at` is the fix for a live incident (2026-09-10): the
+    wake sweep re-launched a redundant cloud worker for "Fin" every ~10-20
+    minutes for 10+ hours because it only ever consulted the legacy flat
+    status a cloud-launched worker writes, never the resident Mac daemon's
+    own per-site status document — so a fully-answered agent looked
+    permanently uncovered. This is the pure "which timestamp wins" half of
+    that fix; `_known_last_turn_ats` (the S3-listing half that gathers the
+    candidates) is an I/O wrapper verified by hand-curl, per this file's
+    module docstring."""
+
+    def test_no_candidates_is_none(self):
+        self.assertIsNone(lam._merged_last_turn_at([]))
+
+    def test_all_none_is_none(self):
+        self.assertIsNone(lam._merged_last_turn_at([None, None]))
+
+    def test_skips_nones_and_returns_the_only_real_value(self):
+        t = NOW - timedelta(minutes=5)
+        self.assertEqual(lam._merged_last_turn_at([None, t, None]), t)
+
+    def test_a_resident_sites_more_recent_turn_wins_over_a_stale_legacy_status(self):
+        # Exactly the live bug: the legacy flat status (an old, dead cloud
+        # worker) is frozen hours in the past; the resident Mac site's own
+        # status is recent. The merge must surface the recent one.
+        stale_legacy = NOW - timedelta(hours=10)
+        fresh_site = NOW - timedelta(minutes=1)
+        self.assertEqual(lam._merged_last_turn_at([stale_legacy, fresh_site]), fresh_site)
+
+    def test_multiple_sites_take_the_most_recent(self):
+        older_site = NOW - timedelta(minutes=30)
+        newer_site = NOW - timedelta(minutes=2)
+        self.assertEqual(
+            lam._merged_last_turn_at([older_site, newer_site, None]), newer_site
+        )
+
+
 class AlreadyNotifiedTests(unittest.TestCase):
     """`_already_notified` reads via `_read_lock` (I/O) so it isn't pure, but
     its comparison logic is worth pinning directly against a stubbed reader —
