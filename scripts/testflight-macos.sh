@@ -66,10 +66,12 @@ rm -rf "$ARCHIVE" "$EXPORT_DIR"
 # Cloud signing via the ASC key: -allowProvisioningUpdates mints the Apple Distribution
 # cert + Mac App Store provisioning profile (the key must be Admin role), so no Apple ID
 # needs to be signed into Xcode (headless).
-# ARCHS=arm64: the default universal archive dies compiling Wax's MetalANNS for
-# x86_64 (Float16 storage types don't exist on Intel Apple platforms). Fin's
-# macOS audience is Apple Silicon; an arm64-only archive is fully App
-# Store-valid and sidesteps the whole slice.
+# ARCHS=arm64: originally forced because Wax's MetalANNS dependency didn't
+# compile for x86_64 (Float16 storage types don't exist on Intel Apple
+# platforms) — Wax was removed 2026-09-11, so that specific reason no longer
+# applies, but this hasn't been re-tested against a universal archive. Fin's
+# macOS audience is Apple Silicon anyway; an arm64-only archive is fully App
+# Store-valid and sidesteps the question entirely.
 xcodebuild \
   -project fin.xcodeproj \
   -scheme "$SCHEME" \

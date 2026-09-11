@@ -7,8 +7,8 @@ import Foundation
 /// exists on exactly one machine — syncing the file (the CloudKit store, the iCloud
 /// Drive mirror) would teach every other device to route terminal work into sessions
 /// it cannot reach. Application Support is the app's convention for exactly this kind
-/// of per-device file (see `VectorMemoryIndexManager.defaultDirectory`); the basename
-/// is shared with fin-agentd so one schema pointer covers both readers.
+/// of per-device file (see `GoalsLedgerLocation`); the basename is shared with
+/// fin-agentd so one schema pointer covers both readers.
 ///
 /// Nothing in the app creates this file. Absent → `RegistryDocument.loadIfPresent`
 /// returns nil and the system prompt stays byte-identical to a build without routing;

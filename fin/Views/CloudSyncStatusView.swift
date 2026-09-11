@@ -38,9 +38,8 @@ final class CloudSyncActivityMonitor: ObservableObject {
     /// CloudKit sync error was visible only to whoever happened to have the iCloud
     /// Sync screen open at that moment, and nowhere else: not the agent log, not
     /// the iCloud mirror, not remotely debuggable at all. `FinApp` wires this to
-    /// `SessionManager.recordLifecycleEvent`, matching `FeedbackService.audit` and
-    /// `AgentMemoryIndexRegistry.audit`. Defaults to os_log so nothing is silently
-    /// dropped before that wiring runs.
+    /// `SessionManager.recordLifecycleEvent`, matching `FeedbackService.audit`.
+    /// Defaults to os_log so nothing is silently dropped before that wiring runs.
     var audit: @MainActor (String) -> Void = {
         CloudSyncActivityMonitor.logger.warning("\($0, privacy: .public)")
     }

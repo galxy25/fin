@@ -23,16 +23,15 @@ review notes, and feature priorities should reinforce it, not dilute it.
 - Project is **XcodeGen-generated**: edit `project.yml`, then `xcodegen
   generate`. Never hand-edit `fin.xcodeproj`.
 - Multiplatform target `fin` (iOS 17+/macOS 14+/visionOS) + separate `fin-tv`
-  target (vendored headless SwiftTerm engine). macOS builds are
-  **arm64-only** (Wax→MetalANNS has no x86_64); use
-  `-destination 'platform=macOS,arch=arm64'`, not generic.
+  target (vendored headless SwiftTerm engine). macOS builds are configured
+  **arm64-only** in `scripts/testflight-macos.sh`; use
+  `-destination 'platform=macOS,arch=arm64'`, not generic. (Origin: Wax/
+  MetalANNS's Float16 code didn't compile for x86_64 — Wax was removed
+  2026-09-11, so universal may be viable again, but that hasn't been
+  re-verified; don't assume it without testing.)
 - Tracked filename is `fin/finApp.swift` (lowercase f) — case-insensitive
   filesystem will happily read `FinApp.swift`, but `git add` needs the real
   path.
-- Upstream Wax re-tagged `0.1.27` (revision `f6c7e1e` vs the recorded
-  `0d837cf`), so a FRESH SPM resolve fails with a fingerprint mismatch.
-  Workaround: seed the generated project's `Package.resolved` from an
-  existing working tree (which pins the recorded revision) before building.
 - TestFlight: `scripts/testflight.sh` (iOS), `-tvos.sh`, `-macos.sh`,
   `-visionos.sh`. Build numbers auto-increment from ASC. See the
   `apple-publish` skill for signing/keychain details.

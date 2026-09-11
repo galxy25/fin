@@ -160,52 +160,15 @@ struct FinApp: App {
             }
         }
 
-        // Semantic recall (PROTOTYPE, vector-recall branch) rides on Wax's built-in
-        // on-device embedder, which needs iOS 18/macOS 15; below that the store runs
-        // keyword-only exactly as before — the gate only excludes iOS 17. visionOS is
-        // keyword-only too, but for a different reason: Wax doesn't compile there
-        // (see project.yml), so the canImport branch vanishes from that build.
-        #if canImport(Wax)
-        if #available(iOS 18.0, macOS 15.0, *) {
-            let indexer = VectorMemoryIndexManager()
-            let memoryStore = MemoryStore(context: context, indexer: indexer)
-            manager.memoryAccess = memoryStore.access
-            // Deleting an agent deletes its plaintext index files outright — the
-            // lazy self-heal can never fire for an agent that no longer exists.
-            AgentMemoryIndexRegistry.destroyIndex = { agentID in
-                Task { await indexer.destroyIndex(agentID: agentID) }
-            }
-            // Index-level audit events (bloat recovery) ride the lifecycle-audit
-            // machinery so they reach the iCloud mirror — the field bloat defect
-            // was only diagnosable remotely.
-            AgentMemoryIndexRegistry.audit = { [weak manager] _, line in
-                manager?.recordLifecycleEvent(line)
-            }
-            // Launch-time consistency pass: remote (CloudKit-synced) deletions have
-            // no per-record hook, so shortly after launch compare every agent's
-            // index against SwiftData truth (cheap; full rebuild only on
-            // divergence), and sweep index files for agents that no longer exist
-            // (deleted on another device). Erasure SLA — see VectorMemoryIndex.
-            Task { @MainActor in
-                // A beat after launch: off the startup critical path, and late
-                // enough that CloudKit's first import has usually landed, so the
-                // pass compares against post-sync truth.
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                let agentIDs = Set((((try? context.fetch(FetchDescriptor<Agent>())) ?? []).map(\.id)))
-                await indexer.pruneOrphanedIndexes(keeping: agentIDs)
-                for agentID in agentIDs {
-                    await indexer.ensureConsistent(
-                        agentID: agentID,
-                        expected: memoryStore.indexableEpisodicRecords(agentID: agentID)
-                    )
-                }
-            }
-        } else {
-            manager.memoryAccess = MemoryStore(context: context).access
-        }
-        #else
+        // Semantic recall: keyword-only for now. The Wax-backed on-device vector
+        // index was removed 2026-09-11 (see VectorMemoryIndex.swift's header) —
+        // dragging in Wax's whole broker/MCP-server module for its embedded vector
+        // store broke both the macOS Release build and iOS compilation, for two
+        // unrelated reasons neither of which had anything to do with the one API
+        // surface Fin actually used. Semantic recall is being rebuilt on the cloud
+        // control plane instead; `AgentMemoryIndexing` (VectorMemoryIndex.swift) is
+        // the seam a future indexer plugs into without touching this call site.
         manager.memoryAccess = MemoryStore(context: context).access
-        #endif
 
         // Session routing, layered onto whichever access the branches above installed:
         // the registry is a plain machine-scoped file (see RoutingRegistryLocation for

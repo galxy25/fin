@@ -26,18 +26,6 @@ packages:
   SwiftCrypto:
     url: https://github.com/apple/swift-crypto.git
     from: 3.12.3
-  Wax:
-    url: https://github.com/christopherkarani/Wax.git
-    # Exact pin, three constraints at once (verified against upstream 2026-08-28):
-    # - 0.2.x does not exist upstream (newest library tag is 0.1.35).
-    # - 0.1.28+ broke iOS: broker code references Foundation.Process in an
-    #   unguarded signature (terminateLaunchedBroker), which iOS lacks.
-    # - `from:` would auto-resolve onto those broken releases; exactVersion holds
-    #   the last tag whose broker guards keep iOS compiling.
-    # visionOS never compiles (the broker's platform guard omits it entirely), so
-    # the dependency below is destination-filtered and Wax callers are wrapped in
-    # `#if canImport(Wax)`.
-    exactVersion: 0.1.27
 targets:
   fin:
     type: application
@@ -58,10 +46,6 @@ targets:
         product: NIO
       - package: SwiftCrypto
         product: Crypto
-      # visionOS filtered out: no Wax release compiles there (see the package pin
-      # comment). Sources guard with `#if canImport(Wax)`; visionOS runs keyword-only.
-      - package: Wax
-        destinationFilters: [iOS, macOS]
     info:
       path: Generated/Info.plist
       properties:
