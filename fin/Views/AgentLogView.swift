@@ -410,12 +410,25 @@ private struct TraceRow: View {
     let isLast: Bool
 
     @State private var isExpanded = false
+    @State private var isArgumentsExpanded = false
 
     /// Long payloads (tool output, reasoning traces) start collapsed so the shape of a
     /// trajectory stays readable; short ones are shown whole since hiding them would add
     /// a tap for nothing.
     private var isCollapsible: Bool {
         entry.text.count > 180 || entry.text.contains("\n")
+    }
+
+    /// `entry.text` for a tool-call row is a hand-written one-line summary (e.g.
+    /// "remember: some title"), not the real payload — the model's actual raw JSON
+    /// arguments live in `toolArguments` and are shown separately, behind their own
+    /// disclosure, so drilling into a step's exact input doesn't depend on the summary
+    /// string having been worth writing for every tool.
+    private var arguments: String? {
+        guard entry.kind == .toolCall, let raw = entry.toolArguments, !raw.isEmpty, raw != "{}" else {
+            return nil
+        }
+        return raw
     }
 
     private var tint: Color {
@@ -506,6 +519,30 @@ private struct TraceRow: View {
                 isCode ? Color.codeBackground : Color.clear,
                 in: RoundedRectangle(cornerRadius: 6)
             )
+        if let arguments {
+            argumentsDisclosure(arguments)
+        }
+    }
+
+    /// The tool-result half of a step (`entry.text` for a `.toolResult` row) is already
+    /// the model's full, real output — no summarizing happens there, so it's shown
+    /// whole above with no separate disclosure needed. This is the missing other half:
+    /// the exact input the model sent, pretty-printed and collapsed by default since
+    /// arguments can run long (e.g. a full file write).
+    private func argumentsDisclosure(_ raw: String) -> some View {
+        DisclosureGroup(isExpanded: $isArgumentsExpanded) {
+            Text(ToolCallFormatting.prettyPrinted(raw))
+                .font(.system(.caption2, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(Color.codeBackground, in: RoundedRectangle(cornerRadius: 6))
+        } label: {
+            Text("Arguments")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.top, 2)
     }
 
     private var metricsLine: String {

@@ -4,6 +4,15 @@ import SwiftData
 struct AgentListView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Agent.createdAt) private var agents: [Agent]
+    #if os(macOS)
+    @Environment(\.openWindow) private var openWindow
+    // Reaching this list at all means either the standalone `.home` window or a
+    // sheet presented over a terminal session (`ControlStripView`'s server-rack
+    // button) — dismissing after opening the hub window matches ServerListView's own
+    // "connect, then get out of the way" behavior for the sheet case, and is a no-op
+    // when there's nothing presented to dismiss (the `.home` window case).
+    @Environment(\.dismiss) private var dismiss
+    #endif
 
     var body: some View {
         List {
@@ -11,11 +20,24 @@ struct AgentListView: View {
                 // The row's single tap target is the per-agent hub — settings, logs,
                 // memory, remote conversation, and artifacts are all one tap away from
                 // there instead of behind a leading-swipe secret.
+                #if os(macOS)
+                // A NavigationLink push here would still work, but a Mac has room for
+                // the hub to be its own resizable window beside the terminal session —
+                // see AgentHubWindowView.
+                Button {
+                    openWindow(id: FinScene.agentHub, value: agent.id)
+                    dismiss()
+                } label: {
+                    AgentRow(agent: agent)
+                }
+                .buttonStyle(.plain)
+                #else
                 NavigationLink {
                     AgentHubView(agent: agent)
                 } label: {
                     AgentRow(agent: agent)
                 }
+                #endif
             }
             .onDelete { offsets in
                 for index in offsets {

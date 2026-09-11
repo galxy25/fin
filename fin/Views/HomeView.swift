@@ -101,6 +101,20 @@ struct HomeView: View {
                 RemoteKeyboardView()
             }
             #endif
+            #if os(macOS)
+            // Unlike iOS, a macOS `.sheet` sizes itself to its content's IDEAL size
+            // rather than filling the screen — and a bare `List` with no frame
+            // constraint reports a near-zero ideal height. Without this, presenting
+            // HomeView as a sheet (ControlStripView's server-rack button, mid-session)
+            // collapsed to just tall enough for the segmented Picker, leaving the
+            // server/agent list rendered outside the visible window: nothing under
+            // the tab bar looked clickable, though the rows were really just
+            // off-frame. The root `.home` route (a real window, not a sheet) mostly
+            // dodged this because a resized window persists — but a fresh window
+            // starts from the same undersized ideal layout, so this also gives that
+            // route a sane starting size.
+            .frame(minWidth: 480, minHeight: 560)
+            #endif
         }
     }
 }

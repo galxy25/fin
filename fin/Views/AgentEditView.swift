@@ -14,6 +14,18 @@ struct AgentEditView: View {
     @State private var shareRatings = FeedbackSettings.shareRatings()
     @State private var shareActivity = FeedbackSettings.shareActivity()
     @State private var showsFeedbackComposer = false
+    #if os(macOS)
+    // The macOS agent hub already gives Settings its own sidebar destination (no more
+    // scrolling past Logs/Memory/Artifacts to get here), so this form's OWN internal
+    // clutter is what's worth collapsing now: the settings someone sets once
+    // (device-wide supervision, privacy opt-ins) or rarely revisits (numeric tuning)
+    // start closed, same DisclosureGroup-in-a-Section idiom ServerEditView already
+    // uses for its own "Advanced" section. iOS/visionOS keep every section open, as
+    // today — this is a Mac-only quiet-down, not a behavior change on other platforms.
+    @State private var isLimitsExpanded = false
+    @State private var isRemoteSupervisionExpanded = false
+    @State private var isHelpImproveExpanded = false
+    #endif
 
     private enum ProbeState: Equatable {
         case idle
@@ -34,11 +46,34 @@ struct AgentEditView: View {
             }
             hostingSection
             modeSection
+            #if os(macOS)
+            collapsibleSection("Limits", isExpanded: $isLimitsExpanded, footer: limitsFooter) {
+                limitsFields
+            }
+            collapsibleSection(
+                "Remote Supervision", isExpanded: $isRemoteSupervisionExpanded, footer: remoteSupervisionFooter
+            ) {
+                remoteSupervisionFields
+            }
+            collapsibleSection(
+                "Help Improve Fin", isExpanded: $isHelpImproveExpanded, footer: helpImproveFooter
+            ) {
+                helpImproveFields
+            }
+            .sheet(isPresented: $showsFeedbackComposer) {
+                FeedbackComposerView()
+            }
+            #else
             limitsSection
             remoteSupervisionSection
             helpImproveSection
+            #endif
             connectedServicesSection
+            #if os(iOS) || os(visionOS)
+            // macOS reaches this from the hub window's own sidebar item instead —
+            // repeating it here would just be a second path to the same screen.
             finKeySection
+            #endif
             promptSection
         }
         .navigationTitle(agent.name.isEmpty ? "Agent" : agent.name)
@@ -302,6 +337,16 @@ struct AgentEditView: View {
 
     private var limitsSection: some View {
         Section {
+            limitsFields
+        } header: {
+            Text("Limits")
+        } footer: {
+            Text(limitsFooter)
+        }
+    }
+
+    private var limitsFields: some View {
+        Group {
             LabeledStepper(
                 title: "Context window",
                 value: $agent.contextWindowTokens,
@@ -333,17 +378,17 @@ struct AgentEditView: View {
                 step: 7
             ) { "\($0) days" }
             temperatureRow
-        } header: {
-            Text("Limits")
-        } footer: {
-            Text("Older turns are trimmed automatically as the conversation approaches "
-                + "the context window. Heartbeat lets an auto-mode agent check a "
-                + "long-running task on its own: while monitoring is armed in the "
-                + "console, it reads the terminal at this interval, sends input if the "
-                + "task is waiting, and stops when the task is complete. This interval "
-                + "is the agent's monitoring cadence (default 60s) unless the model "
-                + "picks its own; Off disables the heartbeat and stays off.")
         }
+    }
+
+    private var limitsFooter: String {
+        "Older turns are trimmed automatically as the conversation approaches "
+            + "the context window. Heartbeat lets an auto-mode agent check a "
+            + "long-running task on its own: while monitoring is armed in the "
+            + "console, it reads the terminal at this interval, sends input if the "
+            + "task is waiting, and stops when the task is complete. This interval "
+            + "is the agent's monitoring cadence (default 60s) unless the model "
+            + "picks its own; Off disables the heartbeat and stays off."
     }
 
     private var temperatureRow: some View {
@@ -363,6 +408,16 @@ struct AgentEditView: View {
 
     private var remoteSupervisionSection: some View {
         Section {
+            remoteSupervisionFields
+        } header: {
+            Text("Remote Supervision")
+        } footer: {
+            Text(remoteSupervisionFooter)
+        }
+    }
+
+    private var remoteSupervisionFields: some View {
+        Group {
             Toggle("Enabled", isOn: $remoteEnabled)
                 .onChange(of: remoteEnabled) { _, newValue in
                     RemoteSupervisionConfig.setEnabled(newValue)
@@ -380,15 +435,15 @@ struct AgentEditView: View {
                 save: RemoteSupervisionConfig.setStatusURL
             )
             LabeledContent("Last poll", value: lastPollDescription)
-        } header: {
-            Text("Remote Supervision")
-        } footer: {
-            Text("Device-wide — these settings apply to every agent on this device "
-                + "and never sync. A supervisor process leaves directives at, and "
-                + "reads status from, presigned S3 URLs. URLs are shown truncated "
-                + "because the link itself is the credential; paste a new one to "
-                + "replace it.")
         }
+    }
+
+    private var remoteSupervisionFooter: String {
+        "Device-wide — these settings apply to every agent on this device "
+            + "and never sync. A supervisor process leaves directives at, and "
+            + "reads status from, presigned S3 URLs. URLs are shown truncated "
+            + "because the link itself is the credential; paste a new one to "
+            + "replace it."
     }
 
     /// The stored URL is never rendered in full — its query string is a bearer
@@ -435,6 +490,19 @@ struct AgentEditView: View {
     /// the privacy policy here.
     private var helpImproveSection: some View {
         Section {
+            helpImproveFields
+        } header: {
+            Text("Help Improve Fin")
+        } footer: {
+            Text(helpImproveFooter)
+        }
+        .sheet(isPresented: $showsFeedbackComposer) {
+            FeedbackComposerView()
+        }
+    }
+
+    private var helpImproveFields: some View {
+        Group {
             Toggle("Share Ratings & Comments", isOn: $shareRatings)
                 .onChange(of: shareRatings) { _, newValue in
                     FeedbackSettings.setShareRatings(newValue)
@@ -446,26 +514,23 @@ struct AgentEditView: View {
             Button("Send Feedback…") {
                 showsFeedbackComposer = true
             }
-        } header: {
-            Text("Help Improve Fin")
-        } footer: {
-            Text("Both are off by default — nothing leaves this device until you turn "
-                + "one on, and these settings apply device-wide and never sync. "
-                + "Share Ratings & Comments sends only what you write in a feedback "
-                + "card: thumbs up or down, your comment, the app version, and the "
-                + "platform. Comments are scrubbed of secret-shaped text before "
-                + "they're stored. Share Redacted Activity Summaries sends counts "
-                + "about finished agent conversations — turns, tool calls per tool, "
-                + "duration, outcome, transcript length, model, and hosting mode — "
-                + "plus a random conversation ID, the app version, the platform, "
-                + "and a timestamp. "
-                + "Your messages and terminal output never leave the device: terminal "
-                + "content is redacted before anything is stored, and summaries are "
-                + "built from counts alone, quoting none of it.")
         }
-        .sheet(isPresented: $showsFeedbackComposer) {
-            FeedbackComposerView()
-        }
+    }
+
+    private var helpImproveFooter: String {
+        "Both are off by default — nothing leaves this device until you turn "
+            + "one on, and these settings apply device-wide and never sync. "
+            + "Share Ratings & Comments sends only what you write in a feedback "
+            + "card: thumbs up or down, your comment, the app version, and the "
+            + "platform. Comments are scrubbed of secret-shaped text before "
+            + "they're stored. Share Redacted Activity Summaries sends counts "
+            + "about finished agent conversations — turns, tool calls per tool, "
+            + "duration, outcome, transcript length, model, and hosting mode — "
+            + "plus a random conversation ID, the app version, the platform, "
+            + "and a timestamp. "
+            + "Your messages and terminal output never leave the device: terminal "
+            + "content is redacted before anything is stored, and summaries are "
+            + "built from counts alone, quoting none of it."
     }
 
     // MARK: - Connected Services
@@ -507,6 +572,33 @@ struct AgentEditView: View {
                 + "cloud worker.")
         }
     }
+
+    #if os(macOS)
+    // MARK: - Collapsible section (macOS)
+
+    /// Same `Section { DisclosureGroup(...) }` idiom `ServerEditView` already uses for
+    /// its own "Advanced" group — the footer text moves inside the disclosure (a
+    /// `Section`'s own footer wouldn't hide with it) so it reads right under the
+    /// fields it explains once expanded, not as a permanently-visible caption.
+    private func collapsibleSection<Content: View>(
+        _ title: String,
+        isExpanded: Binding<Bool>,
+        footer: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Section {
+            DisclosureGroup(title, isExpanded: isExpanded) {
+                VStack(alignment: .leading, spacing: 12) {
+                    content()
+                    Text(footer)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 4)
+            }
+        }
+    }
+    #endif
 
     // MARK: - Prompt
 

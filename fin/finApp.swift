@@ -353,5 +353,31 @@ struct FinApp: App {
                 .preferredColorScheme(.dark)
         }
         .modelContainer(modelContainer)
+        #if os(macOS)
+        // The agent hub (settings, logs/traces, memory, remote, artifacts, key) opens
+        // as its own resizable window on macOS instead of pushing over the terminal —
+        // see AgentHubWindowView. Keyed by Agent.id (a plain UUID) rather than
+        // PersistentIdentifier so the value stays trivially Codable across the
+        // openWindow(id:value:) boundary; the window resolves the live SwiftData model
+        // itself. `.modelContainer` is reattached here deliberately — passing the SAME
+        // container instance to a second scene doesn't create a second store, it's the
+        // documented way to share one SwiftData store across multiple macOS windows.
+        WindowGroup(id: FinScene.agentHub, for: UUID.self) { $agentID in
+            AgentHubWindowView(agentID: agentID)
+                .environmentObject(sessionManager)
+                .environmentObject(entitlementStore)
+                .preferredColorScheme(.dark)
+        }
+        .modelContainer(modelContainer)
+        .defaultSize(width: 920, height: 640)
+        #endif
     }
 }
+
+#if os(macOS)
+/// Scene identifiers shared between `finApp`'s declaration and every `openWindow` call
+/// site, so a renamed scene can't silently desync into a runtime no-op.
+enum FinScene {
+    static let agentHub = "agent-hub"
+}
+#endif

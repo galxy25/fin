@@ -360,6 +360,24 @@ struct AgentConsoleView: View {
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
                 }
+                // `argument("input")` above is a best-effort single-key lookup — it only
+                // shows something for tools whose JSON happens to have a top-level
+                // "input" key. Every other shape (remember's title/content/tags,
+                // recall's query, notify's title/body, …) showed nothing but the tool
+                // name until now. This always shows the full raw arguments, collapsed,
+                // so no tool call is a dead end for "what did it actually send."
+                if call.arguments != "{}" {
+                    DisclosureGroup {
+                        Text(ToolCallFormatting.prettyPrinted(call.arguments))
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } label: {
+                        Text("Arguments")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
         }
         .padding(8)
