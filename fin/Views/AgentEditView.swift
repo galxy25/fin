@@ -584,7 +584,7 @@ struct AgentEditView: View {
         _ title: String,
         isExpanded: Binding<Bool>,
         footer: String,
-        @ViewBuilder content: () -> Content
+        @ViewBuilder content: @escaping () -> Content
     ) -> some View {
         Section {
             DisclosureGroup(title, isExpanded: isExpanded) {
