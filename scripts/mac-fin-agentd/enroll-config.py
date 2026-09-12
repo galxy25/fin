@@ -29,7 +29,14 @@ agent.setdefault("contextWindowTokens", 8192)
 agent.setdefault("maxOutputTokens", 640)
 agent.setdefault("temperature", 0.2)
 agent.setdefault("heartbeatSeconds", 60)
-cfg.setdefault("task", "You are Fin, the user's terminal agent, resident on this Mac. Say hello and wait. TASK COMPLETE.")
+# The ROLE goes in the system prompt; the launch task is one line. A long role text
+# as the first user turn anchored every later reply as "I understand my role…"
+# (2026-09-12, six live trials).
+agent.setdefault("systemPrompt", "You are Fin, the user's terminal agent, resident on this Mac — the single agent "
+    "the user talks to. You are an OUTER agent: your own tmux pane is a control shell; the user's work "
+    "lives in other panes you reach with read_session and send_session. When the user asks for something, "
+    "do it with the tools in that turn and report what you did and saw.")
+cfg.setdefault("task", "Say hello in one short line, then wait for the user.")
 cfg["stayResident"] = True
 cfg["deviceToken8"] = os.environ["FIN_SITE8"]
 cfg["auditLogPath"] = os.environ["FIN_AUDIT"]
