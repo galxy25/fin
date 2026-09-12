@@ -26,6 +26,7 @@ SESSIONS_TABLE=fin-sessions
 SITES_TABLE=fin-sites
 MESSAGES_TABLE=fin-messages
 AGENTS_TABLE=fin-agents
+ENROLL_TOKENS_TABLE=fin-enroll-tokens
 API_NAME=fin-control-plane
 RULE=fin-worker-sweep
 WAKE_RULE=fin-worker-wake
@@ -151,6 +152,20 @@ if ! aws dynamodb describe-table --table-name "$AGENTS_TABLE" >/dev/null 2>&1; t
     --billing-mode PAY_PER_REQUEST >/dev/null
   aws dynamodb wait table-exists --table-name "$AGENTS_TABLE"
   echo "==> Created DynamoDB table $AGENTS_TABLE (on-demand)"
+fi
+
+# One-time enroll tokens (15 min TTL): an installer on a new Mac redeems one
+# and never sees an operator bearer.
+if ! aws dynamodb describe-table --table-name "$ENROLL_TOKENS_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$ENROLL_TOKENS_TABLE" \
+    --attribute-definitions AttributeName=tokenSha256,AttributeType=S \
+    --key-schema AttributeName=tokenSha256,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$ENROLL_TOKENS_TABLE"
+  aws dynamodb update-time-to-live --table-name "$ENROLL_TOKENS_TABLE" \
+    --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
+  echo "==> Created DynamoDB table $ENROLL_TOKENS_TABLE (on-demand, TTL on ttl)"
 fi
 
 # --- model-factory data lake -------------------------------------------------
@@ -299,6 +314,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$AGENTS_TABLE"
     },
     {
+      "Sid": "EnrollTokensTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$ENROLL_TOKENS_TABLE"
+    },
+    {
       "Sid": "AgentObjects",
       "Effect": "Allow",
       "Action": "s3:GetObject",
@@ -342,6 +363,18 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": "s3:PutObject",
       "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/transcripts/*"
+    },
+    {
+      "Sid": "GoalsLedgerReadWrite",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/agents/*/goals-ledger.v*.json"
+    },
+    {
+      "Sid": "WorkerConfigOverlayRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/agentd/*.json"
     },
     {
       "Sid": "MemoryJournalWrite",
@@ -581,6 +614,9 @@ GET /messages/{messageId}
 POST /messages/{messageId}/claim
 POST /messages/{messageId}/ack
 POST /messages/{messageId}/register
+POST /sites/enroll-tokens
+GET /agents/{agent}/goals
+PUT /agents/{agent}/goals
 POST /workers
 GET /workers
 DELETE /workers/{workerId}

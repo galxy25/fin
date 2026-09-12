@@ -237,6 +237,7 @@ SESSIONS_TABLE = _DYNAMODB.Table(SESSIONS_TABLE_NAME)
 SITES_TABLE = _DYNAMODB.Table(SITES_TABLE_NAME)
 MESSAGES_TABLE = _DYNAMODB.Table(MESSAGES_TABLE_NAME)
 AGENTS_TABLE = _DYNAMODB.Table(AGENTS_TABLE_NAME)
+ENROLL_TOKENS_TABLE = _DYNAMODB.Table(os.environ.get("FIN_CP_ENROLL_TOKENS_TABLE", "fin-enroll-tokens"))
 
 # Byte-for-byte the bootstrap from launch.sh; the two presigned URLs are the only
 # substitutions. Any change to launch.sh's user-data belongs here too —
@@ -670,7 +671,7 @@ def _live_workers(user_id=None):
     )
 
 
-def _record(worker_id, user_id, agent, instance_id, instance_type, launched_at, idle_minutes, managed, browser=False):
+def _record(worker_id, user_id, agent, instance_id, instance_type, launched_at, idle_minutes, managed, browser=False, site_id=None):
     item = {
         "workerId": worker_id,
         "userId": user_id,
@@ -683,8 +684,34 @@ def _record(worker_id, user_id, agent, instance_id, instance_type, launched_at, 
         "managed": managed,
         "browser": bool(browser),
     }
+    if site_id:
+        item["siteId"] = site_id
     TABLE.put_item(Item=item)
     return item
+
+
+def _overlay_site_onto_config(config_key, site):
+    """Read-modify-write the instance's config: add the `site` block and swap the
+    control-plane bearer for the site token. `inboxURL` is dropped (Phase 3:
+    messages arrive by claim, and the inbox object is retired); everything else
+    in the config is left exactly as provisioned."""
+    try:
+        config = json.loads(S3.get_object(Bucket=BUCKET, Key=config_key)["Body"].read())
+    except (ClientError, ValueError):
+        raise ApiError(500, "worker config at {} is unreadable".format(config_key))
+    if not isinstance(config, dict):
+        raise ApiError(500, "worker config at {} is not a JSON object".format(config_key))
+    config["site"] = {
+        "id": site["siteId"], "kind": "ec2", "displayName": "Cloud computer",
+        "token": site["siteToken"], "heartbeatSeconds": site.get("heartbeatSeconds", SITE_HEARTBEAT_SECONDS),
+    }
+    control_plane = config.get("controlPlane") if isinstance(config.get("controlPlane"), dict) else {}
+    control_plane["token"] = site["siteToken"]
+    config["controlPlane"] = control_plane
+    supervision = config.get("supervision")
+    if isinstance(supervision, dict):
+        supervision.pop("inboxURL", None)
+    S3.put_object(Bucket=BUCKET, Key=config_key, Body=json.dumps(config, indent=2).encode("utf-8"), ContentType="application/json")
 
 
 def _terminate(worker, reason):
@@ -874,6 +901,7 @@ def _launch_worker(user_id, agent, instance_type, idle_minutes, browser, now, cl
     sitting unanswered, so wiping it on the way up would defeat the whole
     point of waking at all.
     """
+    worker_id = str(uuid.uuid4())
     config_key = CONFIG_KEY.format(user=user_id, agent=_key_slug(agent))
     try:
         S3.head_object(Bucket=BUCKET, Key=config_key)
@@ -884,6 +912,17 @@ def _launch_worker(user_id, agent, instance_type, idle_minutes, browser, now, cl
         # No hand-provisioned config: instantiate the template so the launch
         # proceeds (400s only when the template is missing too).
         _provision_config(user_id, agent, config_key)
+
+    # Every cloud body is a site (docs/SITES.md §3.2), whether its config came
+    # from the template or was provisioned by hand: enroll it and overlay the
+    # site block onto the config the instance is about to fetch, with the SITE
+    # token as its control-plane bearer — the operator bearer never boards an
+    # instance. enrollKey ec2/<workerId> keeps one row per launch.
+    site = json.loads(enroll_site({"_userId": user_id, "body": json.dumps({
+        "agent": agent, "kind": "ec2", "displayName": "Cloud computer",
+        "enrollKey": "ec2/{}".format(worker_id),
+    })})["body"])
+    _overlay_site_onto_config(config_key, site)
 
     user_data = USER_DATA.format(
         binary_url=S3.generate_presigned_url(
@@ -930,9 +969,13 @@ def _launch_worker(user_id, agent, instance_type, idle_minutes, browser, now, cl
         TagSpecifications=[{"ResourceType": "instance", "Tags": tags}],
     )["Instances"][0]
 
-    worker_id = str(uuid.uuid4())
     launched_at = _iso(instance.get("LaunchTime") or now)
-    _record(worker_id, user_id, agent, instance["InstanceId"], instance_type, launched_at, idle_minutes, "control-plane", browser)
+    _record(worker_id, user_id, agent, instance["InstanceId"], instance_type, launched_at, idle_minutes, "control-plane", browser, site_id=site["siteId"])
+    SITES_TABLE.update_item(
+        Key={"siteId": site["siteId"]},
+        UpdateExpression="SET workerId = :w",
+        ExpressionAttributeValues={":w": worker_id},
+    )
     return {
         "workerId": worker_id,
         "instanceId": instance["InstanceId"],
@@ -1067,7 +1110,10 @@ def usage(event):
 # supervision kinds that ignore the agent entirely.
 AGENT_KINDS = ("transcript", "inbox", "status")
 SUPERVISION_KINDS = ("supervisionDirective", "supervisionStatus")
-PRESIGN_KINDS = AGENT_KINDS + SUPERVISION_KINDS
+# The daemon's `update` command: a presigned GET of the published macOS binary
+# plus its sha256 sidecar, verified before the atomic rename (docs/SITES.md §3.5).
+BINARY_KINDS = ("agentdBinary",)
+PRESIGN_KINDS = AGENT_KINDS + SUPERVISION_KINDS + BINARY_KINDS
 
 
 def _presign(method, key):
@@ -1123,6 +1169,13 @@ def presign(event):
             urls["statusGet"] = _presign("get_object", STATUS_KEY.format(user=user_id, agent=slug))
         elif kind == "supervisionDirective":
             urls["supervisionDirectiveGet"] = _presign("get_object", SUPERVISION_DIRECTIVE_KEY.format(user=user_id))
+        elif kind == "agentdBinary":
+            urls["agentdBinaryGet"] = _presign("get_object", MACOS_BINARY_KEY)
+            try:
+                digest = S3.get_object(Bucket=BUCKET, Key=MACOS_BINARY_SHA256_KEY)["Body"].read().decode("utf-8", "replace")
+                urls["agentdBinarySha256"] = digest.split()[0] if digest.split() else ""
+            except ClientError:
+                raise ApiError(404, "no published macOS daemon binary; run scripts/mac-fin-agentd/publish-binary.sh")
         elif kind == "supervisionStatus":
             # Absent deviceId8 => a pre-per-device client; hand it the flat key it
             # has always written to. Present-but-malformed is a real client bug and
@@ -1692,6 +1745,22 @@ def _sweep_verdict(worker, now):
     """Why this worker should die, or None to leave it running."""
     idle = timedelta(minutes=int(worker.get("idleMinutes") or DEFAULT_IDLE_MINUTES))
     launched = _parse_iso(worker.get("launchedAt")) or now
+
+    # A worker that is a site reports through its heartbeat, which is fresher
+    # and richer than the status object: alive and working is never idle,
+    # and a lease three beats stale IS the "status stale" verdict.
+    site = _read_site(worker.get("siteId") or "") if worker.get("siteId") else None
+    if site:
+        if _site_is_live(site, now):
+            if site.get("state") in ("working", "needs-input"):
+                return None
+            beat = _parse_iso(site.get("lastHeartbeatAt")) or launched
+            if now - beat > idle:
+                return "site idle since {}".format(_iso(beat))
+        elif now - launched > timedelta(minutes=BOOT_GRACE_MINUTES) and site.get("lastHeartbeatAt"):
+            lease = _parse_iso(site.get("leaseUntil"))
+            if lease is not None and now - lease > timedelta(seconds=3 * SITE_LEASE_SECONDS):
+                return "site lease lapsed at {}".format(_iso(lease))
 
     status = _read_status(str(worker.get("userId") or ""), str(worker.get("agent") or ""))
     if status is None:
@@ -2398,15 +2467,19 @@ def wake(_event=None):
         (w.get("userId"), _key_slug(w["agent"])) for w in _live_workers() if w.get("agent") and w.get("userId")
     }
     checked, launched, notified = [], [], []
-    for user_id, agent, last_modified in _inbox_candidates():
+    # Phase 3: the queue is fin-messages, not the inbox object. A queued row
+    # nobody has claimed, with no live SITE of any kind for the agent (a resident
+    # Mac counts — the 2026-09-10 relaunch loop was exactly this blindness), is
+    # what wakes a cloud body. `_wake_decision` is unchanged: "has a live
+    # worker" now means "has any live body", the lock is gone, and the row's
+    # createdAt plays the inbox's LastModified.
+    for user_id, agent, oldest_queued_at in _queued_message_candidates(now):
         checked.append(agent)
         try:
             slug = _key_slug(agent)
-            has_live_worker = (user_id, slug) in live_worker_keys
-            lock = _read_lock(INBOX_LOCK_KEY.format(user=user_id, agent=slug))
-            last_turn_at = _merged_last_turn_at(_known_last_turn_ats(user_id, agent))
-            status = {"last_turn_at": _iso(last_turn_at)} if last_turn_at else None
-            action, detail = _wake_decision(has_live_worker, lock, last_modified, status, now)
+            has_live_body = (user_id, slug) in live_worker_keys or _any_live_site(user_id, agent, now)
+            action, detail = _wake_decision(has_live_body, None, oldest_queued_at, None, now)
+            last_modified = oldest_queued_at
             if action == "wake":
                 result = _launch_worker(
                     user_id, agent, DEFAULT_INSTANCE_TYPE, DEFAULT_IDLE_MINUTES, False, now, clear_inbox=False
@@ -2958,8 +3031,6 @@ def delete_site(event, site_id):
 # the message row — never "whoever polled first". Roles (primary/standby) only
 # ROUTE; claims EXCLUDE.
 
-MESSAGES_TABLE_NAME = os.environ.get("FIN_CP_MESSAGES_TABLE", "fin-messages")
-AGENTS_TABLE_NAME = os.environ.get("FIN_CP_AGENTS_TABLE", "fin-agents")
 
 MESSAGE_ID_RE = re.compile(r"^m-[A-Za-z0-9][A-Za-z0-9._-]{7,79}$")
 MESSAGE_SOURCES = ("app", "voice", "mac-terminal", "legacy", "supervisor")
@@ -3525,7 +3596,210 @@ def _mark_stale_sites(now):
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 raise
+            continue
+        # A resident/BYO Mac going silent is news the owner wants once, at the
+        # transition — never per tick, and never for a cloud worker (the EC2
+        # sweep owns those) or a phone that simply went to sleep.
+        if site.get("kind") in ("resident", "byo") and site.get("userId"):
+            _notify_lost_contact(site)
     return marked
+
+
+def _notify_lost_contact(site):
+    synthetic_event = {"_userId": site["userId"], "body": json.dumps({
+        "title": "Fin lost contact with {}".format(site.get("displayName") or "a computer"),
+        "body": "No heartbeat for {} minutes. If the Mac is awake, check fin-agentd there.".format(
+            3 * SITE_LEASE_SECONDS // 60),
+        "agent": site.get("agent") or "Fin",
+    })}
+    try:
+        notify(synthetic_event)
+    except Exception:  # noqa: BLE001 - one push failure must never abort the sweep
+        LOG.exception("stale-site notify failed for %s", site.get("siteId"))
+
+
+# --- Phase 2/3: enroll tokens, goals ledger, binary update, device-site wake --
+
+ENROLL_TOKEN_TTL_SECONDS = 15 * 60
+# Where the build host publishes the macOS daemon for the `update` command, and
+# the sidecar the daemon verifies it against before the atomic rename.
+MACOS_BINARY_KEY = "fin/agentd/fin-agentd-macos-arm64"
+MACOS_BINARY_SHA256_KEY = MACOS_BINARY_KEY + ".sha256"
+GOALS_KEY = "users/{user}/fin/agents/{agent}/goals-ledger.v{version}.json"
+MAX_GOALS_BYTES = 256 * 1024
+# A queued message nobody has claimed for this long, with no live site for the
+# agent, wakes a cloud body. Same grace the inbox-based wake used.
+DEVICE_WAKE_GRACE_MINUTES = int(os.environ.get("FIN_CP_WAKE_GRACE_MINUTES", "3"))
+
+
+def _enroll_token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def mint_enroll_token(event):
+    """POST /sites/enroll-tokens (operator/session) — {agent, kind?, displayName?}
+    → {enrollToken, expiresAt}. One-time, 15 minutes: the installer on a new
+    Mac redeems it via POST /sites/enroll and never sees an operator bearer."""
+    body = _body(event)
+    agent = str(body.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    kind = str(body.get("kind") or "resident").strip()
+    if kind not in SITE_KINDS:
+        raise ApiError(400, "kind must be one of {}".format(", ".join(SITE_KINDS)))
+    display_name = str(body.get("displayName") or "").strip()[:64]
+    now = _now()
+    token = secrets.token_hex(24)
+    expires = now + timedelta(seconds=ENROLL_TOKEN_TTL_SECONDS)
+    ENROLL_TOKENS_TABLE.put_item(Item={
+        "tokenSha256": _enroll_token_hash(token),
+        "userId": event["_userId"],
+        "agent": agent,
+        "kind": kind,
+        "displayName": display_name,
+        "createdAt": _iso(now),
+        "expiresAt": _iso(expires),
+        "ttl": int(expires.timestamp()),
+    })
+    return _response(200, {"enrollToken": token, "expiresAt": _iso(expires), "agent": agent, "kind": kind})
+
+
+def enroll_with_token(event):
+    """POST /sites/enroll with {enrollToken, …} and NO bearer: the token is the
+    authorization. Consumed on success (a conditional delete is the one-time
+    guarantee); expired or unknown → 401, same as any bad credential."""
+    body = _body(event)
+    token = str(body.get("enrollToken") or "").strip()
+    if not token:
+        raise ApiError(401, "unauthorized")
+    key = {"tokenSha256": _enroll_token_hash(token)}
+    row = ENROLL_TOKENS_TABLE.get_item(Key=key).get("Item")
+    expires = _parse_iso((row or {}).get("expiresAt"))
+    if not row or expires is None or _now() >= expires:
+        raise ApiError(401, "unauthorized")
+    try:
+        ENROLL_TOKENS_TABLE.delete_item(Key=key, ConditionExpression="attribute_exists(tokenSha256)")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(401, "unauthorized")
+        raise
+    event["_userId"] = row["userId"]
+    filled = dict(body)
+    filled.setdefault("agent", row["agent"])
+    filled.setdefault("kind", row.get("kind") or "resident")
+    if row.get("displayName") and not filled.get("displayName"):
+        filled["displayName"] = row["displayName"]
+    event["body"] = json.dumps(filled)
+    event.pop("isBase64Encoded", None)
+    return enroll_site(event)
+
+
+# --- goals ledger ---------------------------------------------------------------
+
+
+def _goals_agent_check(event, agent):
+    """A site token may only sync its own agent's ledger."""
+    if event.get("_siteId"):
+        site = _read_site(event["_siteId"]) or {}
+        if _key_slug(site.get("agent") or "") != _key_slug(agent):
+            raise ApiError(404, "no such agent")
+
+
+def get_goals(event, agent):
+    """GET /agents/{agent}/goals → {version, document|null}."""
+    if not AGENT_NAME.match(agent or ""):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    _goals_agent_check(event, agent)
+    user_id = event["_userId"]
+    row = _read_agent_row(user_id, agent)
+    version = int(row.get("goalsVersion") or 0)
+    document = None
+    if version > 0:
+        key = GOALS_KEY.format(user=user_id, agent=_key_slug(agent), version=version)
+        try:
+            document = json.loads(S3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+        except (ClientError, ValueError):
+            document = None
+    return _response(200, {"version": version, "document": document, "updatedBy": row.get("goalsUpdatedBy")})
+
+
+def put_goals(event, agent):
+    """PUT /agents/{agent}/goals with If-Match: <version> and {document}.
+    The version bump is a conditional update on fin-agents FIRST; the loser
+    gets 412 with the current version and document to three-way merge against.
+    Versioned S3 keys sidestep the 400 KB item cap and make every version
+    addressable."""
+    if not AGENT_NAME.match(agent or ""):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    _goals_agent_check(event, agent)
+    body = _body(event)
+    document = body.get("document")
+    if not isinstance(document, dict):
+        raise ApiError(400, "document must be a JSON object")
+    encoded = json.dumps(document, default=_json_default).encode("utf-8")
+    if len(encoded) > MAX_GOALS_BYTES:
+        raise ApiError(413, "goals ledger exceeds {} bytes".format(MAX_GOALS_BYTES))
+    expected_raw = _header(event, "if-match").strip().strip('"')
+    try:
+        expected = int(expected_raw)
+    except ValueError:
+        raise ApiError(428, "If-Match: <version> is required")
+
+    user_id = event["_userId"]
+    slug = _key_slug(agent)
+    updated_by = event.get("_siteId") or "operator"
+    next_version = expected + 1
+    try:
+        AGENTS_TABLE.update_item(
+            Key={"agentKey": _agent_key(user_id, agent)},
+            UpdateExpression="SET userId = :user, #agent = :agent, goalsVersion = :next, goalsUpdatedBy = :by, goalsUpdatedAt = :now",
+            ConditionExpression="attribute_not_exists(goalsVersion) OR goalsVersion = :expected",
+            ExpressionAttributeNames={"#agent": "agent"},
+            ExpressionAttributeValues={
+                ":user": user_id, ":agent": agent, ":next": next_version, ":by": updated_by,
+                ":now": _iso(_now()), ":expected": expected,
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        current = json.loads(get_goals(event, agent)["body"])
+        return _response(412, {"error": "version conflict", "version": current["version"], "document": current["document"]})
+    if expected == 0 and next_version == 1:
+        pass  # first write: attribute_not_exists branch
+    S3.put_object(
+        Bucket=BUCKET, Key=GOALS_KEY.format(user=user_id, agent=slug, version=next_version),
+        Body=encoded, ContentType="application/json",
+    )
+    return _response(200, {"version": next_version})
+
+
+# --- wake on fin-messages (device sites) ---------------------------------------
+
+
+def _queued_message_candidates(now):
+    """(userId, agent, oldest unclaimed createdAt) for every agent with a queued
+    row nobody has claimed — the successor to the inbox-object scan, read from
+    the table the app now writes to."""
+    oldest = {}
+    for row in _scan(
+        table=MESSAGES_TABLE,
+        FilterExpression="#state = :queued",
+        ExpressionAttributeNames={"#state": "state"},
+        ExpressionAttributeValues={":queued": "queued"},
+    ):
+        user_id, agent = row.get("userId"), row.get("agent")
+        created = _parse_iso(row.get("createdAt"))
+        if not user_id or not agent or created is None:
+            continue
+        key = (user_id, agent)
+        if key not in oldest or created < oldest[key]:
+            oldest[key] = created
+    return [(u, a, t) for (u, a), t in oldest.items()]
+
+
+def _any_live_site(user_id, agent, now):
+    return bool(_live_sites(user_id, agent, now))
 
 
 # --- entry point -------------------------------------------------------------
@@ -3557,6 +3831,18 @@ def _require_site_scope(event, method, parts):
     # this site's user AND agent, so a site can only ever act on its own queue.
     if method == "POST" and len(parts) == 3 and parts[0] == "messages" and parts[2] in ("claim", "ack", "register"):
         return
+    # A body's own work, all scoped to `_userId` already: memory (remember/
+    # recall/profile), transcript chunks, device status, feedback, reading
+    # (never writing) the service-credential store, and its own agent's goals
+    # ledger. This is what lets an EC2 instance boot with only a site token.
+    if parts[:1] == ["memory"] or parts[:1] == ["transcript-chunk"] or parts[:1] == ["transcript-chunks"]:
+        return
+    if method == "GET" and parts in (["devices", "status"], ["secrets"]):
+        return
+    if method == "POST" and parts == ["feedback"]:
+        return
+    if len(parts) == 3 and parts[0] == "agents" and parts[2] == "goals":
+        return
     raise ApiError(403, "a site token cannot use this route")
 
 
@@ -3570,6 +3856,12 @@ def _route(event):
 
     if method == "POST" and parts == ["sites", "enroll"]:
         return enroll_site(event)
+    if method == "POST" and parts == ["sites", "enroll-tokens"]:
+        return mint_enroll_token(event)
+    if method == "GET" and len(parts) == 3 and parts[0] == "agents" and parts[2] == "goals":
+        return get_goals(event, parts[1])
+    if method == "PUT" and len(parts) == 3 and parts[0] == "agents" and parts[2] == "goals":
+        return put_goals(event, parts[1])
     if method == "GET" and parts == ["sites"]:
         return list_sites(event)
     if method == "POST" and len(parts) == 3 and parts[0] == "sites" and parts[2] == "heartbeat":
@@ -3662,9 +3954,18 @@ def lambda_handler(event, _context=None):
     http = (event.get("requestContext") or {}).get("http") or {}
     method = str(http.get("method") or "").upper()
     path = str(event.get("rawPath") or http.get("path") or "/").rstrip("/") or "/"
-    is_auth_route = method == "POST" and [p for p in path.split("/") if p] == ["auth", "apple"]
+    parts = [p for p in path.split("/") if p]
+    is_auth_route = method == "POST" and parts == ["auth", "apple"]
+    # An installer redeeming a one-time enroll token has no bearer yet either;
+    # the token IS its authorization (checked and consumed in enroll_with_token).
+    is_token_enroll = (
+        method == "POST" and parts == ["sites", "enroll"]
+        and not _header(event, "authorization").strip()
+    )
 
     try:
+        if is_token_enroll:
+            return enroll_with_token(event)
         if is_auth_route:
             # The one route with no bearer token to check yet — it's how one
             # is obtained. Apple's own identity-token verification IS this

@@ -1036,10 +1036,17 @@ class SiteTokenScopeTests(_SitesTestCase):
         self._assert_denied("GET", "/workers")
         self._assert_denied("DELETE", "/workers/i-123")
 
-    def test_a_site_may_not_read_secrets_or_memory(self):
-        self._assert_denied("GET", "/secrets")
-        self._assert_denied("GET", "/memory")
-        self._assert_denied("GET", "/memory/profile")
+    def test_a_site_may_do_its_own_work_but_never_write_secrets(self):
+        # Phase 2: an EC2 body boots with only a site token, so its own work —
+        # memory, transcript chunks, reading service credentials — is allowed.
+        for method, path in (("GET", "/secrets"), ("GET", "/memory"), ("PUT", "/memory/profile"),
+                             ("PUT", "/transcript-chunk"), ("GET", "/devices/status"),
+                             ("GET", "/agents/Fin/goals"), ("PUT", "/agents/Fin/goals")):
+            lam._require_site_scope({"_siteId": "site-a"}, method, self._parts(path))
+        # Writing or deleting a credential is an operator's act, never a body's.
+        self._assert_denied("PUT", "/secrets/github")
+        self._assert_denied("DELETE", "/secrets/github")
+        self._assert_denied("POST", "/sites/enroll-tokens")
 
     def test_a_site_may_re_sign_its_own_urls_and_notify_its_owner(self):
         lam._require_site_scope({"_siteId": "site-a"}, "POST", self._parts("/presign"))
@@ -1366,6 +1373,220 @@ class SiteTokenMessageScopeTests(unittest.TestCase):
                 lam._require_site_scope({"_siteId": "s"}, method, parts)
 
 
+
+class _FakeS3:
+    """Enough S3 for the config overlay, goals ledger, and the binary sidecar."""
+
+    def __init__(self, objects=None):
+        self.objects = dict(objects or {})
+
+    def get_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise lam.ClientError({"Error": {"Code": "NoSuchKey", "Message": Key}}, "GetObject")
+        import io
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def put_object(self, Bucket, Key, Body, **kwargs):
+        self.objects[Key] = Body if isinstance(Body, bytes) else Body.encode("utf-8")
+        return {}
+
+
+class EnrollTokenTests(_SitesTestCase):
+    def setUp(self):
+        super().setUp()
+        orig = lam.ENROLL_TOKENS_TABLE
+        lam.ENROLL_TOKENS_TABLE = _FakeDynamoTable("tokenSha256")
+        self.addCleanup(setattr, lam, "ENROLL_TOKENS_TABLE", orig)
+        # The fake has no delete_item; give it one that honours attribute_exists.
+        def delete_item(Key, ConditionExpression=None):
+            if Key["tokenSha256"] not in lam.ENROLL_TOKENS_TABLE.items:
+                raise lam.ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "no"}}, "DeleteItem")
+            del lam.ENROLL_TOKENS_TABLE.items[Key["tokenSha256"]]
+        lam.ENROLL_TOKENS_TABLE.delete_item = delete_item
+
+    def _mint(self):
+        response = lam.mint_enroll_token({"_userId": "user-1", "body": json.dumps({"agent": "Fin", "displayName": "Studio Mac"})})
+        return json.loads(response["body"])["enrollToken"]
+
+    def test_a_token_enrolls_once_as_its_owner_then_dies(self):
+        token = self._mint()
+        event = {"body": json.dumps({"enrollToken": token, "enrollKey": "studio/levi"})}
+        first = json.loads(lam.enroll_with_token(event)["body"])
+        self.assertEqual(lam.SITES_TABLE.items[first["siteId"]]["userId"], "user-1")
+        self.assertEqual(lam.SITES_TABLE.items[first["siteId"]]["displayName"], "Studio Mac")
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.enroll_with_token({"body": json.dumps({"enrollToken": token, "enrollKey": "studio/levi"})})
+        self.assertEqual(caught.exception.status, 401)
+
+    def test_an_expired_token_is_unauthorized(self):
+        token = self._mint()
+        row = next(iter(lam.ENROLL_TOKENS_TABLE.items.values()))
+        row["expiresAt"] = _iso(lam._now() - timedelta(seconds=1))
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.enroll_with_token({"body": json.dumps({"enrollToken": token, "enrollKey": "x"})})
+        self.assertEqual(caught.exception.status, 401)
+
+    def test_an_unknown_token_is_unauthorized_not_404(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.enroll_with_token({"body": json.dumps({"enrollToken": "nope", "enrollKey": "x"})})
+        self.assertEqual(caught.exception.status, 401)
+
+
+class GoalsLedgerTests(_SitesTestCase):
+    def setUp(self):
+        super().setUp()
+        self._orig_s3 = lam.S3
+        lam.S3 = _FakeS3()
+        self.addCleanup(setattr, lam, "S3", self._orig_s3)
+
+    def _put(self, version, document, user="user-1", site_id=None):
+        event = {"_userId": user, "headers": {"if-match": str(version)}, "body": json.dumps({"document": document})}
+        if site_id:
+            event["_siteId"] = site_id
+        response = lam.put_goals(event, "Fin")
+        return response["statusCode"], json.loads(response["body"])
+
+    def test_first_write_needs_if_match_zero_and_yields_version_one(self):
+        status, body = self._put(0, {"version": 1, "goals": [{"id": "g1"}]})
+        self.assertEqual((status, body["version"]), (200, 1))
+        got = json.loads(lam.get_goals({"_userId": "user-1"}, "Fin")["body"])
+        self.assertEqual(got["version"], 1)
+        self.assertEqual(got["document"]["goals"][0]["id"], "g1")
+
+    def test_a_stale_write_gets_412_with_the_current_document(self):
+        self._put(0, {"goals": ["a"]})
+        self._put(1, {"goals": ["a", "b"]})
+        status, body = self._put(1, {"goals": ["a", "c"]})  # based on v1, but v2 exists
+        self.assertEqual(status, 412)
+        self.assertEqual((body["version"], body["document"]), (2, {"goals": ["a", "b"]}))
+
+    def test_missing_if_match_is_428(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.put_goals({"_userId": "user-1", "headers": {}, "body": json.dumps({"document": {}})}, "Fin")
+        self.assertEqual(caught.exception.status, 428)
+
+    def test_a_site_may_only_sync_its_own_agent(self):
+        other = self.enroll(agent="Nimbus", enrollKey="nimbus-box")
+        with self.assertRaises(lam.ApiError) as caught:
+            self._put(0, {"goals": []}, site_id=other["siteId"])
+        self.assertEqual(caught.exception.status, 404)
+
+    def test_an_unwritten_ledger_reads_as_version_zero(self):
+        got = json.loads(lam.get_goals({"_userId": "user-1"}, "Fin")["body"])
+        self.assertEqual((got["version"], got["document"]), (0, None))
+
+
+class WorkerSiteOverlayTests(_SitesTestCase):
+    def test_overlay_adds_the_site_block_and_swaps_the_bearer(self):
+        orig = lam.S3
+        lam.S3 = _FakeS3({"cfg.json": json.dumps({
+            "controlPlane": {"endpointURL": "https://cp", "token": "OPERATOR-SECRET"},
+            "supervision": {"directiveURL": "d", "inboxURL": "i", "agentName": "Fin"},
+        }).encode()})
+        self.addCleanup(setattr, lam, "S3", orig)
+        site = self.enroll(kind="ec2", enrollKey="ec2/w1")
+        lam._overlay_site_onto_config("cfg.json", site)
+        config = json.loads(lam.S3.objects["cfg.json"])
+        self.assertEqual(config["site"]["id"], site["siteId"])
+        self.assertEqual(config["controlPlane"]["token"], site["siteToken"])
+        self.assertNotIn("OPERATOR-SECRET", json.dumps(config), "the operator bearer never boards an instance")
+        self.assertNotIn("inboxURL", config["supervision"], "Phase 3: the inbox object is retired")
+
+
+class SweepVerdictWithSiteTests(_SitesTestCase):
+    def _worker(self, site_id):
+        return {"workerId": "w1", "userId": "user-1", "agent": "Fin", "siteId": site_id,
+                "idleMinutes": 30, "launchedAt": _iso(lam._now() - timedelta(hours=2))}
+
+    def test_a_working_site_is_never_swept(self):
+        site = self.enroll(kind="ec2", enrollKey="ec2/w1")
+        row = lam.SITES_TABLE.items[site["siteId"]]
+        row.update({"state": "working", "leaseUntil": _iso(lam._now() + timedelta(seconds=30)),
+                    "lastHeartbeatAt": _iso(lam._now() - timedelta(hours=1))})
+        self.assertIsNone(lam._sweep_verdict(self._worker(site["siteId"]), lam._now()))
+
+    def test_a_site_idle_past_its_window_is_swept(self):
+        site = self.enroll(kind="ec2", enrollKey="ec2/w1")
+        row = lam.SITES_TABLE.items[site["siteId"]]
+        row.update({"state": "idle", "leaseUntil": _iso(lam._now() + timedelta(seconds=30)),
+                    "lastHeartbeatAt": _iso(lam._now() - timedelta(minutes=45))})
+        self.assertIn("site idle since", lam._sweep_verdict(self._worker(site["siteId"]), lam._now()) or "")
+
+    def test_a_site_whose_lease_lapsed_long_ago_is_swept(self):
+        site = self.enroll(kind="ec2", enrollKey="ec2/w1")
+        row = lam.SITES_TABLE.items[site["siteId"]]
+        row.update({"state": "idle", "leaseUntil": _iso(lam._now() - timedelta(minutes=10)),
+                    "lastHeartbeatAt": _iso(lam._now() - timedelta(minutes=11))})
+        self.assertIn("lease lapsed", lam._sweep_verdict(self._worker(site["siteId"]), lam._now()) or "")
+
+
+class WakeOnMessagesTests(_MessagesTestCase):
+    def test_candidates_are_the_oldest_unclaimed_row_per_agent(self):
+        a = self.send("first")
+        self.row(a["messageId"])["createdAt"] = _iso(lam._now() - timedelta(minutes=10))
+        self.send("second")
+        claimed = self.send("claimed one")
+        self.claim(self.imac, claimed["messageId"])
+        candidates = lam._queued_message_candidates(lam._now())
+        self.assertEqual(len(candidates), 1)
+        user, agent, oldest = candidates[0]
+        self.assertEqual((user, agent), ("user-1", "Fin"))
+        self.assertEqual(_iso(oldest), self.row(a["messageId"])["createdAt"])
+
+    def test_a_live_site_of_any_kind_counts_as_a_live_body(self):
+        self.assertTrue(lam._any_live_site("user-1", "Fin", lam._now()))
+        lam.SITES_TABLE.items.clear()
+        self.assertFalse(lam._any_live_site("user-1", "Fin", lam._now()))
+
+
+class StaleSiteNotifyTests(_SitesTestCase):
+    def test_a_silent_resident_site_notifies_once_at_the_transition(self):
+        sent = []
+        orig = lam.notify
+        lam.notify = lambda event: sent.append(json.loads(event["body"]))
+        self.addCleanup(setattr, lam, "notify", orig)
+        site = self.enroll(kind="resident", displayName="Levi's iMac")
+        row = lam.SITES_TABLE.items[site["siteId"]]
+        row.update({"leaseUntil": _iso(lam._now() - timedelta(minutes=5)), "lastHeartbeatAt": "2026-01-01T00:00:00Z"})
+        lam._mark_stale_sites(lam._now())
+        lam._mark_stale_sites(lam._now())
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["title"], "Fin lost contact with Levi's iMac")
+
+    def test_a_silent_cloud_worker_does_not_page_the_owner(self):
+        sent = []
+        orig = lam.notify
+        lam.notify = lambda event: sent.append(1)
+        self.addCleanup(setattr, lam, "notify", orig)
+        site = self.enroll(kind="ec2", enrollKey="ec2/w1")
+        row = lam.SITES_TABLE.items[site["siteId"]]
+        row.update({"leaseUntil": _iso(lam._now() - timedelta(minutes=5)), "lastHeartbeatAt": "2026-01-01T00:00:00Z"})
+        lam._mark_stale_sites(lam._now())
+        self.assertEqual(sent, [])
+
+
+class BinaryPresignTests(unittest.TestCase):
+    def test_agentd_binary_kind_returns_url_and_sidecar_digest(self):
+        orig_s3, orig_presign = lam.S3, lam._presign
+        lam.S3 = _FakeS3({lam.MACOS_BINARY_SHA256_KEY: b"abc123  fin-agentd-macos-arm64\n"})
+        lam._presign = lambda method, key: "https://example.invalid/" + key
+        self.addCleanup(setattr, lam, "S3", orig_s3)
+        self.addCleanup(setattr, lam, "_presign", orig_presign)
+        body = json.loads(lam.presign({"_userId": "u", "body": json.dumps({"kinds": ["agentdBinary"]})})["body"])
+        self.assertTrue(body["urls"]["agentdBinaryGet"].endswith(lam.MACOS_BINARY_KEY))
+        self.assertEqual(body["urls"]["agentdBinarySha256"], "abc123")
+
+    def test_no_published_binary_is_a_404_not_a_500(self):
+        orig_s3, orig_presign = lam.S3, lam._presign
+        lam.S3 = _FakeS3()
+        lam._presign = lambda method, key: "https://example.invalid/" + key
+        self.addCleanup(setattr, lam, "S3", orig_s3)
+        self.addCleanup(setattr, lam, "_presign", orig_presign)
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.presign({"_userId": "u", "body": json.dumps({"kinds": ["agentdBinary"]})})
+        self.assertEqual(caught.exception.status, 404)
+
+
 class SiteRouteRegistrationTests(unittest.TestCase):
     """Every handler in lambda.py's router also needs a route in deploy.sh's
     ROUTES heredoc, or API Gateway 404s a path the Lambda handles perfectly —
@@ -1391,6 +1612,9 @@ class SiteRouteRegistrationTests(unittest.TestCase):
             "POST /messages/{messageId}/claim",
             "POST /messages/{messageId}/ack",
             "POST /messages/{messageId}/register",
+            "POST /sites/enroll-tokens",
+            "GET /agents/{agent}/goals",
+            "PUT /agents/{agent}/goals",
         ):
             self.assertIn(route + "\n", self.deploy_sh, route)
 
