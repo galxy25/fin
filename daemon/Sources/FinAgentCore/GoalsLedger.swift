@@ -512,6 +512,13 @@ public actor GoalsLedgerStore {
         try save()
     }
 
+    /// Wholesale replacement, for the synced lane (`GoalsLedgerSync`): the merged
+    /// document becomes the local truth in one atomic write.
+    public func replace(_ merged: LedgerDocument) throws {
+        document = merged
+        try save()
+    }
+
     /// Atomic write so a crash mid-save can never leave a half-written ledger — a
     /// corrupt ledger would silently amnesia the whole mission. Pretty-printed because
     /// the file doubles as a user-editable artifact.

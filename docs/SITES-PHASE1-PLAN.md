@@ -46,6 +46,22 @@ command (Phase 2); `finSite` in the push payload (a tap already deep-links by
 agent, and the conversation is one merged transcript); per-run transcript keys
 (superseded by hourly chunks before this work started).
 
+## Phase 2 / 3 status (2026-09-12)
+
+| item | state |
+|---|---|
+| Fin's computers lifecycle buttons | done (1d) |
+| One-time enroll tokens | **live** — `POST /sites/enroll-tokens`, redeemed by `POST /sites/enroll` with no bearer |
+| Goals ledger sync | **live** — `GET/PUT /agents/{a}/goals` with If-Match; daemon `DaemonGoalsSync` (three-way merge, debounced push, 412 retry) |
+| macOS binary in S3 + `update` | **built** — `publish-binary.sh`, presign kind `agentdBinary`, daemon verifies sha256 and renames atomically |
+| Sweep `/notify` on silent resident sites | **live** — once, at the stale transition |
+| Operator bearer off EC2 | **live** — every worker is enrolled as a site and boots with its site token; site scope widened to a body's own work |
+| fin-wake reads `fin-messages` / `fin-sites` | **live** — oldest unclaimed queued row; any live site counts as a live body |
+| Inbox retirement (Phase 3) | **live** — a site does not poll the inbox; workers are provisioned without `inboxURL`; wake no longer scans inbox objects |
+| Forced-command key hardening | **not done, on purpose** — `read_session`, the pane inventory, and the launch preflight are SSH exec channels with the site key; a forced command would replace every one of them with `tmux`. The airtight upgrade is the dedicated UNIX user (needs sudo) — Levi's call. |
+| "Let Fin live on this computer", app-device sites claiming their own queue, hosting-mode relabel, multi-agent pane | app work, in progress |
+| Scoped self-signing for BYO | optional; not started |
+
 ## Sub-phases
 
 Phase 1 as written in SITES.md is one commit-sized bullet list covering three

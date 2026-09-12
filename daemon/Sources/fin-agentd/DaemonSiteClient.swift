@@ -1,4 +1,5 @@
 import Foundation
+import Crypto
 import FinAgentCore
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -247,6 +248,63 @@ actor DaemonSiteClient {
         if !(200..<300).contains(status), status != 409 {
             registerFailure("[site] ack answered \(id) failed: HTTP \(status)")
         }
+    }
+
+    // MARK: - update
+
+    /// The `update` command (docs/SITES.md §3.5): ask the control plane for the
+    /// published macOS binary and its sha256, download to a sibling temp file,
+    /// verify, rename over `binaryPath` (a running process keeps its old inode;
+    /// exit 0 afterwards and launchd respawns the new one). Returns the new
+    /// version string on success, nil on any failure — never a half-installed
+    /// binary: the rename is the only step that touches the real path.
+    func performUpdate(binaryPath: String) async -> String? {
+        guard let (status, data) = await post("/presign", body: ["kinds": ["agentdBinary"]]),
+              (200..<300).contains(status),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let urls = object["urls"] as? [String: Any],
+              let get = urls["agentdBinaryGet"] as? String, let url = URL(string: get),
+              let expected = (urls["agentdBinarySha256"] as? String)?.lowercased(), !expected.isEmpty
+        else {
+            audit("[site] update: no published binary (HTTP presign failed)")
+            return nil
+        }
+        let temp = binaryPath + ".update-\(ProcessInfo.processInfo.processIdentifier)"
+        defer { try? FileManager.default.removeItem(atPath: temp) }
+        do {
+            let (bytes, response) = try await transport(URLRequest(url: url))
+            guard (response as? HTTPURLResponse)?.statusCode == 200, !bytes.isEmpty else {
+                audit("[site] update: download failed")
+                return nil
+            }
+            let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            guard digest == expected else {
+                audit("[site] update: sha256 mismatch — refusing to install")
+                return nil
+            }
+            try bytes.write(to: URL(fileURLWithPath: temp), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temp)
+            let version = Self.versionOf(temp)
+            _ = try FileManager.default.replaceItemAt(URL(fileURLWithPath: binaryPath), withItemAt: URL(fileURLWithPath: temp))
+            audit("[site] update: installed fin-agentd \(version ?? "?") — restarting")
+            return version ?? "unknown"
+        } catch {
+            audit("[site] update failed: \(error.localizedDescription.prefix(160))")
+            return nil
+        }
+    }
+
+    nonisolated static func versionOf(_ path: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--version"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        process.waitUntilExit()
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        return output.split(separator: " ").last.map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
     }
 
     // MARK: - Wire shape (pure, tested)

@@ -397,6 +397,9 @@ final class Daemon {
     /// is non-nil, which today is unconditional, matching `composedHeartbeatPrompt`
     /// already reading the same file unconditionally.
     private var goalsLedger: GoalsLedgerStore?
+    /// The shared goals ledger's sync lane (docs/SITES.md §8); nil without a
+    /// control plane.
+    private var goalsSync: DaemonGoalsSync?
     /// The most recent push send, awaited on the exit paths: task-complete fires a push
     /// moments before shutdown, and an exit 300ms later would kill the POST mid-flight —
     /// the one alert a non-resident daemon exists to deliver. Bounded by the client's
@@ -625,6 +628,10 @@ final class Daemon {
         (auditLogPath as NSString).deletingLastPathComponent + "/fin-agentd-site.json"
     }
 
+    var goalsSyncStatePath: String {
+        (auditLogPath as NSString).deletingLastPathComponent + "/goals-sync.json"
+    }
+
     /// The goals ledger sits in that same state directory, under the basename the app
     /// also uses. Unlike the registry it is not machine-scoped in principle — goals
     /// belong to the user — but until the synced lane lands (evals/goals-ledger/
@@ -695,10 +702,16 @@ final class Daemon {
         log("fin-agentd starting: \(config.server.username)@\(config.server.host) → \(config.agent.modelIdentifier)")
 
         if let block = config.supervision {
+            // Phase 3 (docs/SITES.md §11): a site gets its messages by claim, so the
+            // legacy inbox object is not polled — the same message would otherwise
+            // arrive twice, once by claim and once by poll.
+            if config.site != nil, block.inboxURL != nil {
+                log("supervision: inbox polling retired — this body is a site and claims its messages")
+            }
             let client = DaemonDirectiveClient(
                 directiveURL: block.directiveURL,
                 statusURL: block.statusURL,
-                inboxURL: block.inboxURL,
+                inboxURL: config.site == nil ? block.inboxURL : nil,
                 inboxResetAtLaunch: block.inboxResetAtLaunch ?? false,
                 agentName: block.agentName,
                 pollSeconds: block.pollSeconds ?? 30,
@@ -952,6 +965,24 @@ final class Daemon {
         do {
             try await ledgerStore.load()
             goalsLedger = ledgerStore
+            if let block = config.controlPlane {
+                let sync = DaemonGoalsSync(
+                    endpointURL: block.endpointURL, token: block.token, siteID: config.site?.id.lowercased(),
+                    agentName: config.supervision?.agentName ?? "Agent",
+                    store: ledgerStore, statePath: goalsSyncStatePath,
+                    audit: { [weak self] line in
+                        Task { @MainActor in
+                            self?.log(line)
+                            self?.record(AgentAuditEvent(kind: "notice", text: line))
+                        }
+                    }
+                )
+                goalsSync = sync
+                // Pull before the first turn composes its mission section, so a fresh
+                // cloud body inherits the iMac's goals rather than starting blank.
+                let first = await sync.sync()
+                log("goals sync enabled: control plane /agents/…/goals (\(first))")
+            }
             engine.onGoalUpsert = { [weak self] id, title, state, why, nextAction, blockedOn, tags, source in
                 guard let self, let ledger = self.goalsLedger else { return .failed("the daemon is shutting down.") }
                 return await self.goalUpsert(
@@ -1176,8 +1207,16 @@ final class Daemon {
                             // needs launchctl, which is the installer's job, not the daemon's.
                             self.log("[site] \(command.kind) requested — exiting for launchd to respawn")
                             self.shutdown(exitCode: 0)
+                        case "update":
+                            let binary = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
+                            Task { [weak self] in
+                                guard let self, let client = self.siteClient else { return }
+                                if await client.performUpdate(binaryPath: binary) != nil {
+                                    self.shutdown(exitCode: 0)
+                                }
+                            }
                         default:
-                            break // drain is handled inside the client; update is Phase 2
+                            break // drain is handled inside the client
                         }
                     }
                 )
@@ -1328,6 +1367,7 @@ final class Daemon {
                 memoryConsolidator?.tickIfDue()
                 sessionInventoryScanner?.tickIfDue()
                 sessionActivitySummarizer?.tickIfDue()
+                if let goalsSync { Task { await goalsSync.tickIfDue() } }
                 if heartbeatEnabled, !beatsAreSuspended, Date() >= beatAt { break }
                 try? await Task.sleep(for: .milliseconds(250))
             }
@@ -2008,6 +2048,7 @@ final class Daemon {
         case .success(let goal):
             do {
                 try await ledger.addGoal(goal)
+                await goalsSync?.syncSoon()
                 log("[goal_upsert] \(wasUpdate ? "updated" : "created") \(id)")
                 return wasUpdate ? .updated(id: id) : .created(id: id)
             } catch {
@@ -2086,6 +2127,7 @@ final class Daemon {
         }
         do {
             try await ledger.appendUpdate(Update(kind: kind, text: text), toGoal: goalID)
+            await goalsSync?.syncSoon()
             log("[goal_log] \(kind.rawValue) on \(goalID)")
             return .logged
         } catch {
