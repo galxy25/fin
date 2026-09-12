@@ -40,6 +40,18 @@ struct RootView: View {
                     NavigationStack {
                         MarkdownReaderView(document: document, isRoot: true)
                     }
+                    #if os(macOS)
+                    // Same fix as HomeView's sheet-sizing comment: a fresh macOS
+                    // window sizes to its content's IDEAL size, and a `ScrollView`
+                    // wrapping a short `Text` reports a narrow ideal width — so this
+                    // root route (resuming straight to the last-opened file, the one
+                    // path into MarkdownReaderView that skips HomeView entirely)
+                    // rendered as a narrow centered rectangle instead of filling the
+                    // window until switching to Edit, where `TextEditor` is
+                    // inherently greedy about the space it's given. A resized window
+                    // persists past this once one exists — this only bites a fresh one.
+                    .frame(minWidth: 480, minHeight: 560)
+                    #endif
                 case .home:
                     HomeView()
                 }

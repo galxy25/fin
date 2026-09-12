@@ -23,6 +23,7 @@ struct MarkdownListView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                .accessibilityIdentifier("fileRow_\(document.id.uuidString)")
             }
             .onDelete { offsets in
                 for index in offsets {
@@ -31,6 +32,8 @@ struct MarkdownListView: View {
             }
         }
         .listStyle(.plain)
+        .accessibilityIdentifier("fileListView")
+        .task { seedUITestFileIfNeeded() }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
@@ -124,6 +127,31 @@ struct MarkdownListView: View {
                 importErrorMessage = error.localizedDescription
             }
         }
+    }
+
+    /// XCUITest can't drive the system file-open/save panels
+    /// (`fileImporter`/`fileExporter`), so there's no automatable path to a real
+    /// document through this view's own UI — a file written straight into the
+    /// sandbox container and bookmarked directly stands in for one. Gated on the
+    /// same `FIN_UI_TESTING` launch environment flag `launchFinApp()` sets, so it
+    /// never runs for a real user.
+    private func seedUITestFileIfNeeded() {
+        guard ProcessInfo.processInfo.environment["FIN_UI_TESTING"] != nil else { return }
+        guard !documents.contains(where: { $0.name == "ui-test-fixture.md" }) else { return }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("ui-test-fixture.md")
+        let fixtureText = """
+        # UI Test Fixture
+
+        Seeded once per launch under `FIN_UI_TESTING` so the Files tab has a real,
+        readable document to drive without needing the system file picker.
+
+        ## Section Two
+
+        Enough content to exercise both the read pane and the editor.
+        """
+        try? fixtureText.write(to: url, atomically: true, encoding: .utf8)
+        guard let bookmarkData = try? url.bookmarkData() else { return }
+        modelContext.insert(MarkdownDocument(name: url.lastPathComponent, bookmarkData: bookmarkData))
     }
 
     private func sameFile(_ document: MarkdownDocument, as url: URL) -> Bool {

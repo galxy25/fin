@@ -45,6 +45,7 @@ struct MarkdownReaderView: View {
                     .font(.system(.body, design: .monospaced))
                     .autocorrectionDisabled()
                     .padding(4)
+                    .accessibilityIdentifier("markdownEditor")
                     #if os(macOS)
                     .onKeyPress(.escape) {
                         save()
@@ -69,7 +70,17 @@ struct MarkdownReaderView: View {
                                 .padding()
                         }
                     }
+                    .frame(maxWidth: .infinity)
                 }
+                // Unlike `TextEditor` (inherently greedy about the space it's given),
+                // a `ScrollView` wrapping short content reports a narrow, hugging
+                // ideal width on macOS and centers itself in whatever room the window
+                // actually has — visible as a narrow centered rectangle of the
+                // theme's background color until switching to Edit. Forcing both axes
+                // to fill is what makes it behave like every other full-bleed reading
+                // pane in the app.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier("markdownReaderScroll")
                 .contentShape(Rectangle())
                 // Best-effort: on macOS, .textSelection's own double-click-to-select-word
                 // handling appears to claim the event ahead of SwiftUI's gesture system
@@ -123,6 +134,7 @@ struct MarkdownReaderView: View {
                 } label: {
                     Image(systemName: isEditing ? "checkmark" : "pencil")
                 }
+                .accessibilityIdentifier("markdownEditToggle")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
