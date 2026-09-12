@@ -23,6 +23,10 @@ final class TVCloudAccount: ObservableObject {
 
     @Published private(set) var phase: Phase = .waitingForEndpoint
     @Published private(set) var keysInstalled = 0
+    /// Entries the account holds that this TV could not open — sealed with a
+    /// vault key that lost the CloudKit mint race; the sealing device re-seals
+    /// on its next launch (`KeyVaultSync.fingerprint`).
+    @Published private(set) var keysUnopenable = 0
     @Published private(set) var lastSyncAt: Date?
 
     static let sessionTokenKey = "fin.cloudcp.session-token"
@@ -101,19 +105,21 @@ final class TVCloudAccount: ObservableObject {
     /// `DeviceVaultKeyStore`) — that device re-seals on its next launch.
     func syncVault() async {
         phase = .syncing
-        guard let vaultKey = DeviceVaultKeyStore.resolve(context: context, deviceName: "Apple TV") else {
-            phase = .failed("Waiting for iCloud to deliver this account's vault key.")
+        guard let vaultKey = DeviceVaultKeyStore.existing(context: context) else {
+            phase = .failed("Waiting for iCloud to deliver this account's vault key. Open Fin on your iPhone or Mac once, then Sync now.")
             return
         }
         let client = KeyVaultClient(endpoint: endpoint, token: sessionToken)
         do {
             let entries = try await client.list()
-            var installed = 0
+            var installed = 0, unopenable = 0
             for entry in entries {
                 guard let keyID = UUID(uuidString: entry.keyId),
-                      let keyType = SSHKeyType(rawValue: entry.keyType),
-                      let secret = try? KeyVault.open(entry.ciphertext, keyID: keyID, vaultKey: vaultKey)
-                else { continue }
+                      let keyType = SSHKeyType(rawValue: entry.keyType) else { continue }
+                guard let secret = try? KeyVault.open(entry.ciphertext, keyID: keyID, vaultKey: vaultKey) else {
+                    unopenable += 1
+                    continue
+                }
                 do {
                     try KeychainStore.savePrivateKey(Data(secret.pem.utf8), for: keyID)
                     if let passphrase = secret.passphrase, !passphrase.isEmpty {
@@ -132,6 +138,7 @@ final class TVCloudAccount: ObservableObject {
                 installed += 1
             }
             keysInstalled = installed
+            keysUnopenable = unopenable
             lastSyncAt = Date()
             phase = .ready
         } catch KeyVaultClient.ClientError.http(let status, _) where status == 401 {
@@ -192,6 +199,11 @@ struct TVAccountSection: View {
             case .ready:
                 Label("Synced with your Fin account: \(syncedSummary).", systemImage: "checkmark.icloud")
                     .foregroundStyle(.secondary)
+                if account.keysUnopenable > 0 {
+                    Label("\(account.keysUnopenable) key\(account.keysUnopenable == 1 ? "" : "s") in your account couldn't be opened here yet — open Fin on your iPhone or Mac once, then Sync now.",
+                          systemImage: "key.slash")
+                        .foregroundStyle(.orange)
+                }
                 Button("Sync now") { Task { await account.syncVault() } }
             case .failed(let message):
                 Label(message, systemImage: "exclamationmark.triangle")

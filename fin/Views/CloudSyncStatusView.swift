@@ -116,6 +116,9 @@ struct CloudSyncStatusView: View {
     @State private var checked = false
     @State private var probeResult: String?
     @State private var isProbing = false
+    @State private var vaultResult: String?
+    @State private var isPushingVault = false
+    @Environment(\.modelContext) private var modelContext
 
     var body: some View {
         NavigationStack {
@@ -156,6 +159,27 @@ struct CloudSyncStatusView: View {
                         Button("Open iCloud Settings", action: openSystemSettings)
                     }
                 }
+
+                // The key vault (see KeyVault): SSH keys reach the Apple TV through
+                // the Fin account, not iCloud Keychain. This happens at launch on its
+                // own; the button is for "I'm looking at the TV right now".
+                Section {
+                    if let vaultResult {
+                        Text(vaultResult)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button(isPushingVault ? "Sending keys\u{2026}" : "Send Keys to My Fin Account") {
+                        Task { await pushVault() }
+                    }
+                    .disabled(isPushingVault || !CloudControlPlaneConfig.isConfigured)
+                } header: {
+                    Text("Fin Account")
+                } footer: {
+                    Text(CloudControlPlaneConfig.isConfigured
+                        ? "Seals every SSH key on this device with your account's vault key and sends it to your Fin account, so the Apple TV can install it after Sign in with Apple."
+                        : "Sign in with Apple in an agent's settings first — the Apple TV gets its keys through your Fin account.")
+                }
             }
             .navigationTitle("iCloud Sync")
             .toolbar {
@@ -169,6 +193,15 @@ struct CloudSyncStatusView: View {
                 await probeCloud()
             }
         }
+    }
+
+    private func pushVault() async {
+        isPushingVault = true
+        defer { isPushingVault = false }
+        let result = await KeyVaultSync.pushAll(context: modelContext, force: true)
+        vaultResult = result.readable == 0
+            ? "No SSH keys with readable material on this device."
+            : "Sent \(result.pushed) of \(result.readable) key\(result.readable == 1 ? "" : "s") to your Fin account. On the Apple TV, choose Sync now."
     }
 
     private func refresh() async {

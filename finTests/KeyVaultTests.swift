@@ -73,3 +73,15 @@ final class KeyVaultTests: XCTestCase {
         XCTAssertEqual(CloudControlPlaneConfig.endpointURLKey, KeyVault.endpointURLKey)
     }
 }
+
+extension KeyVaultTests {
+    func testFingerprintIsStableShortAndNotTheKey() {
+        let key = Data((0..<32).map { UInt8($0) })
+        let fp = KeyVaultSync.fingerprint(key)
+        XCTAssertEqual(fp.count, 16)
+        XCTAssertEqual(fp, KeyVaultSync.fingerprint(key))
+        var other = key; other[31] ^= 1
+        XCTAssertNotEqual(fp, KeyVaultSync.fingerprint(other))
+        XCTAssertFalse(fp.contains(key.base64EncodedString().prefix(8)))
+    }
+}

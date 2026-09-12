@@ -35,6 +35,17 @@ final class RemoteInputPairing {
 }
 
 enum DeviceVaultKeyStore {
+    /// The canonical vault key if CloudKit has delivered one — never mints.
+    /// For devices that only OPEN entries (the Apple TV): a key minted there could
+    /// only ever lose the race to the sealing devices' key, and would leave every
+    /// entry unopenable until sync sorted it out.
+    @MainActor
+    static func existing(context: ModelContext) -> Data? {
+        let all = (try? context.fetch(FetchDescriptor<RemoteInputPairing>())) ?? []
+        return all.filter { $0.secretData.count == 32 }
+            .min(by: { $0.id.uuidString < $1.id.uuidString })?.secretData
+    }
+
     /// Returns the canonical vault key, minting one if none exists yet.
     ///
     /// Canonical = the record with the lowest id string, so two devices that both
