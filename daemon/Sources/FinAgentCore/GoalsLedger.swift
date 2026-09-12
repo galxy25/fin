@@ -230,6 +230,40 @@ public struct LedgerDocument: Codable, Equatable, Sendable {
 /// per-beat tick text. Both are derived from evals/goals-ledger/prompts/tick.md — edit
 /// THERE first, re-score the corpus, then sync here.
 public enum GoalsTick {
+    /// The follow-up the DAEMON writes after a user turn handed work to another pane
+    /// (docs/SITES.md conduct: "send_session it, then read_session on a later tick").
+    /// Live gap, 2026-09-12: with the goal tools hidden during a user turn nothing
+    /// recorded the hand-off, so no tick read the pane and the user got the PDF but
+    /// never the "done" notification. The daemon knows exactly what was sent where,
+    /// so it records the goal itself — the model is not asked to remember to.
+    public static func followUpGoal(request: String, target: String, source: String?, messageID: String) -> Goal {
+        let idTail = messageID.replacingOccurrences(of: "m-", with: "").prefix(8)
+        let short = request.count > 80 ? String(request.prefix(77)) + "…" : request
+        let via = source == "voice" ? "by voice" : "in the app"
+        return Goal(
+            id: "g-followup-\(idTail)",
+            title: "Follow up: \(short)",
+            state: .active,
+            priority: 1,
+            why: "The user asked for this \(via); it was handed to pane \(target). Done when that pane shows "
+                + "the work finished and the user has been told the outcome.",
+            nextAction: "read_session \(target). If the work is finished, call notify with the outcome in one "
+                + "line (what was delivered, or what went wrong), then close this goal. If the pane is still "
+                + "working, wait for the next tick. If it needs something from the user, tell the user with notify.",
+            tags: ["followup", "send_session"],
+            source: "daemon"
+        )
+    }
+
+    /// The pane target out of the engine's audit line "send_session: main:2.0 (127 chars)".
+    public static func sendSessionTarget(fromAuditText text: String) -> String? {
+        guard text.hasPrefix("send_session: ") else { return nil }
+        let rest = text.dropFirst("send_session: ".count)
+        guard let space = rest.firstIndex(of: " ") else { return String(rest) }
+        let target = String(rest[..<space])
+        return target.contains(":") ? target : nil
+    }
+
     /// A goal whose only substance is "ask the user what the goals are" is not a goal —
     /// it is the model deferring the user's own message back to the user. Two such goals
     /// (g-init-mission, g-mission-setup) hijacked every turn on 2026-09-12: priority 1,

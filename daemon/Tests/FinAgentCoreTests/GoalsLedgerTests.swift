@@ -390,3 +390,23 @@ final class AskTheUserGoalGuardTitleTests: XCTestCase {
         XCTAssertTrue(GoalsTick.isAskTheUserForGoals(title: "Initialize Mission", nextAction: "anything", why: nil))
     }
 }
+
+final class FollowUpGoalTests: XCTestCase {
+    func testParsesTheEnginesSendSessionAuditLine() {
+        XCTAssertEqual(GoalsTick.sendSessionTarget(fromAuditText: "send_session: main:2.0 (127 chars"), "main:2.0")
+        XCTAssertNil(GoalsTick.sendSessionTarget(fromAuditText: "read_session: list sessions"))
+        XCTAssertNil(GoalsTick.sendSessionTarget(fromAuditText: "send_session: nope (1 chars"), "a bare name is not a pane target")
+    }
+
+    func testTheFollowUpDrivesReadThenNotifyThenClose() {
+        let goal = GoalsTick.followUpGoal(request: "Tell the African Intellect claw session to send the grant as a PDF", target: "main:2.0", source: "voice", messageID: "m-9db0e9b4-db1a")
+        XCTAssertEqual(goal.id, "g-followup-9db0e9b4")
+        XCTAssertEqual(goal.state, .active)
+        XCTAssertEqual(goal.priority, 1)
+        XCTAssertTrue(goal.nextAction?.contains("read_session main:2.0") == true)
+        XCTAssertTrue(goal.nextAction?.contains("notify") == true)
+        XCTAssertTrue(goal.why?.contains("by voice") == true)
+        XCTAssertFalse(GoalsTick.isAskTheUserForGoals(title: goal.title, nextAction: goal.nextAction, why: goal.why),
+                       "the daemon's own follow-up must never trip the ask-the-user refusal")
+    }
+}

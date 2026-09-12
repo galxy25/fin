@@ -308,6 +308,9 @@ final class Daemon {
     /// `run()` has the pieces. The pane picture changes every minute; the prompt
     /// the launch composed would otherwise describe the machine as it was then.
     private var refreshSystemPrompt: (() -> Void)?
+    /// Panes the current user turn sent to (from the engine's audit events); after the
+    /// turn the daemon writes one follow-up goal per target.
+    private var sendSessionTargetsThisTurn: [String] = []
     /// Same, but for a given mode — the run loop switches to `.task` before a user
     /// turn and back to `.mission` after it.
     private var setPromptMode: ((PromptMode) -> Void)?
@@ -603,6 +606,26 @@ final class Daemon {
         + "send_session to give another agent's pane an instruction, send_input for your own shell), "
         + "then answer with what you did and what you saw. Do not create, update, or discuss goals in "
         + "this turn; do not describe your role; do not ask what the mission is."
+
+    /// After a user turn: one follow-up goal per pane it sent to, so the next mission
+    /// tick reads the pane and notifies the user with the outcome.
+    private func recordFollowUps(request: String, source: String?, messageID: String) async {
+        let targets = sendSessionTargetsThisTurn
+        sendSessionTargetsThisTurn = []
+        guard !targets.isEmpty, let goalsLedger else { return }
+        for target in targets {
+            let goal = GoalsTick.followUpGoal(request: request, target: target, source: source, messageID: messageID + "-" + target)
+            do {
+                try await goalsLedger.addGoal(goal)
+                let line = "[goals] follow-up recorded: \(goal.id) — read \(target), notify the user when done"
+                log(line)
+                record(AgentAuditEvent(kind: "notice", text: line))
+            } catch {
+                log("[goals] could not record follow-up for \(target): \(error)")
+            }
+        }
+        await goalsSync?.syncSoon()
+    }
 
     /// The prompt a user's message is submitted as. The model sees this; the audit
     /// trail and cloud transcript record the user's exact words (`displayText`).
@@ -1387,9 +1410,11 @@ final class Daemon {
             inFlightSiteMessageID = held.id
             isTurnInFlight = true
             async let ack: Void = siteClient?.markApplied(held.id, runID: transcript?.runID.uuidString) ?? ()
+            sendSessionTargetsThisTurn = []
             setPromptMode?(.task)
             outcome = await engine.submit(Self.userTurnPrompt(text, source: held.source), displayText: text)
             setPromptMode?(.mission)
+            await recordFollowUps(request: text, source: held.source, messageID: held.id)
             await ack
             isTurnInFlight = false
         } else {
@@ -1561,9 +1586,11 @@ final class Daemon {
                 // the window between submit and ack is the one at-least-once window
                 // the design admits, and the shorter it is the rarer a double apply.
                 async let ack: Void = siteClient?.markApplied(message.id, runID: transcript?.runID.uuidString) ?? ()
+                sendSessionTargetsThisTurn = []
                 setPromptMode?(.task)
                 outcome = await engine.submit(Self.userTurnPrompt(text, source: message.source), displayText: text)
                 setPromptMode?(.mission)
+                await recordFollowUps(request: text, source: message.source, messageID: message.id)
                 await ack
                 isTurnInFlight = false
                 inFlightDirectiveID = nil
@@ -1587,9 +1614,11 @@ final class Daemon {
                 inFlightDirectiveID = directive.id
                 pendingUserMessageForDigest = text
                 isTurnInFlight = true
+                sendSessionTargetsThisTurn = []
                 setPromptMode?(.task)
                 outcome = await engine.submit(Self.userTurnPrompt(text, source: nil), displayText: text)
                 setPromptMode?(.mission)
+                await recordFollowUps(request: text, source: nil, messageID: directive.id)
                 isTurnInFlight = false
                 await inboxLockClient?.release()
                 continue
@@ -1747,6 +1776,11 @@ final class Daemon {
     /// Every audit line goes to both sinks: the local JSONL trail, and — when configured
     /// — the redacted cloud transcript the app renders.
     private func record(_ event: AgentAuditEvent) {
+        if event.kind == "toolCall", event.toolName == "send_session",
+           let target = GoalsTick.sendSessionTarget(fromAuditText: event.text),
+           !sendSessionTargetsThisTurn.contains(target) {
+            sendSessionTargetsThisTurn.append(target)
+        }
         auditLog.append(event)
         // The immediate (non-batched) flush for turnStarted lives on the uplink itself
         // (see `DaemonTranscriptUplink.record`) — it owns `flush`, `mirrorKinds`, and
