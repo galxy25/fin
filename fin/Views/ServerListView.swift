@@ -20,22 +20,43 @@ struct ServerListView: View {
 
     private var visibleSites: [FinSite] { sites.sites.filter { $0.state != "retired" } }
 
+    struct SiteGroup { let agent: String; let sites: [FinSite] }
+
+    /// Grouped by agent, agents in first-seen order (the directory is already
+    /// sorted by priority, so "Fin" — the resident — leads).
+    private var siteGroups: [SiteGroup] { Self.grouped(visibleSites) }
+
+    static func grouped(_ sites: [FinSite]) -> [SiteGroup] {
+        var order: [String] = []
+        var byAgent: [String: [FinSite]] = [:]
+        for site in sites {
+            if byAgent[site.agent] == nil { order.append(site.agent) }
+            byAgent[site.agent, default: []].append(site)
+        }
+        return order.map { SiteGroup(agent: $0, sites: byAgent[$0] ?? []) }
+    }
+
     var body: some View {
         List {
             if CloudControlPlaneConfig.isConfigured, !visibleSites.isEmpty {
-                Section {
-                    ForEach(visibleSites) { site in
-                        siteRow(site)
+                // One group per agent: `agent` is a column on every site row, so a
+                // second agent is simply another group in the same pane — this is
+                // the remote control for all agents and all their bodies.
+                ForEach(siteGroups, id: \.agent) { group in
+                    Section {
+                        ForEach(group.sites) { site in
+                            siteRow(site)
+                        }
+                        if group.agent == siteGroups.last?.agent, let siteActionError {
+                            Label(siteActionError, systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
+                    } header: {
+                        Text(siteGroups.count > 1 ? "\(group.agent)\u{2019}s Computers" : "Fin\u{2019}s Computers")
                     }
-                    if let siteActionError {
-                        Label(siteActionError, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                } header: {
-                    Text("Fin's Computers")
+                    .accessibilityIdentifier("finComputersSection_\(group.agent)")
                 }
-                .accessibilityIdentifier("finComputersSection")
             }
             Section {
                 serverRows

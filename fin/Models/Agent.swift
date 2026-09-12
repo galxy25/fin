@@ -62,7 +62,7 @@ enum AgentHostingMode: String, Codable, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .local: return "This Device"
-        case .cloud: return "Cloud Harness"
+        case .cloud: return "Fin's sites"
         }
     }
 

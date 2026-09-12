@@ -86,6 +86,35 @@ enum KeychainStore {
         delete(service: deviceConfigService, account: key)
     }
 
+    /// Device-LOCAL secrets (today: this install's site token). Deliberately NOT
+    /// synchronizable: a site token authenticates one body, and syncing it would
+    /// let two devices heartbeat as the same site — the control plane would see
+    /// one site flapping between two machines. `ThisDeviceOnly` makes the
+    /// non-sync explicit at the keychain level, not just by omission.
+    static func saveLocalSecret(_ value: String, forKey key: String) throws {
+        delete(service: localConfigService, account: key)
+        guard !value.isEmpty else { return }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: localConfigService,
+            kSecAttrAccount as String: key,
+            kSecValueData as String: Data(value.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecAttrSynchronizable as String: false,
+        ]
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw KeychainError.unhandled(status) }
+    }
+
+    static func loadLocalSecret(forKey key: String) -> String? {
+        guard let data = load(service: localConfigService, account: key, synchronizable: false),
+              let value = String(data: data, encoding: .utf8), !value.isEmpty
+        else { return nil }
+        return value
+    }
+
+    private static let localConfigService = "dev.levischoen.fin.device-local"
+
     // `WhenUnlocked` (not `...ThisDeviceOnly`) plus `kSecAttrSynchronizable` is what makes
     // an item eligible for iCloud Keychain sync, so private keys follow the server list
     // they belong to onto every device signed into the same iCloud account.

@@ -53,6 +53,7 @@ actor DaemonSiteClient {
         var messages: [Offer]
         var commands: [Command]
         var urlsExpireAt: String?
+        var urls: [String: String] = [:]
     }
 
     /// `held` = claimed, not yet submitted. `unacked` = submitted, `applied` ack
@@ -101,6 +102,10 @@ actor DaemonSiteClient {
     /// launchd KeepAlive; drain = stop claiming).
     var onCommand: @Sendable (Command) async -> Void = { _ in }
 
+    func setURLHandler(_ handler: @escaping @Sendable ([String: String]) async -> Void) {
+        onURLs = handler
+    }
+
     func configure(
         runID: String?,
         transport: (@Sendable (URLRequest) async throws -> (Data, URLResponse))? = nil,
@@ -115,6 +120,12 @@ actor DaemonSiteClient {
         self.onCommand = onCommand
     }
 
+    /// When the URLs the last heartbeat handed us lapse; sent back on every beat
+    /// so the control plane re-signs within 20 minutes of expiry. Nil until the
+    /// first beat, which therefore always brings a fresh set — that is how a
+    /// site whose config shipped with no presigned URLs at all gets them.
+    private var urlsExpireAt: String?
+    private var onURLs: (@Sendable ([String: String]) async -> Void)?
     private(set) var role: String = "standby"
     private(set) var ledger: Ledger
     private(set) var isDraining = false
@@ -163,10 +174,8 @@ actor DaemonSiteClient {
             "held": ledger.held.map(\.id),
             "unacked": ledger.unacked,
             "capabilities": await capabilitiesProvider(),
-            // The daemon keeps its config-provisioned presigned URLs (refreshed by
-            // the launchd refresh job), so it never asks the heartbeat to re-sign.
-            "urlsExpireAt": "2999-01-01T00:00:00Z",
         ]
+        if let urlsExpireAt { body["urlsExpireAt"] = urlsExpireAt }
         if let runID { body["runId"] = runID }
 
         guard let (status, data) = await post("/sites/\(siteID)/heartbeat", body: body) else { return }
@@ -175,6 +184,10 @@ actor DaemonSiteClient {
             return
         }
         let response = Self.decodeHeartbeat(data)
+        if !response.urls.isEmpty {
+            urlsExpireAt = response.urlsExpireAt
+            await onURLs?(response.urls)
+        }
         let newRole = response.role ?? "standby"
         if newRole != role {
             audit("[site] role: \(newRole)")
@@ -325,7 +338,8 @@ actor DaemonSiteClient {
             heartbeatSeconds: object["heartbeatSeconds"] as? Int,
             messages: messages,
             commands: commands,
-            urlsExpireAt: object["urlsExpireAt"] as? String
+            urlsExpireAt: object["urlsExpireAt"] as? String,
+            urls: (object["urls"] as? [String: Any] ?? [:]).compactMapValues { $0 as? String }
         )
     }
 

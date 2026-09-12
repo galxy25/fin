@@ -274,6 +274,34 @@ struct FinApp: App {
         }
         manager.memorySyncService = memorySync
 
+        // This install as a site (docs/SITES.md Phase 2/3): heartbeats while the
+        // app is active and claims messages addressed to this device, submitting
+        // them through the same path a typed message takes. Only meaningful with
+        // a control plane; `start()` is a no-op without one.
+        let siteClient = AppSiteClient()
+        siteClient.audit = { [weak manager] line in manager?.recordLifecycleEvent(line) }
+        siteClient.targetProvider = { [weak manager] in
+            guard let manager,
+                  let target = manager.relayTargets().first(where: { $0.sessionConnected })
+            else { return nil }
+            let runtime = target.runtime
+            return AppSiteClient.Target(
+                agentID: runtime.agent.id,
+                agentName: runtime.agent.name,
+                submit: { runtime.submit($0) != .rejected },
+                isBusy: { runtime.isBusy },
+                needsInput: { if case .awaitingApproval = runtime.state { return true } else { return false } },
+                assistantReplies: {
+                    let replies = runtime.transcript.messages.filter { $0.role == .assistant && !$0.text.isEmpty }
+                    return (replies.count, replies.last?.text ?? "")
+                }
+            )
+        }
+        manager.siteClient = siteClient
+        // Goals belong to the user, not a device: pull the shared ledger on every
+        // foregrounding and push local changes (docs/SITES.md §8).
+        manager.goalsSync = AppGoalsSync()
+
         // Cross-device push subscriptions: idempotent refresh once the CloudKit
         // account answers. Failures land in the audit trail (and iCloud mirror) —
         // a silent zero-subscription outage cost a full debug cycle.

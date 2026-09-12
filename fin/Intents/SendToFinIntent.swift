@@ -77,7 +77,7 @@ enum FinVoiceIntentCore {
         guard let index = preferredTargetIndex(cloudAgentNames: candidates.map(\.name)) else {
             return .failure(CloudControlPlaneConfig.isConfigured
                 ? "No agent is set up yet. Open Fin and add one first."
-                : "No cloud-hosted agent is set up. In Fin, set an agent's hosting to Cloud Harness first.")
+                : "No cloud-hosted agent is set up. In Fin, set an agent's hosting to Fin's sites first.")
         }
         let agent = candidates[index]
         return .ready(agentID: agent.id, agentName: agent.name, text: trimmed)

@@ -166,6 +166,20 @@ final class SitesAndMessagesTests: XCTestCase {
         XCTAssertNotEqual(id, ControlPlaneClient.newMessageID())
     }
 
+    // MARK: - Fin's computers grouping
+
+    func testSitesGroupByAgentInFirstSeenOrder() {
+        let json = { (name: String, agent: String) -> FinSite in
+            let d: [String: Any] = ["siteId": "\(name)-0000-4000-8000-000000000000", "siteId8": name, "agent": agent,
+                                    "kind": "resident", "displayName": name, "priority": 1, "state": "idle", "live": true,
+                                    "capabilities": [:] as [String: Any]]
+            return try! ControlPlaneClient.decoder.decode(FinSite.self, from: JSONSerialization.data(withJSONObject: d))
+        }
+        let groups = ServerListView.grouped([json("imac0000", "Fin"), json("cloud000", "Fin"), json("nimbus00", "Nimbus")])
+        XCTAssertEqual(groups.map(\.agent), ["Fin", "Nimbus"])
+        XCTAssertEqual(groups[0].sites.map(\.siteId8), ["imac0000", "cloud000"])
+    }
+
     // MARK: - Mirror merge
 
     private func record(_ id: String, kind: AgentLogKind = .userMessage, text: String = "t", at: TimeInterval, site: String? = nil, name: String? = nil, replyTo: String? = nil) -> AgentMirrorRecord {

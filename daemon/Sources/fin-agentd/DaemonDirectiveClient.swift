@@ -107,7 +107,9 @@ struct DaemonStatusSnapshot {
 /// directive channel and the app's inbox — and everything downstream is shared,
 /// including the applied-id ledger.
 private struct PolledDocument {
-    let url: String
+    /// Mutable since 1.6.0: a site's URLs arrive on its heartbeat and are re-signed
+    /// before they lapse (`updateURLs`), so a config may ship with none at all.
+    var url: String
     /// Audit prefix for this source's failures; the directive channel's strings predate
     /// the inbox and stay unchanged.
     let failurePrefix: String
@@ -206,7 +208,7 @@ final class DaemonDirectiveClient {
     let audit: (String) -> Void
 
     let directiveURL: String
-    let statusURL: String?
+    private(set) var statusURL: String?
     /// The app-written second channel, same schema as directives. nil = inbox off.
     let inboxURL: String?
     let agentName: String
@@ -682,6 +684,21 @@ final class DaemonDirectiveClient {
     }
 
     /// Called by the daemon the moment it injects a directive's text into the engine.
+    /// Adopt (or refresh) the presigned URLs the site heartbeat supplies. A changed
+    /// directive URL drops the ETag so the next poll reads fresh; the same URL keeps
+    /// it. An empty string clears nothing — a heartbeat that omits a URL never
+    /// revokes one the config provided.
+    func updateURLs(directiveURL: String?, statusURL: String?) {
+        if let directiveURL, !directiveURL.isEmpty, directiveURL != directiveDocument.url {
+            directiveDocument.url = directiveURL
+            directiveDocument.etag = nil
+            directiveDocument.isFresh = false
+        }
+        if let statusURL, !statusURL.isEmpty {
+            self.statusURL = statusURL
+        }
+    }
+
     func markApplied(_ id: String) {
         appliedIDs.append(id)
         capAppliedIDs()

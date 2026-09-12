@@ -49,6 +49,8 @@ final class SessionManager: ObservableObject {
             if isAppActive {
                 startWatchdog()
                 directiveChannel.appDidBecomeActive()
+                siteClient?.start()
+                if let goalsSync { Task { await goalsSync.syncIfDue() } }
                 // "Compaction should happen by the app whenever I open it" — pulls the
                 // shared cumulative profile (fixes a stale local copy immediately on
                 // open) and opportunistically shares this device's own, ceilinged
@@ -56,6 +58,7 @@ final class SessionManager: ObservableObject {
                 memorySyncService?.compactCumulativeProfileIfDue()
             } else {
                 stopWatchdog()
+                siteClient?.stop()
                 directiveChannel.appDidResignActive()
             }
         }
@@ -99,6 +102,11 @@ final class SessionManager: ObservableObject {
     /// `AgentRemoteConsoleView` instead — this device has no live runtime for those to
     /// hang a trigger off of.
     var memorySyncService: AgentMemorySyncService?
+    /// This install as a site on the control plane (docs/SITES.md): heartbeats
+    /// while active, claims messages addressed to this device. Set by finApp.
+    var siteClient: AppSiteClient?
+    /// The shared goals ledger's sync lane; runs on foregrounding.
+    var goalsSync: AppGoalsSync?
 
     /// Whether an agent's live runtime is hosted on this device right now — the
     /// notification-tap router's fork between the normal console and the

@@ -135,6 +135,19 @@ allow-list in `_require_site_scope` is deny-by-default and is the entire
 boundary, since a site token attaches its owner's `userId` exactly like a
 session token does. Revoke one by re-enrolling (rotates) or retiring (destroys).
 
+### For a supervisor (Phase 3)
+
+An external supervisor reads **`GET /sites`** for presence and **`GET
+/messages?agent=`** for the queue — not `fin/status*.json` and not the inbox
+object. Both are gone: `fin/inbox/*`, `fin/status-*.json` and the whole-document
+`fin/transcripts/{agent}.jsonl` were archived under `users/{u}/fin/_retired-2026-09-12/`
+and deleted. The directive document (`fin/directives.json`) is unchanged.
+Per-site work goes through `POST /messages` with `context.siteHint`.
+
+Site-side `update` needs a published binary: `scripts/mac-fin-agentd/publish-binary.sh`
+uploads `fin/agentd/fin-agentd-macos-arm64` and its `.sha256` sidecar; queue
+`{"kind":"update"}` on a site and it verifies, renames, and restarts.
+
 ## Messages (the claim protocol)
 
 Phase 1b of `docs/SITES.md`. A message is applied by **at most one body**; the

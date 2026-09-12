@@ -63,11 +63,21 @@ BIN_SRC="${FIN_AGENTD_BIN_SRC:-$REPO_ROOT/daemon/.build/release/fin-agentd}"
 REQUIRED_DAEMON_VERSION="${FIN_REQUIRED_DAEMON_VERSION:-1.5.0}"
 # Copied next to the binary at install time; the LaunchAgents reference these, never the
 # checkout (see step 6).
-RUNTIME_SCRIPTS=(refresh.sh provision-config.sh rotate-logs.sh launch-agentd.sh)
+RUNTIME_SCRIPTS=(refresh.sh provision-config.sh enroll-config.py rotate-logs.sh launch-agentd.sh)
 START=0; SITE8_ARG=""; REPROVISION=0; PROVISION_ARGS=()
+ENROLL_TOKEN=""; ENDPOINT="${FIN_CONTROL_PLANE_ENDPOINT:-https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com}"
+MODEL="${FIN_MODEL:-google/gemma-4-12b-qat}"; DISPLAY_NAME=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--start) START=1 ;;
+		# "Let Fin live on this computer" (docs/SITES.md §3.2): redeem a one-time enroll
+		# token minted in the app. No AWS credentials, no operator bearer — the config's
+		# control-plane token is the SITE token and the presigned URLs arrive on the
+		# first heartbeat. Skips provision-config.sh entirely.
+		--enroll) [ $# -ge 2 ] || { echo "error: --enroll needs a token" >&2; exit 64; }; ENROLL_TOKEN="$2"; shift ;;
+		--endpoint) [ $# -ge 2 ] || { echo "error: --endpoint needs a URL" >&2; exit 64; }; ENDPOINT="$2"; shift ;;
+		--model) [ $# -ge 2 ] || { echo "error: --model needs an id" >&2; exit 64; }; MODEL="$2"; shift ;;
+		--name) [ $# -ge 2 ] || { echo "error: --name needs a value" >&2; exit 64; }; DISPLAY_NAME="$2"; shift ;;
 		--binary) [ $# -ge 2 ] || { echo "error: --binary needs a path" >&2; exit 64; }; BIN_SRC="$2"; shift ;;
 		--site8) [ $# -ge 2 ] || { echo "error: --site8 needs a value" >&2; exit 64; }; SITE8_ARG="$2"; shift ;;
 		--reprovision) REPROVISION=1 ;;
@@ -137,7 +147,12 @@ fi
 # authorized_keys line. That leaves a live authorized key on disk beside its private half,
 # and a plain `uninstall.sh` deliberately KEEPS both. Nothing said so.
 step "Preflight"
-"$SCRIPT_DIR/provision-config.sh" --preflight
+if [ -n "$ENROLL_TOKEN" ]; then
+	command -v curl >/dev/null || die "curl is required for --enroll"
+	echo "preflight:  --enroll: no AWS credentials needed; the site token and heartbeat URLs replace them"
+else
+	"$SCRIPT_DIR/provision-config.sh" --preflight
+fi
 
 # --- 3. site identity + dedicated key -------------------------------------------------
 step "Site identity"
@@ -203,6 +218,24 @@ chmod 600 "$AUTHORIZED_KEYS"
 # to the default with no diff and no warning. When a valid config for THIS site is already
 # there, re-sign in place instead (--refresh keeps every other field verbatim).
 step "Config"
+if [ -n "$ENROLL_TOKEN" ]; then
+	# Redeem the one-time token: no bearer at all, the token IS the authorization
+	# (control-plane enroll_with_token). The site id adopts this Mac's site8 so the
+	# per-device status objects it already writes keep their identity.
+	SITE_ID="${SITE8}-0000-4000-8000-000000000000"
+	ENROLL_KEY="$(hostname -s | tr '[:upper:]' '[:lower:]')/$USER"
+	NAME="${DISPLAY_NAME:-$(scutil --get ComputerName 2>/dev/null || hostname -s)}"
+	RESPONSE="$(FIN_TOKEN="$ENROLL_TOKEN" FIN_SITE_ID="$SITE_ID" FIN_KEY="$ENROLL_KEY" FIN_NAME="$NAME" /usr/bin/python3 -c '
+import json, os
+print(json.dumps({"enrollToken": os.environ["FIN_TOKEN"], "enrollKey": os.environ["FIN_KEY"],
+                  "siteId": os.environ["FIN_SITE_ID"], "displayName": os.environ["FIN_NAME"]}))' \
+		| curl -sS -X POST "$ENDPOINT/sites/enroll" -H 'content-type: application/json' --data-binary @-)" \
+		|| die "enroll request failed"
+	FIN_RESPONSE="$RESPONSE" FIN_CONFIG="$CONFIG" FIN_ENDPOINT="$ENDPOINT" FIN_MODEL="$MODEL" \
+	FIN_SITE8="$SITE8" FIN_KEY_PATH="$KEY" FIN_AUDIT="$FIN_AGENTD_HOME/audit.jsonl" FIN_SOCKET="${FIN_TMUX_SOCKET:-fin}" \
+	/usr/bin/python3 "$SCRIPT_DIR/enroll-config.py" || die "enroll: could not write config"
+	CONFIG_MODE="enrolled"
+else
 CONFIG_MODE="full write"
 if [ "$REPROVISION" -eq 0 ] && [ -s "$CONFIG" ] \
 	&& CONFIG_SITE8="$(FIN_CONFIG="$CONFIG" /usr/bin/python3 -c '
@@ -220,6 +253,7 @@ echo "mode: $CONFIG_MODE"
 FIN_DAEMON_VERSION="$DAEMON_VERSION" \
 	"$SCRIPT_DIR/provision-config.sh" "${PROVISION_ARGS[@]+"${PROVISION_ARGS[@]}"}"
 [ -s "$CONFIG" ] || die "provision-config.sh did not produce $CONFIG"
+fi
 
 # --- 6. runtime scripts next to the binary, then the LaunchAgents ----------------------
 # The plists must NEVER point into this git checkout. scripts/mac-fin-agentd exists only

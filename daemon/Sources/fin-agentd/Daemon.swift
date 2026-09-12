@@ -114,8 +114,9 @@ struct DaemonConfig: Decodable {
     /// `AgentDirectiveChannel` speaks. Present = the daemon polls for directives and
     /// uplinks status; absent = the channel is off.
     struct SupervisionConfig: Decodable {
-        /// GET target: the supervisor-written directive document.
-        var directiveURL: String
+        /// GET target: the supervisor-written directive document. Optional since
+        /// 1.6.0: a site receives it on its heartbeat (`DaemonDirectiveClient.updateURLs`).
+        var directiveURL: String?
         /// PUT target: the daemon's status document. Optional — polling works without it.
         var statusURL: String?
         /// GET target: the app-written message document, same schema as directives.
@@ -709,7 +710,7 @@ final class Daemon {
                 log("supervision: inbox polling retired — this body is a site and claims its messages")
             }
             let client = DaemonDirectiveClient(
-                directiveURL: block.directiveURL,
+                directiveURL: block.directiveURL ?? "",
                 statusURL: block.statusURL,
                 inboxURL: config.site == nil ? block.inboxURL : nil,
                 inboxResetAtLaunch: block.inboxResetAtLaunch ?? false,
@@ -966,8 +967,12 @@ final class Daemon {
             try await ledgerStore.load()
             goalsLedger = ledgerStore
             if let block = config.controlPlane {
+                // As the site when there is one: X-Fin-Site makes _authorize check the
+                // bearer AS a site token, so the pair must be the site's, never the
+                // operator's — that mismatch is a 401, not a fallback.
                 let sync = DaemonGoalsSync(
-                    endpointURL: block.endpointURL, token: block.token, siteID: config.site?.id.lowercased(),
+                    endpointURL: block.endpointURL, token: config.site?.token ?? block.token,
+                    siteID: config.site?.id.lowercased(),
                     agentName: config.supervision?.agentName ?? "Agent",
                     store: ledgerStore, statePath: goalsSyncStatePath,
                     audit: { [weak self] line in
@@ -1220,6 +1225,11 @@ final class Daemon {
                         }
                     }
                 )
+                await client.setURLHandler { @MainActor [weak self] urls in
+                    self?.supervision?.updateURLs(
+                        directiveURL: urls["supervisionDirectiveGet"], statusURL: urls["supervisionStatusPut"]
+                    )
+                }
                 transcript?.siteID8 = client.siteID8
                 transcript?.siteName = client.displayName
                 memoryConsolidator?.terminalPanesProvider = { [weak self] in self?.lastPaneObservations ?? [] }

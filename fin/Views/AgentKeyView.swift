@@ -40,6 +40,7 @@ struct AgentKeyView: View {
             keySection
             if publicKeyLine != nil {
                 grantSection
+            liveHereSection
                 cloudSection
             }
             if let banner {
@@ -124,6 +125,71 @@ struct AgentKeyView: View {
                 + "key picker. To revoke access later, delete the line ending "
                 + "in \u{201c}\(AgentSSHKey.comment)\u{201d} from "
                 + "~/.ssh/authorized_keys on that computer.")
+        }
+    }
+
+    // MARK: - Let Fin live on this computer
+
+    @State private var enrollCommand: String?
+    @State private var enrollExpiry: Date?
+    @State private var isMintingEnroll = false
+
+    /// Granting the key (above) makes a machine a server Fin can REACH; this
+    /// makes it a site Fin can RUN ON (docs/SITES.md §4): one-time token,
+    /// fifteen minutes, redeemed by the installer with no operator credential
+    /// on that machine at all.
+    private var liveHereSection: some View {
+        Section {
+            if let enrollCommand {
+                Text(enrollCommand)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                Button("Copy Install Command") {
+                    copyToPasteboard(enrollCommand)
+                    banner = "Install command copied — it expires in 15 minutes."
+                }
+                if let enrollExpiry {
+                    Text("Token expires \(enrollExpiry.formatted(.relative(presentation: .named))).")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            } else {
+                Button(isMintingEnroll ? "Preparing…" : "Let Fin Live on This Computer…") { mintEnroll() }
+                    .disabled(isMintingEnroll || !CloudControlPlaneConfig.isConfigured)
+                if !CloudControlPlaneConfig.isConfigured {
+                    Text("Needs the control plane (Hosting settings).")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        } header: {
+            Text("Let Fin Live on a Computer")
+        } footer: {
+            Text("Run this on a Mac from a checkout of Fin. It installs fin-agentd as a "
+                + "resident site that heartbeats to your account and claims your messages. "
+                + "The token is one-time; the site can be retired from Fin\u{2019}s Computers.")
+        }
+        .accessibilityIdentifier("liveHereSection")
+    }
+
+    private func mintEnroll() {
+        isMintingEnroll = true
+        Task {
+            defer { isMintingEnroll = false }
+            let body: [String: Any] = ["agent": "Fin", "kind": "resident"]
+            guard case .success((let status, let data)) = await ControlPlaneClient.perform(
+                ControlPlaneClient.request("POST", path: "/sites/enroll-tokens", body: body)
+            ), status == 200,
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let token = object["enrollToken"] as? String
+            else {
+                banner = "Couldn\u{2019}t get an enroll token from the control plane."
+                return
+            }
+            var endpoint = CloudControlPlaneConfig.endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            while endpoint.hasSuffix("/") { endpoint.removeLast() }
+            enrollCommand = "scripts/mac-fin-agentd/install.sh --enroll \(token) --endpoint \(endpoint) --start"
+            enrollExpiry = (object["expiresAt"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
         }
     }
 
