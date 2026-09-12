@@ -14,6 +14,7 @@ import base64
 import importlib.util
 import json
 import os
+import re
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -726,72 +727,139 @@ class PresignSupervisionStatusBackCompatTests(unittest.TestCase):
 
 
 
-class _FakeSitesTable:
-    """Enough DynamoDB for the sites routes: get/put/update with the one
-    conditional shape they use (`rev = :rev`) and a scan that honours the two
-    string FilterExpressions in this file. A fake rather than moto because the
-    point of these tests is the routes' own logic, and the conditional write is
-    the only DynamoDB behaviour they actually depend on."""
+class _FakeDynamoTable:
+    """Enough DynamoDB for the sites/messages routes, in memory: get/put/update/
+    scan with a real evaluator for the handful of expression shapes lambda.py
+    uses (SET/REMOVE, attribute_not_exists, =, <, IN, AND/OR/parentheses) and
+    a FilterExpression evaluator for the same grammar. A fake rather than moto
+    on purpose: the point of these tests is the routes' own logic, and the
+    conditional write is the only DynamoDB behaviour they depend on — this
+    evaluates it for real instead of pattern-matching strings, so a condition
+    that is subtly wrong fails here the way it would fail live."""
 
-    def __init__(self, items=()):
-        self.items = {i["siteId"]: dict(i) for i in items}
+    def __init__(self, key, items=()):
+        self.key = key
+        self.items = {i[key]: dict(i) for i in items}
 
+    # -- expression evaluation ---------------------------------------------
+    @staticmethod
+    def _resolve(token, names, values):
+        token = token.strip()
+        if token.startswith(":"):
+            return values[token]
+        if token.startswith("#"):
+            return names[token]
+        return token
+
+    def _field(self, item, token, names):
+        name = names.get(token, token) if token.startswith("#") else token
+        return item.get(name)
+
+    def _eval(self, expr, item, names, values):
+        expr = expr.strip()
+        # Strip one layer of enclosing parentheses if they wrap the whole thing.
+        if expr.startswith("(") and expr.endswith(")"):
+            depth = 0
+            wraps = True
+            for i, ch in enumerate(expr):
+                depth += (ch == "(") - (ch == ")")
+                if depth == 0 and i < len(expr) - 1:
+                    wraps = False
+                    break
+            if wraps:
+                return self._eval(expr[1:-1], item, names, values)
+        for op in (" OR ", " AND "):
+            depth = 0
+            for i in range(len(expr)):
+                ch = expr[i]
+                depth += (ch == "(") - (ch == ")")
+                if depth == 0 and expr[i:i + len(op)] == op:
+                    left = self._eval(expr[:i], item, names, values)
+                    right = self._eval(expr[i + len(op):], item, names, values)
+                    return (left or right) if op == " OR " else (left and right)
+        m = re.match(r"^attribute_not_exists\((\S+)\)$", expr)
+        if m:
+            return self._field(item, m.group(1), names) is None
+        m = re.match(r"^(\S+) IN \((.+)\)$", expr)
+        if m:
+            wanted = [values[v.strip()] for v in m.group(2).split(",")]
+            return self._field(item, m.group(1), names) in wanted
+        m = re.match(r"^(\S+) (=|<|>|<=|>=) (\S+)$", expr)
+        if m:
+            left = self._field(item, m.group(1), names)
+            right = values[m.group(3)]
+            op = m.group(2)
+            if left is None:
+                return False
+            return {"=": left == right, "<": left < right, ">": left > right,
+                    "<=": left <= right, ">=": left >= right}[op]
+        raise AssertionError("unsupported expression: " + expr)
+
+    def _apply_update(self, item, update, names, values):
+        rest = update
+        remove = None
+        if " REMOVE " in rest:
+            rest, remove = rest.split(" REMOVE ", 1)
+        assert rest.startswith("SET "), update
+        for clause in rest[4:].split(", "):
+            field, _, value = clause.partition(" = ")
+            field = names.get(field.strip(), field.strip())
+            item[field] = values[value.strip()]
+        if remove:
+            for field in remove.split(","):
+                item.pop(names.get(field.strip(), field.strip()), None)
+
+    @staticmethod
+    def _conditional_failure(op):
+        return lam.ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException", "Message": "no"}}, op
+        )
+
+    # -- the API surface the code uses --------------------------------------
     def get_item(self, Key):
-        item = self.items.get(Key["siteId"])
+        item = self.items.get(Key[self.key])
         return {"Item": dict(item)} if item else {}
 
-    def _check_rev(self, item, values):
-        return int((item or {}).get("rev") or 0) == int(values[":rev"])
-
-    def put_item(self, Item, ConditionExpression=None, ExpressionAttributeValues=None):
-        if ConditionExpression:
-            assert ConditionExpression == "rev = :rev", ConditionExpression
-            if not self._check_rev(self.items.get(Item["siteId"]), ExpressionAttributeValues):
-                raise lam.ClientError(
-                    {"Error": {"Code": "ConditionalCheckFailedException", "Message": "no"}},
-                    "PutItem",
-                )
-        self.items[Item["siteId"]] = dict(Item)
+    def put_item(self, Item, ConditionExpression=None, ExpressionAttributeValues=None,
+                 ExpressionAttributeNames=None):
+        existing = self.items.get(Item[self.key])
+        if ConditionExpression and not self._eval(
+            ConditionExpression, existing or {}, ExpressionAttributeNames or {}, ExpressionAttributeValues or {}
+        ):
+            raise self._conditional_failure("PutItem")
+        self.items[Item[self.key]] = dict(Item)
 
     def update_item(self, Key, UpdateExpression, ExpressionAttributeValues=None,
                     ExpressionAttributeNames=None, ConditionExpression=None):
-        item = self.items.setdefault(Key["siteId"], {"siteId": Key["siteId"]})
+        names = ExpressionAttributeNames or {}
         values = ExpressionAttributeValues or {}
-        if ConditionExpression:
-            assert ConditionExpression == "rev = :rev", ConditionExpression
-            if not self._check_rev(item, values):
-                raise lam.ClientError(
-                    {"Error": {"Code": "ConditionalCheckFailedException", "Message": "no"}},
-                    "UpdateItem",
-                )
-        if "commands = :c" in UpdateExpression:
-            item["commands"] = values[":c"]
-        if ":retired" in values:
-            item["state"] = values[":retired"]
-            item["retiredAt"] = values[":now"]
-        if ":next" in values:
-            item["rev"] = values[":next"]
-        if "REMOVE" in UpdateExpression:
-            for field in UpdateExpression.split("REMOVE", 1)[1].split(","):
-                item.pop(field.strip(), None)
+        item = self.items.get(Key[self.key])
+        if ConditionExpression and not self._eval(ConditionExpression, item or {}, names, values):
+            raise self._conditional_failure("UpdateItem")
+        if item is None:
+            item = {self.key: Key[self.key]}
+            self.items[Key[self.key]] = item
+        self._apply_update(item, UpdateExpression, names, values)
 
-    def scan(self, FilterExpression=None, ExpressionAttributeValues=None, **kwargs):
-        values = ExpressionAttributeValues or {}
+    def scan(self, FilterExpression=None, ExpressionAttributeValues=None,
+             ExpressionAttributeNames=None, **kwargs):
         rows = list(self.items.values())
-        if FilterExpression and "userId = :user" in FilterExpression:
-            rows = [r for r in rows if r.get("userId") == values[":user"]]
-        if FilterExpression and "enrollKey = :key" in FilterExpression:
-            rows = [r for r in rows if r.get("enrollKey") == values[":key"]]
-        if FilterExpression and "agent = :agent" in FilterExpression:
-            rows = [r for r in rows if r.get("agent") == values[":agent"]]
+        if FilterExpression:
+            rows = [r for r in rows if self._eval(
+                FilterExpression, r, ExpressionAttributeNames or {}, ExpressionAttributeValues or {}
+            )]
         return {"Items": [dict(r) for r in rows]}
 
 
 class _SitesTestCase(unittest.TestCase):
     def setUp(self):
-        self._orig = lam.SITES_TABLE
-        lam.SITES_TABLE = _FakeSitesTable()
-        self.addCleanup(lambda: setattr(lam, "SITES_TABLE", self._orig))
+        for attr, key in (("SITES_TABLE", "siteId"), ("MESSAGES_TABLE", "messageId"), ("AGENTS_TABLE", "agentKey")):
+            orig = getattr(lam, attr)
+            setattr(lam, attr, _FakeDynamoTable(key))
+            self.addCleanup(setattr, lam, attr, orig)
+        self._orig_presign = lam._presign
+        lam._presign = lambda method, key: "https://example.invalid/{}".format(key)
+        self.addCleanup(setattr, lam, "_presign", self._orig_presign)
 
     def enroll(self, user="user-1", **body):
         payload = {"agent": "Fin", "kind": "resident", "enrollKey": "levis-imac/deepspacenine"}
@@ -855,9 +923,6 @@ class SiteEnrollmentTests(_SitesTestCase):
 class SiteLeaseTests(_SitesTestCase):
     def setUp(self):
         super().setUp()
-        self._orig_presign = lam._presign
-        lam._presign = lambda method, key: "https://example.invalid/{}".format(key)
-        self.addCleanup(lambda: setattr(lam, "_presign", self._orig_presign))
         self.site = self.enroll()
 
     def _beat(self, user="user-1", **body):
@@ -990,6 +1055,317 @@ class SiteTokenScopeTests(_SitesTestCase):
 
 
 
+
+class _MessagesTestCase(_SitesTestCase):
+    """Two enrolled bodies for one user's agent: the resident iMac (100) and a
+    cloud worker (10), both beating so both are live."""
+
+    def setUp(self):
+        super().setUp()
+        self.imac = self.enroll(enrollKey="imac", displayName="Levi's iMac", kind="resident")
+        self.cloud = self.enroll(enrollKey="cloud-1", displayName="Cloud computer", kind="ec2")
+        self.beat(self.imac, capabilities={"tmux_sessions": [
+            {"session": "main", "tasks": ["fin project work", "pocketdj"]},
+        ]})
+        self.beat(self.cloud, capabilities={"tmux_sessions": [{"session": "agent", "tasks": ["deploys"]}]})
+
+    def beat(self, site, user="user-1", **body):
+        event = {"_userId": user, "_siteId": site["siteId"], "body": json.dumps(body)}
+        return json.loads(lam.site_heartbeat(event, site["siteId"])["body"])
+
+    def send(self, text, user="user-1", **extra):
+        payload = {"agent": "Fin", "text": text}
+        payload.update(extra)
+        return json.loads(lam.send_message({"_userId": user, "body": json.dumps(payload)})["body"])
+
+    def claim(self, site, message_id, **body):
+        event = {"_userId": "user-1", "_siteId": site["siteId"], "body": json.dumps(body)}
+        response = lam.claim_message(event, message_id)
+        return response["statusCode"], json.loads(response["body"])
+
+    def ack(self, site, message_id, state, **body):
+        payload = {"state": state}
+        payload.update(body)
+        event = {"_userId": "user-1", "_siteId": site["siteId"], "body": json.dumps(payload)}
+        return lam.ack_message(event, message_id)
+
+    def row(self, message_id):
+        return lam.MESSAGES_TABLE.items[message_id]
+
+
+class PinForTests(unittest.TestCase):
+    """§3.4 as a pure function."""
+
+    def _site(self, sid, sessions):
+        return {"siteId": sid, "siteId8": sid[:8], "displayName": sid,
+                "capabilities": {"tmux_sessions": sessions}}
+
+    def setUp(self):
+        self.imac = self._site("imac-0000-4000-8000-000000000000", [
+            {"session": "main", "tasks": ["fin project work"]}])
+        self.cloud = self._site("cloud-000-4000-8000-000000000000", [
+            {"session": "agent", "tasks": ["deploys"]}])
+
+    def test_a_site_hint_naming_a_live_site_pins(self):
+        pin, by, _ = lam._pin_for("anything", {"siteHint": self.cloud["siteId8"]}, [self.imac, self.cloud])
+        self.assertEqual((pin, by), (self.cloud["siteId"], "hint"))
+
+    def test_a_site_hint_naming_a_dead_site_is_ignored(self):
+        pin, by, _ = lam._pin_for("anything", {"siteHint": "nope"}, [self.imac])
+        self.assertEqual((pin, by), (None, None))
+
+    def test_a_whole_word_session_mention_pins_to_that_site(self):
+        pin, by, _ = lam._pin_for("what is the agent session doing", {}, [self.imac, self.cloud])
+        self.assertEqual((pin, by), (self.cloud["siteId"], "context"))
+
+    def test_a_substring_is_not_a_mention(self):
+        # "mainly" must not route to the "main" session — same rule as the app.
+        pin, by, _ = lam._pin_for("mainly wondering", {}, [self.imac, self.cloud])
+        self.assertEqual((pin, by), (None, None))
+
+    def test_the_senders_active_session_names_count_as_context(self):
+        pin, by, _ = lam._pin_for("run the tests", {"activeSessionNames": ["main"]}, [self.imac, self.cloud])
+        self.assertEqual((pin, by), (self.imac["siteId"], "context"))
+
+    def test_two_matching_sites_ask_for_clarification_rather_than_guess(self):
+        pin, by, candidates = lam._pin_for("check main and agent", {}, [self.imac, self.cloud])
+        self.assertIsNone(pin)
+        self.assertEqual(by, "clarify")
+        self.assertEqual(sorted(candidates), sorted([self.imac["displayName"], self.cloud["displayName"]]))
+
+
+class EligibilityTests(unittest.TestCase):
+    """§6.2 as a pure function. `now` is fixed; leases are relative to it."""
+
+    def _row(self, **fields):
+        row = {"state": "queued"}
+        row.update(fields)
+        return row
+
+    def test_a_pinned_row_is_only_eligible_to_the_pinned_site(self):
+        row = self._row(pinSiteId="a")
+        self.assertTrue(lam._eligible(row, "a", False, True, lambda _: True, NOW))
+        self.assertFalse(lam._eligible(row, "b", True, True, lambda _: True, NOW))
+
+    def test_a_targeted_row_goes_to_its_target_while_that_target_is_live(self):
+        row = self._row(targetSiteId="a")
+        self.assertTrue(lam._eligible(row, "a", False, True, lambda _: True, NOW))
+        self.assertFalse(lam._eligible(row, "b", True, True, lambda _: True, NOW))
+
+    def test_a_stale_target_falls_through_to_the_primary(self):
+        row = self._row(targetSiteId="dead")
+        self.assertTrue(lam._eligible(row, "b", True, True, lambda _: False, NOW))
+        self.assertFalse(lam._eligible(row, "c", False, True, lambda _: False, NOW))
+
+    def test_with_no_live_primary_any_live_site_may_take_it(self):
+        # Last-resort failover: better a standby answers than nobody does.
+        row = self._row()
+        self.assertTrue(lam._eligible(row, "anyone", False, False, lambda _: False, NOW))
+
+    def test_a_row_under_a_fresh_claim_is_offered_to_nobody(self):
+        row = self._row(state="claimed", leaseUntil=_iso(NOW + timedelta(seconds=30)))
+        self.assertFalse(lam._eligible(row, "a", True, True, lambda _: True, NOW))
+
+    def test_a_row_whose_claim_lapsed_is_offered_again(self):
+        row = self._row(state="claimed", leaseUntil=_iso(NOW - timedelta(seconds=1)))
+        self.assertTrue(lam._eligible(row, "a", True, True, lambda _: True, NOW))
+
+    def test_applied_and_answered_rows_are_never_offered(self):
+        for state in ("applied", "answered", "expired"):
+            self.assertFalse(lam._eligible(self._row(state=state), "a", True, True, lambda _: True, NOW))
+
+
+class PrimaryElectionTests(_MessagesTestCase):
+    def test_the_higher_priority_site_preempts_on_its_first_beat(self):
+        # The cloud worker beat first in setUp; the iMac beat second and won.
+        self.assertEqual(self.beat(self.cloud)["role"], "standby")
+        self.assertEqual(self.beat(self.imac)["role"], "primary")
+
+    def test_a_lower_priority_site_cannot_take_the_role_while_the_lease_is_fresh(self):
+        self.beat(self.imac)
+        self.assertEqual(self.beat(self.cloud)["role"], "standby")
+
+    def test_a_silent_primary_is_replaced_once_its_lease_lapses(self):
+        self.beat(self.imac)
+        row = lam.AGENTS_TABLE.items[lam._agent_key("user-1", "Fin")]
+        row["primaryLeaseUntil"] = _iso(lam._now() - timedelta(seconds=1))
+        self.assertEqual(self.beat(self.cloud)["role"], "primary")
+
+    def test_a_site_that_does_not_want_the_role_never_takes_it(self):
+        lam.AGENTS_TABLE.items.clear()
+        self.assertEqual(self.beat(self.cloud, wantsPrimary=False)["role"], "standby")
+        self.assertNotIn(lam._agent_key("user-1", "Fin"), lam.AGENTS_TABLE.items)
+
+    def test_only_the_primary_is_handed_the_legacy_inbox(self):
+        # §6.5: the legacy document keeps exactly one consumer.
+        self.assertIn("legacyInboxGet", self.beat(self.imac))
+        self.assertNotIn("legacyInboxGet", self.beat(self.cloud))
+
+
+class SendMessageTests(_MessagesTestCase):
+    def test_a_retry_with_the_same_id_is_a_no_op(self):
+        first = self.send("hello", messageId="m-11111111-aaaa")
+        second = self.send("hello again", messageId="m-11111111-aaaa")
+        self.assertEqual(first["messageId"], second["messageId"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(self.row("m-11111111-aaaa")["text"], "hello")
+
+    def test_an_unaddressed_message_targets_the_live_primary(self):
+        self.beat(self.imac)
+        result = self.send("what's up")
+        self.assertEqual(result["targetSiteId"], self.imac["siteId"])
+        self.assertEqual(result["targetSiteName"], "Levi's iMac")
+        self.assertEqual(result["routedBy"], "primary")
+
+    def test_a_session_mention_pins_regardless_of_who_is_primary(self):
+        self.beat(self.imac)
+        result = self.send("restart the deploys in the agent session")
+        self.assertEqual(result["pinSiteId"], self.cloud["siteId"])
+        self.assertEqual(result["routedBy"], "context")
+
+    def test_with_no_live_site_the_row_still_queues(self):
+        lam.SITES_TABLE.items.clear()
+        lam.AGENTS_TABLE.items.clear()
+        result = self.send("anyone there?")
+        self.assertEqual(result["state"], "queued")
+        self.assertIsNone(result["targetSiteId"])
+
+    def test_another_users_message_is_invisible(self):
+        sent = self.send("mine")
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.get_message({"_userId": "user-2"}, sent["messageId"])
+        self.assertEqual(caught.exception.status, 404)
+
+
+class ClaimProtocolTests(_MessagesTestCase):
+    """§6.3 / §6.4 — the exclusion guarantees, pinned on the real condition."""
+
+    def test_exactly_one_of_two_claimants_is_granted(self):
+        sent = self.send("do the thing")
+        a_status, _ = self.claim(self.imac, sent["messageId"])
+        b_status, _ = self.claim(self.cloud, sent["messageId"])
+        self.assertEqual((a_status, b_status), (200, 409))
+
+    def test_the_claimant_may_re_claim_its_own_message(self):
+        sent = self.send("do the thing")
+        self.claim(self.imac, sent["messageId"])
+        status, _ = self.claim(self.imac, sent["messageId"])
+        self.assertEqual(status, 200)
+
+    def test_a_lapsed_claim_can_be_taken_by_another_site(self):
+        sent = self.send("do the thing")
+        self.claim(self.imac, sent["messageId"])
+        self.row(sent["messageId"])["leaseUntil"] = _iso(lam._now() - timedelta(seconds=1))
+        status, _ = self.claim(self.cloud, sent["messageId"])
+        self.assertEqual(status, 200)
+
+    def test_an_applied_message_cannot_be_reclaimed_even_after_its_lease_lapses(self):
+        # §6.4's one at-least-once window is a death BETWEEN submit and ack;
+        # once acked, the lease no longer matters.
+        sent = self.send("do the thing")
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied")
+        self.row(sent["messageId"])["leaseUntil"] = _iso(lam._now() - timedelta(seconds=1))
+        status, _ = self.claim(self.cloud, sent["messageId"])
+        self.assertEqual(status, 409)
+
+    def test_only_the_claimant_may_ack(self):
+        sent = self.send("do the thing")
+        self.claim(self.imac, sent["messageId"])
+        with self.assertRaises(lam.ApiError) as caught:
+            self.ack(self.cloud, sent["messageId"], "applied")
+        self.assertEqual(caught.exception.status, 409)
+
+    def test_acks_only_move_forward(self):
+        sent = self.send("do the thing")
+        self.claim(self.imac, sent["messageId"])
+        with self.assertRaises(lam.ApiError):
+            self.ack(self.imac, sent["messageId"], "answered")  # not applied yet
+        self.ack(self.imac, sent["messageId"], "applied", runId="run-1")
+        self.ack(self.imac, sent["messageId"], "answered", replyPreview="done")
+        row = self.row(sent["messageId"])
+        self.assertEqual((row["state"], row["appliedRunId"], row["replyPreview"]), ("answered", "run-1", "done"))
+        self.assertIn("ttl", row)
+
+    def test_a_site_cannot_claim_another_agents_message(self):
+        other = self.enroll(agent="Nimbus", enrollKey="nimbus-box")
+        sent = self.send("for fin only")
+        with self.assertRaises(lam.ApiError) as caught:
+            self.claim(other, sent["messageId"])
+        self.assertEqual(caught.exception.status, 404)
+
+
+class HeartbeatDispatchTests(_MessagesTestCase):
+    def test_the_primary_is_offered_an_unaddressed_message(self):
+        self.beat(self.imac)
+        sent = self.send("hello")
+        offered = [m["id"] for m in self.beat(self.imac)["messages"]]
+        self.assertEqual(offered, [sent["messageId"]])
+        self.assertEqual([m["id"] for m in self.beat(self.cloud)["messages"]], [])
+
+    def test_a_held_message_is_renewed_not_re_offered(self):
+        self.beat(self.imac)
+        sent = self.send("hello")
+        self.claim(self.imac, sent["messageId"])
+        self.row(sent["messageId"])["leaseUntil"] = _iso(lam._now() + timedelta(seconds=5))
+        result = self.beat(self.imac, held=[sent["messageId"]])
+        self.assertEqual(result["messages"], [])
+        renewed = lam._parse_iso(self.row(sent["messageId"])["leaseUntil"])
+        self.assertGreater(renewed, lam._now() + timedelta(seconds=60))
+
+    def test_unacked_ids_are_acked_on_the_next_beat_before_anyone_else_sees_them(self):
+        # §6.4 "site dies after submit, before ack", restarted within the lease.
+        self.beat(self.imac)
+        sent = self.send("hello")
+        self.claim(self.imac, sent["messageId"])
+        self.beat(self.imac, unacked=[sent["messageId"]])
+        self.assertEqual(self.row(sent["messageId"])["state"], "applied")
+        self.assertEqual(self.beat(self.cloud)["messages"], [])
+
+    def test_a_standby_takes_over_when_the_primary_goes_silent(self):
+        self.beat(self.imac)
+        sent = self.send("hello")  # targeted at the iMac
+        lam.SITES_TABLE.items[self.imac["siteId"]]["leaseUntil"] = _iso(lam._now() - timedelta(seconds=1))
+        lam.AGENTS_TABLE.items[lam._agent_key("user-1", "Fin")]["primaryLeaseUntil"] = _iso(lam._now() - timedelta(seconds=1))
+        result = self.beat(self.cloud)
+        self.assertEqual(result["role"], "primary")
+        self.assertEqual([m["id"] for m in result["messages"]], [sent["messageId"]])
+
+
+class LegacyRegisterTests(_MessagesTestCase):
+    def test_registering_twice_creates_once(self):
+        event = {"_userId": "user-1", "_siteId": self.imac["siteId"], "body": json.dumps({"text": "old build says hi"})}
+        first = json.loads(lam.register_message(event, "m-legacy-0001")["body"])
+        second = json.loads(lam.register_message(event, "m-legacy-0001")["body"])
+        self.assertEqual((first["created"], second["created"]), (True, False))
+        self.assertEqual(self.row("m-legacy-0001")["pinSiteId"], self.imac["siteId"])
+        self.assertEqual(self.row("m-legacy-0001")["source"], "legacy")
+
+
+class StaleSiteSweepTests(_SitesTestCase):
+    def test_a_site_silent_for_three_leases_is_marked_stale_never_retired(self):
+        site = self.enroll()
+        lam.SITES_TABLE.items[site["siteId"]]["leaseUntil"] = _iso(lam._now() - timedelta(seconds=4 * lam.SITE_LEASE_SECONDS))
+        lam.SITES_TABLE.items[site["siteId"]]["lastHeartbeatAt"] = "2026-01-01T00:00:00Z"
+        self.assertEqual(lam._mark_stale_sites(lam._now()), [site["siteId"]])
+        self.assertEqual(lam.SITES_TABLE.items[site["siteId"]]["state"], "stale")
+
+    def test_an_enrolled_site_that_never_beat_is_not_stale(self):
+        site = self.enroll()
+        self.assertEqual(lam._mark_stale_sites(lam._now()), [])
+
+
+class SiteTokenMessageScopeTests(unittest.TestCase):
+    def test_a_site_may_claim_ack_and_register(self):
+        for action in ("claim", "ack", "register"):
+            lam._require_site_scope({"_siteId": "s"}, "POST", ["messages", "m-1", action])
+
+    def test_a_site_may_not_send_or_list_messages(self):
+        for method, parts in (("POST", ["messages"]), ("GET", ["messages"]), ("GET", ["messages", "m-1"])):
+            with self.assertRaises(lam.ApiError):
+                lam._require_site_scope({"_siteId": "s"}, method, parts)
+
+
 class SiteRouteRegistrationTests(unittest.TestCase):
     """Every handler in lambda.py's router also needs a route in deploy.sh's
     ROUTES heredoc, or API Gateway 404s a path the Lambda handles perfectly —
@@ -1009,11 +1385,21 @@ class SiteRouteRegistrationTests(unittest.TestCase):
             "POST /sites/{siteId}/heartbeat",
             "POST /sites/{siteId}/commands",
             "DELETE /sites/{siteId}",
+            "POST /messages",
+            "GET /messages",
+            "GET /messages/{messageId}",
+            "POST /messages/{messageId}/claim",
+            "POST /messages/{messageId}/ack",
+            "POST /messages/{messageId}/register",
         ):
             self.assertIn(route + "\n", self.deploy_sh, route)
 
     def test_the_sites_table_is_created_and_granted(self):
         self.assertIn("SITES_TABLE=fin-sites", self.deploy_sh)
+        self.assertIn("MESSAGES_TABLE=fin-messages", self.deploy_sh)
+        self.assertIn("AGENTS_TABLE=fin-agents", self.deploy_sh)
+        self.assertIn('"Sid": "MessagesTable"', self.deploy_sh)
+        self.assertIn('"Sid": "AgentsTable"', self.deploy_sh)
         self.assertIn('"Sid": "SitesTable"', self.deploy_sh)
         # Scan is load-bearing: enrollment idempotency and the site list are
         # both scans, and a policy with only Get/Put would 403 at runtime.

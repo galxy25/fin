@@ -24,6 +24,8 @@ TOKENS_TABLE=fin-device-tokens
 USERS_TABLE=fin-users
 SESSIONS_TABLE=fin-sessions
 SITES_TABLE=fin-sites
+MESSAGES_TABLE=fin-messages
+AGENTS_TABLE=fin-agents
 API_NAME=fin-control-plane
 RULE=fin-worker-sweep
 WAKE_RULE=fin-worker-wake
@@ -123,6 +125,32 @@ if ! aws dynamodb describe-table --table-name "$SITES_TABLE" >/dev/null 2>&1; th
     --billing-mode PAY_PER_REQUEST >/dev/null
   aws dynamodb wait table-exists --table-name "$SITES_TABLE"
   echo "==> Created DynamoDB table $SITES_TABLE (on-demand)"
+fi
+
+# Messages: keyed by the client-minted messageId so a retry is a no-op. TTL on
+# `ttl` reaps answered rows after MESSAGE_RETENTION_DAYS; open rows carry no
+# ttl and live until they are answered.
+if ! aws dynamodb describe-table --table-name "$MESSAGES_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$MESSAGES_TABLE" \
+    --attribute-definitions AttributeName=messageId,AttributeType=S \
+    --key-schema AttributeName=messageId,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$MESSAGES_TABLE"
+  aws dynamodb update-time-to-live --table-name "$MESSAGES_TABLE" \
+    --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
+  echo "==> Created DynamoDB table $MESSAGES_TABLE (on-demand, TTL on ttl)"
+fi
+
+# Per-(user, agent) election state: who is primary and until when.
+if ! aws dynamodb describe-table --table-name "$AGENTS_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$AGENTS_TABLE" \
+    --attribute-definitions AttributeName=agentKey,AttributeType=S \
+    --key-schema AttributeName=agentKey,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$AGENTS_TABLE"
+  echo "==> Created DynamoDB table $AGENTS_TABLE (on-demand)"
 fi
 
 # --- model-factory data lake -------------------------------------------------
@@ -257,6 +285,18 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$SITES_TABLE"
+    },
+    {
+      "Sid": "MessagesTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$MESSAGES_TABLE"
+    },
+    {
+      "Sid": "AgentsTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$AGENTS_TABLE"
     },
     {
       "Sid": "AgentObjects",
@@ -535,6 +575,12 @@ GET /sites
 POST /sites/{siteId}/heartbeat
 POST /sites/{siteId}/commands
 DELETE /sites/{siteId}
+POST /messages
+GET /messages
+GET /messages/{messageId}
+POST /messages/{messageId}/claim
+POST /messages/{messageId}/ack
+POST /messages/{messageId}/register
 POST /workers
 GET /workers
 DELETE /workers/{workerId}

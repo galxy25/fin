@@ -149,6 +149,11 @@ SESSIONS_TABLE_NAME = os.environ.get("FIN_CP_SESSIONS_TABLE", "fin-sessions")
 # `userId` is on every row, and a site token is a second way to BECOME that
 # user, never a way to skip being one.
 SITES_TABLE_NAME = os.environ.get("FIN_CP_SITES_TABLE", "fin-sites")
+# Messages and per-agent election state (docs/SITES.md §3, §6). fin-messages
+# is keyed by the client-minted messageId so a retry is a no-op; fin-agents is
+# keyed per (user, agent) and holds the primary role's lease.
+MESSAGES_TABLE_NAME = os.environ.get("FIN_CP_MESSAGES_TABLE", "fin-messages")
+AGENTS_TABLE_NAME = os.environ.get("FIN_CP_AGENTS_TABLE", "fin-agents")
 SECURITY_GROUP_NAME = "fin-agent-egress"
 INSTANCE_PROFILE_NAME = "fin-agent-ssm"
 AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
@@ -230,6 +235,8 @@ DEVICE_TOKENS_TABLE = _DYNAMODB.Table(DEVICE_TOKENS_TABLE_NAME)
 USERS_TABLE = _DYNAMODB.Table(USERS_TABLE_NAME)
 SESSIONS_TABLE = _DYNAMODB.Table(SESSIONS_TABLE_NAME)
 SITES_TABLE = _DYNAMODB.Table(SITES_TABLE_NAME)
+MESSAGES_TABLE = _DYNAMODB.Table(MESSAGES_TABLE_NAME)
+AGENTS_TABLE = _DYNAMODB.Table(AGENTS_TABLE_NAME)
 
 # Byte-for-byte the bootstrap from launch.sh; the two presigned URLs are the only
 # substitutions. Any change to launch.sh's user-data belongs here too —
@@ -984,7 +991,11 @@ def create_worker(event):
         if alive:
             raise ApiError(409, "agent {} already has a live worker ({})".format(agent, alive[0]["workerId"]))
 
-    result = _launch_worker(user_id, agent, instance_type, idle_minutes, browser, now, clear_inbox=True)
+    # clear_inbox=False since sites Phase 1b (docs/SITES.md §6.5): a new body can
+    # no longer discard messages another body will handle. Provisioned configs
+    # carry supervision.inboxResetAtLaunch, so a fresh instance seeds the backlog
+    # into its ledger instead of replaying it.
+    result = _launch_worker(user_id, agent, instance_type, idle_minutes, browser, now, clear_inbox=False)
     LOG.info("launched %s for agent %s (%s%s)", result["instanceId"], agent, instance_type, ", browser" if browser else "")
     return _response(201, result)
 
@@ -1782,11 +1793,14 @@ def sweep(_event=None):
             })
             LOG.info("swept %s (agent %s): %s", worker.get("instanceId"), worker.get("agent"), verdict)
 
+    stale_sites = _mark_stale_sites(now)
+
     return {
         "generatedAt": _iso(now),
         "checked": len(live),
         "terminated": terminated,
         "reconciled": reconciled,
+        "staleSites": stale_sites,
         "adopted": [{"workerId": w["workerId"], "agent": w["agent"], "instanceId": w["instanceId"]} for w in adopted],
     }
 
@@ -2763,13 +2777,16 @@ def list_sites(event):
     agent = str(((event.get("queryStringParameters") or {}).get("agent") or "")).strip()
     expression = "userId = :user"
     values = {":user": user_id}
+    kwargs = {}
     if agent:
-        expression += " AND agent = :agent"
+        # `agent` is a DynamoDB reserved word; it must be aliased in every expression.
+        expression += " AND #agent = :agent"
         values[":agent"] = agent
+        kwargs["ExpressionAttributeNames"] = {"#agent": "agent"}
     now = _now()
     sites = [
         _public_site(s, now)
-        for s in _scan(table=SITES_TABLE, FilterExpression=expression, ExpressionAttributeValues=values)
+        for s in _scan(table=SITES_TABLE, FilterExpression=expression, ExpressionAttributeValues=values, **kwargs)
     ]
     sites.sort(key=lambda s: (-int(s.get("priority") or 0), s.get("displayName") or ""))
     return _response(200, {"generatedAt": _iso(now), "sites": sites})
@@ -2860,6 +2877,7 @@ def site_heartbeat(event, site_id):
         "heartbeatSeconds": SITE_HEARTBEAT_SECONDS,
         "commands": commands,
     }
+    response.update(_heartbeat_dispatch(updated, body, now))
 
     # Re-sign before the daemon's copies lapse, not after: URLs signed with the
     # Lambda's temporary credentials die with those credentials regardless of
@@ -2933,6 +2951,583 @@ def delete_site(event, site_id):
     return _response(200, {"siteId": site_id, "state": "retired"})
 
 
+# --- messages, claims, and primary election ----------------------------------
+#
+# Phase 1b of docs/SITES.md §3.4 and §6. A message is applied by AT MOST ONE
+# body, and the thing that decides which one is a DynamoDB conditional write on
+# the message row — never "whoever polled first". Roles (primary/standby) only
+# ROUTE; claims EXCLUDE.
+
+MESSAGES_TABLE_NAME = os.environ.get("FIN_CP_MESSAGES_TABLE", "fin-messages")
+AGENTS_TABLE_NAME = os.environ.get("FIN_CP_AGENTS_TABLE", "fin-agents")
+
+MESSAGE_ID_RE = re.compile(r"^m-[A-Za-z0-9][A-Za-z0-9._-]{7,79}$")
+MESSAGE_SOURCES = ("app", "voice", "mac-terminal", "legacy", "supervisor")
+MESSAGE_STATES = ("queued", "claimed", "applied", "answered", "expired")
+MAX_MESSAGE_CHARS = 8000
+MAX_REPLY_PREVIEW_CHARS = 500
+# A claim lease outlives a whole heartbeat gap several times over; a site that
+# holds a message renews it on every beat, and a site that dies stops renewing,
+# so the row is re-offered within this long. 120 s is the design's number.
+MESSAGE_LEASE_SECONDS_DEFAULT = 120
+MESSAGE_LEASE_SECONDS_MAX = 600
+# Primary role lease: one heartbeat interval is 20 s, so a silent primary is
+# replaced after three missed beats — the same arithmetic as the site lease.
+PRIMARY_LEASE_SECONDS = SITE_LEASE_SECONDS
+# Answered/expired rows linger this long so GET /messages/{id} can still answer
+# a late poll, then DynamoDB TTL reaps them.
+MESSAGE_RETENTION_DAYS = 14
+MESSAGES_PER_HEARTBEAT = 10
+MAX_LISTED_MESSAGES = 50
+
+
+def _agent_key(user_id, agent):
+    """fin-agents is keyed per (user, agent): an agent name is only unique
+    within one user's account, never globally."""
+    return "{}/{}".format(user_id, _key_slug(agent))
+
+
+def _read_agent_row(user_id, agent):
+    return AGENTS_TABLE.get_item(Key={"agentKey": _agent_key(user_id, agent)}).get("Item") or {}
+
+
+def _elect_primary(user_id, agent, site, now):
+    """§6.1: one conditional update per heartbeat. The iMac (100) preempts a
+    cloud worker (10) on its first beat; a silent primary is replaced after its
+    lease lapses; the loser reads back `standby`. Returns "primary" or "standby"."""
+    until = now + timedelta(seconds=PRIMARY_LEASE_SECONDS)
+    try:
+        AGENTS_TABLE.update_item(
+            Key={"agentKey": _agent_key(user_id, agent)},
+            UpdateExpression=(
+                "SET userId = :user, #agent = :agent, primarySiteId = :me, "
+                "primaryPriority = :p, primaryLeaseUntil = :until"
+            ),
+            ConditionExpression=(
+                "attribute_not_exists(primarySiteId) OR primarySiteId = :me "
+                "OR primaryLeaseUntil < :now OR primaryPriority < :p"
+            ),
+            ExpressionAttributeNames={"#agent": "agent"},
+            ExpressionAttributeValues={
+                ":user": user_id,
+                ":agent": agent,
+                ":me": site["siteId"],
+                ":p": int(site.get("priority") or 0),
+                ":until": _iso(until),
+                ":now": _iso(now),
+            },
+        )
+        return "primary"
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return "standby"
+        raise
+
+
+def _primary_is_live(agent_row, now):
+    lease = _parse_iso(agent_row.get("primaryLeaseUntil"))
+    return bool(agent_row.get("primarySiteId")) and lease is not None and now < lease
+
+
+def _live_sites(user_id, agent, now):
+    rows = _scan(
+        table=SITES_TABLE,
+        FilterExpression="userId = :user AND #agent = :agent",
+        ExpressionAttributeNames={"#agent": "agent"},
+        ExpressionAttributeValues={":user": user_id, ":agent": agent},
+    )
+    return [s for s in rows if _site_is_live(s, now)]
+
+
+def _word_mentioned(word, text):
+    """Whole-word, case-insensitive — the same rule as the app's
+    SessionRouter.wordMentioned, so a message routes the same way whether the
+    app or the control plane decides."""
+    word = (word or "").strip()
+    if not word:
+        return False
+    return re.search(r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])", text, re.IGNORECASE) is not None
+
+
+def _pin_for(text, context, live_sites):
+    """§3.4, as a pure function. Returns (pinSiteId, routedBy, candidates):
+    - `siteHint` naming a live site pins to it ("hint");
+    - otherwise the message text plus the sender's active session names are
+      matched against every live site's tmux sessions and task vocabulary —
+      exactly one site → pin ("context"); several → no pin and "clarify" with
+      the candidates' display names; none → no pin, routed by primary later."""
+    context = context if isinstance(context, dict) else {}
+    hint = str(context.get("siteHint") or "").strip().lower()
+    if hint:
+        for site in live_sites:
+            if hint in (site.get("siteId"), site.get("siteId8")):
+                return site["siteId"], "hint", []
+
+    haystack = text or ""
+    names = context.get("activeSessionNames")
+    if isinstance(names, list):
+        haystack += "\n" + " ".join(str(n) for n in names if isinstance(n, str))
+
+    matched = []
+    for site in live_sites:
+        sessions = ((site.get("capabilities") or {}).get("tmux_sessions") or [])
+        words = []
+        for entry in sessions:
+            if not isinstance(entry, dict):
+                continue
+            words.append(str(entry.get("session") or ""))
+            words.extend(str(t) for t in (entry.get("tasks") or []) if isinstance(t, str))
+        if any(_word_mentioned(w, haystack) for w in words):
+            matched.append(site)
+    if len(matched) == 1:
+        return matched[0]["siteId"], "context", []
+    if len(matched) > 1:
+        return None, "clarify", [s.get("displayName") for s in matched]
+    return None, None, []
+
+
+def _eligible(row, site_id, is_primary, primary_live, target_live, now):
+    """§6.2 for one row. `target_live` is a callable siteId -> bool so the pure
+    rule can be tested without a table."""
+    state = row.get("state")
+    lease = _parse_iso(row.get("leaseUntil"))
+    if state == "claimed":
+        if lease is not None and now < lease:
+            return False
+    elif state != "queued":
+        return False
+    pin = row.get("pinSiteId")
+    if pin:
+        return pin == site_id
+    target = row.get("targetSiteId")
+    if target == site_id:
+        return True
+    if target and target_live(target):
+        return False
+    if is_primary:
+        return True
+    return not primary_live
+
+
+def _open_messages(user_id, agent):
+    return _scan(
+        table=MESSAGES_TABLE,
+        FilterExpression="userId = :user AND #agent = :agent AND #state IN (:queued, :claimed)",
+        ExpressionAttributeNames={"#agent": "agent", "#state": "state"},
+        ExpressionAttributeValues={
+            ":user": user_id, ":agent": agent, ":queued": "queued", ":claimed": "claimed",
+        },
+    )
+
+
+def _public_message(row):
+    return {
+        "messageId": row.get("messageId"),
+        "agent": row.get("agent"),
+        "text": row.get("text"),
+        "source": row.get("source"),
+        "createdAt": row.get("createdAt"),
+        "state": row.get("state"),
+        "routedBy": row.get("routedBy"),
+        "pinSiteId": row.get("pinSiteId"),
+        "targetSiteId": row.get("targetSiteId"),
+        "targetSiteName": row.get("targetSiteName"),
+        "clarifyCandidates": row.get("clarifyCandidates") or [],
+        "claimedBy": row.get("claimedBy"),
+        "claimedAt": row.get("claimedAt"),
+        "appliedAt": row.get("appliedAt"),
+        "appliedRunId": row.get("appliedRunId"),
+        "answeredAt": row.get("answeredAt"),
+        "replyPreview": row.get("replyPreview"),
+    }
+
+
+def _owned_message(event, message_id):
+    if not MESSAGE_ID_RE.match(message_id or ""):
+        raise ApiError(404, "no such message")
+    row = MESSAGES_TABLE.get_item(Key={"messageId": message_id}).get("Item")
+    if not row or not row.get("userId") or row.get("userId") != event.get("_userId"):
+        raise ApiError(404, "no such message")
+    return row
+
+
+def send_message(event):
+    """POST /messages — {agent, text, messageId?, source?, context?}. Idempotent
+    on messageId: a retry with the same id is a no-op that returns the row as
+    it stands, so a flaky network can never double-send."""
+    body = _body(event)
+    user_id = event["_userId"]
+
+    agent = str(body.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ApiError(400, "text must be a non-empty string")
+    if len(text) > MAX_MESSAGE_CHARS:
+        raise ApiError(413, "text exceeds {} characters".format(MAX_MESSAGE_CHARS))
+    source = str(body.get("source") or "app").strip()
+    if source not in MESSAGE_SOURCES:
+        raise ApiError(400, "source must be one of {}".format(", ".join(MESSAGE_SOURCES)))
+    message_id = str(body.get("messageId") or "").strip()
+    if message_id and not MESSAGE_ID_RE.match(message_id):
+        raise ApiError(400, "messageId must look like m-<uuid>")
+    if not message_id:
+        message_id = "m-" + str(uuid.uuid4())
+    context = body.get("context") if isinstance(body.get("context"), dict) else {}
+
+    now = _now()
+    live = _live_sites(user_id, agent, now)
+    pin, routed_by, candidates = _pin_for(text, context, live)
+    target = None
+    if pin is None and routed_by != "clarify":
+        agent_row = _read_agent_row(user_id, agent)
+        if _primary_is_live(agent_row, now):
+            target = agent_row.get("primarySiteId")
+            routed_by = "primary"
+    by_id = {s["siteId"]: s for s in live}
+    target_name = (by_id.get(pin or target) or {}).get("displayName")
+
+    row = {
+        "messageId": message_id,
+        "userId": user_id,
+        "agent": agent,
+        "text": text,
+        "source": source,
+        "createdAt": _iso(now),
+        "state": "queued",
+        "context": context,
+        "routedBy": routed_by,
+        "clarifyCandidates": candidates,
+    }
+    if pin:
+        row["pinSiteId"] = pin
+    if target:
+        row["targetSiteId"] = target
+    if target_name:
+        row["targetSiteName"] = target_name
+    author = str(context.get("device_id8") or "").strip().lower()
+    if DEVICE_ID_RE.match(author):
+        row["authorSiteId8"] = author
+
+    try:
+        MESSAGES_TABLE.put_item(Item=row, ConditionExpression="attribute_not_exists(messageId)")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        existing = _owned_message(event, message_id)
+        return _response(200, dict(_public_message(existing), duplicate=True))
+    return _response(200, _public_message(row))
+
+
+def get_message(event, message_id):
+    return _response(200, _public_message(_owned_message(event, message_id)))
+
+
+def list_messages(event):
+    """GET /messages?agent= — the caller's most recent rows for one agent,
+    newest first, for the console's pending/queued/answered rendering."""
+    user_id = event["_userId"]
+    agent = str(((event.get("queryStringParameters") or {}).get("agent") or "")).strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent query parameter is required")
+    rows = _scan(
+        table=MESSAGES_TABLE,
+        FilterExpression="userId = :user AND #agent = :agent",
+        ExpressionAttributeNames={"#agent": "agent"},
+        ExpressionAttributeValues={":user": user_id, ":agent": agent},
+    )
+    rows.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
+    return _response(200, {"agent": agent, "messages": [_public_message(r) for r in rows[:MAX_LISTED_MESSAGES]]})
+
+
+def _acting_site(event):
+    """The body performing a claim/ack/register: the authenticated site, or —
+    for an operator/session token, which the app uses when it acts as a site
+    itself — the row named by `siteId` in the body. Either way the site must
+    belong to the caller."""
+    site_id = event.get("_siteId")
+    if not site_id:
+        site_id = str(_body(event).get("siteId") or "").strip().lower()
+        if not site_id:
+            raise ApiError(400, "siteId is required when not authenticated as a site")
+    return _owned_site(event, site_id)
+
+
+def _same_agent(site, row):
+    return _key_slug(site.get("agent") or "") == _key_slug(row.get("agent") or "")
+
+
+def claim_message(event, message_id):
+    """§6.3 step 3. Exactly one body wins; the condition is the whole story."""
+    site = _acting_site(event)
+    row = _owned_message(event, message_id)
+    if not _same_agent(site, row):
+        raise ApiError(404, "no such message")
+    body = _body(event)
+    try:
+        lease_seconds = int(body.get("leaseSeconds") or MESSAGE_LEASE_SECONDS_DEFAULT)
+    except (TypeError, ValueError):
+        raise ApiError(400, "leaseSeconds must be an integer")
+    lease_seconds = max(10, min(lease_seconds, MESSAGE_LEASE_SECONDS_MAX))
+    now = _now()
+    try:
+        MESSAGES_TABLE.update_item(
+            Key={"messageId": message_id},
+            UpdateExpression="SET claimedBy = :me, claimedAt = :now, leaseUntil = :until, #state = :claimed",
+            ConditionExpression=(
+                "attribute_not_exists(claimedBy) OR claimedBy = :me "
+                "OR (leaseUntil < :now AND #state IN (:queued, :claimed))"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":me": site["siteId"],
+                ":now": _iso(now),
+                ":until": _iso(now + timedelta(seconds=lease_seconds)),
+                ":claimed": "claimed",
+                ":queued": "queued",
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return _response(409, {"granted": False, "messageId": message_id})
+        raise
+    return _response(200, {
+        "granted": True,
+        "messageId": message_id,
+        "leaseUntil": _iso(now + timedelta(seconds=lease_seconds)),
+        "text": row.get("text"),
+        "source": row.get("source"),
+        "createdAt": row.get("createdAt"),
+    })
+
+
+def ack_message(event, message_id):
+    """§6.3 steps 5–6: {state: applied|answered, runId?, replyPreview?}. Only
+    the claimant may ack, and only forward (queued/claimed → applied →
+    answered) — a late duplicate ack is a 409, not a rewind."""
+    site = _acting_site(event)
+    row = _owned_message(event, message_id)
+    if not _same_agent(site, row):
+        raise ApiError(404, "no such message")
+    body = _body(event)
+    state = str(body.get("state") or "").strip()
+    if state not in ("applied", "answered"):
+        raise ApiError(400, "state must be applied or answered")
+    now = _now()
+    names = {"#state": "state"}
+    values = {":me": site["siteId"], ":now": _iso(now)}
+    if state == "applied":
+        update = "SET #state = :applied, appliedAt = :now, appliedBy = :me"
+        values[":applied"] = "applied"
+        values[":queued"] = "queued"
+        values[":claimed"] = "claimed"
+        condition = "claimedBy = :me AND #state IN (:queued, :claimed)"
+        run_id = body.get("runId")
+        if isinstance(run_id, str) and run_id:
+            update += ", appliedRunId = :run"
+            values[":run"] = run_id
+    else:
+        update = "SET #state = :answered, answeredAt = :now, #ttl = :ttl"
+        names["#ttl"] = "ttl"
+        values[":answered"] = "answered"
+        values[":applied"] = "applied"
+        values[":ttl"] = int((now + timedelta(days=MESSAGE_RETENTION_DAYS)).timestamp())
+        condition = "claimedBy = :me AND #state = :applied"
+        preview = body.get("replyPreview")
+        if isinstance(preview, str) and preview.strip():
+            update += ", replyPreview = :preview"
+            values[":preview"] = preview.strip()[:MAX_REPLY_PREVIEW_CHARS]
+    try:
+        MESSAGES_TABLE.update_item(
+            Key={"messageId": message_id},
+            UpdateExpression=update,
+            ConditionExpression=condition,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(409, "not the claimant, or the message is already past that state")
+        raise
+    if state == "applied" and row.get("source") == "legacy":
+        _trim_legacy_inbox(row["userId"], row["agent"], message_id)
+    return _response(200, {"messageId": message_id, "state": state})
+
+
+def register_message(event, message_id):
+    """§6.5: the primary lifts an entry out of the legacy inbox document into a
+    real row so even a preemption race on that document is settled by the
+    claim. 200 whether this call created the row or it already existed."""
+    site = _acting_site(event)
+    if not MESSAGE_ID_RE.match(message_id or ""):
+        raise ApiError(400, "messageId must look like m-<uuid>")
+    body = _body(event)
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ApiError(400, "text must be a non-empty string")
+    now = _now()
+    row = {
+        "messageId": message_id,
+        "userId": site["userId"],
+        "agent": site["agent"],
+        "text": text[:MAX_MESSAGE_CHARS],
+        "source": "legacy",
+        "createdAt": _iso(now),
+        "state": "queued",
+        "context": {},
+        "routedBy": "legacy",
+        "pinSiteId": site["siteId"],
+        "clarifyCandidates": [],
+    }
+    try:
+        MESSAGES_TABLE.put_item(Item=row, ConditionExpression="attribute_not_exists(messageId)")
+        created = True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        created = False
+    return _response(200, {"messageId": message_id, "created": created})
+
+
+def _trim_legacy_inbox(user_id, agent, message_id):
+    """Remove one applied id from fin/inbox/{agent}.json with If-Match, one
+    retry on a lost race. Best-effort: an old build's concurrent GET-merge-PUT
+    can at worst resurrect an already-applied id, which every consumer's
+    ledger ignores — so a failure here is logged, never surfaced."""
+    key = INBOX_KEY.format(user=user_id, agent=_key_slug(agent))
+    for _attempt in range(2):
+        try:
+            obj = S3.get_object(Bucket=BUCKET, Key=key)
+            document = json.loads(obj["Body"].read())
+            etag = obj.get("ETag")
+        except (ClientError, ValueError):
+            return
+        directives = document.get("directives") if isinstance(document, dict) else None
+        if not isinstance(directives, list):
+            return
+        kept = [d for d in directives if not (isinstance(d, dict) and d.get("id") == message_id)]
+        if len(kept) == len(directives):
+            return
+        document["directives"] = kept
+        try:
+            S3.put_object(
+                Bucket=BUCKET, Key=key, Body=json.dumps(document).encode("utf-8"),
+                ContentType="application/json", IfMatch=etag,
+            )
+            return
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in ("PreconditionFailed", "412"):
+                continue
+            LOG.warning("legacy inbox trim failed for %s: %s", agent, _scrub(exc))
+            return
+
+
+def _heartbeat_dispatch(site, body, now):
+    """The message half of a heartbeat: election, held-lease renewal, unacked
+    crash recovery, and the eligible rows to offer. Returns the fields to
+    merge into the heartbeat response."""
+    user_id, agent = site["userId"], site["agent"]
+    wants_primary = bool(body.get("wantsPrimary", True))
+    role = _elect_primary(user_id, agent, site, now) if wants_primary else "standby"
+    agent_row = _read_agent_row(user_id, agent)
+    is_primary = agent_row.get("primarySiteId") == site["siteId"] and _primary_is_live(agent_row, now)
+    primary_live = _primary_is_live(agent_row, now)
+
+    held = [m for m in (body.get("held") or []) if isinstance(m, str) and MESSAGE_ID_RE.match(m)]
+    unacked = [m for m in (body.get("unacked") or []) if isinstance(m, str) and MESSAGE_ID_RE.match(m)]
+
+    renewed_until = _iso(now + timedelta(seconds=MESSAGE_LEASE_SECONDS_DEFAULT))
+    for message_id in held[:MESSAGES_PER_HEARTBEAT * 2]:
+        try:
+            MESSAGES_TABLE.update_item(
+                Key={"messageId": message_id},
+                UpdateExpression="SET leaseUntil = :until",
+                ConditionExpression="claimedBy = :me AND #state = :claimed",
+                ExpressionAttributeNames={"#state": "state"},
+                ExpressionAttributeValues={":me": site["siteId"], ":until": renewed_until, ":claimed": "claimed"},
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+    # §6.4 "site dies after submit, before ack": the id is in the daemon's
+    # `unacked` ledger; acking it here under claimedBy=me means the row leaves
+    # `queued` before anyone else can be offered it.
+    for message_id in unacked[:MESSAGES_PER_HEARTBEAT * 2]:
+        try:
+            MESSAGES_TABLE.update_item(
+                Key={"messageId": message_id},
+                UpdateExpression="SET #state = :applied, appliedAt = :now, appliedBy = :me",
+                ConditionExpression="claimedBy = :me AND #state IN (:queued, :claimed)",
+                ExpressionAttributeNames={"#state": "state"},
+                ExpressionAttributeValues={
+                    ":me": site["siteId"], ":now": _iso(now),
+                    ":applied": "applied", ":queued": "queued", ":claimed": "claimed",
+                },
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+
+    live_cache = {}
+
+    def target_live(site_id):
+        if site_id not in live_cache:
+            row = _read_site(site_id)
+            live_cache[site_id] = bool(row) and _site_is_live(row, now)
+        return live_cache[site_id]
+
+    offers = []
+    for row in sorted(_open_messages(user_id, agent), key=lambda r: r.get("createdAt") or ""):
+        if row.get("messageId") in held:
+            continue
+        if _eligible(row, site["siteId"], is_primary, primary_live, target_live, now):
+            offers.append({
+                "id": row["messageId"],
+                "text": row.get("text"),
+                "source": row.get("source"),
+                "createdAt": row.get("createdAt"),
+                "pinSiteId": row.get("pinSiteId"),
+            })
+        if len(offers) >= MESSAGES_PER_HEARTBEAT:
+            break
+
+    result = {"role": role, "messages": offers}
+    if is_primary:
+        result["legacyInboxGet"] = _presign("get_object", INBOX_KEY.format(user=user_id, agent=_key_slug(agent)))
+    return result
+
+
+def _mark_stale_sites(now):
+    """Sweep half for sites: a site silent for three leases is `stale` (never
+    terminated — a resident Mac is not ours to kill). Returns the ids marked."""
+    cutoff = now - timedelta(seconds=3 * SITE_LEASE_SECONDS)
+    marked = []
+    for site in _scan(table=SITES_TABLE):
+        if site.get("state") in ("stale", "retired"):
+            continue
+        lease = _parse_iso(site.get("leaseUntil"))
+        if lease is not None and lease > cutoff:
+            continue
+        if lease is None and site.get("lastHeartbeatAt") is None:
+            continue  # enrolled, never beat: not stale, just not started yet
+        try:
+            SITES_TABLE.update_item(
+                Key={"siteId": site["siteId"]},
+                UpdateExpression="SET #state = :stale, rev = :next",
+                ConditionExpression="rev = :rev",
+                ExpressionAttributeNames={"#state": "state"},
+                ExpressionAttributeValues={
+                    ":stale": "stale", ":rev": int(site.get("rev") or 0), ":next": int(site.get("rev") or 0) + 1,
+                },
+            )
+            marked.append(site["siteId"])
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+    return marked
+
+
 # --- entry point -------------------------------------------------------------
 
 
@@ -2958,6 +3553,10 @@ def _require_site_scope(event, method, parts):
     # are already scoped to `_userId` and neither can name another site.
     if method == "POST" and parts in (["presign"], ["notify"]):
         return
+    # The claim protocol. Each handler re-checks that the message belongs to
+    # this site's user AND agent, so a site can only ever act on its own queue.
+    if method == "POST" and len(parts) == 3 and parts[0] == "messages" and parts[2] in ("claim", "ack", "register"):
+        return
     raise ApiError(403, "a site token cannot use this route")
 
 
@@ -2979,6 +3578,18 @@ def _route(event):
         return queue_site_command(event, parts[1])
     if method == "DELETE" and len(parts) == 2 and parts[0] == "sites":
         return delete_site(event, parts[1])
+    if method == "POST" and parts == ["messages"]:
+        return send_message(event)
+    if method == "GET" and parts == ["messages"]:
+        return list_messages(event)
+    if method == "GET" and len(parts) == 2 and parts[0] == "messages":
+        return get_message(event, parts[1])
+    if method == "POST" and len(parts) == 3 and parts[0] == "messages" and parts[2] == "claim":
+        return claim_message(event, parts[1])
+    if method == "POST" and len(parts) == 3 and parts[0] == "messages" and parts[2] == "ack":
+        return ack_message(event, parts[1])
+    if method == "POST" and len(parts) == 3 and parts[0] == "messages" and parts[2] == "register":
+        return register_message(event, parts[1])
     if method == "POST" and parts == ["workers"]:
         return create_worker(event)
     if method == "GET" and parts == ["workers"]:
