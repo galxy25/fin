@@ -90,8 +90,8 @@ struct FinApp: App {
             // and message-relay tables: ephemeral (7-day sweep below), redacted
             // before write, and synced precisely because their whole purpose is to
             // reach the user's other devices.
-            // RemoteInputPairing joins the synced set: it exists to be read by the
-            // user's OTHER devices (the Apple TV's remote-keyboard secret) — the
+            // RemoteInputPairing (the account's key-vault key, see KeyVault) joins the
+            // synced set: it exists to be read by the user's OTHER devices — the
             // private database's access control is the whole point of storing it there.
             let syncedConfig = ModelConfiguration(
                 "Synced",
@@ -273,6 +273,11 @@ struct FinApp: App {
             manager?.runtime(forAgentID: agentID)?.recordSupervisionNotice(line)
         }
         manager.memorySyncService = memorySync
+
+        // Key vault (see KeyVault): seal every SSH key this device holds and push
+        // it to the control plane, once, so the Apple TV can fetch it after Sign in
+        // with Apple. No-op without a control plane; retried next launch on failure.
+        Task { await KeyVaultSync.pushAll(context: context) }
 
         // This install as a site (docs/SITES.md Phase 2/3): heartbeats while the
         // app is active and claims messages addressed to this device, submitting

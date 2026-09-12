@@ -115,6 +115,7 @@ struct KeyImportView: View {
             return
         }
         modelContext.insert(metadata)
+        Task { await KeyVaultSync.push(metadata, context: modelContext) }
         onImported(metadata)
         dismiss()
     }

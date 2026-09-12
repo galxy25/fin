@@ -395,6 +395,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/inbox/*.lock"
     },
     {
+      "Sid": "KeyVaultWrite",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/vault/*"
+    },
+    {
       "Sid": "ArtifactsReadWrite",
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:DeleteObject"],
@@ -645,6 +651,9 @@ GET /artifacts
 GET /artifacts/{path+}
 PUT /artifacts/{path+}
 DELETE /artifacts/{path+}
+GET /vault/keys
+PUT /vault/keys/{keyId}
+DELETE /vault/keys/{keyId}
 ROUTES
 
 if ! aws apigatewayv2 get-stage --api-id "$API_ID" --stage-name '$default' >/dev/null 2>&1; then

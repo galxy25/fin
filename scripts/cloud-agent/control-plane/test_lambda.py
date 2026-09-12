@@ -1390,6 +1390,69 @@ class _FakeS3:
         self.objects[Key] = Body if isinstance(Body, bytes) else Body.encode("utf-8")
         return {}
 
+    def delete_object(self, Bucket, Key):
+        self.objects.pop(Key, None)
+        return {}
+
+    def list_objects_v2(self, **kwargs):
+        prefix = kwargs.get("Prefix", "")
+        keys = sorted(k for k in self.objects if k.startswith(prefix))
+        return {"Contents": [{"Key": k} for k in keys]}
+
+
+class KeyVaultTests(unittest.TestCase):
+    """The vault stores ciphertext only, per user, for session tokens only."""
+
+    def setUp(self):
+        self._orig_s3 = lam.S3
+        lam.S3 = _FakeS3()
+        self.addCleanup(setattr, lam, "S3", self._orig_s3)
+
+    @staticmethod
+    def _put(user, key_id, **fields):
+        body = {"name": "laptop", "keyType": "ed25519", "ciphertext": base64.b64encode(b"sealed").decode()}
+        body.update(fields)
+        return lam.put_vault_key({"_userId": user, "body": json.dumps(body)}, key_id)
+
+    @staticmethod
+    def _list(user):
+        return json.loads(lam.list_vault_keys({"_userId": user})["body"])["keys"]
+
+    def test_entries_round_trip_per_user_and_never_cross_accounts(self):
+        self._put("user-1", "0f0f0f0f-0000-4000-8000-000000000001")
+        self._put("user-2", "0f0f0f0f-0000-4000-8000-000000000002", name="tv")
+        mine = self._list("user-1")
+        self.assertEqual([entry["keyId"] for entry in mine], ["0F0F0F0F-0000-4000-8000-000000000001"])
+        self.assertEqual(mine[0]["ciphertext"], base64.b64encode(b"sealed").decode())
+        self.assertTrue(mine[0]["updatedAt"])
+        self.assertEqual([entry["name"] for entry in self._list("user-2")], ["tv"])
+
+    def test_delete_is_idempotent_and_scoped(self):
+        self._put("user-1", "0f0f0f0f-0000-4000-8000-000000000001")
+        lam.delete_vault_key({"_userId": "user-2"}, "0f0f0f0f-0000-4000-8000-000000000001")
+        self.assertEqual(len(self._list("user-1")), 1)
+        lam.delete_vault_key({"_userId": "user-1"}, "0f0f0f0f-0000-4000-8000-000000000001")
+        lam.delete_vault_key({"_userId": "user-1"}, "0f0f0f0f-0000-4000-8000-000000000001")
+        self.assertEqual(self._list("user-1"), [])
+
+    def test_rejects_bad_ids_types_and_non_base64(self):
+        for key_id, fields in (
+            ("../etc", {}),
+            ("0f0f0f0f-0000-4000-8000-000000000001", {"keyType": "dsa"}),
+            ("0f0f0f0f-0000-4000-8000-000000000001", {"ciphertext": "not base64!!"}),
+            ("0f0f0f0f-0000-4000-8000-000000000001", {"name": " "}),
+        ):
+            with self.assertRaises(lam.ApiError) as caught:
+                self._put("user-1", key_id, **fields)
+            self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(lam.S3.objects, {})
+
+    def test_a_site_token_cannot_touch_the_vault(self):
+        for method, parts in (("GET", ["vault", "keys"]), ("PUT", ["vault", "keys", "x"]), ("DELETE", ["vault", "keys", "x"])):
+            with self.assertRaises(lam.ApiError) as caught:
+                lam._require_site_scope({"_siteId": "site-1", "_userId": "user-1"}, method, parts)
+            self.assertEqual(caught.exception.status, 403)
+
 
 class EnrollTokenTests(_SitesTestCase):
     def setUp(self):

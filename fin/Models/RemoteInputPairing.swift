@@ -1,16 +1,21 @@
 import Foundation
 import SwiftData
 
-/// The shared secret behind the Apple TV remote-input channel, distributed through
-/// the user's private CloudKit database. Possession of this key is the entire
-/// same-iCloud-account gate: the record syncs only to devices signed into the same
-/// account, so a peer that can seal a valid frame has, by construction, read access
-/// to this user's private database. The key never travels over the local network —
-/// both ends derive a per-connection session key from it (see `RemoteInputCipher`).
+/// The account's VAULT KEY: 32 random bytes distributed through the user's private
+/// CloudKit database, with which every key-vault entry is sealed (see `KeyVault`).
+/// Possession is the entire same-iCloud-account gate: the record syncs only to
+/// devices signed into the same account, so a device that can open a vault entry
+/// has, by construction, read access to this user's private database. The control
+/// plane holds ciphertext only. The key itself never leaves CloudKit.
+///
+/// The class (= CloudKit record type) name is frozen: it was minted for the retired
+/// Apple TV remote-keyboard channel, and renaming a synced model means a Production
+/// schema deploy plus every device re-minting — for zero user-visible gain. The
+/// store below carries the honest name.
 ///
 /// CloudKit mirroring rules (same as every synced model): every property has a
 /// default, no unique constraints. Both devices may race to mint a key before the
-/// first sync lands; `RemoteInputPairingStore.resolve` converges on the record with
+/// first sync lands; `DeviceVaultKeyStore.resolve` converges on the record with
 /// the lexicographically lowest id and ignores the rest, so the race settles without
 /// coordination once sync catches up.
 @Model
@@ -29,8 +34,8 @@ final class RemoteInputPairing {
     }
 }
 
-enum RemoteInputPairingStore {
-    /// Returns the canonical pairing secret, minting one if none exists yet.
+enum DeviceVaultKeyStore {
+    /// Returns the canonical vault key, minting one if none exists yet.
     ///
     /// Canonical = the record with the lowest id string, so two devices that both
     /// minted before their first sync converge on the same winner afterward (the

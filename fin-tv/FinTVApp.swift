@@ -1,7 +1,8 @@
 // Fin on Apple TV: an SSH terminal whose configuration arrives over CloudKit
-// (the same synced Server/KeyMetadata rows every Fin device shares) and whose
-// input arrives from a Bluetooth keyboard (GCKeyboard) or the Fin iOS app acting
-// as a remote keyboard over the local network, gated to the same iCloud account.
+// (the same synced Server/KeyMetadata rows every Fin device shares), whose SSH
+// keys arrive through the key vault after Sign in with Apple (TVCloudAccount —
+// tvOS has no iCloud Keychain), and whose input is a Bluetooth keyboard
+// (GCKeyboard) or the system's own iPhone-typing keyboard.
 import SwiftUI
 import SwiftData
 import UIKit
@@ -22,7 +23,7 @@ final class FinTVAppDelegate: NSObject, UIApplicationDelegate {
 struct FinTVApp: App {
     @StateObject private var sessionManager: TVSessionManager
     @StateObject private var keyboardMonitor: TVKeyboardMonitor
-    @StateObject private var remoteInput: RemoteInputService
+    @StateObject private var account: TVCloudAccount
     private let modelContainer: ModelContainer
     @UIApplicationDelegateAdaptor(FinTVAppDelegate.self) private var appDelegate
 
@@ -68,7 +69,7 @@ struct FinTVApp: App {
 
         // Same join as the iOS app: Server.keyID -> KeyMetadata (synced) -> key
         // material in THIS device's Keychain. tvOS never receives iCloud Keychain
-        // items, so the material gets here via the companion's provisioning path.
+        // items, so the material gets here through the key vault (TVCloudAccount).
         manager.resolveCredentials = { server in
             guard let keyID = server.keyID else { return nil }
             let descriptor = FetchDescriptor<KeyMetadata>(predicate: #Predicate { $0.id == keyID })
@@ -94,38 +95,9 @@ struct FinTVApp: App {
         // Capture gating (only while a terminal is on screen) is wired by the
         // terminal screen via TVInputRouter below.
 
-        let remote = RemoteInputService()
-        remote.pairingSecret = {
-            RemoteInputPairingStore.resolve(context: context, deviceName: UIDevice.current.name)
-        }
-        remote.sendToSession = { [weak manager] bytes in
-            manager?.activeSession?.send(bytes: bytes)
-        }
-        remote.provisionKey = { keyID, name, keyTypeRaw, pem, passphrase in
-            guard let keyType = SSHKeyType(rawValue: keyTypeRaw) else { return false }
-            do {
-                try KeychainStore.savePrivateKey(Data(pem.utf8), for: keyID)
-                if let passphrase, !passphrase.isEmpty {
-                    try KeychainStore.savePassphrase(Data(passphrase.utf8), for: keyID)
-                }
-            } catch {
-                return false
-            }
-            // The KeyMetadata row normally arrives via CloudKit on its own; if it
-            // hasn't yet, materialize it now (same id) so the key is usable
-            // immediately — sync will merge rather than duplicate on record name.
-            let descriptor = FetchDescriptor<KeyMetadata>(predicate: #Predicate { $0.id == keyID })
-            if (try? context.fetch(descriptor).first) == nil {
-                let metadata = KeyMetadata(name: name, keyType: keyType)
-                metadata.id = keyID
-                context.insert(metadata)
-            }
-            return true
-        }
-
         _sessionManager = StateObject(wrappedValue: manager)
         _keyboardMonitor = StateObject(wrappedValue: keyboard)
-        _remoteInput = StateObject(wrappedValue: remote)
+        _account = StateObject(wrappedValue: TVCloudAccount(context: context))
     }
 
     var body: some Scene {
@@ -133,11 +105,10 @@ struct FinTVApp: App {
             TVRootView()
                 .environmentObject(sessionManager)
                 .environmentObject(keyboardMonitor)
-                .environmentObject(remoteInput)
+                .environmentObject(account)
                 .preferredColorScheme(.dark)
                 .onAppear {
                     keyboardMonitor.start()
-                    remoteInput.start(deviceName: UIDevice.current.name)
                 }
         }
         .modelContainer(modelContainer)

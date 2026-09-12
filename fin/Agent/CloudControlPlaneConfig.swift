@@ -18,7 +18,8 @@ import Foundation
 ///   end-to-end encrypted, offered only to the user's signed-in devices — and
 ///   never KVS, SwiftData, or CloudKit records, all plaintext to the server.
 enum CloudControlPlaneConfig {
-    static let endpointURLKey = "fin.cloudcp.endpointURL"
+    /// Defined in `KeyVault` so the tvOS target reads the same iCloud KVS slot.
+    static let endpointURLKey = KeyVault.endpointURLKey
     static let tokenKey = "fin.cloudcp.token"
 
     /// Posted when `SyncedDeviceConfig`'s pull adopts an externally changed

@@ -327,6 +327,27 @@ via `APNS_TEAM_ID` / `APNS_TOPIC`. Without the key the deploy still succeeds:
 token registration, storage, and every other route work — only `POST /notify`
 answers `503 APNs key is not configured`.
 
+## Key vault (sealed SSH keys for devices without iCloud Keychain)
+
+tvOS is excluded from iCloud Keychain, so the Apple TV cannot receive the
+user's SSH private keys the way every other Fin device does. The vault is how
+they get there without a local network in the loop:
+
+- Every keychain-holding device seals each key with the account's **vault
+  key** — 32 random bytes that live only in the user's private CloudKit
+  database (`RemoteInputPairing`, name frozen for schema reasons) — and
+  `PUT /vault/keys/{keyId}` the ciphertext (`{"name","keyType","ciphertext"}`,
+  base64, ≤ 64 KB). The app does this once per key at import/generation and
+  sweeps at launch (`KeyVaultSync`).
+- The Apple TV signs in with Apple (`POST /auth/apple`), `GET /vault/keys`,
+  and opens each entry with the vault key CloudKit delivered (`TVCloudAccount`).
+- `DELETE /vault/keys/{keyId}` is idempotent.
+
+The service holds ciphertext only (ChaChaPoly, HKDF-derived key, key id as
+associated data — `fin/Vault/KeyVault.swift`). Session tokens only: a site
+token is denied by `_require_site_scope`, since a body has its own SSH
+identity (`fin-agent-ssh-key`) and never needs the user's.
+
 ## Service credentials (write-only secret store)
 
 Third-party credentials a worker needs — a Gmail app password, an API key, an

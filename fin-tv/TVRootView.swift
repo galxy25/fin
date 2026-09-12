@@ -7,7 +7,7 @@ import SwiftData
 struct TVRootView: View {
     @EnvironmentObject private var sessionManager: TVSessionManager
     @EnvironmentObject private var keyboardMonitor: TVKeyboardMonitor
-    @EnvironmentObject private var remoteInput: RemoteInputService
+    @EnvironmentObject private var account: TVCloudAccount
     @Environment(\.scenePhase) private var scenePhase
     @Query(sort: \Server.createdAt) private var servers: [Server]
 
@@ -15,9 +15,11 @@ struct TVRootView: View {
         NavigationStack {
             TVServerListView()
         }
+        .task { await account.refresh() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 sessionManager.resumeActiveSessionIfNeeded(servers: servers)
+                Task { await account.refresh() }
             }
         }
     }
@@ -26,26 +28,33 @@ struct TVRootView: View {
 struct TVServerListView: View {
     @EnvironmentObject private var sessionManager: TVSessionManager
     @EnvironmentObject private var keyboardMonitor: TVKeyboardMonitor
-    @EnvironmentObject private var remoteInput: RemoteInputService
     @Query(sort: \Server.createdAt) private var servers: [Server]
 
     var body: some View {
         Group {
             if servers.isEmpty {
-                VStack(spacing: 20) {
-                    Image(systemName: "server.rack")
-                        .font(.system(size: 60))
-                        .foregroundStyle(.secondary)
-                    Text("No Servers Yet")
-                        .font(.title2)
-                    Text("Servers you add in Fin on iPhone, iPad, or Mac appear here automatically through iCloud. Give sync a moment after first launch.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 700)
+                List {
+                    Section {
+                        VStack(spacing: 20) {
+                            Image(systemName: "server.rack")
+                                .font(.system(size: 60))
+                                .foregroundStyle(.secondary)
+                            Text("No Servers Yet")
+                                .font(.title2)
+                            Text("Servers you add in Fin on iPhone, iPad, or Mac appear here automatically through iCloud. Give sync a moment after first launch.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .frame(maxWidth: 700)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 40)
+                    }
+                    TVAccountSection()
                 }
             } else {
                 List {
+                    TVAccountSection()
                     Section {
                         ForEach(servers) { server in
                             NavigationLink {
@@ -89,21 +98,9 @@ struct TVServerListView: View {
     }
 
     private var footerStatus: String {
-        var parts: [String] = []
-        parts.append(keyboardMonitor.keyboardAttached
+        keyboardMonitor.keyboardAttached
             ? "Bluetooth keyboard connected."
-            : "Pair a Bluetooth keyboard in Settings, or use the Fin iOS app as a remote keyboard.")
-        switch remoteInput.state {
-        case .connected(let peerName):
-            parts.append("Remote keyboard: \(peerName).")
-        case .advertising:
-            parts.append("Discoverable to Fin on your other devices (same network and iCloud account).")
-        case .failed(let message):
-            parts.append("Remote keyboard unavailable: \(message)")
-        case .idle:
-            break
-        }
-        return parts.joined(separator: " ")
+            : "Pair a Bluetooth keyboard in Settings, or type from your iPhone with the system keyboard."
     }
 }
 
@@ -111,7 +108,6 @@ struct TVTerminalScreen: View {
     let server: Server
     @EnvironmentObject private var sessionManager: TVSessionManager
     @EnvironmentObject private var keyboardMonitor: TVKeyboardMonitor
-    @EnvironmentObject private var remoteInput: RemoteInputService
     @AppStorage("themeBackgroundHex") private var themeBackgroundHex: String = "#000000"
     @AppStorage("themeForegroundHex") private var themeForegroundHex: String = "#00FF00"
     @State private var fallbackCommand = ""
@@ -166,12 +162,6 @@ struct TVTerminalScreen: View {
             if keyboardMonitor.keyboardAttached {
                 Image(systemName: "keyboard.fill")
                     .foregroundStyle(.secondary)
-            }
-            if case .connected(let peerName) = remoteInput.state {
-                Label(peerName, systemImage: "iphone.radiowaves.left.and.right")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
             }
             // System text entry as the no-keyboard fallback — tvOS pops its
             // full-screen keyboard (which itself offers iPhone typing via the

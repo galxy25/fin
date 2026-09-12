@@ -3845,6 +3845,107 @@ def _any_live_site(user_id, agent, now):
 # --- entry point -------------------------------------------------------------
 
 
+
+# --- key vault ---------------------------------------------------------------
+# SSH private keys for the user's devices that iCloud Keychain does not reach
+# (tvOS is excluded from it). Every entry is CIPHERTEXT to this service: the app
+# seals it with a 32-byte vault key that lives only in the user's private
+# CloudKit database (`RemoteInputPairing`, the same record the retired remote-
+# keyboard channel used), so the server holds nothing it can open. Session
+# (Sign in with Apple) tokens only — a site token is deliberately denied by
+# `_require_site_scope`: a body needs its own SSH identity, never the user's.
+VAULT_KEY = "users/{user}/fin/vault/keys/{keyId}.json"
+VAULT_PREFIX = "users/{user}/fin/vault/keys/"
+MAX_VAULT_ENTRY_BYTES = 64 * 1024
+_VAULT_KEY_ID = re.compile(r"^[0-9A-Fa-f-]{1,64}$")
+_VAULT_KEY_TYPES = ("ed25519", "rsa")
+
+
+def _vault_key_id(raw):
+    key_id = str(raw or "").strip()
+    if not _VAULT_KEY_ID.match(key_id):
+        raise ApiError(400, "keyId must be a UUID")
+    return key_id.upper()
+
+
+def _public_vault_entry(document):
+    return {
+        "keyId": document.get("keyId"),
+        "name": document.get("name") or "",
+        "keyType": document.get("keyType") or "",
+        "ciphertext": document.get("ciphertext") or "",
+        "updatedAt": document.get("updatedAt"),
+    }
+
+
+def list_vault_keys(event):
+    """GET /vault/keys — every sealed key of the caller's account."""
+    prefix = VAULT_PREFIX.format(user=event["_userId"])
+    entries, token = [], None
+    while True:
+        kwargs = {"Bucket": BUCKET, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = S3.list_objects_v2(**kwargs)
+        for item in page.get("Contents", []):
+            if not item["Key"].endswith(".json"):
+                continue
+            try:
+                raw = S3.get_object(Bucket=BUCKET, Key=item["Key"])["Body"].read()
+                document = json.loads(raw)
+            except (ClientError, ValueError):
+                continue
+            if isinstance(document, dict) and document.get("ciphertext"):
+                entries.append(_public_vault_entry(document))
+        token = page.get("NextContinuationToken")
+        if not token:
+            break
+    entries.sort(key=lambda entry: entry.get("updatedAt") or "")
+    return _response(200, {"keys": entries})
+
+
+def put_vault_key(event, key_id):
+    """PUT /vault/keys/{keyId} — {"name", "keyType", "ciphertext"} replaces the
+    entry wholesale. The ciphertext is opaque base64; only its size is checked."""
+    key_id = _vault_key_id(key_id)
+    body = _body(event)
+    name = body.get("name")
+    key_type = body.get("keyType")
+    ciphertext = body.get("ciphertext")
+    if not isinstance(name, str) or not name.strip():
+        raise ApiError(400, "name must be a non-empty string")
+    if key_type not in _VAULT_KEY_TYPES:
+        raise ApiError(400, "keyType must be one of {}".format(", ".join(_VAULT_KEY_TYPES)))
+    if not isinstance(ciphertext, str) or not ciphertext:
+        raise ApiError(400, "ciphertext must be a non-empty base64 string")
+    if len(ciphertext) > MAX_VAULT_ENTRY_BYTES:
+        raise ApiError(400, "ciphertext exceeds {} bytes".format(MAX_VAULT_ENTRY_BYTES))
+    try:
+        base64.b64decode(ciphertext, validate=True)
+    except (ValueError, binascii.Error):
+        raise ApiError(400, "ciphertext must be base64")
+    document = {
+        "keyId": key_id,
+        "name": name.strip()[:120],
+        "keyType": key_type,
+        "ciphertext": ciphertext,
+        "updatedAt": _iso(_now()),
+    }
+    S3.put_object(
+        Bucket=BUCKET, Key=VAULT_KEY.format(user=event["_userId"], keyId=key_id),
+        Body=json.dumps(document, sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+    )
+    return _response(200, _public_vault_entry(document))
+
+
+def delete_vault_key(event, key_id):
+    """DELETE /vault/keys/{keyId} — idempotent; a missing entry is already gone."""
+    key_id = _vault_key_id(key_id)
+    S3.delete_object(Bucket=BUCKET, Key=VAULT_KEY.format(user=event["_userId"], keyId=key_id))
+    return _response(200, {"keyId": key_id, "deleted": True})
+
+
 def _require_site_scope(event, method, parts):
     """A site token authenticates ONE body, and may only act as that body.
 
@@ -3970,6 +4071,12 @@ def _route(event):
         return put_memory_profile(event)
     if method == "GET" and parts == ["devices", "status"]:
         return list_device_status(event)
+    if method == "GET" and parts == ["vault", "keys"]:
+        return list_vault_keys(event)
+    if method == "PUT" and len(parts) == 3 and parts[:2] == ["vault", "keys"]:
+        return put_vault_key(event, parts[2])
+    if method == "DELETE" and len(parts) == 3 and parts[:2] == ["vault", "keys"]:
+        return delete_vault_key(event, parts[2])
     if method == "GET" and parts == ["artifacts"]:
         return list_artifacts(event)
     if method == "GET" and len(parts) >= 2 and parts[0] == "artifacts":

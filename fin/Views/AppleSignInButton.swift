@@ -66,7 +66,9 @@ struct AppleSignInButton: View {
             }
             isSigningIn = true
             Task {
-                let signInOutcome = await AppleSignInClient.signIn(identityToken: identityToken)
+                let signInOutcome = await AppleSignInClient.signIn(
+                    identityToken: identityToken, endpoint: CloudControlPlaneConfig.endpointURL
+                )
                 await MainActor.run {
                     isSigningIn = false
                     outcome = signInOutcome

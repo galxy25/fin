@@ -4,8 +4,10 @@ import Foundation
 /// per-user session token (`POST /auth/apple` — see `scripts/cloud-agent/
 /// control-plane/lambda.py`'s `auth_apple`/`_verify_apple_identity_token`).
 /// This is the ONLY control-plane call that needs no prior bearer token —
-/// it's how one is obtained — so it always targets the fixed control-plane
-/// endpoint directly rather than going through `CloudControlPlaneConfig.token`.
+/// it's how one is obtained — so it takes the endpoint explicitly rather than
+/// going through `CloudControlPlaneConfig`: the tvOS target compiles this file
+/// without the rest of `fin/Agent` and reads the endpoint straight from iCloud
+/// Key-Value Storage (`TVCloudAccount`).
 enum AppleSignInClient {
     enum Outcome: Equatable {
         case signedIn(sessionToken: String)
@@ -16,9 +18,8 @@ enum AppleSignInClient {
     /// `identityToken` is the raw bytes from `ASAuthorizationAppleIDCredential
     /// .identityToken`, UTF-8 decoded by the caller (`AppleSignInButton`) —
     /// kept as `String` here so this stays testable without AuthenticationServices.
-    static func signIn(identityToken: String) async -> Outcome {
-        var base = CloudControlPlaneConfig.endpointURL
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    static func signIn(identityToken: String, endpoint: String) async -> Outcome {
+        var base = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") { base.removeLast() }
         guard !base.isEmpty, let url = URL(string: base + "/auth/apple") else {
             return .notConfigured

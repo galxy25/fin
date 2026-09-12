@@ -13,6 +13,17 @@
 	<array>
 		<string>CloudKit</string>
 	</array>
+	<!-- The control-plane endpoint the iPhone/Mac wrote rides iCloud Key-Value
+	     Storage (tvOS supports KVS, just not iCloud Keychain) — the TV reads the
+	     same slot and never asks the user to type a URL. -->
+	<key>com.apple.developer.ubiquity-kvstore-identifier</key>
+	<string>$(TeamIdentifierPrefix)$(CFBundleIdentifier)</string>
+	<!-- Sign in with Apple: earns the TV its own control-plane session token, from
+	     which it fetches the account's key vault (see KeyVault). -->
+	<key>com.apple.developer.applesignin</key>
+	<array>
+		<string>Default</string>
+	</array>
 	<!-- CloudKit's silent import pushes ride APNs, same as iOS/macOS; without this
 	     the TV only pulls on foreground launch. Flipped to production at submission. -->
 	<key>aps-environment</key>

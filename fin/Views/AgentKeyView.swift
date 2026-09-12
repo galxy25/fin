@@ -249,6 +249,7 @@ struct AgentKeyView: View {
             return
         }
         modelContext.insert(metadata)
+        Task { await KeyVaultSync.push(metadata, context: modelContext) }
         publicKeyLine = generated.publicKeyLine
     }
 
