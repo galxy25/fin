@@ -28,12 +28,10 @@ struct MarkdownReaderWindowView: View {
         } else {
             // Reachable if the file was deleted (on this or another synced
             // device) while this window was still open.
-            ContentUnavailableView(
-                "File Not Found",
-                systemImage: "questionmark.circle",
-                description: Text("This file may have been removed.")
+            OrphanedWindowView(
+                title: "File Not Found",
+                description: "This file may have been removed from Fin."
             )
-            .frame(minWidth: 480, minHeight: 320)
         }
     }
 }

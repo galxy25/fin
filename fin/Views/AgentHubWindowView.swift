@@ -88,12 +88,15 @@ struct AgentHubWindowView: View {
             // Reachable if the agent was deleted (on this or another synced device)
             // while this window was still open, or during state restoration before
             // CloudKit's import has landed the record yet.
-            ContentUnavailableView(
-                "Agent Not Found",
-                systemImage: "questionmark.circle",
-                description: Text("This agent may have been deleted.")
+            // Live, 2026-09-12: macOS restored ONLY this window after an update, for
+            // an agent that no longer existed (a screenshot fixture, since cleaned
+            // up) — the app opened to a blank "Agent Not Found" with no way in.
+            // Give CloudKit a moment to land the record, then open the main window
+            // and close this one.
+            OrphanedWindowView(
+                title: "Agent Not Found",
+                description: "This agent may have been deleted."
             )
-            .frame(minWidth: 480, minHeight: 320)
         }
     }
 
@@ -164,3 +167,36 @@ struct AgentHubWindowView: View {
     }
 }
 #endif
+
+
+/// A secondary window whose subject is gone: wait briefly for sync, then open
+/// the main window and dismiss this one. A button does the same immediately.
+struct OrphanedWindowView: View {
+    let title: String
+    let description: String
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+
+    var body: some View {
+        ContentUnavailableView {
+            Label(title, systemImage: "questionmark.circle")
+        } description: {
+            Text(description)
+        } actions: {
+            Button("Open Fin") { recover() }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("orphanedWindowOpenFin")
+        }
+        .frame(minWidth: 480, minHeight: 320)
+        .task {
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            recover()
+        }
+    }
+
+    private func recover() {
+        openWindow(id: FinScene.main)
+        dismissWindow()
+    }
+}

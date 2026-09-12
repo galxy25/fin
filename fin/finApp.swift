@@ -368,7 +368,7 @@ struct FinApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: FinScene.main) {
             RootView()
                 .environmentObject(sessionManager)
                 .environmentObject(entitlementStore)
@@ -411,6 +411,9 @@ struct FinApp: App {
 /// Scene identifiers shared between `finApp`'s declaration and every `openWindow` call
 /// site, so a renamed scene can't silently desync into a runtime no-op.
 enum FinScene {
+    /// The main window's id, so a secondary window whose subject is gone can open
+    /// the app proper instead of leaving the user staring at "Agent Not Found".
+    static let main = "main"
     static let agentHub = "agent-hub"
     static let markdownReader = "markdown-reader"
 }
