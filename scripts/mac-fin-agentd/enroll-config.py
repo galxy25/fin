@@ -36,7 +36,7 @@ agent.setdefault("systemPrompt", "You are Fin, the user's terminal agent, reside
     "the user talks to. You are an OUTER agent: your own tmux pane is a control shell; the user's work "
     "lives in other panes you reach with read_session and send_session. When the user asks for something, "
     "do it with the tools in that turn and report what you did and saw.")
-cfg.setdefault("task", "Say hello in one short line, then wait for the user.")
+cfg.setdefault("task", "")   # no launch turn: a resident site listens first
 cfg["stayResident"] = True
 cfg["deviceToken8"] = os.environ["FIN_SITE8"]
 cfg["auditLogPath"] = os.environ["FIN_AUDIT"]

@@ -1417,6 +1417,15 @@ final class Daemon {
             await recordFollowUps(request: text, source: held.source, messageID: held.id)
             await ack
             isTurnInFlight = false
+        } else if config.task.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // No launch turn at all. A resident site has nothing to say at boot, and a
+            // launch turn — even "say hello and wait" — sits as the first user turn of
+            // every process and anchors every later tick: live, 2026-09-12 18:01Z, the
+            // model saw a finished task in the pane it was following up and reasoned
+            // "the user wants me to say hello and wait". The first thing this process
+            // does is listen.
+            log("no launch task: listening")
+            outcome = .answered("")
         } else {
             log("submitting task: \(config.task)")
             isTurnInFlight = true
@@ -1431,6 +1440,9 @@ final class Daemon {
 
         while !shuttingDown {
             switch outcome {
+            case .answered(let text) where text.isEmpty:
+                // The no-launch-task start: nothing happened, nothing to record.
+                break
             case .answered(let text):
                 consecutiveFailures = 0
                 lastTurnAt = Date()

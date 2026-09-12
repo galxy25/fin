@@ -247,9 +247,11 @@ public enum GoalsTick {
             priority: 1,
             why: "The user asked for this \(via); it was handed to pane \(target). Done when that pane shows "
                 + "the work finished and the user has been told the outcome.",
-            nextAction: "read_session \(target). If the work is finished, call notify with the outcome in one "
-                + "line (what was delivered, or what went wrong), then close this goal. If the pane is still "
-                + "working, wait for the next tick. If it needs something from the user, tell the user with notify.",
+            nextAction: "read_session \(target). The pane's LATEST reply is the answer. If it says the work is "
+                + "finished — a file uploaded, sent, delivered, a task completed — call notify NOW with that "
+                + "outcome in one line and close this goal; do not wait for further confirmation and do not "
+                + "just say hello. If it is still working, do nothing this tick. If it needs something from "
+                + "the user, tell the user with notify.",
             tags: ["followup", "send_session"],
             source: "daemon"
         )

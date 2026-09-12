@@ -404,7 +404,7 @@ final class FollowUpGoalTests: XCTestCase {
         XCTAssertEqual(goal.state, .active)
         XCTAssertEqual(goal.priority, 1)
         XCTAssertTrue(goal.nextAction?.contains("read_session main:2.0") == true)
-        XCTAssertTrue(goal.nextAction?.contains("notify") == true)
+        XCTAssertTrue(goal.nextAction?.contains("notify NOW") == true)
         XCTAssertTrue(goal.why?.contains("by voice") == true)
         XCTAssertFalse(GoalsTick.isAskTheUserForGoals(title: goal.title, nextAction: goal.nextAction, why: goal.why),
                        "the daemon's own follow-up must never trip the ask-the-user refusal")
