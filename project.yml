@@ -229,16 +229,49 @@ targets:
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/fin.app/fin"
         "TEST_HOST[sdk=macosx*]": "$(BUILT_PRODUCTS_DIR)/fin.app/Contents/MacOS/fin"
         BUNDLE_LOADER: "$(TEST_HOST)"
+  finUITests:
+    # macOS-only for now: XCUITest drives the real, running app through its own
+    # synchronized accessibility protocol (waitForExistence, hittable checks) rather
+    # than generic AppleScript/System Events GUI scripting — the latter proved
+    # unreliable mid-investigation (inconsistent element counts, ambiguous
+    # same-named-window addressing) for exactly the kind of "does this window stay
+    # populated after an interaction" question this exists to answer.
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: finUITests
+    dependencies:
+      - target: fin
+    settings:
+      # No signing overrides here, deliberately — mirrors PocketDJUITests exactly.
+      # This target inherits settings.base's CODE_SIGN_STYLE: Automatic /
+      # DEVELOPMENT_TEAM below, which is fine for interactive Xcode runs but
+      # unreliable for a headless `xcodebuild test`: this Mac's hardware UDID was
+      # never registered for a Mac Development profile ("Device isn't registered
+      # in your developer account" / "No profiles found"), and separately the app
+      # carries the Push capability (com.apple.developer.aps-environment in
+      # fin-macOS.entitlements) which a Mac Development profile wouldn't grant
+      # anyway. Real ad-hoc signing (`codesign --sign -`, no profile needed at
+      # all) happens purely at the xcodebuild-invocation level in
+      # scripts/test-macos.sh (CODE_SIGNING_ALLOWED=NO on build-for-testing, then
+      # codesign, then test-without-building) — never here. See
+      # .claude/skills/apple-test/SKILL.md.
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin.uitests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: fin
 schemes:
   fin:
     build:
       targets:
         fin: all
         finTests: [test]
+        finUITests: [test]
     run:
       config: Debug
     test:
       targets:
         - finTests
+        - finUITests
     archive:
       config: Release

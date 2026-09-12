@@ -40,6 +40,7 @@ struct ControlStripView: View {
             } label: {
                 Image(systemName: "server.rack")
             }
+            .accessibilityIdentifier("controlStrip_servers")
             if let agent = agents.first {
                 Button {
                     // A cloud-hosted agent has no local runtime to panel-embed;

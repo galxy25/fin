@@ -31,6 +31,7 @@ struct AgentListView: View {
                     AgentRow(agent: agent)
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("agentRow_\(agent.id.uuidString)")
                 #else
                 NavigationLink {
                     AgentHubView(agent: agent)

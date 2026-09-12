@@ -14,18 +14,6 @@ struct AgentEditView: View {
     @State private var shareRatings = FeedbackSettings.shareRatings()
     @State private var shareActivity = FeedbackSettings.shareActivity()
     @State private var showsFeedbackComposer = false
-    #if os(macOS)
-    // The macOS agent hub already gives Settings its own sidebar destination (no more
-    // scrolling past Logs/Memory/Artifacts to get here), so this form's OWN internal
-    // clutter is what's worth collapsing now: the settings someone sets once
-    // (device-wide supervision, privacy opt-ins) or rarely revisits (numeric tuning)
-    // start closed, same DisclosureGroup-in-a-Section idiom ServerEditView already
-    // uses for its own "Advanced" section. iOS/visionOS keep every section open, as
-    // today — this is a Mac-only quiet-down, not a behavior change on other platforms.
-    @State private var isLimitsExpanded = false
-    @State private var isRemoteSupervisionExpanded = false
-    @State private var isHelpImproveExpanded = false
-    #endif
 
     private enum ProbeState: Equatable {
         case idle
@@ -35,6 +23,19 @@ struct AgentEditView: View {
     }
 
     var body: some View {
+        #if os(macOS)
+        // NOT `Form` on macOS. Every attempt to keep Form here — with collapsible
+        // sections (DisclosureGroup, then a manual toggle), without them, wrapped in
+        // NavigationSplitView, wrapped in a plain HStack instead — was live-tested and
+        // reproduced the identical failure: content clips hard partway down with a
+        // scrollbar that reports existing but never moves, no matter how the window
+        // or its containers are restructured. That points at `Form` itself (NSTableView
+        // -backed) misbehaving in this specific secondary-window context on this
+        // machine's bleeding-edge macOS/Xcode, not at anything this file authors. A
+        // plain `ScrollView` is a completely different rendering path and was verified
+        // live to scroll correctly end to end.
+        macBody
+        #else
         Form {
             Section("Identity") {
                 TextField("Name", text: $agent.name)
@@ -46,50 +47,119 @@ struct AgentEditView: View {
             }
             hostingSection
             modeSection
-            #if os(macOS)
-            collapsibleSection("Limits", isExpanded: $isLimitsExpanded, footer: limitsFooter) {
-                limitsFields
-            }
-            collapsibleSection(
-                "Remote Supervision", isExpanded: $isRemoteSupervisionExpanded, footer: remoteSupervisionFooter
-            ) {
-                remoteSupervisionFields
-            }
-            collapsibleSection(
-                "Help Improve Fin", isExpanded: $isHelpImproveExpanded, footer: helpImproveFooter
-            ) {
-                helpImproveFields
-            }
-            .sheet(isPresented: $showsFeedbackComposer) {
-                FeedbackComposerView()
-            }
-            #else
             limitsSection
             remoteSupervisionSection
             helpImproveSection
-            #endif
             connectedServicesSection
-            #if os(iOS) || os(visionOS)
             // macOS reaches this from the hub window's own sidebar item instead —
             // repeating it here would just be a second path to the same screen.
             finKeySection
-            #endif
             promptSection
         }
+        .accessibilityIdentifier("agentSettingsForm")
         .navigationTitle(agent.name.isEmpty ? "Agent" : agent.name)
-        #if os(iOS) || os(visionOS)
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            apiKey = KeychainStore.loadAgentAPIKey(for: agent.id) ?? ""
+            didLoadAPIKey = true
+        }
         #endif
+    }
+
+    #if os(macOS)
+    private var macBody: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                MacSettingsGroup(header: "Identity") {
+                    TextField("Name", text: $agent.name)
+                }
+                MacSettingsGroup(header: "Provider", footer: agent.provider.explanation) {
+                    providerFields
+                }
+                if agent.provider == .openAICompatible {
+                    MacSettingsGroup(
+                        header: "Endpoint",
+                        footer: "Any OpenAI-compatible chat endpoint. For LM Studio, turn on "
+                            + "\"Serve on Local Network\" and use your Tailscale address with port 1234."
+                    ) {
+                        endpointFields
+                    }
+                    MacSettingsGroup(
+                        header: "Model",
+                        footer: discoveredModels.isEmpty
+                            ? "Test the connection to list the models this endpoint has loaded." : nil
+                    ) {
+                        modelFields
+                    }
+                }
+                MacSettingsGroup(header: "Hosting", footer: hostingFooter) {
+                    hostingFields
+                }
+                MacSettingsGroup(header: "Mode", footer: modeFooter) {
+                    modeFields
+                }
+                MacSettingsGroup(header: "Limits", footer: limitsFooter) {
+                    limitsFields
+                }
+                MacSettingsGroup(header: "Remote Supervision", footer: remoteSupervisionFooter) {
+                    remoteSupervisionFields
+                }
+                MacSettingsGroup(header: "Help Improve Fin", footer: helpImproveFooter) {
+                    helpImproveFields
+                }
+                .sheet(isPresented: $showsFeedbackComposer) {
+                    FeedbackComposerView()
+                }
+                MacSettingsGroup(
+                    header: "Connected Services",
+                    footer: "Third-party credentials a cloud worker uses while driving a task "
+                        + "— a Gmail app password, an API key. They're encrypted in your "
+                        + "own AWS Secrets Manager; the app can store them but can never "
+                        + "read them back."
+                ) {
+                    NavigationLink("Connected Services") {
+                        ConnectedServicesView()
+                    }
+                }
+                MacSettingsGroup(
+                    header: "Fin's Key",
+                    footer: "Fin's own SSH key. Add its public half to a computer to let "
+                        + "Fin work there — from this device, your other devices, or a "
+                        + "cloud worker."
+                ) {
+                    NavigationLink("Fin's Key") {
+                        AgentKeyView()
+                    }
+                }
+                MacSettingsGroup(header: "System prompt") {
+                    promptFields
+                }
+            }
+            .padding(20)
+        }
+        .accessibilityIdentifier("agentSettingsForm")
+        .navigationTitle(agent.name.isEmpty ? "Agent" : agent.name)
         .task {
             apiKey = KeychainStore.loadAgentAPIKey(for: agent.id) ?? ""
             didLoadAPIKey = true
         }
     }
+    #endif
 
     // MARK: - Provider
 
     private var providerSection: some View {
         Section {
+            providerFields
+        } header: {
+            Text("Provider")
+        } footer: {
+            Text(agent.provider.explanation)
+        }
+    }
+
+    private var providerFields: some View {
+        Group {
             Picker("Runs on", selection: providerBinding) {
                 ForEach(AgentProvider.allCases) { provider in
                     Label(provider.label, systemImage: provider.systemImage).tag(provider)
@@ -101,10 +171,6 @@ struct AgentEditView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
-        } header: {
-            Text("Provider")
-        } footer: {
-            Text(agent.provider.explanation)
         }
     }
 
@@ -120,6 +186,16 @@ struct AgentEditView: View {
     /// render redacted and are replaced by pasting, never edited.
     private var hostingSection: some View {
         Section {
+            hostingFields
+        } header: {
+            Text("Hosting")
+        } footer: {
+            Text(hostingFooter)
+        }
+    }
+
+    private var hostingFields: some View {
+        Group {
             Picker("Hosted by", selection: hostingBinding) {
                 ForEach(AgentHostingMode.allCases) { mode in
                     Label(mode.label, systemImage: mode.systemImage).tag(mode)
@@ -153,23 +229,23 @@ struct AgentEditView: View {
                     redact: CloudControlPlaneConfig.redactedToken
                 )
             }
-        } header: {
-            Text("Hosting")
-        } footer: {
-            Text(agent.hostingMode == .cloud
-                ? "An isolated fin-agentd harness owns this agent's conversation. "
-                    + "This device only views its transcript and sends it messages — "
-                    + "no local runtime, heartbeat, or watchdog runs anywhere. "
-                    + "Switch back to This Device at any time to restore local hosting. "
-                    + "The two control plane fields are device-wide — one control "
-                    + "plane launches workers for every cloud agent on this device — "
-                    + "and let the console start a harness on demand. Sign in with "
-                    + "Apple to get your own account's token automatically; the token "
-                    + "field itself stays for pasting it into a non-interactive process "
-                    + "(the resident daemon) that can't sign in on its own."
-                : "This device (or whichever device arms monitoring) runs the "
-                    + "conversation loop — the standard path.")
         }
+    }
+
+    private var hostingFooter: String {
+        agent.hostingMode == .cloud
+            ? "An isolated fin-agentd harness owns this agent's conversation. "
+                + "This device only views its transcript and sends it messages — "
+                + "no local runtime, heartbeat, or watchdog runs anywhere. "
+                + "Switch back to This Device at any time to restore local hosting. "
+                + "The two control plane fields are device-wide — one control "
+                + "plane launches workers for every cloud agent on this device — "
+                + "and let the console start a harness on demand. Sign in with "
+                + "Apple to get your own account's token automatically; the token "
+                + "field itself stays for pasting it into a non-interactive process "
+                + "(the resident daemon) that can't sign in on its own."
+            : "This device (or whichever device arms monitoring) runs the "
+                + "conversation loop — the standard path."
     }
 
     private var hostingBinding: Binding<AgentHostingMode> {
@@ -214,6 +290,17 @@ struct AgentEditView: View {
 
     private var endpointSection: some View {
         Section {
+            endpointFields
+        } header: {
+            Text("Endpoint")
+        } footer: {
+            Text("Any OpenAI-compatible chat endpoint. For LM Studio, turn on "
+                + "\"Serve on Local Network\" and use your Tailscale address with port 1234.")
+        }
+    }
+
+    private var endpointFields: some View {
+        Group {
             TextField("http://100.64.0.1:1234/v1", text: $agent.endpointURL)
                 .autocapitalizationNeverIfAvailable()
                 .disableAutocorrection(true)
@@ -226,11 +313,6 @@ struct AgentEditView: View {
                 }
             testConnectionButton
             probeResult
-        } header: {
-            Text("Endpoint")
-        } footer: {
-            Text("Any OpenAI-compatible chat endpoint. For LM Studio, turn on "
-                + "\"Serve on Local Network\" and use your Tailscale address with port 1234.")
         }
     }
 
@@ -270,6 +352,18 @@ struct AgentEditView: View {
 
     private var modelSection: some View {
         Section {
+            modelFields
+        } header: {
+            Text("Model")
+        } footer: {
+            if discoveredModels.isEmpty {
+                Text("Test the connection to list the models this endpoint has loaded.")
+            }
+        }
+    }
+
+    private var modelFields: some View {
+        Group {
             TextField("Model identifier", text: $agent.modelIdentifier)
                 .autocapitalizationNeverIfAvailable()
                 .disableAutocorrection(true)
@@ -288,12 +382,6 @@ struct AgentEditView: View {
                     }
                 }
             }
-        } header: {
-            Text("Model")
-        } footer: {
-            if discoveredModels.isEmpty {
-                Text("Test the connection to list the models this endpoint has loaded.")
-            }
         }
     }
 
@@ -301,6 +389,16 @@ struct AgentEditView: View {
 
     private var modeSection: some View {
         Section {
+            modeFields
+        } header: {
+            Text("Mode")
+        } footer: {
+            Text(modeFooter)
+        }
+    }
+
+    private var modeFields: some View {
+        Group {
             Picker("Default mode", selection: modeBinding) {
                 ForEach(AgentMode.allCases) { mode in
                     Label(mode.label, systemImage: mode.systemImage).tag(mode)
@@ -308,17 +406,17 @@ struct AgentEditView: View {
             }
             Toggle("Notify on Response", isOn: notifyBinding)
             Toggle("Mirror Logs to iCloud", isOn: mirrorBinding)
-        } header: {
-            Text("Mode")
-        } footer: {
-            Text("Auto lets the agent run its own commands. Manual asks you to approve "
-                + "each one. Commands that look destructive always ask, in either mode. "
-                + "Notify on Response posts a notification when this agent finishes a "
-                + "turn while your screen is locked or the app is in the background. "
-                + "Mirror Logs to iCloud copies this agent's activity log, with secrets "
-                + "redacted, into iCloud Drive → Fin → AgentLogs so your other devices "
-                + "can read it.")
         }
+    }
+
+    private var modeFooter: String {
+        "Auto lets the agent run its own commands. Manual asks you to approve "
+            + "each one. Commands that look destructive always ask, in either mode. "
+            + "Notify on Response posts a notification when this agent finishes a "
+            + "turn while your screen is locked or the app is in the background. "
+            + "Mirror Logs to iCloud copies this agent's activity log, with secrets "
+            + "redacted, into iCloud Drive → Fin → AgentLogs so your other devices "
+            + "can read it."
     }
 
     private var notifyBinding: Binding<Bool> {
@@ -343,6 +441,7 @@ struct AgentEditView: View {
         } footer: {
             Text(limitsFooter)
         }
+        .accessibilityIdentifier("settingsSection_Limits")
     }
 
     private var limitsFields: some View {
@@ -422,6 +521,7 @@ struct AgentEditView: View {
                 .onChange(of: remoteEnabled) { _, newValue in
                     RemoteSupervisionConfig.setEnabled(newValue)
                 }
+                .accessibilityIdentifier("remoteSupervisionEnabledToggle")
             remoteURLField(
                 title: "Directive URL",
                 current: RemoteSupervisionConfig.directiveURL,
@@ -573,37 +673,16 @@ struct AgentEditView: View {
         }
     }
 
-    #if os(macOS)
-    // MARK: - Collapsible section (macOS)
-
-    /// Same `Section { DisclosureGroup(...) }` idiom `ServerEditView` already uses for
-    /// its own "Advanced" group — the footer text moves inside the disclosure (a
-    /// `Section`'s own footer wouldn't hide with it) so it reads right under the
-    /// fields it explains once expanded, not as a permanently-visible caption.
-    private func collapsibleSection<Content: View>(
-        _ title: String,
-        isExpanded: Binding<Bool>,
-        footer: String,
-        @ViewBuilder content: @escaping () -> Content
-    ) -> some View {
-        Section {
-            DisclosureGroup(title, isExpanded: isExpanded) {
-                VStack(alignment: .leading, spacing: 12) {
-                    content()
-                    Text(footer)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, 4)
-            }
-        }
-    }
-    #endif
-
     // MARK: - Prompt
 
     private var promptSection: some View {
         Section("System prompt") {
+            promptFields
+        }
+    }
+
+    private var promptFields: some View {
+        Group {
             TextEditor(text: $agent.systemPrompt)
                 .frame(minHeight: 160)
                 .font(.system(.caption, design: .monospaced))
@@ -686,3 +765,33 @@ private struct LabeledStepper: View {
         )
     }
 }
+
+#if os(macOS)
+/// One "card" in `AgentEditView.macBody`'s plain `ScrollView` — visually stands in
+/// for `Section`'s header/content/footer grouping, without `Section` or `Form`
+/// (see `AgentEditView.body`'s comment for why: both were live-tested and ruled
+/// out as broken in this window context, not just theorized about).
+private struct MacSettingsGroup<Content: View>: View {
+    let header: String
+    var footer: String?
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(header)
+                .font(.headline)
+            VStack(alignment: .leading, spacing: 12) {
+                content
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+            if let footer, !footer.isEmpty {
+                Text(footer)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+#endif

@@ -61,15 +61,24 @@ struct AgentHubWindowView: View {
 
     var body: some View {
         if let agent {
-            NavigationSplitView {
+            // Plain HStack, NOT NavigationSplitView. Live-tested (both via automation
+            // and directly by hand): with NavigationSplitView here, Settings' Form
+            // failed to scroll past the Limits section — real, human-confirmed, not
+            // just a static-analysis guess — and a separate live test showed the
+            // window's content vanishing on some interactions. NavigationSplitView is
+            // a comparatively new API; on this Mac's bleeding-edge macOS/Xcode this
+            // combination (secondary WindowGroup(for:) scene + NavigationSplitView +
+            // Form) is unreliable enough that removing it is the more trustworthy
+            // fix than continuing to patch around it.
+            HStack(spacing: 0) {
                 sidebar(for: agent)
-            } detail: {
+                    .frame(width: 220)
+                Divider()
                 detail(for: agent)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .navigationTitle(agent.name.isEmpty ? "Agent" : agent.name)
-            // Same lesson as HomeView's sheet-collapse fix: an explicit minimum keeps
-            // this window from opening too small to be useful on first launch.
             .frame(minWidth: 760, minHeight: 480)
+            .accessibilityIdentifier("agentHubWindow")
         } else {
             // Reachable if the agent was deleted (on this or another synced device)
             // while this window was still open, or during state restoration before
@@ -86,52 +95,66 @@ struct AgentHubWindowView: View {
     private func sidebar(for agent: Agent) -> some View {
         List(selection: $selection) {
             Section {
-                Label(HubSection.settings.title, systemImage: HubSection.settings.systemImage)
-                    .tag(HubSection.settings)
+                sidebarRow(.settings)
             }
             Section("What's going on") {
-                Label(HubSection.logs.title, systemImage: HubSection.logs.systemImage)
-                    .tag(HubSection.logs)
-                Label(HubSection.memory.title, systemImage: HubSection.memory.systemImage)
-                    .tag(HubSection.memory)
+                sidebarRow(.logs)
+                sidebarRow(.memory)
                 if sessionManager.isRemotelyHosted(agent) {
-                    Label(HubSection.remote.title, systemImage: HubSection.remote.systemImage)
-                        .tag(HubSection.remote)
+                    sidebarRow(.remote)
                 }
-                Label(HubSection.artifacts.title, systemImage: HubSection.artifacts.systemImage)
-                    .tag(HubSection.artifacts)
+                sidebarRow(.artifacts)
             }
             Section {
-                Label(HubSection.key.title, systemImage: HubSection.key.systemImage)
-                    .tag(HubSection.key)
+                sidebarRow(.key)
             }
         }
+        .accessibilityIdentifier("hubSidebar")
         .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 260)
     }
 
+    /// One sidebar row, identified for UI-test/automation drive-through
+    /// (`hubSidebarRow_settings`, `hubSidebarRow_logs`, …) — a stable hook that
+    /// doesn't depend on localized title text.
+    private func sidebarRow(_ section: HubSection) -> some View {
+        Label(section.title, systemImage: section.systemImage)
+            .tag(section)
+            .accessibilityIdentifier("hubSidebarRow_\(section)")
+    }
+
+    /// Wrapped in its own `NavigationStack` per selection — `NavigationSplitView`'s
+    /// detail column is documented to want one (it's what gives a pushed
+    /// destination, like Settings' "Connected Services"/"Fin's Key" links, a place
+    /// to push into, and what supplies `.navigationTitle`/`.toolbar` a real
+    /// navigation context). Without it, `AgentEditView`'s bare `Form` had no bounded
+    /// scroll container to size against and simply clipped instead of scrolling —
+    /// this is also what fixes that.
     @ViewBuilder
     private func detail(for agent: Agent) -> some View {
-        // `.remote` can only be reached while `isRemotelyHosted` is true (it's the only
-        // way the sidebar row appears) — but hosting can flip in the background (an
-        // in-flight migration, another device changing it) while this window sits on
-        // that selection, so the fallback isn't dead code.
-        switch selection ?? .settings {
-        case .settings:
-            AgentEditView(agent: agent)
-        case .logs:
-            AgentLogView(agent: agent)
-        case .memory:
-            AgentMemoryView(agent: agent)
-        case .remote:
-            if sessionManager.isRemotelyHosted(agent) {
-                AgentRemoteConsoleView(agent: agent)
-            } else {
+        NavigationStack {
+            // `.remote` can only be reached while `isRemotelyHosted` is true (it's
+            // the only way the sidebar row appears) — but hosting can flip in the
+            // background (an in-flight migration, another device changing it)
+            // while this window sits on that selection, so the fallback isn't dead
+            // code.
+            switch selection ?? .settings {
+            case .settings:
                 AgentEditView(agent: agent)
+            case .logs:
+                AgentLogView(agent: agent)
+            case .memory:
+                AgentMemoryView(agent: agent)
+            case .remote:
+                if sessionManager.isRemotelyHosted(agent) {
+                    AgentRemoteConsoleView(agent: agent)
+                } else {
+                    AgentEditView(agent: agent)
+                }
+            case .artifacts:
+                ArtifactsView()
+            case .key:
+                AgentKeyView()
             }
-        case .artifacts:
-            ArtifactsView()
-        case .key:
-            AgentKeyView()
         }
     }
 }

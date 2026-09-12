@@ -271,12 +271,30 @@ struct FinApp: App {
         // Cross-device push subscriptions: idempotent refresh once the CloudKit
         // account answers. Failures land in the audit trail (and iCloud mirror) —
         // a silent zero-subscription outage cost a full debug cycle.
-        Task { [weak manager] in
-            let subscriber = AgentSignalSubscriber()
-            subscriber.onSubscriptionAudit = { message in
-                Task { @MainActor in manager?.recordLifecycleEvent(message) }
+        //
+        // Skipped when launched by `launchFinApp()` (finUITests/XCUIHelpers.swift),
+        // which sets FIN_UI_TESTING=1: `CKContainer(identifier:)` traps outright —
+        // a non-throwing, non-catchable crash inside Apple's own framework —
+        // whenever the running binary's code signature lacks a valid CloudKit
+        // container entitlement, which an ad-hoc-signed UI test run (see
+        // `.claude/skills/apple-test/SKILL.md`; ad-hoc signing needs no
+        // provisioning profile, which is also exactly why it has no CloudKit
+        // entitlement) never has. `XCTestConfigurationFilePath` was tried first
+        // and does NOT work here: it's set on a unit-test host process (same
+        // process as the app), but a UI test's app-under-test is a genuinely
+        // separate process `XCUIApplication.launch()` spawns, and that env var
+        // isn't propagated to it — confirmed live, the crash still reproduced
+        // with that check in place. Real users always run a properly-signed
+        // build with no launch environment override, so this changes nothing
+        // for them.
+        if ProcessInfo.processInfo.environment["FIN_UI_TESTING"] == nil {
+            Task { [weak manager] in
+                let subscriber = AgentSignalSubscriber()
+                subscriber.onSubscriptionAudit = { message in
+                    Task { @MainActor in manager?.recordLifecycleEvent(message) }
+                }
+                await subscriber.ensureSubscriptions()
             }
-            await subscriber.ensureSubscriptions()
         }
 
         manager.lifecycleAuditAgents = {

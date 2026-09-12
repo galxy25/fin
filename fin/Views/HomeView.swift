@@ -28,12 +28,15 @@ struct HomeView: View {
             VStack(spacing: 0) {
                 Picker("Mode", selection: $mode) {
                     ForEach(Mode.allCases, id: \.self) { mode in
-                        Text(mode.rawValue).tag(mode)
+                        Text(mode.rawValue)
+                            .tag(mode)
+                            .accessibilityIdentifier("homeMode_\(mode.rawValue)")
                     }
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal)
                 .padding(.top, 8)
+                .accessibilityIdentifier("homeModePicker")
 
                 switch mode {
                 case .terminal:
@@ -42,6 +45,7 @@ struct HomeView: View {
                     MarkdownListView()
                 case .agents:
                     AgentListView()
+                        .accessibilityIdentifier("agentListView")
                 }
             }
             .navigationTitle(mode.title)
