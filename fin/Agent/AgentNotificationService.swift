@@ -27,7 +27,25 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
     /// the `DeviceIdentity.short` of the device the signal originated on (nil
     /// when an old push didn't carry it); `FinApp` wires it to
     /// `SessionManager.pendingAgentOpen`.
-    var onOpenAgent: ((_ agentID: UUID, _ originDeviceID8: String?) -> Void)?
+    var onOpenAgent: ((_ agentID: UUID, _ originDeviceID8: String?, _ threadID: String?) -> Void)?
+
+    /// docs/THREADS.md §2: the thread of the control-plane message this device
+    /// is currently answering for an agent (`AppSiteClient` sets it at claim,
+    /// clears it at the answered ack). A local banner posted while it is set
+    /// groups under the thread — the same `thread-id` the control plane's
+    /// pushes use — so the Lock Screen shows one request as one group
+    /// whichever body answered.
+    private(set) var activeThreads: [UUID: String] = [:]
+
+    func setActiveThread(_ threadID: String?, for agentID: UUID) {
+        if let threadID, !threadID.isEmpty { activeThreads[agentID] = threadID } else { activeThreads.removeValue(forKey: agentID) }
+    }
+
+    /// The `thread-id` a local banner for `agentID` groups under. Pure over
+    /// the table so the fallback is testable.
+    nonisolated static func threadIdentifier(for agentID: UUID, activeThreads: [UUID: String]) -> String {
+        activeThreads[agentID] ?? agentID.uuidString
+    }
 
     /// Persists a cross-device `AgentSignal` alongside every local banner; `FinApp`
     /// wires it to an insert on the synced store. Runs BEFORE the is-app-active
@@ -55,8 +73,8 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
     /// production value is `FinVoiceIntentCore.deliver` with `source: "app"` —
     /// the same `/messages` path a Siri reply or the in-app composer takes.
     /// Injectable so the response handling is testable without a control plane.
-    var replyDeliverer: (_ agentID: UUID, _ agentName: String, _ text: String) async -> Bool = { agentID, agentName, text in
-        await FinVoiceIntentCore.deliver(agentID: agentID, agentName: agentName, text: text, source: "app").delivered
+    var replyDeliverer: (_ agentID: UUID, _ agentName: String, _ text: String, _ threadID: String?) async -> Bool = { agentID, agentName, text, threadID in
+        await FinVoiceIntentCore.deliver(agentID: agentID, agentName: agentName, text: text, source: "app", threadID: threadID).delivered
     }
 
     /// Install as the notification-center delegate (finApp init) and register
@@ -148,10 +166,15 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         content.body = Self.preview(of: body)
         content.sound = .default
         content.categoryIdentifier = category
-        content.threadIdentifier = agentID.uuidString
-        content.userInfo = FinCommunicationNotification.Payload.userInfo(kind: kind, agentID: agentID, agentName: name)
+        // Grouped by the thread being answered when there is one, else the
+        // agent — the same rule the control plane applies to its pushes.
+        let threadID = activeThreads[agentID]
+        content.threadIdentifier = Self.threadIdentifier(for: agentID, activeThreads: activeThreads)
+        content.userInfo = FinCommunicationNotification.Payload.userInfo(
+            kind: kind, agentID: agentID, agentName: name, threadID: threadID
+        )
         let decorated = (try? FinCommunicationNotification.communicationContent(
-            from: content, agentName: name, agentID: agentID
+            from: content, agentName: name, agentID: agentID, threadID: threadID
         )) ?? content
         return UNNotificationRequest(identifier: identifier, content: decorated, trigger: nil)
     }
@@ -380,6 +403,9 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         var originDeviceID8: String?
         var agentName: String?
         var messageID: String?
+        /// `fin.threadId` (docs/THREADS.md §2): a typed reply joins this
+        /// thread; a tap opens the console on it.
+        var threadID: String?
     }
 
     /// Parses a "fin" notification payload — `{"agentID": "<uuid>",
@@ -397,7 +423,7 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         else { return nil }
         return FinPayload(
             agentID: agentID, originDeviceID8: payload.originDeviceID8,
-            agentName: payload.agentName, messageID: payload.messageID
+            agentName: payload.agentName, messageID: payload.messageID, threadID: payload.threadID
         )
     }
 
@@ -433,9 +459,9 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
             return
         }
         if let parsed = Self.parseFinPayload(userInfo) {
-            onOpenAgent?(parsed.agentID, parsed.originDeviceID8 ?? DeviceIdentity.short)
+            onOpenAgent?(parsed.agentID, parsed.originDeviceID8 ?? DeviceIdentity.short, parsed.threadID)
         } else if let target = AgentSignalSubscriber.openTarget(fromPushUserInfo: userInfo) {
-            onOpenAgent?(target.agentID, target.originDeviceID8)
+            onOpenAgent?(target.agentID, target.originDeviceID8, nil)
         }
     }
 
@@ -450,7 +476,9 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
             postReplyFailure(agentName: nil)
             return false
         }
-        let delivered = await replyDeliverer(target.agentID, target.agentName, trimmed)
+        // The reply joins the thread the push named (docs/THREADS.md §2).
+        let threadID = Self.parseFinPayload(userInfo)?.threadID
+        let delivered = await replyDeliverer(target.agentID, target.agentName, trimmed, threadID)
         if !delivered { postReplyFailure(agentName: target.agentName) }
         return delivered
     }

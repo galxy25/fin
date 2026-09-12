@@ -424,7 +424,7 @@ final class CommunicationNotificationTests: XCTestCase {
 
         let agentID = UUID()
         var captured: (UUID, String, String)?
-        service.replyDeliverer = { id, name, text in captured = (id, name, text); return true }
+        service.replyDeliverer = { id, name, text, _ in captured = (id, name, text); return true }
 
         let userInfo: [AnyHashable: Any] = ["fin": ["kind": "agentReply", "agentID": agentID.uuidString, "agentName": "Fin"]]
         let delivered = await service.handleTypedReply("  yes, merge it  ", userInfo: userInfo)

@@ -516,6 +516,37 @@ final class AgentRuntime: ObservableObject {
     /// in-flight turn completes. Enqueueing is deliberately side-effect free: the
     /// suppression-lift and recovery-reset a submit implies happen when the queued
     /// prompt actually runs (`startSubmittedTurn`), not at enqueue.
+    /// docs/THREADS.md §4: the thread each control-plane prompt belongs to,
+    /// keyed by the user message's transcript id, so the local console's
+    /// picker can filter turns the way the remote one does. A prompt typed
+    /// here has no thread (nil) and shows under "All activity" only.
+    @Published private(set) var promptThreadIDs: [UUID: String] = [:]
+    /// Threads for prompts submitted but not yet started (queued behind a turn),
+    /// keyed by the trimmed text — consumed when the turn opens.
+    private var pendingThreadIDs: [String: String] = [:]
+
+    /// `submit` for a prompt the site client applied from the control plane,
+    /// tagged with its thread.
+    @discardableResult
+    func submit(_ text: String, threadID: String?) -> SubmitOutcome {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let threadID, !trimmed.isEmpty { pendingThreadIDs[trimmed] = threadID }
+        return submit(text)
+    }
+
+    /// The thread of the turn a message falls in: a user message's own tag, or
+    /// — for the assistant/tool messages that follow it — the nearest user
+    /// message before it. Pure over the transcript order.
+    nonisolated static func threadIDs(for messages: [AgentMessage], promptThreadIDs: [UUID: String]) -> [UUID: String?] {
+        var result: [UUID: String?] = [:]
+        var current: String?
+        for message in messages {
+            if message.role == .user { current = promptThreadIDs[message.id] }
+            result[message.id] = current
+        }
+        return result
+    }
+
     @discardableResult
     func submit(_ text: String) -> SubmitOutcome {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -544,7 +575,11 @@ final class AgentRuntime: ObservableObject {
             return false
         }
 
-        transcript.append(AgentMessage(role: .user, text: trimmed))
+        let prompt = AgentMessage(role: .user, text: trimmed)
+        transcript.append(prompt)
+        if let threadID = pendingThreadIDs.removeValue(forKey: trimmed) {
+            promptThreadIDs[prompt.id] = threadID
+        }
         currentRunID = UUID()
         runSequence = 0
         record(.userMessage, trimmed)

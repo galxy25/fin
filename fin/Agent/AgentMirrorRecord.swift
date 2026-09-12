@@ -21,13 +21,23 @@ struct AgentMirrorRecord: Identifiable, Equatable {
     /// message id it applied. Two lines sharing one are the same message
     /// applied twice (the at-least-once window) and are collapsed in `merge`.
     let inReplyTo: String?
+    /// docs/THREADS.md §2: the thread every line of a message turn belongs to
+    /// (`thread_id`). Optional: lines written before threads existed carry only
+    /// the user line's `in_reply_to`, which the app resolves through the
+    /// control-plane row's `threadId` instead.
+    let threadID: String?
+    /// For `send_session` / `read_session` tool lines: the tmux pane the turn
+    /// relayed into (`target`, e.g. `main:2.0`) — the pane's side of a thread as
+    /// a structured field, not a string parsed out of prose.
+    let target: String?
 
     /// Synthetic row, for reader-generated notices (e.g. an oversized file that
     /// was skipped rather than read) — never parsed from a mirror line.
     init(
         id: String, kind: AgentLogKind, text: String, timestamp: Date,
         sequence: Int = 0, runID: String = "", toolName: String? = nil,
-        siteID8: String? = nil, siteName: String? = nil, inReplyTo: String? = nil
+        siteID8: String? = nil, siteName: String? = nil, inReplyTo: String? = nil,
+        threadID: String? = nil, target: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -39,6 +49,8 @@ struct AgentMirrorRecord: Identifiable, Equatable {
         self.siteID8 = siteID8
         self.siteName = siteName
         self.inReplyTo = inReplyTo
+        self.threadID = threadID
+        self.target = target
     }
 
     /// Decodes one JSONL line; nil for blank lines, the truncation marker, or
@@ -60,6 +72,8 @@ struct AgentMirrorRecord: Identifiable, Equatable {
         self.siteID8 = object["site_id8"] as? String
         self.siteName = object["site_name"] as? String
         self.inReplyTo = object["in_reply_to"] as? String
+        self.threadID = (object["thread_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        self.target = (object["target"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     /// `AgentLogEntry.jsonlLine()` writes plain ISO8601 without fractional seconds.
@@ -108,7 +122,7 @@ enum MirrorRecords {
                         text: first.text + "\n(handled by \(names.joined(separator: " and ")))",
                         timestamp: first.timestamp, sequence: first.sequence, runID: first.runID,
                         toolName: first.toolName, siteID8: first.siteID8, siteName: first.siteName,
-                        inReplyTo: first.inReplyTo
+                        inReplyTo: first.inReplyTo, threadID: first.threadID, target: first.target
                     )
                     continue
                 }

@@ -30,7 +30,6 @@ struct TVTerminalScreen: View {
     @State private var command = ""
     @State private var ctrlLatched = false
     @State private var scrollTarget = 0
-    @State private var showsThreadsNote = false
     @State private var agentClient: TVAgentClient?
 
     private var mode: TVScreenMode { TVScreenMode(rawValue: modeRaw) ?? .keyboard }
@@ -95,15 +94,8 @@ struct TVTerminalScreen: View {
     @ViewBuilder
     private func topStrip(session: TVTerminalSession) -> some View {
         HStack(spacing: 18) {
-            if mode == .agent {
-                // Thread selector — a placeholder until threads land (docs/THREADS.md).
-                Button {
-                    showsThreadsNote.toggle()
-                } label: {
-                    Label("Threads", systemImage: "list.bullet.rectangle")
-                        .labelStyle(.iconOnly)
-                }
-                .accessibilityLabel("Threads")
+            if mode == .agent, let agentClient {
+                threadMenu(agentClient)
             }
             Button { pageUp() } label: { Image(systemName: "chevron.up.2") }
                 .accessibilityLabel(mode == .keyboard ? "Page up" : "Earlier in the conversation")
@@ -119,12 +111,6 @@ struct TVTerminalScreen: View {
                 .font(.footnote)
                 .frame(maxWidth: 520)
                 .onSubmit(submitCommand)
-            if showsThreadsNote, mode == .agent {
-                Text("Threads are coming: one place per request.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
             Spacer(minLength: 0)
             Button {
                 sessionManager.close(server.id)
@@ -137,6 +123,41 @@ struct TVTerminalScreen: View {
         .font(.footnote)
         .padding(.horizontal, 28)
         .padding(.vertical, 10)
+    }
+
+    /// docs/THREADS.md §4: the thread selector — "All activity" plus one row
+    /// per thread with its status and title; the conversation filters to the
+    /// pick and sends join it.
+    private func threadMenu(_ client: TVAgentClient) -> some View {
+        Menu {
+            Button {
+                client.selectThread(nil)
+            } label: {
+                Label("All activity", systemImage: client.selectedThreadID == nil ? "checkmark" : "list.bullet")
+            }
+            ForEach(client.threads) { thread in
+                Button {
+                    client.selectThread(thread.threadId)
+                } label: {
+                    Label(
+                        "\(thread.status.chip.label) · \(thread.displayTitle)",
+                        systemImage: client.selectedThreadID == thread.threadId ? "checkmark" : thread.status.chip.systemImage
+                    )
+                }
+            }
+            if client.threads.isEmpty {
+                Text("No threads yet")
+            }
+        } label: {
+            if let thread = client.selectedThread {
+                Label(thread.displayTitle, systemImage: thread.status.chip.systemImage)
+                    .lineLimit(1)
+                    .frame(maxWidth: 360)
+            } else {
+                Label("All activity", systemImage: "list.bullet.rectangle")
+            }
+        }
+        .accessibilityLabel("Threads")
     }
 
     // MARK: - Bottom strip

@@ -37,6 +37,9 @@ struct AgentLogView: View {
     /// so every filter answered "no matching events" for a mission the iMac
     /// daemon had just run. Never inserted into the store: display-only objects.
     @StateObject private var cloudTraces = CloudTraceStore()
+    /// docs/THREADS.md §4: the picker filters runs to those whose lines carry
+    /// the selected thread.
+    @StateObject private var threadStore = ThreadStore()
     @State private var expandedRuns: Set<UUID> = []
     @State private var didSetInitialExpansion = false
     @State private var exportURL: URL?
@@ -92,8 +95,8 @@ struct AgentLogView: View {
             Text("This deletes \(entries.count) recorded event(s). It can't be undone.")
         }
         .sheet(item: $exportURL) { ExportSheet(url: $0) }
-        .onAppear { cloudTraces.start(agentName: agent.name) }
-        .onDisappear { cloudTraces.stop() }
+        .onAppear { cloudTraces.start(agentName: agent.name); threadStore.start(agentName: agent.name) }
+        .onDisappear { cloudTraces.stop(); threadStore.stop() }
         .task {
             guard !didSetInitialExpansion else { return }
             didSetInitialExpansion = true
@@ -134,8 +137,22 @@ struct AgentLogView: View {
             if grouped[entry.runID] == nil { order.append(entry.runID) }
             grouped[entry.runID, default: []].append(entry)
         }
-        return order.map { id in
+        let all = order.map { id in
             AgentRun(id: id, entries: (grouped[id] ?? []).sorted { $0.sequence < $1.sequence })
+        }
+        guard let threadID = threadStore.selectedThreadID else { return all }
+        let threadOfMessage = threadStore.threadOfMessage
+        return all.filter { Self.runCarries(threadID: threadID, entries: $0.entries, threadOfMessage: threadOfMessage) }
+    }
+
+    /// A run belongs to a thread when any of its lines names it (`thread_id`),
+    /// or its user line's `in_reply_to` resolves to it — the same rule as
+    /// `ThreadMembership`, over log rows. Pure.
+    static func runCarries(threadID: String, entries: [LogItem], threadOfMessage: [String: String]) -> Bool {
+        entries.contains { entry in
+            if let explicit = entry.threadID { return explicit == threadID }
+            guard let reply = entry.inReplyTo else { return false }
+            return (threadOfMessage[reply] ?? reply) == threadID
         }
     }
 
@@ -154,6 +171,10 @@ struct AgentLogView: View {
     private var filterBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 7) {
+                if CloudControlPlaneConfig.isConfigured {
+                    ThreadPicker(store: threadStore, compact: true)
+                        .padding(.trailing, 4)
+                }
                 FilterChip(title: "All", isOn: kindFilter == nil) { kindFilter = nil }
                 ForEach(AgentLogKind.allCases, id: \.self) { kind in
                     FilterChip(
@@ -279,6 +300,10 @@ struct LogItem: Identifiable {
     /// The export line: the stored row's own JSONL, or a plain rendering of a
     /// cloud row.
     let jsonl: String?
+    /// Thread membership (docs/THREADS.md §2), from a cloud row's `thread_id`
+    /// and `in_reply_to`; nil on this device's own runtime rows.
+    var threadID: String?
+    var inReplyTo: String?
 
     init(_ e: AgentLogEntry) {
         id = e.id; runID = e.runID; sequence = e.sequence; timestamp = e.timestamp; kind = e.kind
@@ -298,11 +323,15 @@ struct LogItem: Identifiable {
         isFailure = r.kind == .error
         promptTokens = nil; completionTokens = nil; totalTokens = nil; latencyMS = nil
         timeToFirstTokenMS = nil; reasoningMS = nil; toolDurationMS = nil; approvalWaitMS = nil; interTokenMeanMS = nil
-        let object: [String: Any] = [
+        threadID = r.threadID; inReplyTo = r.inReplyTo
+        var object: [String: Any] = [
             "id": r.id, "run_id": r.runID, "sequence": r.sequence, "kind": r.kind.rawValue, "text": r.text,
             "timestamp": AgentMirrorRecord.timestampFormatter.string(from: r.timestamp),
             "site_id8": r.siteID8 ?? "", "site_name": r.siteName ?? "", "tool_name": r.toolName ?? "",
         ]
+        if let thread = r.threadID { object["thread_id"] = thread }
+        if let reply = r.inReplyTo { object["in_reply_to"] = reply }
+        if let target = r.target { object["target"] = target }
         jsonl = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) }
     }
 }

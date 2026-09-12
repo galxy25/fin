@@ -50,6 +50,9 @@ enum FinCommunicationNotification {
         /// app uses it to drop a push about a turn it already showed locally.
         var messageID: String?
         var originDeviceID8: String?
+        /// The thread the push belongs to (`fin.threadId`, docs/THREADS.md §2)
+        /// — what a typed reply joins and what the conversation groups by.
+        var threadID: String?
 
         /// nil only when there is no `fin` dictionary at all. Blank strings read
         /// as absent; a malformed agent id reads as absent rather than failing
@@ -65,15 +68,19 @@ enum FinCommunicationNotification {
                 agentID: string("agentID").flatMap(UUID.init(uuidString:)),
                 agentName: string("agentName"),
                 messageID: string("messageId"),
-                originDeviceID8: string("originDeviceID8")
+                originDeviceID8: string("originDeviceID8"),
+                threadID: string("threadId")
             )
         }
 
         /// The `fin` dict to put in a local banner's `userInfo`, mirroring what
         /// the control plane sends so both parse identically.
-        static func userInfo(kind: String, agentID: UUID, agentName: String, messageID: String? = nil) -> [String: Any] {
+        static func userInfo(
+            kind: String, agentID: UUID, agentName: String, messageID: String? = nil, threadID: String? = nil
+        ) -> [String: Any] {
             var fin: [String: Any] = ["kind": kind, "agentID": agentID.uuidString, "agentName": agentName]
             if let messageID, !messageID.isEmpty { fin["messageId"] = messageID }
+            if let threadID, !threadID.isEmpty { fin["threadId"] = threadID }
             return ["fin": fin]
         }
     }
@@ -81,13 +88,14 @@ enum FinCommunicationNotification {
     // MARK: - Intent
 
     /// The sender identity every Fin message carries. `conversationIdentifier`
-    /// groups the thread: one conversation per agent, keyed by the agent id when
-    /// the payload has one and by name otherwise (the design's "agentID or
-    /// agentName"). `customIdentifier` is the agent id string so a spoken reply's
-    /// recipient can be matched back to the agent even if two agents share a
-    /// display name.
-    static func sendMessageIntent(agentName: String, agentID: UUID?, body: String) -> INSendMessageIntent {
-        let conversationID = agentID?.uuidString ?? agentName
+    /// groups the thread: the Fin thread (`fin.threadId`) when the payload has
+    /// one — the same `thread-id` the control plane's pushes group by — else one
+    /// conversation per agent, keyed by the agent id when the payload has one
+    /// and by name otherwise (the design's "agentID or agentName").
+    /// `customIdentifier` is the agent id string so a spoken reply's recipient
+    /// can be matched back to the agent even if two agents share a display name.
+    static func sendMessageIntent(agentName: String, agentID: UUID?, body: String, threadID: String? = nil) -> INSendMessageIntent {
+        let conversationID = conversationIdentifier(agentName: agentName, agentID: agentID, threadID: threadID)
         let sender = INPerson(
             personHandle: INPersonHandle(value: agentName, type: .unknown),
             nameComponents: nil,
@@ -116,10 +124,16 @@ enum FinCommunicationNotification {
     /// `com.apple.developer.usernotifications.communication` entitlement —
     /// callers fall back to the untouched content, which is exactly the
     /// pre-Phase-1 plain alert.
+    /// Pure: the conversation a message groups under. Blank thread ids fall back.
+    static func conversationIdentifier(agentName: String, agentID: UUID?, threadID: String?) -> String {
+        if let threadID = threadID?.trimmingCharacters(in: .whitespacesAndNewlines), !threadID.isEmpty { return threadID }
+        return agentID?.uuidString ?? agentName
+    }
+
     static func communicationContent(
-        from content: UNNotificationContent, agentName: String, agentID: UUID?
+        from content: UNNotificationContent, agentName: String, agentID: UUID?, threadID: String? = nil
     ) throws -> UNNotificationContent {
-        let intent = sendMessageIntent(agentName: agentName, agentID: agentID, body: content.body)
+        let intent = sendMessageIntent(agentName: agentName, agentID: agentID, body: content.body, threadID: threadID)
         let interaction = INInteraction(intent: intent, response: nil)
         interaction.direction = .incoming
         interaction.donate(completion: nil)
@@ -135,6 +149,8 @@ enum FinCommunicationNotification {
               let payload = Payload.parse(content.userInfo),
               let agentName = payload.agentName
         else { return content }
-        return (try? communicationContent(from: content, agentName: agentName, agentID: payload.agentID)) ?? content
+        return (try? communicationContent(
+            from: content, agentName: agentName, agentID: payload.agentID, threadID: payload.threadID
+        )) ?? content
     }
 }

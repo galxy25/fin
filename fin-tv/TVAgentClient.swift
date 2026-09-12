@@ -14,8 +14,20 @@ final class TVAgentClient: ObservableObject {
         let createdAt: Date
     }
 
+    /// The turns on screen: every turn, or — with a thread selected — the
+    /// thread's (docs/THREADS.md §4, the same `ThreadMembership` rule the
+    /// iPhone applies).
     @Published private(set) var turns: [TranscriptTurns.Turn] = []
     @Published private(set) var pending: [Pending] = []
+    /// `GET /threads` for this agent, newest activity first.
+    @Published private(set) var threads: [ThreadSummary] = []
+    /// nil = All activity. Sends carry it as `threadId`.
+    @Published private(set) var selectedThreadID: String?
+    private var allTurns: [TranscriptTurns.Turn] = []
+    /// `messageId → threadId` from the selected thread's detail, so a legacy
+    /// `in_reply_to`-only line still lands in its thread.
+    private var threadOfMessage: [String: String] = [:]
+    private var userChoseThread = false
     @Published private(set) var lastError: String?
     @Published private(set) var lastRefreshAt: Date?
     @Published private(set) var isSending = false
@@ -78,12 +90,61 @@ final class TVAgentClient: ObservableObject {
             groups.append(previous.records)
         }
         let records = MirrorRecords.merge(groups).filter { $0.kind != .notice }
-        turns = TranscriptTurns.turns(from: records)
+        allTurns = TranscriptTurns.turns(from: records)
         let applied = Set(records.compactMap(\.inReplyTo))
         pending.removeAll { applied.contains($0.id) }
         lastRefreshAt = Date()
         lastError = nil
+        await refreshThreads()
+        applyThreadFilter()
         await refreshPendingStates()
+    }
+
+    // MARK: - Threads
+
+    /// `GET /threads?agent=`; the default selection rule applies until the
+    /// user picks one. Never fails the transcript: a thread error leaves the
+    /// last list in place.
+    func refreshThreads() async {
+        guard let encoded = agentName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let request = request("GET", path: "/threads?agent=\(encoded)&limit=20")
+        else { return }
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let list = try? ThreadDecoding.decoder.decode(ThreadListResponse.self, from: data)
+        else { return }
+        threads = ThreadSelection.sorted(list.threads)
+        if !userChoseThread {
+            let wanted = ThreadSelection.defaultThreadID(threads)
+            if wanted != selectedThreadID { selectedThreadID = wanted; await loadThreadMessages() }
+        }
+    }
+
+    func selectThread(_ threadID: String?) {
+        userChoseThread = true
+        selectedThreadID = threadID
+        applyThreadFilter()
+        Task { await loadThreadMessages(); applyThreadFilter() }
+    }
+
+    var selectedThread: ThreadSummary? { threads.first { $0.threadId == selectedThreadID } }
+
+    /// `GET /threads/{id}` for the message rows only — the map a legacy
+    /// `in_reply_to` line is resolved through.
+    private func loadThreadMessages() async {
+        guard let threadID = selectedThreadID, let request = request("GET", path: "/threads/\(threadID)") else { return }
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return }
+        for row in object["messages"] as? [[String: Any]] ?? [] {
+            guard let id = row["messageId"] as? String else { continue }
+            threadOfMessage[id] = (row["threadId"] as? String) ?? id
+        }
+    }
+
+    private func applyThreadFilter() {
+        turns = ThreadMembership.turns(allTurns, in: selectedThreadID, threadOfMessage: threadOfMessage)
     }
 
     private struct Chunk {
@@ -124,10 +185,7 @@ final class TVAgentClient: ObservableObject {
         pending.append(Pending(id: id, text: trimmed, state: "sending", createdAt: Date()))
         isSending = true
         defer { isSending = false }
-        let body: [String: Any] = [
-            "agent": agentName, "text": trimmed, "messageId": id, "source": "app",
-            "context": ["device_id8": DeviceIdentity.short, "activeSessionNames": []],
-        ]
+        let body = Self.messageBody(agent: agentName, text: trimmed, messageID: id, threadID: selectedThreadID)
         guard let request = request("POST", path: "/messages", body: body) else { return }
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -143,6 +201,17 @@ final class TVAgentClient: ObservableObject {
             update(id, state: "failed")
             lastError = error.localizedDescription
         }
+    }
+
+    /// The `POST /messages` body; `threadId` only when a thread is selected
+    /// (docs/THREADS.md §2 — "All activity" roots a new thread). Pure.
+    nonisolated static func messageBody(agent: String, text: String, messageID: String, threadID: String?) -> [String: Any] {
+        var body: [String: Any] = [
+            "agent": agent, "text": text, "messageId": messageID, "source": "app",
+            "context": ["device_id8": DeviceIdentity.short, "activeSessionNames": []],
+        ]
+        if let threadID, !threadID.isEmpty { body["threadId"] = threadID }
+        return body
     }
 
     private func update(_ id: String, state: String) {

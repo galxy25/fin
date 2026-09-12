@@ -15,6 +15,11 @@ struct AgentConsoleView: View {
     @State private var draft = ""
     @State private var exportURL: URL?
     @State private var showsFeedbackCard = false
+    /// docs/THREADS.md §4: the same picker as the remote console, keyed by
+    /// the thread each control-plane prompt arrived with (`AgentRuntime.
+    /// promptThreadIDs`) when this app hosts the site. Defaults to "All
+    /// activity" here: a prompt typed into this console has no thread.
+    @StateObject private var threadStore = ThreadStore()
 
     private var isInline: Bool { onClose != nil }
 
@@ -53,6 +58,14 @@ struct AgentConsoleView: View {
         VStack(spacing: 0) {
             if isInline { inlineHeader }
             modeBar
+            if CloudControlPlaneConfig.isConfigured {
+                HStack {
+                    ThreadPicker(store: threadStore, compact: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 6)
+            }
             Divider()
             transcriptList
             if let pending = runtime.pendingApproval {
@@ -75,6 +88,13 @@ struct AgentConsoleView: View {
         .sheet(item: $exportURL) { url in
             TranscriptExportSheet(url: url)
         }
+        .onAppear {
+            // "All" by default on the local console (docs/THREADS.md §4): the
+            // thread list still loads so a control-plane prompt can be picked out.
+            threadStore.select(nil, byUser: true)
+            threadStore.start(agentName: runtime.agent.name)
+        }
+        .onDisappear { threadStore.stop() }
         // A turn just finished on screen — the one moment the user is provably
         // present AND has something fresh to rate. The gate keeps it rare (3+
         // finished conversations, once per 7 days, never after "Don't Ask Again");
@@ -257,7 +277,20 @@ struct AgentConsoleView: View {
 
     /// The system prompt is configuration, not conversation — it stays out of the log.
     private var visibleMessages: [AgentMessage] {
-        runtime.transcript.messages.filter { $0.role != .system || $0.isLocalOnly }
+        Self.visibleMessages(
+            runtime.transcript.messages, threadID: threadStore.selectedThreadID, promptThreadIDs: runtime.promptThreadIDs
+        )
+    }
+
+    /// The system prompt stays out; with a thread selected, only the turns
+    /// whose prompt arrived in that thread remain. Pure.
+    static func visibleMessages(
+        _ messages: [AgentMessage], threadID: String?, promptThreadIDs: [UUID: String]
+    ) -> [AgentMessage] {
+        let shown = messages.filter { $0.role != .system || $0.isLocalOnly }
+        guard let threadID else { return shown }
+        let threads = AgentRuntime.threadIDs(for: messages, promptThreadIDs: promptThreadIDs)
+        return shown.filter { threads[$0.id] == threadID }
     }
 
     private var emptyState: some View {
