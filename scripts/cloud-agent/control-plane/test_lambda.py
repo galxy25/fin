@@ -796,20 +796,20 @@ class _FakeDynamoTable:
         raise AssertionError("unsupported expression: " + expr)
 
     def _apply_update(self, item, update, names, values):
-        rest = update.strip()
-        remove = None
-        if rest.startswith("REMOVE "):
-            rest, remove = "", rest[len("REMOVE "):]
-        elif " REMOVE " in rest:
-            rest, remove = rest.split(" REMOVE ", 1)
-        assert not rest or rest.startswith("SET "), update
-        for clause in rest[4:].split(", ") if rest else []:
-            field, _, value = clause.partition(" = ")
-            field = names.get(field.strip(), field.strip())
-            item[field] = values[value.strip()]
-        if remove:
-            for field in remove.split(","):
-                item.pop(names.get(field.strip(), field.strip()), None)
+        # SET / REMOVE / ADD sections in any order, each a comma list.
+        sections = re.split(r"\b(SET|REMOVE|ADD)\b", " " + update.strip())
+        assert not sections[0].strip(), update
+        for keyword, body in zip(sections[1::2], sections[2::2]):
+            for clause in [c.strip() for c in body.split(",") if c.strip()]:
+                if keyword == "SET":
+                    field, _, value = clause.partition(" = ")
+                    item[names.get(field.strip(), field.strip())] = values[value.strip()]
+                elif keyword == "REMOVE":
+                    item.pop(names.get(clause, clause), None)
+                else:  # ADD field :value — numeric add, the only form used
+                    field, _, value = clause.partition(" ")
+                    field = names.get(field.strip(), field.strip())
+                    item[field] = (item.get(field) or 0) + values[value.strip()]
 
     @staticmethod
     def _conditional_failure(op):
@@ -832,7 +832,7 @@ class _FakeDynamoTable:
         self.items[Item[self.key]] = dict(Item)
 
     def update_item(self, Key, UpdateExpression, ExpressionAttributeValues=None,
-                    ExpressionAttributeNames=None, ConditionExpression=None):
+                    ExpressionAttributeNames=None, ConditionExpression=None, ReturnValues=None):
         names = ExpressionAttributeNames or {}
         values = ExpressionAttributeValues or {}
         item = self.items.get(Key[self.key])
@@ -842,6 +842,7 @@ class _FakeDynamoTable:
             item = {self.key: Key[self.key]}
             self.items[Key[self.key]] = item
         self._apply_update(item, UpdateExpression, names, values)
+        return {"Attributes": dict(item)} if ReturnValues == "ALL_NEW" else {}
 
     def scan(self, FilterExpression=None, ExpressionAttributeValues=None,
              ExpressionAttributeNames=None, **kwargs):
@@ -853,12 +854,47 @@ class _FakeDynamoTable:
         return {"Items": [dict(r) for r in rows]}
 
 
+class _FakeEventsTable:
+    """fin-thread-events: (threadId, seq) composite key, append-only, with the
+    one Query shape `_thread_events_for` uses (`threadId = :thread AND seq >
+    :after`, ascending, Limit)."""
+
+    def __init__(self):
+        self.rows = []
+
+    def put_item(self, Item, **kwargs):
+        self.rows.append(json.loads(json.dumps(Item, default=lam._json_default)))
+
+    def query(self, KeyConditionExpression, ExpressionAttributeValues, ScanIndexForward=True,
+              Limit=None, ExclusiveStartKey=None, **kwargs):
+        assert KeyConditionExpression == "threadId = :thread AND seq > :after", KeyConditionExpression
+        thread, after = ExpressionAttributeValues[":thread"], ExpressionAttributeValues[":after"]
+        rows = sorted((r for r in self.rows if r["threadId"] == thread and r["seq"] > after), key=lambda r: r["seq"])
+        if ExclusiveStartKey:
+            rows = [r for r in rows if r["seq"] > ExclusiveStartKey["seq"]]
+        page = rows[:Limit] if Limit else rows
+        result = {"Items": [dict(r) for r in page]}
+        if Limit and len(rows) > Limit:
+            result["LastEvaluatedKey"] = {"threadId": thread, "seq": page[-1]["seq"]}
+        return result
+
+    def for_thread(self, thread_id):
+        return sorted((r for r in self.rows if r["threadId"] == thread_id), key=lambda r: r["seq"])
+
+
 class _SitesTestCase(unittest.TestCase):
     def setUp(self):
         for attr, key in (("SITES_TABLE", "siteId"), ("MESSAGES_TABLE", "messageId"), ("AGENTS_TABLE", "agentKey")):
             orig = getattr(lam, attr)
             setattr(lam, attr, _FakeDynamoTable(key))
             self.addCleanup(setattr, lam, attr, orig)
+        self.addCleanup(setattr, lam, "THREAD_EVENTS_TABLE", lam.THREAD_EVENTS_TABLE)
+        lam.THREAD_EVENTS_TABLE = _FakeEventsTable()
+        self.events = lam.THREAD_EVENTS_TABLE
+        # The CloudWatch line, captured instead of printed.
+        self.event_lines = []
+        self.addCleanup(setattr, lam, "_emit_thread_event_line", lam._emit_thread_event_line)
+        lam._emit_thread_event_line = self.event_lines.append
         self._orig_presign = lam._presign
         lam._presign = lambda method, key: "https://example.invalid/{}".format(key)
         self.addCleanup(setattr, lam, "_presign", self._orig_presign)
@@ -1540,10 +1576,13 @@ class AnsweredPushTests(_MessagesTestCase):
         payload = self.apns.payloads[0]
         self.assertEqual(payload["aps"]["alert"], {"title": "Fin", "body": "It is noon."})
         self.assertEqual(payload["aps"]["category"], "fin.reply")
-        self.assertEqual(payload["aps"]["thread-id"], agent_id)
+        # docs/THREADS.md §2: the Lock Screen groups by Fin thread, not agent.
+        self.assertEqual(payload["aps"]["thread-id"], message_id)
         self.assertEqual(payload["aps"]["mutable-content"], 1)
         self.assertNotIn("interruption-level", payload["aps"])
-        self.assertEqual(payload["fin"], {"agentName": "Fin", "messageId": message_id, "agentID": agent_id})
+        self.assertEqual(payload["fin"], {
+            "agentName": "Fin", "messageId": message_id, "agentID": agent_id, "threadId": message_id,
+        })
         self.assertTrue(self.row(message_id)["pushedAt"])
         # A duplicate ack is a 409 and, separately, can never push again.
         with self.assertRaises(lam.ApiError):
@@ -1624,6 +1663,7 @@ class AnsweredPushTests(_MessagesTestCase):
         self.assertEqual([token for _, token, _ in self.apns.sent], ["tok-phone"])
         self.assertEqual(self.apns.payloads[0]["fin"], {
             "agentName": "Fin", "messageId": message_id, "agentID": agent_id, "originDeviceID8": "a4a1d987",
+            "threadId": message_id,
         })
         self.assertTrue(self.row(message_id).get("pushedAt"))
 
@@ -1644,17 +1684,20 @@ class AnsweredPushTests(_MessagesTestCase):
         parseFinPayload, finTests/CommunicationNotificationTests
         testTheControlPlanesAckPushIsReplyableAndTappable): a typed Reply needs
         BOTH fin.agentID and fin.agentName, a tap needs fin.agentID, and the
-        NSE threads on aps.thread-id. The daemon and the app both send agentID
-        + originDeviceID8 on the answered ack; this pins the resulting shape."""
+        NSE threads on aps.thread-id — the Fin thread (docs/THREADS.md §2),
+        which for a lone request is the message's own id. The daemon and the
+        app both send agentID + originDeviceID8 on the answered ack; this pins
+        the resulting shape."""
         agent_id = str(lam.uuid.uuid4())
         message_id, _ = self.answer(agentID=agent_id, originDeviceID8="a4a1d987")
         payload = self.apns.payloads[0]
-        self.assertEqual(payload["aps"]["thread-id"], agent_id)
+        self.assertEqual(payload["aps"]["thread-id"], message_id)
         self.assertEqual(payload["aps"]["category"], "fin.reply")
         self.assertEqual(payload["aps"]["mutable-content"], 1)
-        self.assertEqual(set(payload["fin"]), {"agentName", "messageId", "agentID", "originDeviceID8"})
+        self.assertEqual(set(payload["fin"]), {"agentName", "messageId", "agentID", "originDeviceID8", "threadId"})
         self.assertEqual(json.dumps(payload["fin"], sort_keys=True), json.dumps({
             "agentID": agent_id, "agentName": "Fin", "messageId": message_id, "originDeviceID8": "a4a1d987",
+            "threadId": message_id,
         }, sort_keys=True))
 
     def test_the_push_is_not_gated_on_voice(self):
@@ -2125,6 +2168,566 @@ class SiteRouteRegistrationTests(unittest.TestCase):
         # both scans, and a policy with only Get/Put would 403 at runtime.
         sid = self.deploy_sh.split('"Sid": "SitesTable"', 1)[1].split("}", 1)[0]
         self.assertIn("dynamodb:Scan", sid)
+
+
+
+# --- threads (docs/THREADS.md) -------------------------------------------------
+
+
+class _ThreadsTestCase(_MessagesTestCase):
+    """Messages harness plus a controllable clock, so ordering tests can put
+    activity at distinct instants, and helpers for the read routes."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = [NOW]
+        self.addCleanup(setattr, lam, "_now", lam._now)
+        lam._now = lambda: self.clock[0]
+
+    def tick(self, seconds=1):
+        self.clock[0] = self.clock[0] + timedelta(seconds=seconds)
+
+    def kinds(self, thread_id):
+        return [e["kind"] for e in self.events.for_thread(thread_id)]
+
+    def list_threads(self, user="user-1", **params):
+        query = {"agent": "Fin"}
+        query.update(params)
+        response = lam.list_threads({"_userId": user, "queryStringParameters": query})
+        return response["statusCode"], json.loads(response["body"])
+
+    def get_thread(self, thread_id, user="user-1"):
+        response = lam.get_thread({"_userId": user}, thread_id)
+        return response["statusCode"], json.loads(response["body"])
+
+    def lifecycle(self, text="do the thing", site=None, preview="done", **send_extra):
+        """send → claim → applied → answered on one site; returns the message id."""
+        site = site or self.imac
+        sent = self.send(text, **send_extra)
+        self.tick()
+        self.claim(site, sent["messageId"])
+        self.tick()
+        self.ack(site, sent["messageId"], "applied", runId="run-1")
+        self.tick()
+        self.ack(site, sent["messageId"], "answered", replyPreview=preview)
+        self.tick()
+        return sent["messageId"]
+
+
+class ThreadAssignmentTests(_ThreadsTestCase):
+    def test_a_message_roots_its_own_thread_by_default(self):
+        sent = self.send("hello")
+        self.assertEqual(sent["threadId"], sent["messageId"])
+        self.assertEqual(self.row(sent["messageId"])["threadId"], sent["messageId"])
+        self.assertNotIn("threadReason", self.row(sent["messageId"]))
+
+    def test_an_explicit_thread_id_joins_that_thread(self):
+        root = self.send("first")
+        reply = self.send("second", threadId=root["messageId"])
+        self.assertEqual(reply["threadId"], root["messageId"])
+        self.assertEqual(self.row(reply["messageId"])["threadReason"], "explicit")
+        # Naming a MEMBER resolves to the root, so a reply to a reply stays in one thread.
+        third = self.send("third", threadId=reply["messageId"])
+        self.assertEqual(third["threadId"], root["messageId"])
+
+    def test_a_foreign_unknown_or_other_agent_thread_id_is_a_400(self):
+        theirs = self.send("not yours", user="user-2")
+        nimbus = self.enroll(agent="Nimbus", enrollKey="nimbus-box")
+        self.beat(nimbus)
+        other_agent = json.loads(lam.send_message({"_userId": "user-1", "body": json.dumps(
+            {"agent": "Nimbus", "text": "nimbus thing"})})["body"])
+        for bad in (theirs["messageId"], other_agent["messageId"], "m-00000000-does-not-exist", "garbage"):
+            with self.assertRaises(lam.ApiError, msg=bad) as caught:
+                self.send("reply", threadId=bad)
+            self.assertEqual(caught.exception.status, 400)
+
+    def test_the_site_may_propose_a_thread_at_applied_time_with_a_reason(self):
+        root = self.send("send the PDF to the claw session")
+        later = self.send("did it finish?")
+        self.claim(self.imac, later["messageId"])
+        response = self.ack(self.imac, later["messageId"], "applied", threadId=root["messageId"], threadReason="pane:main:2.0")
+        self.assertEqual(json.loads(response["body"])["threadId"], root["messageId"])
+        row = self.row(later["messageId"])
+        self.assertEqual((row["threadId"], row["threadReason"]), (root["messageId"], "pane:main:2.0"))
+        assigned = [e for e in self.events.for_thread(root["messageId"]) if e["kind"] == "thread.assigned"]
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(assigned[0]["detail"], {
+            "messageId": later["messageId"], "threadId": root["messageId"], "reason": "pane:main:2.0",
+        })
+        self.assertEqual(assigned[0]["actor"], "system")
+
+    def test_a_proposal_is_validated_like_an_explicit_id(self):
+        theirs = self.send("not yours", user="user-2")
+        mine = self.send("mine")
+        self.claim(self.imac, mine["messageId"])
+        with self.assertRaises(lam.ApiError) as caught:
+            self.ack(self.imac, mine["messageId"], "applied", threadId=theirs["messageId"])
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(self.row(mine["messageId"])["state"], "claimed", "a refused proposal applies nothing")
+
+    def test_explicit_membership_beats_the_sites_proposal(self):
+        root = self.send("root")
+        elsewhere = self.send("elsewhere")
+        reply = self.send("reply", threadId=root["messageId"])
+        self.claim(self.imac, reply["messageId"])
+        self.ack(self.imac, reply["messageId"], "applied", threadId=elsewhere["messageId"], threadReason="pane:x:1")
+        self.assertEqual(self.row(reply["messageId"])["threadId"], root["messageId"])
+        assigned = [e for e in self.events.for_thread(root["messageId"]) if e["kind"] == "thread.assigned"]
+        self.assertEqual(assigned[-1]["detail"]["reason"], "explicit")
+
+    def test_no_proposal_means_root_and_a_long_reason_is_clipped(self):
+        sent = self.send("alone")
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied")
+        assigned = [e for e in self.events.for_thread(sent["messageId"]) if e["kind"] == "thread.assigned"]
+        self.assertEqual(assigned[0]["detail"]["reason"], "root")
+        other = self.send("other")
+        another = self.send("another")
+        self.claim(self.imac, another["messageId"])
+        self.ack(self.imac, another["messageId"], "applied", threadId=other["messageId"], threadReason="x" * 100)
+        self.assertEqual(len(self.row(another["messageId"])["threadReason"]), lam.MAX_THREAD_REASON_CHARS)
+
+    def test_the_public_message_carries_thread_pushed_and_claimed_stamps(self):
+        message_id = self.lifecycle()
+        public = lam._public_message(self.row(message_id))
+        for key in ("threadId", "pushedAt", "appliedRunId", "claimedAt"):
+            self.assertIn(key, public)
+        self.assertEqual((public["threadId"], public["appliedRunId"]), (message_id, "run-1"))
+        self.assertTrue(public["claimedAt"])
+
+
+class ThreadEventTests(_ThreadsTestCase):
+    def test_one_event_per_transition_with_monotonic_seq(self):
+        message_id = self.lifecycle()
+        events = self.events.for_thread(message_id)
+        self.assertEqual([e["seq"] for e in events], [1, 2, 3, 4, 5])
+        self.assertEqual([e["kind"] for e in events], [
+            "message.queued", "message.claimed", "message.applied", "thread.assigned", "message.answered",
+        ])
+        self.assertEqual(self.row(message_id)["threadEventSeq"], 5)
+        self.assertEqual(len(self.event_lines), 5, "one CloudWatch line per event")
+        self.assertEqual(self.event_lines[0]["kind"], "message.queued")
+        for event in events:
+            self.assertEqual((event["userId"], event["agent"]), ("user-1", "Fin"))
+            self.assertTrue(event["ttl"] > int(NOW.timestamp()))
+
+    def test_event_details_name_the_actors(self):
+        message_id = self.lifecycle(context={"device_id8": "a4a1d987"})
+        queued, claimed, applied, _assigned, answered = self.events.for_thread(message_id)
+        self.assertEqual((queued["actor"], queued["detail"]["source"], queued["detail"]["routedBy"]), ("a4a1d987", "app", "primary"))
+        self.assertEqual(queued["detail"]["authorSiteId8"], "a4a1d987")
+        self.assertEqual((claimed["actor"], claimed["detail"]["siteId8"]), (self.imac["siteId8"], self.imac["siteId8"]))
+        self.assertEqual(applied["detail"]["runId"], "run-1")
+        self.assertEqual((answered["detail"]["replyPreview"], answered["detail"]["pushed"]), ("done", False))
+
+    def test_a_delivered_answer_push_is_recorded_as_pushed(self):
+        _PushHarness(self)
+        message_id = self.lifecycle(preview="It is noon.")
+        answered = self.events.for_thread(message_id)[-1]
+        self.assertTrue(answered["detail"]["pushed"])
+
+    def test_renewals_and_retries_are_not_transitions(self):
+        sent = self.send("q", messageId="m-11111111-aaaa")
+        self.send("q", messageId="m-11111111-aaaa")  # duplicate send
+        self.claim(self.imac, sent["messageId"])
+        self.claim(self.imac, sent["messageId"])  # holder renews
+        self.assertEqual(self.kinds(sent["messageId"]), ["message.queued", "message.claimed"])
+
+    def test_seq_is_per_thread_and_a_moved_message_keeps_its_early_events(self):
+        root = self.send("root")
+        moved = self.send("moved")
+        self.claim(self.imac, moved["messageId"])
+        self.ack(self.imac, moved["messageId"], "applied", threadId=root["messageId"], threadReason="pane:main:2.0")
+        self.assertEqual(self.kinds(moved["messageId"]), ["message.queued", "message.claimed"])
+        self.assertEqual(self.kinds(root["messageId"]), ["message.queued", "message.applied", "thread.assigned"])
+        self.assertEqual([e["seq"] for e in self.events.for_thread(root["messageId"])], [1, 2, 3])
+
+    def test_a_bookkeeping_failure_never_fails_the_route(self):
+        class _Broken:
+            def put_item(self, **kwargs):
+                raise RuntimeError("dynamo down")
+
+            def query(self, **kwargs):
+                raise RuntimeError("dynamo down")
+
+        lam.THREAD_EVENTS_TABLE = _Broken()
+        sent = self.send("still works")
+        self.assertEqual(sent["state"], "queued")
+        status, body = self.get_thread(sent["messageId"])
+        self.assertEqual((status, body["events"]), (200, []))
+
+    def test_an_unknown_thread_never_gets_a_root_row_conjured(self):
+        self.assertIsNone(lam._thread_event("user-1", "m-00000000-nothing", "notify.sent", "operator", {}))
+        self.assertNotIn("m-00000000-nothing", lam.MESSAGES_TABLE.items)
+        self.assertEqual(self.events.rows, [])
+
+    def test_the_heartbeats_unacked_path_records_applied(self):
+        sent = self.send("q")
+        self.claim(self.imac, sent["messageId"])
+        self.beat(self.imac, unacked=[sent["messageId"]])
+        self.assertEqual(self.kinds(sent["messageId"]), [
+            "message.queued", "message.claimed", "message.applied", "thread.assigned",
+        ])
+
+
+class NotifyThreadTests(_ThreadsTestCase):
+    def setUp(self):
+        super().setUp()
+        self.apns = _PushHarness(self)
+
+    def notify(self, user="user-1", site=None, **body):
+        payload = {"title": "Fin", "body": "which branch?"}
+        payload.update(body)
+        event = {"_userId": user, "body": json.dumps(payload)}
+        if site:
+            event["_siteId"] = site["siteId"]
+        response = lam.notify(event)
+        return response["statusCode"], json.loads(response["body"])
+
+    def test_notify_with_thread_id_records_notify_sent_and_groups_the_push(self):
+        root = self.send("root")
+        status, result = self.notify(event="request-input", agent="Fin", threadId=root["messageId"])
+        self.assertEqual((status, result["delivered"]), (200, 1))
+        events = self.events.for_thread(root["messageId"])
+        self.assertEqual([e["kind"] for e in events], ["message.queued", "notify.sent"])
+        self.assertEqual(events[-1]["actor"], "operator")
+        self.assertEqual(events[-1]["detail"], {
+            "event": "request-input", "title": "Fin", "body": "which branch?",
+            "delivered": 1, "failed": 0, "suppressed": False, "threadId": root["messageId"],
+        })
+        payload = self.apns.payloads[0]
+        self.assertEqual(payload["aps"]["thread-id"], root["messageId"])
+        self.assertEqual(payload["fin"]["threadId"], root["messageId"])
+
+    def test_notify_with_only_message_id_resolves_the_thread(self):
+        root = self.send("root")
+        reply = self.send("reply", threadId=root["messageId"])
+        status, _ = self.notify(event="task-complete", messageId=reply["messageId"])
+        self.assertEqual(status, 200)
+        sent = self.events.for_thread(root["messageId"])[-1]
+        self.assertEqual((sent["kind"], sent["detail"]["messageId"], sent["detail"]["threadId"]),
+                         ("notify.sent", reply["messageId"], root["messageId"]))
+        self.assertEqual(self.apns.payloads[0]["fin"]["threadId"], root["messageId"])
+
+    def test_a_suppressed_push_is_still_an_event(self):
+        message_id = self.lifecycle(preview="It is noon.")  # the ack pushed
+        status, result = self.notify(event="task-complete", messageId=message_id)
+        self.assertEqual((status, result.get("suppressed")), (200, True))
+        sent = self.events.for_thread(message_id)[-1]
+        self.assertEqual((sent["kind"], sent["detail"]["suppressed"], sent["detail"]["delivered"]), ("notify.sent", True, 0))
+
+    def test_a_foreign_thread_id_is_ignored_not_fatal(self):
+        theirs = self.send("theirs", user="user-2")
+        status, _ = self.notify(threadId=theirs["messageId"])
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events.for_thread(theirs["messageId"]), [
+            e for e in self.events.rows if e["kind"] == "message.queued" and e["threadId"] == theirs["messageId"]
+        ])
+        self.assertNotIn("fin", self.apns.payloads[0])
+
+    def test_a_site_is_the_actor_when_it_notifies(self):
+        root = self.send("root")
+        self.notify(site=self.imac, event="agent-stalled", threadId=root["messageId"])
+        self.assertEqual(self.events.for_thread(root["messageId"])[-1]["actor"], self.imac["siteId8"])
+
+    def test_without_a_thread_nothing_is_recorded(self):
+        status, _ = self.notify()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events.rows, [])
+
+
+class GoalFollowupEventTests(_ThreadsTestCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, lam, "S3", lam.S3)
+        lam.S3 = _FakeS3()
+
+    def put(self, version, goals, site=None):
+        event = {"_userId": "user-1", "headers": {"if-match": str(version)}, "body": json.dumps({"document": {"goals": goals}})}
+        if site:
+            event["_siteId"] = site["siteId"]
+        return lam.put_goals(event, "Fin")["statusCode"]
+
+    def followup(self, message_id, target="main:2.0"):
+        tail = message_id.replace("m-", "")[:8]
+        return {
+            "id": "g-followup-" + tail, "title": "Follow up: send the PDF", "state": "active", "priority": 1,
+            "why": "The user asked for this by voice; it was handed to pane {}.".format(target),
+            "next_action": "read_session {}. The pane's LATEST reply is the answer.".format(target),
+            "tags": ["followup", "send_session"], "source": "daemon",
+        }
+
+    def test_a_new_followup_goal_is_an_event_on_the_requests_thread(self):
+        sent = self.send("send the PDF to the claw session")
+        self.assertEqual(self.put(0, [{"id": "g1", "title": "unrelated"}], site=self.imac), 200)
+        self.assertEqual(self.put(1, [{"id": "g1", "title": "unrelated"}, self.followup(sent["messageId"])], site=self.imac), 200)
+        events = self.events.for_thread(sent["messageId"])
+        self.assertEqual([e["kind"] for e in events], ["message.queued", "goal.followup"])
+        self.assertEqual(events[-1]["actor"], self.imac["siteId8"])
+        self.assertEqual(events[-1]["detail"]["goalId"], "g-followup-" + sent["messageId"][2:10])
+        self.assertEqual(events[-1]["detail"]["target"], "main:2.0")
+        self.assertTrue(events[-1]["detail"]["nextAction"].startswith("read_session main:2.0"))
+
+    def test_an_unchanged_followup_is_not_re_reported(self):
+        sent = self.send("q")
+        goal = self.followup(sent["messageId"])
+        self.put(0, [goal])
+        self.put(1, [goal, {"id": "g2", "title": "new but not a follow-up"}])
+        self.assertEqual(self.kinds(sent["messageId"]), ["message.queued", "goal.followup"])
+
+    def test_a_goal_naming_its_thread_outright_wins_over_the_id_tail(self):
+        root = self.send("root")
+        reply = self.send("reply", threadId=root["messageId"])
+        goal = dict(self.followup("m-ffffffff-no-such-message"), message_id=reply["messageId"])
+        self.put(0, [goal])
+        self.assertEqual(self.kinds(root["messageId"])[-1], "goal.followup")
+
+    def test_a_followup_with_no_matching_message_is_skipped(self):
+        self.put(0, [self.followup("m-ffffffff-no-such-message")])
+        self.assertEqual(self.events.rows, [])
+
+    def test_new_followup_detection_is_pure(self):
+        before = {"goals": [{"id": "g-followup-a"}, {"id": "g1"}]}
+        after = {"goals": [{"id": "g-followup-a"}, {"id": "g-followup-b"}, {"id": "g2"}, "junk"]}
+        self.assertEqual([g["id"] for g in lam._new_followup_goals(before, after)], ["g-followup-b"])
+        self.assertEqual([g["id"] for g in lam._new_followup_goals(None, after)], ["g-followup-a", "g-followup-b"])
+        self.assertEqual(lam._new_followup_goals(after, {"goals": "nope"}), [])
+
+
+class RelayEventTests(_ThreadsTestCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, lam, "S3", lam.S3)
+        lam.S3 = _FakeS3()
+
+    def line(self, id_, tool, text, target="main:2.0", **extra):
+        obj = {"id": id_, "timestamp": _iso(NOW), "run_id": "r1", "sequence": 1, "kind": "toolCall",
+               "tool_name": tool, "text": text, "target": target}
+        obj.update(extra)
+        return json.dumps(obj)
+
+    def put(self, lines, site=None):
+        site = site or self.imac
+        event = {"_userId": "user-1", "_siteId": site["siteId"], "body": json.dumps({
+            "agent": "Fin", "hour": "2026-09-12T10", "lines": lines,
+        })}
+        return lam.put_transcript_chunk(event)["statusCode"]
+
+    def test_send_and_read_session_lines_with_a_target_become_relay_events(self):
+        root = self.send("send the PDF")
+        reply = self.send("did it finish?", threadId=root["messageId"])
+        status = self.put([
+            self.line("l1", "send_session", "send_session: main:2.0 (127 chars)", in_reply_to=root["messageId"]),
+            self.line("l2", "read_session", "read_session: main:2.0", thread_id=root["messageId"]),
+            self.line("l3", "read_session", "read_session: main:2.0", in_reply_to=reply["messageId"]),
+        ])
+        self.assertEqual(status, 200)
+        events = self.events.for_thread(root["messageId"])[2:]
+        self.assertEqual([e["kind"] for e in events], ["relay.sent", "relay.read", "relay.read"])
+        self.assertEqual(events[0]["actor"], self.imac["siteId8"])
+        self.assertEqual(events[0]["detail"], {
+            "target": "main:2.0", "text": "send_session: main:2.0 (127 chars)", "lineId": "l1", "runId": "r1",
+            "inReplyTo": root["messageId"],
+        })
+        self.assertEqual(events[1]["detail"]["threadId"], root["messageId"])
+
+    def test_re_sending_the_ring_does_not_duplicate_events(self):
+        root = self.send("root")
+        lines = [self.line("l1", "send_session", "sent", in_reply_to=root["messageId"])]
+        self.put(lines)
+        self.put(lines)
+        self.put(lines + [self.line("l2", "read_session", "read", in_reply_to=root["messageId"])])
+        self.assertEqual(self.kinds(root["messageId"]), ["message.queued", "relay.sent", "relay.read"])
+
+    def test_lines_without_a_target_or_a_thread_are_not_relays(self):
+        root = self.send("root")
+        self.put([
+            self.line("l1", "send_session", "no target", target="", in_reply_to=root["messageId"]),
+            self.line("l2", "send_session", "heartbeat turn, no thread"),
+            self.line("l3", "remember", "other tool", in_reply_to=root["messageId"]),
+            json.dumps({"id": "l4", "kind": "reply", "text": "plain", "timestamp": _iso(NOW)}),
+            "not json at all",
+        ])
+        self.assertEqual(self.kinds(root["messageId"]), ["message.queued"])
+
+    def test_the_line_parser_is_pure(self):
+        kind, detail, site8 = lam._relay_line_event(json.dumps({
+            "kind": "toolCall", "tool_name": "read_session", "target": "agent:1", "text": "x" * 500,
+            "site_id8": "deadbeef", "thread_id": "m-1",
+        }))
+        self.assertEqual((kind, site8, len(detail["text"]), detail["threadId"]), ("relay.read", "deadbeef", 200, "m-1"))
+        self.assertIsNone(lam._relay_line_event("{}"))
+
+
+class ThreadStatusTests(unittest.TestCase):
+    """The one pure derivation, table-driven."""
+
+    @staticmethod
+    def notify(event):
+        return {"kind": "notify.sent", "detail": {"event": event}}
+
+    def test_status_table(self):
+        answered = [{"state": "answered"}]
+        open_msg = [{"state": "claimed"}]
+        cases = [
+            ("no events, open message", open_msg, [], "working"),
+            ("no events, all answered", answered, [], "answered"),
+            ("request-input last", answered, [{"kind": "message.answered"}, self.notify("request-input")], "waiting_on_you"),
+            ("request-input then answered", answered, [self.notify("request-input"), {"kind": "message.answered"}], "answered"),
+            ("agent-stalled last with open message", open_msg, [self.notify("agent-stalled")], "stalled"),
+            ("agent-stalled then a new message", [{"state": "queued"}], [self.notify("agent-stalled"), {"kind": "message.queued"}], "working"),
+            ("follow-up goal open", answered, [{"kind": "message.answered"}, {"kind": "goal.followup"}], "working"),
+            ("follow-up then answered", answered, [{"kind": "goal.followup"}, {"kind": "message.answered"}], "answered"),
+            ("task-complete last, all answered", answered, [self.notify("task-complete")], "answered"),
+            ("empty thread", [], [], "answered"),
+        ]
+        for name, messages, events, expected in cases:
+            self.assertEqual(lam._thread_status(messages, events), expected, name)
+
+    def test_open_goal_is_the_latest_unanswered_followup(self):
+        self.assertIsNone(lam._thread_open_goal([]))
+        events = [{"kind": "goal.followup", "detail": {"goalId": "g-followup-1"}}]
+        self.assertEqual(lam._thread_open_goal(events), "g-followup-1")
+        self.assertIsNone(lam._thread_open_goal(events + [{"kind": "message.answered"}]))
+
+    def test_participants_are_distinct_and_ordered(self):
+        messages = [{"authorSiteId8": "a4a1d987"}, {}]
+        events = [
+            {"actor": "4cf8cfd8"}, {"actor": "system", "detail": {"target": "main:2.0"}},
+            {"actor": "operator"}, {"actor": "4cf8cfd8", "detail": {"target": "main:2.0"}},
+        ]
+        self.assertEqual(lam._thread_participants(messages, events), ["a4a1d987", "4cf8cfd8", "main:2.0", "operator"])
+        self.assertEqual(lam._thread_participants([{}], []), ["user"])
+
+
+class ThreadListTests(_ThreadsTestCase):
+    def test_threads_are_newest_activity_first_and_limited(self):
+        first = self.lifecycle("first")
+        second = self.send("second")["messageId"]
+        self.tick()
+        third = self.send("third")["messageId"]
+        self.tick()
+        # Activity on the FIRST thread makes it the newest.
+        lam._thread_event("user-1", first, "notify.sent", "operator", {"event": "task-complete"})
+        status, body = self.list_threads()
+        self.assertEqual(status, 200)
+        self.assertEqual([t["threadId"] for t in body["threads"]], [first, third, second])
+        self.assertEqual([t["status"] for t in body["threads"]], ["answered", "working", "working"])
+        status, body = self.list_threads(limit="2")
+        self.assertEqual([t["threadId"] for t in body["threads"]], [first, third])
+
+    def test_a_pre_threads_row_is_its_own_thread(self):
+        legacy = {"messageId": "m-legacy-0001-aaaa", "userId": "user-1", "agent": "Fin", "text": "old",
+                  "state": "answered", "createdAt": _iso(NOW - timedelta(days=1))}
+        lam.MESSAGES_TABLE.items[legacy["messageId"]] = legacy
+        status, body = self.list_threads()
+        self.assertEqual([t["threadId"] for t in body["threads"]], [legacy["messageId"]])
+        self.assertEqual(body["threads"][0]["title"], "old")
+        status, body = self.get_thread(legacy["messageId"])
+        self.assertEqual((status, body["thread"]["messageCount"], body["messages"][0]["threadId"]), (200, 1, legacy["messageId"]))
+
+    def test_summary_fields(self):
+        root = self.send("x" * 100, context={"device_id8": "a4a1d987"})
+        reply = self.send("reply", threadId=root["messageId"])
+        self.claim(self.cloud, reply["messageId"])
+        _status, body = self.list_threads()
+        summary = body["threads"][0]
+        self.assertEqual(len(summary["title"]), lam.MAX_THREAD_TITLE_CHARS)
+        self.assertTrue(summary["title"].endswith("…"))
+        self.assertEqual((summary["messageCount"], summary["agent"], summary["status"]), (2, "Fin", "working"))
+        self.assertEqual(summary["participants"], ["a4a1d987", self.cloud["siteId8"]])
+        self.assertNotIn("openGoal", summary)
+        self.assertEqual(summary["lastActivityAt"], self.row(reply["messageId"])["claimedAt"])
+
+    def test_open_goal_surfaces(self):
+        root = self.send("root")
+        lam._thread_event("user-1", root["messageId"], "goal.followup", self.imac["siteId8"], {"goalId": "g-followup-abc"})
+        _status, body = self.list_threads()
+        self.assertEqual(body["threads"][0]["openGoal"], "g-followup-abc")
+
+    def test_listing_is_scoped_to_caller_and_agent(self):
+        self.send("mine")
+        self.send("theirs", user="user-2")
+        _status, body = self.list_threads(user="user-2")
+        self.assertEqual([t["title"] for t in body["threads"]], ["theirs"])
+        _status, body = self.list_threads(agent="Nimbus")
+        self.assertEqual(body["threads"], [])
+        with self.assertRaises(lam.ApiError):
+            lam.list_threads({"_userId": "user-1", "queryStringParameters": {}})
+
+
+class ThreadGetTests(_ThreadsTestCase):
+    def test_get_returns_messages_and_a_merged_timeline_oldest_first(self):
+        root = self.send("root")
+        self.tick()
+        moved = self.send("moved")
+        self.tick()
+        self.claim(self.imac, moved["messageId"])
+        self.tick()
+        self.ack(self.imac, moved["messageId"], "applied", threadId=root["messageId"], threadReason="pane:main:2.0")
+        status, body = self.get_thread(root["messageId"])
+        self.assertEqual(status, 200)
+        self.assertEqual([m["messageId"] for m in body["messages"]], [root["messageId"], moved["messageId"]])
+        self.assertEqual([e["kind"] for e in body["events"]], [
+            "message.queued", "message.queued", "message.claimed", "message.applied", "thread.assigned",
+        ])
+        self.assertEqual([e["threadId"] for e in body["events"]][:3], [root["messageId"], moved["messageId"], moved["messageId"]])
+        self.assertEqual(body["thread"]["status"], "working")
+        self.assertEqual(body["thread"]["messageCount"], 2)
+        for event in body["events"]:
+            self.assertEqual(set(event), {"threadId", "seq", "agent", "kind", "actor", "detail", "at"})
+
+    def test_a_member_id_a_foreign_id_and_garbage_are_404(self):
+        root = self.send("root")
+        reply = self.send("reply", threadId=root["messageId"])
+        theirs = self.send("theirs", user="user-2")
+        for bad in (reply["messageId"], theirs["messageId"], "m-00000000-nothing", "nope"):
+            with self.assertRaises(lam.ApiError, msg=bad) as caught:
+                lam.get_thread({"_userId": "user-1"}, bad)
+            self.assertEqual(caught.exception.status, 404)
+
+    def test_events_tail_after_seq(self):
+        message_id = self.lifecycle()
+        response = lam.get_thread_events({"_userId": "user-1", "queryStringParameters": {"after": "3"}}, message_id)
+        body = json.loads(response["body"])
+        self.assertEqual([e["seq"] for e in body["events"]], [4, 5])
+        response = lam.get_thread_events({"_userId": "user-1"}, message_id)
+        self.assertEqual(len(json.loads(response["body"])["events"]), 5)
+        with self.assertRaises(lam.ApiError):
+            lam.get_thread_events({"_userId": "user-1", "queryStringParameters": {"after": "x"}}, message_id)
+
+    def test_the_router_reaches_all_three_routes(self):
+        message_id = self.lifecycle()
+        for path in ("/threads", "/threads/" + message_id, "/threads/" + message_id + "/events"):
+            event = {"_userId": "user-1", "rawPath": path, "requestContext": {"http": {"method": "GET"}},
+                     "queryStringParameters": {"agent": "Fin"}}
+            self.assertEqual(lam._route(event)["statusCode"], 200, path)
+
+
+class ThreadSiteScopeTests(unittest.TestCase):
+    def test_a_site_may_read_threads(self):
+        for parts in (["threads"], ["threads", "m-1"], ["threads", "m-1", "events"]):
+            lam._require_site_scope({"_siteId": "s"}, "GET", parts)
+
+    def test_a_site_may_not_write_threads(self):
+        for method, parts in (("POST", ["threads"]), ("PUT", ["threads", "m-1"]), ("DELETE", ["threads", "m-1"])):
+            with self.assertRaises(lam.ApiError) as caught:
+                lam._require_site_scope({"_siteId": "s"}, method, parts)
+            self.assertEqual(caught.exception.status, 403)
+
+
+class ThreadRouteRegistrationTests(SiteRouteRegistrationTests):
+    def test_every_threads_route_is_registered(self):
+        for route in ("GET /threads", "GET /threads/{threadId}", "GET /threads/{threadId}/events"):
+            self.assertIn(route + "\n", self.deploy_sh, route)
+
+    def test_the_thread_events_table_is_created_and_granted(self):
+        self.assertIn("THREAD_EVENTS_TABLE=fin-thread-events", self.deploy_sh)
+        self.assertIn('"Sid": "ThreadEventsTable"', self.deploy_sh)
+        sid = self.deploy_sh.split('"Sid": "ThreadEventsTable"', 1)[1].split("}", 1)[0]
+        self.assertIn("dynamodb:Query", sid)
+        self.assertIn("dynamodb:PutItem", sid)
+        self.assertIn("AttributeName=seq,KeyType=RANGE", self.deploy_sh)
 
 
 if __name__ == "__main__":

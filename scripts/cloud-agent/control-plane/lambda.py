@@ -154,6 +154,10 @@ SITES_TABLE_NAME = os.environ.get("FIN_CP_SITES_TABLE", "fin-sites")
 # keyed per (user, agent) and holds the primary role's lease.
 MESSAGES_TABLE_NAME = os.environ.get("FIN_CP_MESSAGES_TABLE", "fin-messages")
 AGENTS_TABLE_NAME = os.environ.get("FIN_CP_AGENTS_TABLE", "fin-agents")
+# Thread events (docs/THREADS.md §3): one row per transition a thread goes
+# through, keyed (threadId, seq). Written only by this Lambda, never by a
+# client, and reaped after THREAD_EVENT_RETENTION_DAYS.
+THREAD_EVENTS_TABLE_NAME = os.environ.get("FIN_CP_THREAD_EVENTS_TABLE", "fin-thread-events")
 SECURITY_GROUP_NAME = "fin-agent-egress"
 INSTANCE_PROFILE_NAME = "fin-agent-ssm"
 AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
@@ -237,6 +241,7 @@ SESSIONS_TABLE = _DYNAMODB.Table(SESSIONS_TABLE_NAME)
 SITES_TABLE = _DYNAMODB.Table(SITES_TABLE_NAME)
 MESSAGES_TABLE = _DYNAMODB.Table(MESSAGES_TABLE_NAME)
 AGENTS_TABLE = _DYNAMODB.Table(AGENTS_TABLE_NAME)
+THREAD_EVENTS_TABLE = _DYNAMODB.Table(THREAD_EVENTS_TABLE_NAME)
 ENROLL_TOKENS_TABLE = _DYNAMODB.Table(os.environ.get("FIN_CP_ENROLL_TOKENS_TABLE", "fin-enroll-tokens"))
 
 # Byte-for-byte the bootstrap from launch.sh; the two presigned URLs are the only
@@ -1467,15 +1472,19 @@ def _normalize_notify_event(raw):
     return event if event in NOTIFY_EVENTS else "notify"
 
 
-def _push_aps_extra(event, agent_id=""):
+def _push_aps_extra(event, agent_id="", thread_id=""):
     """The APNs `aps` keys a Phase-1 (communication-notification) push adds on
     top of the alert: the category the app's reply action hangs off, the
-    per-agent thread, and — for the two "needs you" events only — the
-    time-sensitive level. Old app builds ignore every one of these."""
+    thread, and — for the two "needs you" events only — the time-sensitive
+    level. Old app builds ignore every one of these. The thread is the Fin
+    thread (docs/THREADS.md §2) when the push belongs to one, so the Lock
+    Screen groups by request; the per-agent id is the fallback grouping."""
     extra = {
         "category": PUSH_CATEGORY_INPUT if event in NOTIFY_INPUT_EVENTS else PUSH_CATEGORY_REPLY,
     }
-    if agent_id:
+    if thread_id:
+        extra["thread-id"] = thread_id
+    elif agent_id:
         extra["thread-id"] = agent_id
     if event in NOTIFY_INPUT_EVENTS:
         extra["interruption-level"] = "time-sensitive"
@@ -1651,12 +1660,13 @@ def _release_message_push(user_id, message_id, now):
 
 def notify(event):
     """POST /notify — {"title", "body", "agent"?, "agentID"?, "originDeviceID8"?,
-    "event"?, "messageId"?}: one APNs alert to every registered device. `event`
-    (one of NOTIFY_EVENTS; absent or unknown reads as "notify") picks the
-    category / interruption level; `messageId` names the fin-messages row this
-    push answers, so the row's own answered-ack push is suppressed (one push per
-    message). The response reports counts and APNs reason strings only — never
-    a token, never the auth key, never the JWT."""
+    "event"?, "messageId"?, "threadId"?}: one APNs alert to every registered
+    device. `event` (one of NOTIFY_EVENTS; absent or unknown reads as "notify")
+    picks the category / interruption level; `messageId` names the fin-messages
+    row this push answers, so the row's own answered-ack push is suppressed (one
+    push per message); `threadId` (or the message's thread) groups the push and
+    records a notify.sent thread event. The response reports counts and APNs
+    reason strings only — never a token, never the auth key, never the JWT."""
     if not _apns_configured():
         raise ApiError(503, "APNs key is not configured; redeploy with FIN_APNS_KEY_PATH set (see control-plane/README.md)")
     body = _body(event)
@@ -1692,6 +1702,13 @@ def notify(event):
     message_id = str(body.get("messageId") or "").strip()
     if not MESSAGE_ID_RE.match(message_id):
         message_id = ""
+    user_id = event["_userId"]
+    # The thread this push belongs to (docs/THREADS.md §2): named outright, or
+    # resolved from the message being answered. Tolerant like messageId: a
+    # foreign or unknown id means "no thread", never a refused push.
+    thread_id = _thread_root_for(user_id, str(body.get("threadId") or "").strip()) or ""
+    if not thread_id and message_id:
+        thread_id = _thread_root_for(user_id, message_id) or ""
 
     fin = {}
     if agent_id:
@@ -1702,6 +1719,8 @@ def notify(event):
         fin["agentName"] = agent
     if message_id:
         fin["messageId"] = message_id
+    if thread_id:
+        fin["threadId"] = thread_id
 
     # One push per message (design §3.7.3): the daemon acks `answered` before
     # it POSTs its task-complete push, so the ack push normally wins and this
@@ -1714,11 +1733,26 @@ def notify(event):
     # lands, so `suppressed` below always means "a push for this message
     # already reached a device (or is in flight)" — never "a push was tried".
     now = _now()
-    user_id = event["_userId"]
     claim = _mark_message_pushed(user_id, message_id, now) if message_id else None
     claimed = claim is True  # None (foreign/unknown row, storage trouble): push anyway
+
+    def record(delivered, failed, suppressed):
+        # The thread's view of this push (docs/THREADS.md §3), whatever APNs
+        # said: a suppressed push is still the moment the site said something.
+        _thread_event(user_id, thread_id, "notify.sent", _notify_actor(event), {
+            "event": push_event,
+            "title": title,
+            "body": text[:MAX_THREAD_PREVIEW_CHARS],
+            "delivered": delivered,
+            "failed": failed,
+            "suppressed": suppressed,
+            "messageId": message_id or None,
+            "threadId": thread_id or None,
+        }, now=now)
+
     if claim is False:
         LOG.info("notify: %s already pushed, suppressed", message_id)
+        record(0, 0, True)
         return _response(200, {
             "delivered": 0, "failed": 0, "removed": 0, "suppressed": True,
             "note": "this messageId was already pushed to the owner's devices",
@@ -1727,7 +1761,7 @@ def notify(event):
         result = _push_to_user(
             user_id, title, text,
             fin=fin or None,
-            aps_extra=_push_aps_extra(push_event, agent_id),
+            aps_extra=_push_aps_extra(push_event, agent_id, thread_id),
         )
     except BaseException:
         if claimed:
@@ -1735,6 +1769,7 @@ def notify(event):
         raise
     if claimed and not result["delivered"]:
         _release_message_push(user_id, message_id, now)
+    record(result["delivered"], result["failed"], False)
     if "note" in result:
         return _response(200, {"delivered": 0, "failed": 0, "removed": 0, "note": result["note"]})
     # 502 when tokens exist but nothing got through, so an unattended caller's
@@ -1745,6 +1780,16 @@ def notify(event):
         "removed": result["removed"],
         "reasons": result["reasons"],
     })
+
+
+def _notify_actor(event):
+    """Who spoke: the authenticated site's id8, or "operator" for a session /
+    operator token (a Claude session calling notify-levi.sh, the app)."""
+    site_id = event.get("_siteId")
+    if site_id:
+        site = _read_site(site_id) or {}
+        return site.get("siteId8") or site_id
+    return "operator"
 
 
 # --- service credentials (write-only) ----------------------------------------
@@ -2120,10 +2165,68 @@ def put_transcript_chunk(event):
     # reasoning and tool calls vanished after two restarts). Lines carry ids;
     # the stored hour keeps what it had and takes what is new, newest kept
     # when the cap bites.
-    merged = _merge_transcript_lines(_get_transcript_chunk(event["_userId"], agent, hour), lines)
+    existing = _get_transcript_chunk(event["_userId"], agent, hour)
+    merged = _merge_transcript_lines(existing, lines)
     encoded = "\n".join(merged).encode("utf-8")
     S3.put_object(Bucket=BUCKET, Key=key, Body=encoded, ContentType="application/json")
+    # Only lines this PUT introduced: the daemon re-sends its whole ring every
+    # flush, and a relay event per re-send would multiply every pane turn.
+    known = {_transcript_line_key(line) for line in existing}
+    fresh = [line for line in lines if _transcript_line_key(line) not in known]
+    _relay_events_from_lines(event, fresh)
     return _response(200, {"agent": agent, "hour": hour, "lines": len(merged)})
+
+
+RELAY_TOOL_KINDS = {"send_session": "relay.sent", "read_session": "relay.read"}
+
+
+def _relay_line_event(line):
+    """(kind, detail) for one transcript line that relays into a pane — a
+    toolCall line for send_session / read_session carrying the structured
+    `target` field (docs/THREADS.md §2) — or None. Pure; the thread the
+    event belongs to is whichever the line names (`thread_id` once the daemon
+    stamps every line of a turn; `in_reply_to` on today's user lines)."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or obj.get("kind") != "toolCall":
+        return None
+    kind = RELAY_TOOL_KINDS.get(str(obj.get("tool_name") or ""))
+    target = str(obj.get("target") or "").strip()
+    if not kind or not target:
+        return None
+    detail = {
+        "target": target,
+        "text": str(obj.get("text") or "")[:MAX_THREAD_PREVIEW_CHARS],
+        "lineId": obj.get("id"),
+        "runId": obj.get("run_id"),
+    }
+    for field, key in (("in_reply_to", "inReplyTo"), ("thread_id", "threadId")):
+        if obj.get(field):
+            detail[key] = str(obj[field])
+    return kind, detail, str(obj.get("site_id8") or "")
+
+
+def _relay_events_from_lines(event, lines):
+    """relay.sent / relay.read thread events for the pane-relaying lines in
+    one chunk PUT. Best-effort like every thread write; a line naming no
+    thread (a heartbeat turn) produces nothing."""
+    user_id = event["_userId"]
+    roots = {}
+    for line in lines:
+        parsed = _relay_line_event(line)
+        if not parsed:
+            continue
+        kind, detail, line_site8 = parsed
+        named = detail.get("threadId") or detail.get("inReplyTo") or ""
+        if named not in roots:
+            roots[named] = _thread_root_for(user_id, named)
+        thread_id = roots[named]
+        if not thread_id:
+            continue
+        actor = line_site8 or _notify_actor(event)
+        _thread_event(user_id, thread_id, kind, actor, detail)
 
 
 def _transcript_line_key(line):
@@ -3453,7 +3556,14 @@ def _public_message(row):
         "appliedRunId": row.get("appliedRunId"),
         "answeredAt": row.get("answeredAt"),
         "replyPreview": row.get("replyPreview"),
+        "pushedAt": row.get("pushedAt"),
+        "threadId": _thread_of(row),
     }
+
+
+def _thread_of(row):
+    """A row written before threads existed is its own root."""
+    return row.get("threadId") or row.get("messageId")
 
 
 def _owned_message(event, message_id):
@@ -3489,6 +3599,14 @@ def send_message(event):
     if not message_id:
         message_id = "m-" + str(uuid.uuid4())
     context = body.get("context") if isinstance(body.get("context"), dict) else {}
+    # Explicit thread membership (docs/THREADS.md §2): a reply inside a thread
+    # view or from a notification carrying fin.threadId. Any message id of the
+    # thread names it; a foreign, unknown, or other-agent id is a 400.
+    thread_id = str(body.get("threadId") or "").strip()
+    if thread_id:
+        thread_id = _thread_root_for(user_id, thread_id, agent=agent)
+        if not thread_id:
+            raise ApiError(400, "threadId must name a message of this agent that you sent")
 
     now = _now()
     live = _live_sites(user_id, agent, now)
@@ -3513,7 +3631,10 @@ def send_message(event):
         "context": context,
         "routedBy": routed_by,
         "clarifyCandidates": candidates,
+        "threadId": thread_id or message_id,
     }
+    if thread_id:
+        row["threadReason"] = "explicit"
     if pin:
         row["pinSiteId"] = pin
     if target:
@@ -3531,6 +3652,13 @@ def send_message(event):
             raise
         existing = _owned_message(event, message_id)
         return _response(200, dict(_public_message(existing), duplicate=True))
+    _thread_event(user_id, row["threadId"], "message.queued", row.get("authorSiteId8") or "user", {
+        "messageId": message_id,
+        "source": source,
+        "routedBy": routed_by,
+        "targetSiteId": pin or target,
+        "authorSiteId8": row.get("authorSiteId8"),
+    }, now=now)
     return _response(200, _public_message(row))
 
 
@@ -3606,6 +3734,14 @@ def claim_message(event, message_id):
         if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             return _response(409, {"granted": False, "messageId": message_id})
         raise
+    # A re-claim by the holder (the heartbeat renewing its lease) is not a
+    # transition; only the first claim is.
+    if row.get("claimedBy") != site["siteId"]:
+        _thread_event(row["userId"], _thread_of(row), "message.claimed", site.get("siteId8") or site["siteId"], {
+            "messageId": message_id,
+            "siteId8": site.get("siteId8"),
+            "claimedBy": site["siteId"],
+        }, now=now)
     return _response(200, {
         "granted": True,
         "messageId": message_id,
@@ -3613,6 +3749,7 @@ def claim_message(event, message_id):
         "text": row.get("text"),
         "source": row.get("source"),
         "createdAt": row.get("createdAt"),
+        "threadId": _thread_of(row),
     })
 
 
@@ -3633,6 +3770,7 @@ def ack_message(event, message_id):
     now = _now()
     names = {"#state": "state"}
     values = {":me": site["siteId"], ":now": _iso(now)}
+    thread_id, thread_reason = _thread_of(row), None
     if state == "applied":
         update = "SET #state = :applied, appliedAt = :now, appliedBy = :me"
         values[":applied"] = "applied"
@@ -3643,6 +3781,16 @@ def ack_message(event, message_id):
         if isinstance(run_id, str) and run_id:
             update += ", appliedRunId = :run"
             values[":run"] = run_id
+        # Thread assignment (docs/THREADS.md §2): the site proposes the thread
+        # this message's turn belongs to (it relayed into the same pane as an
+        # earlier request); explicit membership chosen by the sender wins;
+        # otherwise the message roots its own thread. Decided and logged
+        # here, exactly once per message.
+        thread_id, thread_reason, proposed = _decide_thread(row, body)
+        if proposed:
+            update += ", threadId = :thread, threadReason = :reason"
+            values[":thread"] = thread_id
+            values[":reason"] = thread_reason
     else:
         update = "SET #state = :answered, answeredAt = :now, #ttl = :ttl"
         names["#ttl"] = "ttl"
@@ -3668,9 +3816,53 @@ def ack_message(event, message_id):
         raise
     if state == "applied" and row.get("source") == "legacy":
         _trim_legacy_inbox(row["userId"], row["agent"], message_id)
-    if state == "answered" and ":preview" in values:
-        _push_answered_reply(row, message_id, values[":preview"], body, now)
-    return _response(200, {"messageId": message_id, "state": state})
+    actor = site.get("siteId8") or site["siteId"]
+    if state == "applied":
+        _thread_event(row["userId"], thread_id, "message.applied", actor, {
+            "messageId": message_id,
+            "siteId8": site.get("siteId8"),
+            "runId": values.get(":run"),
+        }, now=now)
+        _thread_event(row["userId"], thread_id, "thread.assigned", "system", {
+            "messageId": message_id,
+            "threadId": thread_id,
+            "reason": thread_reason,
+        }, now=now)
+        return _response(200, {"messageId": message_id, "state": state, "threadId": thread_id})
+    pushed = False
+    if ":preview" in values:
+        pushed = _push_answered_reply(row, message_id, values[":preview"], body, now)
+    _thread_event(row["userId"], thread_id, "message.answered", actor, {
+        "messageId": message_id,
+        "siteId8": site.get("siteId8"),
+        "replyPreview": values.get(":preview", "")[:MAX_THREAD_PREVIEW_CHARS],
+        "pushed": bool(pushed),
+    }, now=now)
+    return _response(200, {"messageId": message_id, "state": state, "threadId": thread_id})
+
+
+MAX_THREAD_REASON_CHARS = 40
+
+
+def _decide_thread(row, body):
+    """(threadId, reason, proposed) for a message being applied. `proposed`
+    is whether the row must be rewritten: only when the site's proposal is
+    taken. Reason vocabulary: `explicit` (sender chose at POST /messages),
+    the site's own `threadReason` (e.g. `pane:main:2.0`; `proposed` when it
+    gave none), or `root`. A proposal naming a foreign / other-agent id is a
+    400 — a silent fallback would hide exactly the daemon bug this logs."""
+    if row.get("threadReason") == "explicit":
+        return _thread_of(row), "explicit", False
+    proposed = str(body.get("threadId") or "").strip()
+    if not proposed:
+        return _thread_of(row), "root", False
+    thread_id = _thread_root_for(row["userId"], proposed, agent=row.get("agent"))
+    if not thread_id:
+        raise ApiError(400, "threadId must name a message of this agent")
+    reason = str(body.get("threadReason") or "").strip()[:MAX_THREAD_REASON_CHARS] or "proposed"
+    if thread_id == row["messageId"]:
+        return thread_id, "root", False
+    return thread_id, reason, True
 
 
 def _push_answered_reply(row, message_id, preview, body, now):
@@ -3698,7 +3890,7 @@ def _push_answered_reply(row, message_id, preview, body, now):
     claimed = False
     try:
         if _mark_message_pushed(user_id, message_id, now) is not True:
-            return
+            return False
         claimed = True
         agent_name = str(row.get("agent") or "").strip() or "Fin"
         agent_id = str(body.get("agentID") or "").strip()
@@ -3709,19 +3901,21 @@ def _push_answered_reply(row, message_id, preview, body, now):
         origin_device_id8 = str(body.get("originDeviceID8") or "").strip()
         if not DEVICE_ID8.match(origin_device_id8):
             origin_device_id8 = ""
-        fin = {"agentName": agent_name, "messageId": message_id}
+        thread_id = _thread_of(row)
+        fin = {"agentName": agent_name, "messageId": message_id, "threadId": thread_id}
         if agent_id:
             fin["agentID"] = agent_id
         if origin_device_id8:
             fin["originDeviceID8"] = origin_device_id8
         result = _push_to_user(
             user_id, agent_name, preview,
-            fin=fin, aps_extra=_push_aps_extra("answered", agent_id),
+            fin=fin, aps_extra=_push_aps_extra("answered", agent_id, thread_id),
             exclude_device_id8=origin_device_id8,
         )
         LOG.info("answered push for %s: delivered %d, failed %d", message_id, result["delivered"], result["failed"])
         if not result["delivered"]:
             _release_message_push(user_id, message_id, now)
+        return result["delivered"] > 0
     except ApiError as exc:
         # 503 (APNs not configured) / 500 (bundle can't sign): the reply still
         # reaches the app through GET /messages; only the announcement is lost.
@@ -3732,6 +3926,7 @@ def _push_answered_reply(row, message_id, preview, body, now):
         LOG.warning("answered push for %s failed: %s", message_id, _scrub(exc))
         if claimed:
             _release_message_push(user_id, message_id, now)
+    return False
 
 
 def register_message(event, message_id):
@@ -3758,6 +3953,7 @@ def register_message(event, message_id):
         "routedBy": "legacy",
         "pinSiteId": site["siteId"],
         "clarifyCandidates": [],
+        "threadId": message_id,
     }
     try:
         MESSAGES_TABLE.put_item(Item=row, ConditionExpression="attribute_not_exists(messageId)")
@@ -3766,6 +3962,11 @@ def register_message(event, message_id):
         if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
             raise
         created = False
+    if created:
+        _thread_event(site["userId"], message_id, "message.queued", "user", {
+            "messageId": message_id, "source": "legacy", "routedBy": "legacy",
+            "targetSiteId": site["siteId"], "authorSiteId8": None,
+        }, now=now)
     return _response(200, {"messageId": message_id, "created": created})
 
 
@@ -3834,7 +4035,7 @@ def _heartbeat_dispatch(site, body, now):
     # `queued` before anyone else can be offered it.
     for message_id in unacked[:MESSAGES_PER_HEARTBEAT * 2]:
         try:
-            MESSAGES_TABLE.update_item(
+            applied = MESSAGES_TABLE.update_item(
                 Key={"messageId": message_id},
                 UpdateExpression="SET #state = :applied, appliedAt = :now, appliedBy = :me",
                 ConditionExpression="claimedBy = :me AND #state IN (:queued, :claimed)",
@@ -3843,10 +4044,21 @@ def _heartbeat_dispatch(site, body, now):
                     ":me": site["siteId"], ":now": _iso(now),
                     ":applied": "applied", ":queued": "queued", ":claimed": "claimed",
                 },
+                ReturnValues="ALL_NEW",
             )
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 raise
+            continue
+        row = (applied or {}).get("Attributes") or {"messageId": message_id}
+        actor = site.get("siteId8") or site["siteId"]
+        _thread_event(user_id, _thread_of(row), "message.applied", actor, {
+            "messageId": message_id, "siteId8": site.get("siteId8"), "runId": None, "via": "heartbeat",
+        }, now=now)
+        _thread_event(user_id, _thread_of(row), "thread.assigned", "system", {
+            "messageId": message_id, "threadId": _thread_of(row),
+            "reason": "explicit" if row.get("threadReason") == "explicit" else "root",
+        }, now=now)
 
     live_cache = {}
 
@@ -4073,13 +4285,406 @@ def put_goals(event, agent):
             raise
         current = json.loads(get_goals(event, agent)["body"])
         return _response(412, {"error": "version conflict", "version": current["version"], "document": current["document"]})
-    if expected == 0 and next_version == 1:
-        pass  # first write: attribute_not_exists branch
+    # The version we are replacing, for the follow-up diff below. Best-effort:
+    # an unreadable previous version means every follow-up looks new, which
+    # over-reports rather than loses an event.
+    previous = None
+    if expected > 0:
+        try:
+            previous = json.loads(
+                S3.get_object(Bucket=BUCKET, Key=GOALS_KEY.format(user=user_id, agent=slug, version=expected))["Body"].read()
+            )
+        except (ClientError, ValueError):
+            previous = None
     S3.put_object(
         Bucket=BUCKET, Key=GOALS_KEY.format(user=user_id, agent=slug, version=next_version),
         Body=encoded, ContentType="application/json",
     )
+    _followup_goal_events(event, agent, previous, document)
     return _response(200, {"version": next_version})
+
+
+# --- threads (docs/THREADS.md) -------------------------------------------------
+#
+# A thread is a user request plus everything it caused. Identity is a
+# `threadId` on every fin-messages row (the root's own messageId); the
+# observable spine is fin-thread-events, one row per transition, written only
+# here. Status is derived, never stored (`_thread_status`). Every event write
+# is best-effort: a thread bookkeeping failure must never fail the send, claim,
+# ack, notify, goals, or transcript route that caused it.
+
+THREAD_EVENT_RETENTION_DAYS = 30
+MAX_LISTED_THREADS = 50
+MAX_THREAD_TITLE_CHARS = 80
+MAX_THREAD_PREVIEW_CHARS = 200
+MAX_THREAD_EVENTS_READ = 1000
+THREAD_EVENT_KINDS = (
+    "message.queued", "message.claimed", "message.applied", "message.answered",
+    "thread.assigned", "notify.sent", "goal.followup", "relay.sent", "relay.read",
+)
+THREAD_STATUSES = ("waiting_on_you", "working", "stalled", "answered")
+
+
+def _thread_root_for(user_id, message_id, agent=None):
+    """The root threadId behind any message id the caller holds, or None when
+    the id is malformed, unknown, another user's, or (when `agent` is given)
+    another agent's. Never raises: callers choose between 400 (a client
+    asserted membership) and "no thread" (a hint)."""
+    if not message_id or not MESSAGE_ID_RE.match(message_id):
+        return None
+    try:
+        row = MESSAGES_TABLE.get_item(Key={"messageId": message_id}).get("Item")
+    except Exception as exc:  # noqa: BLE001 - a hint lookup never takes a route down
+        LOG.warning("thread lookup failed for %s: %s", message_id, _scrub(exc))
+        return None
+    if not row or row.get("userId") != user_id:
+        return None
+    if agent is not None and _key_slug(row.get("agent") or "") != _key_slug(agent):
+        return None
+    return _thread_of(row)
+
+
+def _thread_event(user_id, thread_id, kind, actor, detail, now=None):
+    """Appends one event to a thread and prints it as a structured CloudWatch
+    line (`{"thread_event": {...}}`), so any wrong status is traceable
+    without the app. `seq` comes from an atomic counter on the thread's ROOT
+    message row (`ADD threadEventSeq :one`, returned with the update), which
+    is race-free across concurrent Lambdas and needs no extra table; the
+    condition `userId = :user` doubles as the ownership check and refuses to
+    conjure a root row for an id that was never a message. Returns the row
+    written, or None — never raises."""
+    if kind not in THREAD_EVENT_KINDS:
+        LOG.warning("thread event kind %r is not in THREAD_EVENT_KINDS", kind)
+    if not thread_id or not MESSAGE_ID_RE.match(str(thread_id)):
+        return None
+    now = now or _now()
+    try:
+        result = MESSAGES_TABLE.update_item(
+            Key={"messageId": thread_id},
+            UpdateExpression="SET threadLastAt = :at ADD #evseq :one",
+            ConditionExpression="userId = :user",
+            ExpressionAttributeNames={"#evseq": "threadEventSeq"},
+            ExpressionAttributeValues={":at": _iso(now), ":one": 1, ":user": user_id},
+            ReturnValues="ALL_NEW",
+        )
+        root = (result or {}).get("Attributes") or {}
+        seq = int(root.get("threadEventSeq") or 0)
+        if seq <= 0:
+            return None
+        row = {
+            "threadId": thread_id,
+            "seq": seq,
+            "userId": user_id,
+            "agent": root.get("agent"),
+            "kind": kind,
+            "actor": str(actor or "system"),
+            "detail": {k: v for k, v in (detail or {}).items() if v is not None},
+            "at": _iso(now),
+            "ttl": int((now + timedelta(days=THREAD_EVENT_RETENTION_DAYS)).timestamp()),
+        }
+        THREAD_EVENTS_TABLE.put_item(Item=row)
+        _emit_thread_event_line(_public_thread_event(row))
+        return row
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code != "ConditionalCheckFailedException":
+            LOG.warning("thread event %s for %s failed: %s", kind, thread_id, _scrub(exc))
+        return None
+    except Exception as exc:  # noqa: BLE001 - observability never fails the route
+        LOG.warning("thread event %s for %s failed: %s", kind, thread_id, _scrub(exc))
+        return None
+
+
+def _emit_thread_event_line(public):
+    """One structured stdout line per event — CloudWatch is the debug tail
+    that works when the app is what is broken."""
+    print(json.dumps({"thread_event": public}, default=_json_default))
+
+
+def _public_thread_event(row):
+    return {
+        "threadId": row.get("threadId"),
+        "seq": int(row.get("seq") or 0),
+        "agent": row.get("agent"),
+        "kind": row.get("kind"),
+        "actor": row.get("actor"),
+        "detail": row.get("detail") or {},
+        "at": row.get("at"),
+    }
+
+
+def _thread_events_for(thread_id, after=0, limit=MAX_THREAD_EVENTS_READ):
+    """One thread key's events, seq ascending, after `after`. Read failures
+    read as no events (the routes still answer from the message rows)."""
+    events, start = [], None
+    try:
+        while len(events) < limit:
+            kwargs = {
+                "KeyConditionExpression": "threadId = :thread AND seq > :after",
+                "ExpressionAttributeValues": {":thread": thread_id, ":after": int(after or 0)},
+                "ScanIndexForward": True,
+                "Limit": min(limit - len(events), 500),
+            }
+            if start:
+                kwargs["ExclusiveStartKey"] = start
+            page = THREAD_EVENTS_TABLE.query(**kwargs)
+            events.extend(page.get("Items", []))
+            start = page.get("LastEvaluatedKey")
+            if not start:
+                break
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("thread events read failed for %s: %s", thread_id, _scrub(exc))
+    return [_public_thread_event(e) for e in events]
+
+
+def _thread_timeline(thread_id, member_ids):
+    """Every event of a thread: those written under the thread key plus the
+    early events of members that were rooted alone before ack time moved
+    them (docs/THREADS.md §2 implicit membership) — those still live under
+    the member's own id. Ordered by time, then seq."""
+    events = list(_thread_events_for(thread_id))
+    for member in member_ids:
+        if member and member != thread_id:
+            events.extend(_thread_events_for(member))
+    events.sort(key=lambda e: (e.get("at") or "", e.get("threadId") != thread_id, e.get("seq") or 0))
+    return events
+
+
+def _thread_status(messages, events):
+    """Derived, never stored (docs/THREADS.md §1). In precedence order:
+    `waiting_on_you` — the last event is a push asking for input;
+    `stalled` — the last event is an agent-stalled push (it outranks an open
+    message: a stall IS the state of that open message);
+    `working` — any message still queued/claimed/applied, or the last event is
+    a follow-up goal Fin still owes an answer on;
+    `answered` — otherwise."""
+    last = events[-1] if events else {}
+    kind = last.get("kind")
+    detail = last.get("detail") or {}
+    if kind == "notify.sent" and detail.get("event") == "request-input":
+        return "waiting_on_you"
+    if kind == "notify.sent" and detail.get("event") == "agent-stalled":
+        return "stalled"
+    if any(m.get("state") in ("queued", "claimed", "applied") for m in messages):
+        return "working"
+    if kind == "goal.followup":
+        return "working"
+    return "answered"
+
+
+def _thread_open_goal(events):
+    """The follow-up goal Fin still owes a reply on: the latest goal.followup
+    with no message.answered after it."""
+    open_goal = None
+    for event in events:
+        if event.get("kind") == "goal.followup":
+            open_goal = (event.get("detail") or {}).get("goalId")
+        elif event.get("kind") == "message.answered":
+            open_goal = None
+    return open_goal
+
+
+def _thread_participants(messages, events):
+    """Distinct actors in first-seen order: user device id8s, site id8s, pane
+    targets, "operator" for notify calls without a site."""
+    seen = []
+
+    def add(value):
+        value = str(value or "").strip()
+        if value and value != "system" and value not in seen:
+            seen.append(value)
+
+    authors = [m.get("authorSiteId8") for m in messages if m.get("authorSiteId8")]
+    for author in authors or (["user"] if messages else []):
+        add(author)
+    for event in events:
+        actor = event.get("actor")
+        if actor != "user" or not authors:  # a known device speaks for "user"
+            add(actor)
+        add((event.get("detail") or {}).get("target"))
+    return seen
+
+
+def _message_activity_at(row):
+    return max(str(row.get(k) or "") for k in ("createdAt", "claimedAt", "appliedAt", "answeredAt", "threadLastAt"))
+
+
+def _thread_summary(thread_id, messages, events):
+    messages = sorted(messages, key=lambda r: r.get("createdAt") or "")
+    root = next((m for m in messages if m.get("messageId") == thread_id), messages[0] if messages else {})
+    stamps = [_message_activity_at(m) for m in messages] + [e.get("at") or "" for e in events]
+    title = str(root.get("text") or "").strip()
+    if len(title) > MAX_THREAD_TITLE_CHARS:
+        title = title[:MAX_THREAD_TITLE_CHARS - 1].rstrip() + "…"
+    summary = {
+        "threadId": thread_id,
+        "agent": root.get("agent"),
+        "title": title,
+        "status": _thread_status(messages, events),
+        "messageCount": len(messages),
+        "lastActivityAt": max(stamps) if stamps else None,
+        "createdAt": root.get("createdAt"),
+        "participants": _thread_participants(messages, events),
+    }
+    open_goal = _thread_open_goal(events)
+    if open_goal:
+        summary["openGoal"] = open_goal
+    return summary
+
+
+def _threads_by_id(rows):
+    threads = {}
+    for row in rows:
+        threads.setdefault(_thread_of(row), []).append(row)
+    return threads
+
+
+def list_threads(event):
+    """GET /threads?agent=<name>[&limit=] — the caller's threads for one agent,
+    newest activity first. Events are read only for the threads that make the
+    cut, sorted first on the message rows' own stamps (the root row's
+    threadLastAt is bumped by every event write, so that pre-sort already
+    sees event activity)."""
+    user_id = event["_userId"]
+    params = event.get("queryStringParameters") or {}
+    agent = str(params.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent query parameter is required")
+    try:
+        limit = int(params.get("limit") or MAX_LISTED_THREADS)
+    except ValueError:
+        raise ApiError(400, "limit must be an integer")
+    limit = max(1, min(limit, MAX_LISTED_THREADS))
+    rows = _scan(
+        table=MESSAGES_TABLE,
+        FilterExpression="userId = :user AND #agent = :agent",
+        ExpressionAttributeNames={"#agent": "agent"},
+        ExpressionAttributeValues={":user": user_id, ":agent": agent},
+    )
+    threads = _threads_by_id(rows)
+    ordered = sorted(threads.items(), key=lambda kv: max(_message_activity_at(r) for r in kv[1]), reverse=True)
+    summaries = []
+    for thread_id, messages in ordered[:limit]:
+        events = _thread_timeline(thread_id, [m.get("messageId") for m in messages])
+        summaries.append(_thread_summary(thread_id, messages, events))
+    summaries.sort(key=lambda s: s.get("lastActivityAt") or "", reverse=True)
+    return _response(200, {"agent": agent, "threads": summaries})
+
+
+def _owned_thread(event, thread_id):
+    """The root row and every member row of a thread the caller owns, or 404.
+    A pre-threads row is its own root (no threadId attribute)."""
+    root = _owned_message(event, thread_id)
+    members = _scan(
+        table=MESSAGES_TABLE,
+        FilterExpression="userId = :user AND threadId = :thread",
+        ExpressionAttributeValues={":user": event["_userId"], ":thread": thread_id},
+    )
+    if not any(m.get("messageId") == thread_id for m in members):
+        members.append(root)
+    if _thread_of(root) != thread_id:
+        # The id names a member, not a root: point the caller at the root.
+        raise ApiError(404, "no such thread (that message belongs to thread {})".format(_thread_of(root)))
+    return root, sorted(members, key=lambda r: r.get("createdAt") or "")
+
+
+def get_thread(event, thread_id):
+    """GET /threads/{threadId} → {thread, messages (oldest first), events (oldest first)}."""
+    _root, messages = _owned_thread(event, thread_id)
+    events = _thread_timeline(thread_id, [m.get("messageId") for m in messages])
+    return _response(200, {
+        "thread": _thread_summary(thread_id, messages, events),
+        "messages": [_public_message(m) for m in messages],
+        "events": events,
+    })
+
+
+def get_thread_events(event, thread_id):
+    """GET /threads/{threadId}/events?after=<seq> — the debug tail: this
+    thread key's own events only, seq ascending."""
+    _owned_thread(event, thread_id)
+    params = event.get("queryStringParameters") or {}
+    try:
+        after = int(params.get("after") or 0)
+    except ValueError:
+        raise ApiError(400, "after must be an integer")
+    return _response(200, {"threadId": thread_id, "events": _thread_events_for(thread_id, after=after)})
+
+
+FOLLOWUP_GOAL_PREFIX = "g-followup-"
+# A tmux target ("main:2.0", "agent:1") out of prose; ends on an alphanumeric
+# so a sentence's trailing period is not part of the pane.
+PANE_TARGET = r"([A-Za-z0-9._-]+:[A-Za-z0-9._:-]*[A-Za-z0-9])"
+READ_SESSION_TARGET = re.compile(r"read_session\s+" + PANE_TARGET)
+HANDED_TO_PANE = re.compile(r"handed to pane\s+" + PANE_TARGET)
+
+
+def _new_followup_goals(previous, current):
+    """Goals in `current` whose id starts with g-followup- and that `previous`
+    lacked. Pure; tolerant of either document being None or shapeless."""
+    def ids(document):
+        goals = (document or {}).get("goals") if isinstance(document, dict) else None
+        return {g.get("id") for g in goals if isinstance(g, dict)} if isinstance(goals, list) else set()
+    before = ids(previous)
+    goals = (current or {}).get("goals") if isinstance(current, dict) else None
+    return [
+        g for g in (goals or [])
+        if isinstance(g, dict) and str(g.get("id") or "").startswith(FOLLOWUP_GOAL_PREFIX) and g.get("id") not in before
+    ]
+
+
+def _followup_goal_detail(goal):
+    next_action = str(goal.get("next_action") or goal.get("nextAction") or "")
+    target = None
+    for text in (next_action, str(goal.get("why") or "")):
+        match = READ_SESSION_TARGET.search(text) or HANDED_TO_PANE.search(text)
+        if match:
+            target = match.group(1)
+            break
+    return {
+        "goalId": goal.get("id"),
+        "title": str(goal.get("title") or "")[:MAX_THREAD_PREVIEW_CHARS],
+        "nextAction": next_action[:MAX_THREAD_PREVIEW_CHARS],
+        "target": target,
+    }
+
+
+def _followup_goal_thread(user_id, agent, goal, rows_cache):
+    """The thread a follow-up goal belongs to: the goal's own thread_id /
+    message_id when it carries one, else the message whose id starts with
+    the tail the daemon put in the goal id (`g-followup-<first 8 of the uuid>`)."""
+    for field in ("thread_id", "threadId", "message_id", "messageId", "source"):
+        candidate = str(goal.get(field) or "")
+        if MESSAGE_ID_RE.match(candidate):
+            resolved = _thread_root_for(user_id, candidate, agent=agent)
+            if resolved:
+                return resolved
+    tail = str(goal.get("id") or "")[len(FOLLOWUP_GOAL_PREFIX):]
+    if not tail:
+        return None
+    if rows_cache.get("rows") is None:
+        rows_cache["rows"] = _scan(
+            table=MESSAGES_TABLE,
+            FilterExpression="userId = :user AND #agent = :agent",
+            ExpressionAttributeNames={"#agent": "agent"},
+            ExpressionAttributeValues={":user": user_id, ":agent": agent},
+        )
+    for row in rows_cache["rows"]:
+        if str(row.get("messageId") or "").startswith("m-" + tail):
+            return _thread_of(row)
+    return None
+
+
+def _followup_goal_events(event, agent, previous, current):
+    """goal.followup for each follow-up goal this ledger write introduced."""
+    user_id = event["_userId"]
+    cache = {}
+    for goal in _new_followup_goals(previous, current):
+        thread_id = _followup_goal_thread(user_id, agent, goal, cache)
+        if not thread_id:
+            LOG.info("goal.followup %s: no thread found", goal.get("id"))
+            continue
+        _thread_event(user_id, thread_id, "goal.followup", _notify_actor(event), _followup_goal_detail(goal))
 
 
 # --- wake on fin-messages (device sites) ---------------------------------------
@@ -4257,6 +4862,11 @@ def _require_site_scope(event, method, parts):
         return
     if len(parts) == 3 and parts[0] == "agents" and parts[2] == "goals":
         return
+    # Reading (never writing — every thread write is a side effect of a route
+    # above) its owner's threads, so a body can see what a request already
+    # caused before it acts (docs/THREADS.md §2).
+    if method == "GET" and parts[:1] == ["threads"]:
+        return
     raise ApiError(403, "a site token cannot use this route")
 
 
@@ -4296,6 +4906,12 @@ def _route(event):
         return ack_message(event, parts[1])
     if method == "POST" and len(parts) == 3 and parts[0] == "messages" and parts[2] == "register":
         return register_message(event, parts[1])
+    if method == "GET" and parts == ["threads"]:
+        return list_threads(event)
+    if method == "GET" and len(parts) == 2 and parts[0] == "threads":
+        return get_thread(event, parts[1])
+    if method == "GET" and len(parts) == 3 and parts[0] == "threads" and parts[2] == "events":
+        return get_thread_events(event, parts[1])
     if method == "POST" and parts == ["workers"]:
         return create_worker(event)
     if method == "GET" and parts == ["workers"]:

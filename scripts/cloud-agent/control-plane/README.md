@@ -199,6 +199,73 @@ claimant; an applied row can never be reclaimed however stale its lease.
 `create_worker` no longer resets `fin/inbox/{agent}.json`. The sweep marks a
 site silent for three leases `stale` — never terminates it.
 
+## Threads
+
+`docs/THREADS.md`: a thread is one user request plus everything it caused,
+across the user, Fin's sites, the panes Fin relays into, and operator
+sessions. Identity is `threadId` on every `fin-messages` row (a root's is its
+own `messageId`; a row written before threads existed reads as its own root).
+Status is derived on read, never stored.
+
+**Membership.** `POST /messages` takes an optional `threadId` — any message id
+of the thread, resolved to its root; a foreign, unknown, or other-agent id is a
+400. Otherwise the message roots a new thread. At `applied` ack time the site
+may propose `threadId` (+ `threadReason`, ≤ 40 chars, e.g. `pane:main:2.0`)
+for a message that relayed into the same pane as an earlier request; explicit
+membership chosen by the sender always wins. The decision is logged once per
+message as `thread.assigned` with reason `explicit | <threadReason> | root`.
+
+**Events** (`fin-thread-events`, hash `threadId`, range `seq`, TTL 30 days) —
+one row per transition, written only by the Lambda, `seq` allocated by an
+atomic counter on the thread's root message row (`ADD threadEventSeq`), so it
+is strictly monotonic per thread with no extra table. Every write also prints
+one `{"thread_event": {...}}` line to CloudWatch. Best-effort: a bookkeeping
+failure never fails the route that caused it.
+
+| kind | actor | written by | detail |
+|---|---|---|---|
+| `message.queued` | device id8 / `user` | `POST /messages`, `/register` | messageId, source, routedBy, targetSiteId, authorSiteId8 |
+| `message.claimed` | site id8 | `/claim` (first claim only; renewals are not transitions) | messageId, siteId8, claimedBy |
+| `message.applied` | site id8 | `/ack applied`, heartbeat `unacked` | messageId, siteId8, runId |
+| `thread.assigned` | `system` | `/ack applied` | messageId, threadId, reason |
+| `message.answered` | site id8 | `/ack answered` | messageId, siteId8, replyPreview (≤ 200), pushed |
+| `notify.sent` | site id8 / `operator` | `POST /notify` | event, title, body (≤ 200), delivered, failed, suppressed, messageId, threadId |
+| `goal.followup` | site id8 / `operator` | `PUT /agents/{agent}/goals` (a `g-followup-*` goal the previous version lacked) | goalId, title, nextAction (≤ 200), target |
+| `relay.sent` / `relay.read` | site id8 | `PUT /transcript-chunk` (new `toolCall` lines for `send_session` / `read_session` carrying `target`) | target, text (≤ 200), lineId, runId, inReplyTo, threadId |
+
+`POST /notify` takes optional `threadId` (or resolves it from `messageId`);
+the APNs payload then carries `fin.threadId` and `aps.thread-id` = the thread
+(the per-agent id is the fallback grouping), so the Lock Screen groups by
+request. The answered-ack push does the same.
+
+**Routes** (session, operator, and site tokens; a site may only read):
+
+```sh
+curl -sS "$API/threads?agent=Fin&limit=20" -H "$AUTH"
+# -> {agent, threads:[{threadId, agent, title (first message, ≤ 80), status,
+#     messageCount, lastActivityAt, createdAt, participants:[...], openGoal?}]}
+#    newest activity first, at most 50
+curl -sS "$API/threads/<threadId>" -H "$AUTH"
+# -> {thread:{...same summary...}, messages:[public rows, oldest first],
+#     events:[oldest first — the thread's own plus the early events of members
+#     that were rooted alone before ack time moved them]}
+curl -sS "$API/threads/<threadId>/events?after=<seq>" -H "$AUTH"   # debug tail
+```
+
+**Status** (`_thread_status(messages, events)`, pure, in precedence order):
+
+| status | when |
+|---|---|
+| `waiting_on_you` | the last event is `notify.sent` with event `request-input` |
+| `stalled` | the last event is `notify.sent` with event `agent-stalled` (outranks an open message: the stall *is* that message's state) |
+| `working` | any message still `queued` / `claimed` / `applied`, or the last event is `goal.followup` |
+| `answered` | otherwise |
+
+`openGoal` is the latest `goal.followup` goal id with no `message.answered`
+after it. Participants are the distinct actors in first-seen order: user
+device id8s (or `user` when no device is known), site id8s, pane targets,
+`operator`.
+
 ## Auto-provisioning
 
 The app lets any agent be set to Cloud Harness and delivers mail to its

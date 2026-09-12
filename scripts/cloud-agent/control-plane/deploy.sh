@@ -27,6 +27,7 @@ SITES_TABLE=fin-sites
 MESSAGES_TABLE=fin-messages
 AGENTS_TABLE=fin-agents
 ENROLL_TOKENS_TABLE=fin-enroll-tokens
+THREAD_EVENTS_TABLE=fin-thread-events
 API_NAME=fin-control-plane
 RULE=fin-worker-sweep
 WAKE_RULE=fin-worker-wake
@@ -166,6 +167,22 @@ if ! aws dynamodb describe-table --table-name "$ENROLL_TOKENS_TABLE" >/dev/null 
   aws dynamodb update-time-to-live --table-name "$ENROLL_TOKENS_TABLE" \
     --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
   echo "==> Created DynamoDB table $ENROLL_TOKENS_TABLE (on-demand, TTL on ttl)"
+fi
+
+# Thread events (docs/THREADS.md §3): one row per transition a thread goes
+# through, keyed (threadId, seq) so a thread's timeline is one Query in seq
+# order. Written only by the Lambda; TTL reaps rows after 30 days (the
+# message rows they describe are gone after 14).
+if ! aws dynamodb describe-table --table-name "$THREAD_EVENTS_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$THREAD_EVENTS_TABLE" \
+    --attribute-definitions AttributeName=threadId,AttributeType=S AttributeName=seq,AttributeType=N \
+    --key-schema AttributeName=threadId,KeyType=HASH AttributeName=seq,KeyType=RANGE \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$THREAD_EVENTS_TABLE"
+  aws dynamodb update-time-to-live --table-name "$THREAD_EVENTS_TABLE" \
+    --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
+  echo "==> Created DynamoDB table $THREAD_EVENTS_TABLE (on-demand, TTL on ttl)"
 fi
 
 # --- model-factory data lake -------------------------------------------------
@@ -318,6 +335,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$ENROLL_TOKENS_TABLE"
+    },
+    {
+      "Sid": "ThreadEventsTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:Query"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$THREAD_EVENTS_TABLE"
     },
     {
       "Sid": "AgentObjects",
@@ -620,6 +643,9 @@ GET /messages/{messageId}
 POST /messages/{messageId}/claim
 POST /messages/{messageId}/ack
 POST /messages/{messageId}/register
+GET /threads
+GET /threads/{threadId}
+GET /threads/{threadId}/events
 POST /sites/enroll-tokens
 GET /agents/{agent}/goals
 PUT /agents/{agent}/goals
