@@ -117,6 +117,31 @@ public enum AgentTurnLogic {
     /// MENTIONS the phrase mid-sentence must not complete: live-proven false positive —
     /// a model restating its instructions ("I will only reply TASK COMPLETE when
     /// instructed…") completed the task and shut the daemon down.
+    /// A heartbeat DECISION blob (`{"decision": "idle", ...}`), possibly fenced,
+    /// standing where a user's answer should be. Live, 2026-09-12: three voice
+    /// requests were "answered" with this after the model, deep in a task turn,
+    /// pattern-matched its recent heartbeat history and emitted the tick
+    /// contract. Such text is never an answer; the daemon retries or settles.
+    public static func looksLikeHeartbeatDecision(_ text: String) -> Bool {
+        var body = Substring(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        if body.hasPrefix("```") {
+            body = body.drop(while: { $0 != "\n" }).dropFirst()
+            body = Substring(body.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        guard body.hasPrefix("{") else { return false }
+        let head = body.prefix(240)
+        return head.contains("\"decision\"")
+    }
+
+    /// The one corrective turn a task turn gets when its answer was a decision
+    /// blob: the request restated, JSON forbidden, tools optional.
+    public static func decisionRetryPrompt(request: String) -> String {
+        "That was a heartbeat decision, not an answer. There is no heartbeat right now — the user "
+            + "asked you something and is waiting. Their request: \"\(request)\". Answer them now in plain "
+            + "language, using what you already read this turn (call a tool only if you still lack a "
+            + "fact). Never emit JSON."
+    }
+
     public static func containsTaskComplete(_ text: String) -> Bool {
         let trailingPunctuation: Set<Character> = [".", "!", "*", "_", "`", "\"", "'"]
         var trimmed = Substring(text)

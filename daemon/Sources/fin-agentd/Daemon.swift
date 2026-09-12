@@ -448,6 +448,10 @@ final class Daemon {
     /// `answered` ack — and for the request-input push, which names it so the
     /// control plane pushes that message once (the question, not the reply).
     private var inFlightSiteMessageID: String?
+    /// The request text of the in-flight message, for the one corrective turn a
+    /// decision-blob "answer" earns (`AgentTurnLogic.decisionRetryPrompt`).
+    private var inFlightSiteMessageText: String?
+    private var retriedDecisionAnswer = false
 
     /// Settle the claimed control-plane message a turn was answering when that
     /// turn ended WITHOUT an answer. Live bug (2026-09-12): only the `.answered`
@@ -459,6 +463,7 @@ final class Daemon {
     private func settleInFlightMessage(_ preview: String) async {
         guard let id = inFlightSiteMessageID else { return }
         inFlightSiteMessageID = nil
+        inFlightSiteMessageText = nil
         let line = "[site] message \(id.prefix(10)) settled without an answer: \(preview)"
         log(line)
         record(AgentAuditEvent(kind: "notice", text: line))
@@ -625,7 +630,10 @@ final class Daemon {
         + "for this turn. Use the tools to do it (read_session to find a pane by its folder or title, "
         + "send_session to give another agent's pane an instruction, send_input for your own shell), "
         + "then answer with what you did and what you saw. Do not create, update, or discuss goals in "
-        + "this turn; do not describe your role; do not ask what the mission is."
+        + "this turn; do not describe your role; do not ask what the mission is. This is NOT a heartbeat "
+        + "tick: never answer with a decision JSON — answer the person in plain language. If they ask "
+        + "you (Fin) something you can answer from what you know, answer it directly rather than "
+        + "relaying it anywhere."
 
     /// After a user turn: one follow-up goal per pane it sent to, so the next mission
     /// tick reads the pane and notifies the user with the outcome.
@@ -1432,6 +1440,8 @@ final class Daemon {
             transcript?.pendingInReplyTo = held.id
             pendingUserMessageForDigest = text
             inFlightSiteMessageID = held.id
+            inFlightSiteMessageText = held.text
+            retriedDecisionAnswer = false
             isTurnInFlight = true
             async let ack: Void = siteClient?.markApplied(held.id, runID: transcript?.runID.uuidString) ?? ()
             sendSessionTargetsThisTurn = []
@@ -1468,6 +1478,24 @@ final class Daemon {
                 // The no-launch-task start: nothing happened, nothing to record —
                 // unless a claimed message was in flight, which must not outlive it.
                 await settleInFlightMessage("Fin finished without a reply.")
+            case .answered(let text) where inFlightSiteMessageID != nil && AgentTurnLogic.looksLikeHeartbeatDecision(text):
+                // A decision blob is never the user's answer. One corrective turn;
+                // if that also comes back as a decision, settle honestly rather
+                // than push JSON to a phone (and read it aloud in a car).
+                if !retriedDecisionAnswer, let request = inFlightSiteMessageText {
+                    retriedDecisionAnswer = true
+                    let line = "[site] answer was a heartbeat decision; retrying once for \(inFlightSiteMessageID?.prefix(10) ?? "")"
+                    log(line)
+                    record(AgentAuditEvent(kind: "notice", text: line))
+                    isTurnInFlight = true
+                    setPromptMode?(.task)
+                    outcome = await engine.submit(AgentTurnLogic.decisionRetryPrompt(request: request))
+                    setPromptMode?(.mission)
+                    isTurnInFlight = false
+                    continue
+                }
+                lastTurnAt = Date()
+                await settleInFlightMessage("Fin got confused and answered with its own status instead of your question. Please ask again.")
             case .answered(let text):
                 consecutiveFailures = 0
                 lastTurnAt = Date()
@@ -1479,6 +1507,7 @@ final class Daemon {
                 let answeredMessageID = inFlightSiteMessageID
                 if let id = inFlightSiteMessageID {
                     inFlightSiteMessageID = nil
+                    inFlightSiteMessageText = nil
                     await siteClient?.markAnswered(id, replyPreview: text)
                 }
                 if let userMessage = pendingUserMessageForDigest {
@@ -1626,6 +1655,8 @@ final class Daemon {
                 transcript?.pendingInReplyTo = message.id
                 pendingUserMessageForDigest = text
                 inFlightSiteMessageID = message.id
+                inFlightSiteMessageText = message.text
+                retriedDecisionAnswer = false
                 isTurnInFlight = true
                 // Ack `applied` right after submit begins, not after the turn ends:
                 // the window between submit and ack is the one at-least-once window
