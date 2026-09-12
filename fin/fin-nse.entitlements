@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- fin-nse (iOS / visionOS): the Notification Service Extension's ONLY
+	     entitlement. updating(from:) on a UNNotificationContent — the call that
+	     turns a push into a communication notification — throws without it.
+	     Nothing else: the extension needs no app group, no iCloud, no push
+	     registration and no token (docs/CARPLAY-IMESSAGE-DESIGN.md §3.3 step 3). -->
+	<key>com.apple.developer.usernotifications.communication</key>
+	<true/>
+</dict>
+</plist>

@@ -35,5 +35,17 @@
 	<array>
 		<string>Default</string>
 	</array>
+	<!-- Communication notifications, same purpose as the iOS entitlement (design
+	     §3.3/§5.1): Fin's replies arrive like messages from a contact "Fin" with a
+	     Reply field in Notification Center. macOS support is UNVERIFIED end to end
+	     (design §3.6); the code degrades to a plain alert if updating(from:) throws. -->
+	<key>com.apple.developer.usernotifications.communication</key>
+	<true/>
+	<!-- Time Sensitive interruption level for "needs input" pushes. -->
+	<key>com.apple.developer.usernotifications.time-sensitive</key>
+	<true/>
+	<!-- SiriKit: in-app INSendMessageIntent handling (FinMessageIntentHandler). -->
+	<key>com.apple.developer.siri</key>
+	<true/>
 </dict>
 </plist>

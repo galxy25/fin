@@ -33,5 +33,22 @@
 	<array>
 		<string>Default</string>
 	</array>
+	<!-- Communication notifications (docs/CARPLAY-IMESSAGE-DESIGN.md §3.3/§5.1):
+	     lets the app's local banners and the fin-nse extension's rewritten pushes
+	     carry an INSendMessageIntent donation, so Fin's replies show with an avatar
+	     and — with Announce Notifications on — Siri reads them aloud in CarPlay /
+	     on AirPods and takes a spoken reply. Self-serve capability, no review. -->
+	<key>com.apple.developer.usernotifications.communication</key>
+	<true/>
+	<!-- Time Sensitive: "Fin needs your input" pushes carry
+	     interruption-level time-sensitive, because Announce's default filter is
+	     "Time Sensitive and Direct Messages". Self-serve capability. -->
+	<key>com.apple.developer.usernotifications.time-sensitive</key>
+	<true/>
+	<!-- SiriKit: the in-app INSendMessageIntent handler (FinMessageIntentHandler)
+	     is a SiriKit Messaging-domain handler, and Siri only dispatches to apps
+	     with the Siri capability. Self-serve. -->
+	<key>com.apple.developer.siri</key>
+	<true/>
 </dict>
 </plist>

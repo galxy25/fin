@@ -144,6 +144,11 @@ final class AppSiteClient: ObservableObject {
             guard let atSubmit = entry.repliesAtSubmit, !answered.contains(entry.id),
                   replies.count > atSubmit, !target.isBusy() else { continue }
             answered.insert(entry.id)
+            // The control plane pushes a `fin.reply` notification back to every
+            // device on this ack — including this one. This device already showed
+            // the turn (it hosted it), so mark the id BEFORE the ack goes out and
+            // `AgentNotificationService.willPresent` drops the echo.
+            AgentNotificationService.shared.markSurfacedLocally(messageID: entry.id)
             _ = await siteRequest("POST", "/messages/\(entry.id)/ack",
                                   body: ["state": "answered", "replyPreview": String(replies.latest.prefix(500))],
                                   siteID: siteID, token: siteToken)

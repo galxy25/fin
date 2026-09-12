@@ -126,6 +126,16 @@ struct VoiceSetupView: View {
                 }
 
                 Section {
+                    // Phase 1 of docs/CARPLAY-IMESSAGE-DESIGN.md: Fin's replies are
+                    // communication notifications, so Announce reads them aloud in
+                    // the car — but only once the user flips this one switch.
+                    Text("To hear Fin in the car, turn on Settings > Notifications > Announce Notifications > CarPlay.")
+                        .font(.footnote)
+                } header: {
+                    Text("In the car")
+                }
+
+                Section {
                     Text("Assigning the shortcut to your \(triggerName) is the one step Fin can't do for you — Apple keeps that in Settings. Everything else is above.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
