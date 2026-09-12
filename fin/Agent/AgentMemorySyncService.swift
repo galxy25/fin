@@ -201,6 +201,9 @@ final class AgentMemorySyncService {
         var descriptor = FetchDescriptor<AgentMemory>(predicate: #Predicate<AgentMemory> { $0.id == localID })
         descriptor.fetchLimit = 1
         if let existing = try? context.fetch(descriptor).first {
+            // A row pulled by an older build under the writer's UUID is re-homed to the
+            // local agent even when its content is unchanged — that is the whole fix.
+            if existing.agentID != agentID { existing.agentID = agentID; return true }
             guard updatedAt > existing.updatedAt else { return false }
             existing.title = safeTitle
             existing.content = safeContent
@@ -210,9 +213,14 @@ final class AgentMemorySyncService {
             return true
         }
 
+        // The LOCAL agent the pull was made for, never the writer's `agentId`: the
+        // ledger is keyed by agent NAME, and a daemon's configured UUID need not match
+        // this device's Agent record. Live, 2026-09-12 (Mac): today's digests from the
+        // iMac landed under the daemon's UUID, and the memory view — filtering by the
+        // local agent's id — showed nothing newer than a week.
         let record = AgentMemory(
             kind: .episodic,
-            agentID: (entry["agentId"] as? String).flatMap { UUID(uuidString: $0) } ?? agentID,
+            agentID: agentID,
             conversationID: (entry["conversationId"] as? String).flatMap { UUID(uuidString: $0) },
             title: safeTitle,
             content: safeContent,

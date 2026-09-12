@@ -198,6 +198,42 @@ final class AgentMemorySyncServiceTests: XCTestCase {
         }
     }
 
+    /// Live, 2026-09-12 (Mac): the iMac daemon writes digests under ITS configured
+    /// UUID; the Mac's Fin record has another. The memory view filters by the local
+    /// id, so 31 digests pulled that day were invisible. The ledger is keyed by agent
+    /// NAME; the local agent the pull was made for owns the rows.
+    @MainActor
+    func testPulledEntriesBelongToTheLocalAgentNotTheWritersUUID() async throws {
+        try await withControlPlaneConfigured {
+            let (service, context) = try makeService()
+            let localAgentID = UUID()
+            let daemonAgentID = UUID()
+            let ledgerID = "m-\(UUID().uuidString)"
+            // A row an older build pulled under the daemon's UUID: must be re-homed.
+            let stale = AgentMemory(kind: .episodic, agentID: daemonAgentID, conversationID: nil, title: "old", content: "old")
+            stale.id = AgentMemorySyncService.localID(forLedgerID: ledgerID)
+            context.insert(stale)
+            try context.save()
+            let responseBody: [String: Any] = ["agent": "Fin", "entries": [[
+                "id": ledgerID, "agentId": daemonAgentID.uuidString, "kind": "episodic",
+                "title": "old", "content": "old", "tags": "", "originDevice8": otherDevice,
+                "createdAt": "2026-09-12T12:00:00Z", "updatedAt": "2026-09-12T12:00:00Z",
+            ], [
+                "id": "m-\(UUID().uuidString)", "agentId": daemonAgentID.uuidString, "kind": "episodic",
+                "title": "new", "content": "new", "tags": "", "originDevice8": otherDevice,
+                "createdAt": "2026-09-12T13:00:00Z", "updatedAt": "2026-09-12T13:00:00Z",
+            ]]]
+            let data = try JSONSerialization.data(withJSONObject: responseBody)
+            service.transport = { request in
+                (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            }
+            await service.sync(agentID: localAgentID, agentName: "Fin")
+            let rows = try context.fetch(FetchDescriptor<AgentMemory>())
+            XCTAssertEqual(rows.count, 2)
+            XCTAssertTrue(rows.allSatisfy { $0.agentID == localAgentID }, "every pulled row belongs to the local agent")
+        }
+    }
+
     @MainActor
     func testPullSkipsEntriesAuthoredByThisDevice() async throws {
         try await withControlPlaneConfigured {
