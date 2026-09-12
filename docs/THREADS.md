@@ -137,6 +137,13 @@ Regression tests on both.
 
 ## 7. Delivery order
 
+**Status 2026-09-12 (evening): all four steps shipped.** Control plane 4ceeb1e +
+answered-ack proposals; daemon 1.6.4 (7967c36); app + tvOS 0833c4d, on
+TestFlight for all four platforms. Live check: a pane-relay request produced a
+thread with six events (queued → claimed → applied → assigned → answered →
+relay.read) and participants `user`, the iMac, and `main:2.0`; every line of
+the turn carried `thread_id` and the read_session line carried `target`.
+
 1. Daemon fix for the reply-text bug + tests (ships with the next TestFlight).
 2. Lambda: `threadId`, events table, routes, notify/transcript hooks, tests,
    deploy (additive, old apps ignore the fields).
