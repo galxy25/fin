@@ -50,9 +50,110 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         persistSignal?(kind, agentID, agentName, Self.signalPreview(of: text))
     }
 
-    /// Install as the notification-center delegate (finApp init).
+    /// Delivers a typed notification reply (`UNTextInputNotificationResponse`) to
+    /// the agent the notification named; returns whether it was accepted. The
+    /// production value is `FinVoiceIntentCore.deliver` with `source: "app"` —
+    /// the same `/messages` path a Siri reply or the in-app composer takes.
+    /// Injectable so the response handling is testable without a control plane.
+    var replyDeliverer: (_ agentID: UUID, _ agentName: String, _ text: String) async -> Bool = { agentID, agentName, text in
+        await FinVoiceIntentCore.deliver(agentID: agentID, agentName: agentName, text: text, source: "app").delivered
+    }
+
+    /// Install as the notification-center delegate (finApp init) and register
+    /// the message-style categories (`fin.reply` / `fin.input`) whose text-input
+    /// actions put a Reply / Answer field on every Fin notification — remote
+    /// pushes carry the category from the control plane, local banners set it
+    /// here; both resolve against this one registration.
     func install() {
-        UNUserNotificationCenter.current().delegate = self
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.setNotificationCategories(Self.notificationCategories)
+    }
+
+    /// The two communication categories, each with exactly one text-input
+    /// action (design §3.3: "a `UNNotificationCategory("fin.reply")` with a
+    /// `UNTextInputNotificationAction`"). Pure — asserted by
+    /// `CommunicationNotificationTests`.
+    nonisolated static var notificationCategories: Set<UNNotificationCategory> {
+        let reply = UNTextInputNotificationAction(
+            identifier: FinCommunicationNotification.replyActionIdentifier,
+            title: "Reply",
+            options: [],
+            textInputButtonTitle: "Send",
+            textInputPlaceholder: "Message"
+        )
+        let answer = UNTextInputNotificationAction(
+            identifier: FinCommunicationNotification.inputActionIdentifier,
+            title: "Answer",
+            options: [],
+            textInputButtonTitle: "Send",
+            textInputPlaceholder: "Your answer"
+        )
+        return [
+            UNNotificationCategory(
+                identifier: FinCommunicationNotification.replyCategory,
+                actions: [reply], intentIdentifiers: ["INSendMessageIntent"], options: []
+            ),
+            UNNotificationCategory(
+                identifier: FinCommunicationNotification.inputCategory,
+                actions: [answer], intentIdentifiers: ["INSendMessageIntent"], options: []
+            ),
+        ]
+    }
+
+    // MARK: - Foreground dedupe of control-plane reply pushes
+
+    /// Message ids of turns THIS device hosted and acked as answered
+    /// (`AppSiteClient.beat`). The control plane pushes a `fin.reply` to every
+    /// device on that ack, this one included; `willPresent` drops the echo. A
+    /// small ring — the window only needs to cover the seconds between the ack
+    /// and its push arriving.
+    private(set) var recentlySurfacedMessageIDs: [String] = []
+    static let recentlySurfacedLimit = 64
+
+    func markSurfacedLocally(messageID: String) {
+        guard !messageID.isEmpty else { return }
+        recentlySurfacedMessageIDs.removeAll { $0 == messageID }
+        recentlySurfacedMessageIDs.append(messageID)
+        if recentlySurfacedMessageIDs.count > Self.recentlySurfacedLimit {
+            recentlySurfacedMessageIDs.removeFirst(recentlySurfacedMessageIDs.count - Self.recentlySurfacedLimit)
+        }
+    }
+
+    /// A foregrounded app hides a `fin.reply` push whose `messageId` names a turn
+    /// it already surfaced itself; every other notification presents. Only the
+    /// reply category — a `fin.input` for a question this device is parked on
+    /// is still worth a banner, and attention/update pushes carry no message id.
+    nonisolated static func shouldSuppressForeground(
+        category: String, userInfo: [AnyHashable: Any], surfacedMessageIDs: [String]
+    ) -> Bool {
+        guard category == FinCommunicationNotification.replyCategory,
+              let messageID = FinCommunicationNotification.Payload.parse(userInfo)?.messageID
+        else { return false }
+        return surfacedMessageIDs.contains(messageID)
+    }
+
+    /// Builds one message-style local banner: category set, payload carrying the
+    /// agent name so a typed reply can be addressed, and the same
+    /// `INSendMessageIntent` donation the extension performs on a remote push
+    /// (so app-hosted and remote replies look identical). The donation degrades
+    /// to the plain content when the entitlement is missing or the update throws.
+    private func communicationRequest(
+        identifier: String, category: String, kind: String,
+        agentName: String, body: String, agentID: UUID
+    ) -> UNNotificationRequest {
+        let name = agentName.isEmpty ? "Agent" : agentName
+        let content = UNMutableNotificationContent()
+        content.title = name
+        content.body = Self.preview(of: body)
+        content.sound = .default
+        content.categoryIdentifier = category
+        content.threadIdentifier = agentID.uuidString
+        content.userInfo = FinCommunicationNotification.Payload.userInfo(kind: kind, agentID: agentID, agentName: name)
+        let decorated = (try? FinCommunicationNotification.communicationContent(
+            from: content, agentName: name, agentID: agentID
+        )) ?? content
+        return UNNotificationRequest(identifier: identifier, content: decorated, trigger: nil)
     }
 
     /// Ask once, at the moment it first matters: a prompt was just submitted, so a
@@ -72,18 +173,15 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         recordSignal(.turnFinished, agentID: agentID, agentName: agentName, text: reply)
         guard !isAppActive else { return }
 
-        let content = UNMutableNotificationContent()
-        content.title = agentName.isEmpty ? "Agent" : agentName
-        content.body = Self.preview(of: reply)
-        content.sound = .default
-        // Mirrors PocketDJ's namespaced payload so a tap can route to the right
-        // conversation once deep-linking is wired.
-        content.userInfo = ["fin": ["kind": "agentReply", "agentID": agentID.uuidString]]
-
-        let request = UNNotificationRequest(
+        // A message from "Fin": fin.reply category (Reply field) + the same
+        // INSendMessageIntent donation a control-plane push gets in fin-nse, so
+        // Announce reads an app-hosted reply aloud exactly like a remote one.
+        // The "fin" payload mirrors PocketDJ's namespaced shape so a tap routes
+        // to the right conversation.
+        let request = communicationRequest(
             identifier: "agent-reply-\(agentID.uuidString)",
-            content: content,
-            trigger: nil
+            category: FinCommunicationNotification.replyCategory, kind: "agentReply",
+            agentName: agentName, body: reply, agentID: agentID
         )
         UNUserNotificationCenter.current().add(request)
     }
@@ -94,16 +192,11 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         recordSignal(.inputRequested, agentID: agentID, agentName: agentName, text: question)
         guard !isAppActive else { return }
 
-        let content = UNMutableNotificationContent()
-        content.title = agentName.isEmpty ? "Agent" : agentName
-        content.body = Self.preview(of: question)
-        content.sound = .default
-        content.userInfo = ["fin": ["kind": "agentInput", "agentID": agentID.uuidString]]
-
-        let request = UNNotificationRequest(
+        // fin.input: an Answer field, and the same message-style donation.
+        let request = communicationRequest(
             identifier: "agent-input-\(agentID.uuidString)",
-            content: content,
-            trigger: nil
+            category: FinCommunicationNotification.inputCategory, kind: "agentInput",
+            agentName: agentName, body: question, agentID: agentID
         )
         UNUserNotificationCenter.current().add(request)
     }
@@ -260,30 +353,61 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
     /// resume thread. Live TestFlight crash: SIGABRT in UIApplication's snapshot
     /// assertion every time a notification was tapped (symbolicated to the didReceive
     /// closure). Isolation here makes UIKit's completion run on the main thread.
+    ///
+    /// One exception: a control-plane `fin.reply` push about a turn THIS device
+    /// hosted and already showed (`markSurfacedLocally`) is dropped — the user is
+    /// looking at that very reply.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.banner, .list, .sound]
+        let content = notification.request.content
+        if Self.shouldSuppressForeground(
+            category: content.categoryIdentifier, userInfo: content.userInfo,
+            surfacedMessageIDs: recentlySurfacedMessageIDs
+        ) {
+            return []
+        }
+        return [.banner, .list, .sound]
+    }
+
+    /// A parsed "fin" payload with the one field every consumer needs — the
+    /// agent id — guaranteed present. `agentName` / `messageID` ride along for
+    /// typed replies and reply-push dedupe; see
+    /// `FinCommunicationNotification.Payload` for the wire shape.
+    struct FinPayload: Equatable {
+        var agentID: UUID
+        var originDeviceID8: String?
+        var agentName: String?
+        var messageID: String?
     }
 
     /// Parses a "fin" notification payload — `{"agentID": "<uuid>",
-    /// "originDeviceID8"?: "<8 hex>"}` — used by both a local (on-device)
-    /// banner's `userInfo` and a daemon-originated `/notify` push's APNs
-    /// payload (`lambda.py`'s `notify`). `originDeviceID8` is absent for a
-    /// local banner (minted by THIS device, so the origin is local by
-    /// construction) and present for a daemon push (the daemon isn't the
-    /// receiving device, so it must say so explicitly) — the caller decides
-    /// what an absent origin means, this just reports what the payload said.
-    nonisolated static func parseFinPayload(
-        _ userInfo: [AnyHashable: Any]
-    ) -> (agentID: UUID, originDeviceID8: String?)? {
-        guard let fin = userInfo["fin"] as? [String: Any],
-              let idString = fin["agentID"] as? String,
-              let agentID = UUID(uuidString: idString)
+    /// "originDeviceID8"?: "<8 hex>", "agentName"?, "messageId"?}` — used by
+    /// both a local (on-device) banner's `userInfo` and a control-plane push's
+    /// APNs payload (`lambda.py`). `originDeviceID8` is absent for a local
+    /// banner (minted by THIS device, so the origin is local by construction)
+    /// and present for a daemon push (the daemon isn't the receiving device, so
+    /// it must say so explicitly) — the caller decides what an absent origin
+    /// means, this just reports what the payload said. nil without a parseable
+    /// agent id.
+    nonisolated static func parseFinPayload(_ userInfo: [AnyHashable: Any]) -> FinPayload? {
+        guard let payload = FinCommunicationNotification.Payload.parse(userInfo),
+              let agentID = payload.agentID
         else { return nil }
-        let origin = fin["originDeviceID8"] as? String
-        return (agentID, origin?.isEmpty == false ? origin : nil)
+        return FinPayload(
+            agentID: agentID, originDeviceID8: payload.originDeviceID8,
+            agentName: payload.agentName, messageID: payload.messageID
+        )
+    }
+
+    /// Where a typed notification reply goes: the agent the payload names, by id
+    /// AND name (the control plane addresses messages by name; the legacy inbox
+    /// by id). nil when either is missing — a reply must never be guessed onto
+    /// the wrong agent. Pure.
+    nonisolated static func replyTarget(from userInfo: [AnyHashable: Any]) -> (agentID: UUID, agentName: String)? {
+        guard let payload = parseFinPayload(userInfo), let name = payload.agentName else { return nil }
+        return (payload.agentID, name)
     }
 
     /// A tap deep-links to the agent named in the payload — either a "fin"
@@ -293,15 +417,52 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
     /// `AgentSignalSubscriber`). A "fin" payload with no origin field means a
     /// local banner: minted by THIS device, so the origin is the local device
     /// by construction.
+    ///
+    /// A reply typed into the notification's text field (`fin.reply` / `fin.input`
+    /// actions) is delivered instead of deep-linked: it goes to the named agent
+    /// through `replyDeliverer` (`/messages`, `source: "app"`), and the app is
+    /// not opened — that is the point of replying from the Lock Screen, Watch,
+    /// or Notification Center.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
         let userInfo = response.notification.request.content.userInfo
+        if let typed = response as? UNTextInputNotificationResponse {
+            await handleTypedReply(typed.userText, userInfo: userInfo)
+            return
+        }
         if let parsed = Self.parseFinPayload(userInfo) {
             onOpenAgent?(parsed.agentID, parsed.originDeviceID8 ?? DeviceIdentity.short)
         } else if let target = AgentSignalSubscriber.openTarget(fromPushUserInfo: userInfo) {
             onOpenAgent?(target.agentID, target.originDeviceID8)
         }
+    }
+
+    /// Delivers a typed reply, or — when it can't be addressed or the send
+    /// fails — says so with a plain local banner rather than silently eating
+    /// the user's words. Returns whether delivery was attempted and succeeded.
+    @discardableResult
+    func handleTypedReply(_ text: String, userInfo: [AnyHashable: Any]) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard let target = Self.replyTarget(from: userInfo) else {
+            postReplyFailure(agentName: nil)
+            return false
+        }
+        let delivered = await replyDeliverer(target.agentID, target.agentName, trimmed)
+        if !delivered { postReplyFailure(agentName: target.agentName) }
+        return delivered
+    }
+
+    private func postReplyFailure(agentName: String?) {
+        let content = UNMutableNotificationContent()
+        content.title = "Reply not sent"
+        content.body = agentName.map { "Couldn't reach \($0) — open Fin and try again." }
+            ?? "Couldn't tell which agent to reply to — open Fin and try again."
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "agent-reply-failed", content: content, trigger: nil)
+        )
     }
 }

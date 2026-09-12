@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Privacy manifest for the fin app bundle (iOS / macOS / visionOS).
+	     Fin does no tracking and contacts no tracking domains. The required-reason
+	     APIs below are the ones the app itself calls; SPM dependencies carry
+	     their own manifests where they need one. -->
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<!-- Collected data types are declared in App Store Connect's privacy label;
+	     nothing collected by the app is linked to identity for tracking. -->
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<!-- UserDefaults: device-local settings (site id, cloud config,
+			     feedback gate, theme). Reason CA92.1 — accessed only from this
+			     app's own bundle, never shared across apps. -->
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+		<dict>
+			<!-- File attributes (AgentLogMirror / AgentMirrorReader read the size
+			     of the app's own iCloud-container mirror files). Reason C617.1 —
+			     files inside the app's own container only. -->
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C617.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

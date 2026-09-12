@@ -46,6 +46,12 @@ targets:
         product: NIO
       - package: SwiftCrypto
         product: Crypto
+      # Notification Service Extension (docs/CARPLAY-IMESSAGE-DESIGN.md §3.3):
+      # turns a control-plane push into a communication notification so Siri
+      # announces Fin's replies in the car. Embedded in the app bundle on every
+      # destination of this target; fin-tv deliberately has no such dependency.
+      - target: fin-nse
+        embed: true
     info:
       path: Generated/Info.plist
       properties:
@@ -108,6 +114,14 @@ targets:
         FinDirectiveURL: "$(FIN_DIRECTIVE_URL)"
         FinStatusURL: "$(FIN_STATUS_URL)"
         FinAutoSession: "$(FIN_AUTO_SESSION)"
+        # SiriKit in-app intent handling (design §5.2): this is what Xcode's
+        # "Supported Intents" section writes for an APP target, and it is what
+        # lets Announce Notifications' spoken reply reach
+        # FinAppDelegate.application(_:handlerFor:) → FinMessageIntentHandler.
+        # INIntentsSupported is the Intents-EXTENSION key and is deliberately
+        # not declared — there is no Intents extension.
+        NSUserActivityTypes:
+          - INSendMessageIntent
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin
@@ -128,6 +142,46 @@ targets:
         FIN_DIRECTIVE_URL: ""
         FIN_STATUS_URL: ""
         FIN_AUTO_SESSION: ""
+  fin-nse:
+    # Notification Service Extension — docs/CARPLAY-IMESSAGE-DESIGN.md §3.3 step 3
+    # and §5.1. A push carrying `fin.agentName` with category fin.reply / fin.input
+    # is rewritten into a communication notification (INSendMessageIntent donation
+    # with an INPerson "Fin" sender), which is what makes Siri read it aloud in
+    # CarPlay / on AirPods and offer a spoken reply. Same three destinations as
+    # the app; embedded by the fin target's dependency above. tvOS never gets it.
+    type: app-extension
+    supportedDestinations: [iOS, macOS, visionOS]
+    sources:
+      - path: fin-nse
+      # The intent-building/payload-parsing half is shared verbatim with the app
+      # (the app's local banners perform the identical donation, so app-hosted
+      # and remote replies look the same). Pure Foundation/Intents/UserNotifications
+      # — it must never import anything from the app module.
+      - path: fin/Notifications
+    info:
+      path: Generated/Info-nse.plist
+      properties:
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleDisplayName: "Fin Notifications"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).NotificationService"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin.nse
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: EC27UF79GL
+        # Version numbers must match the containing app's (App Store validation).
+        MARKETING_VERSION: "1.0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: "YES"
+        # Communication Notifications entitlement; the macOS variant adds the App
+        # Sandbox the Mac App Store requires of every embedded extension.
+        CODE_SIGN_ENTITLEMENTS: fin/fin-nse.entitlements
+        "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": fin/fin-nse-macOS.entitlements
   fin-tv:
     type: application
     platform: tvOS

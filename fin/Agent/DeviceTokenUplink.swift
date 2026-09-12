@@ -34,6 +34,7 @@ enum DeviceTokenUplink {
             tokenHex: hex(deviceToken),
             platform: platform,
             deviceName: deviceName,
+            deviceID8: DeviceIdentity.short,
             endpoint: CloudControlPlaneConfig.endpointURL,
             bearer: CloudControlPlaneConfig.token
         ) else {
@@ -61,12 +62,17 @@ enum DeviceTokenUplink {
         data.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// The `/device-tokens` contract: `{"token", "platform", "deviceName"?}`.
-    /// `deviceName` is omitted when blank rather than sent empty.
+    /// The `/device-tokens` contract: `{"token", "platform", "deviceName"?,
+    /// "deviceId8"?}`. `deviceName` is omitted when blank rather than sent
+    /// empty. `deviceId8` is this device's `DeviceIdentity.short` — the same
+    /// value `AppSiteClient` puts in `originDeviceID8` when it acks a turn it
+    /// hosted as answered, which is how the control plane knows to leave THIS
+    /// device's tokens out of that reply's fan-out (design §3.7.3).
     static func request(
         tokenHex: String,
         platform: String,
         deviceName: String?,
+        deviceID8: String = "",
         endpoint: String,
         bearer: String
     ) -> URLRequest? {
@@ -76,6 +82,7 @@ enum DeviceTokenUplink {
         var object: [String: Any] = ["token": tokenHex, "platform": platform]
         let trimmedName = deviceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !trimmedName.isEmpty { object["deviceName"] = trimmedName }
+        if !deviceID8.isEmpty { object["deviceId8"] = deviceID8 }
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
         request.setValue("Bearer \(bearer)", forHTTPHeaderField: "authorization")

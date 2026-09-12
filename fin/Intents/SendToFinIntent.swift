@@ -32,10 +32,15 @@ enum FinVoiceIntentCore {
     /// Delivery: `POST /messages` when a control plane is configured (the row is
     /// what `AskFinIntent` polls for `answered`), else the legacy presigned
     /// inbox append. Returns the control-plane message id when there is one.
-    static func deliver(agentID: UUID, agentName: String, text: String) async -> (delivered: Bool, messageID: String?) {
+    /// `source` is the control plane's provenance tag: `"voice"` for anything
+    /// Siri dictated (the App Intents, an Announce reply in the car), `"app"`
+    /// for a reply typed into a notification's text field.
+    static func deliver(
+        agentID: UUID, agentName: String, text: String, source: String = "voice"
+    ) async -> (delivered: Bool, messageID: String?) {
         if CloudControlPlaneConfig.isConfigured {
             let id = ControlPlaneClient.newMessageID()
-            let context = ControlPlaneClient.MessageContext(source: "voice")
+            let context = ControlPlaneClient.MessageContext(source: source)
             switch await ControlPlaneClient.sendMessage(agent: agentName, text: text, messageID: id, context: context) {
             case .success: return (true, id)
             case .failure: return (false, nil)
@@ -48,8 +53,12 @@ enum FinVoiceIntentCore {
     /// Validates the dictated text and resolves the delivery target once, for
     /// whichever intent asked. Returns plain value types (never the `@Model`
     /// itself) so a caller can hop off the main actor to poll S3 afterward.
+    /// `preferringAgent`: a name or agent-id string an explicit recipient named
+    /// (a SiriKit `INSendMessageIntent`'s recipient, a notification reply's
+    /// payload); when it matches one of the user's agents that agent wins,
+    /// otherwise the default rule below applies unchanged.
     @MainActor
-    static func prepare(message: String, container: ModelContainer?) -> Prepared {
+    static func prepare(message: String, container: ModelContainer?, preferringAgent requested: String? = nil) -> Prepared {
         guard let container else {
             return .failure("Fin isn't ready yet — open the app once and try again.")
         }
@@ -60,10 +69,26 @@ enum FinVoiceIntentCore {
         guard trimmed.count <= CloudAgentChannel.maxTextLength else {
             return .failure("That message is too long to send.")
         }
-        // Target resolution. With a control plane configured, the user talks to
-        // Fin — one name, one conversation — whatever body happens to be up, so
-        // hosting mode is not a filter (docs/SITES.md §4 "Voice"). Without one,
-        // the legacy rule: the cloud-hosted agent, preferring one named "Fin".
+        let candidates = candidateAgents(container: container)
+        guard let index = requestedTargetIndex(agents: candidates, requested: requested)
+                ?? preferredTargetIndex(cloudAgentNames: candidates.map(\.name)) else {
+            return .failure(CloudControlPlaneConfig.isConfigured
+                ? "No agent is set up yet. Open Fin and add one first."
+                : "No cloud-hosted agent is set up. In Fin, set an agent's hosting to Fin's sites first.")
+        }
+        let agent = candidates[index]
+        return .ready(agentID: agent.id, agentName: agent.name, text: trimmed)
+    }
+
+    /// The agents a voice message can be addressed to, as plain `(id, name)`
+    /// values. With a control plane configured, the user talks to Fin — one
+    /// name, one conversation — whatever body happens to be up, so hosting mode
+    /// is not a filter (docs/SITES.md §4 "Voice"). Without one, the legacy rule:
+    /// the cloud-hosted agents only. Shared by `prepare` and the SiriKit
+    /// handler's recipient resolution so the two can't disagree.
+    @MainActor
+    static func candidateAgents(container: ModelContainer?) -> [(id: UUID, name: String)] {
+        guard let container else { return [] }
         let candidates: [Agent]
         if CloudControlPlaneConfig.isConfigured {
             candidates = (try? container.mainContext.fetch(FetchDescriptor<Agent>())) ?? []
@@ -74,13 +99,7 @@ enum FinVoiceIntentCore {
             )
             candidates = (try? container.mainContext.fetch(descriptor)) ?? []
         }
-        guard let index = preferredTargetIndex(cloudAgentNames: candidates.map(\.name)) else {
-            return .failure(CloudControlPlaneConfig.isConfigured
-                ? "No agent is set up yet. Open Fin and add one first."
-                : "No cloud-hosted agent is set up. In Fin, set an agent's hosting to Fin's sites first.")
-        }
-        let agent = candidates[index]
-        return .ready(agentID: agent.id, agentName: agent.name, text: trimmed)
+        return candidates.map { (id: $0.id, name: $0.name) }
     }
 
     /// Which cloud agent wins delivery: the one literally named "Fin" if present,
@@ -93,6 +112,21 @@ enum FinVoiceIntentCore {
             return exact
         }
         return cloudAgentNames.isEmpty ? nil : 0
+    }
+
+    /// An EXPLICIT target: the agent whose id string or name matches what the
+    /// caller named (case-insensitive; an announced notification's sender
+    /// carries the agent id as its `customIdentifier`, a Siri "send a message
+    /// to Ops using Fin" carries a name). nil when nothing was requested or
+    /// nothing matches — the caller then falls back to `preferredTargetIndex`,
+    /// so a mis-heard name still reaches Fin rather than failing. Pure.
+    static func requestedTargetIndex(agents: [(id: UUID, name: String)], requested: String?) -> Int? {
+        guard let requested = requested?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !requested.isEmpty else { return nil }
+        if let byID = agents.firstIndex(where: { $0.id.uuidString.caseInsensitiveCompare(requested) == .orderedSame }) {
+            return byID
+        }
+        return agents.firstIndex(where: { $0.name.caseInsensitiveCompare(requested) == .orderedSame })
     }
 
     /// The newest assistant line in `transcript` that wasn't already present in

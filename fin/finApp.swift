@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import Intents
 #if os(macOS)
 import AppKit
 #else
@@ -18,7 +19,21 @@ import UIKit
 /// rotate; the control plane dedupes), which is how the headless fin-agentd
 /// daemon gets a push path to this device. Registration failure is normal on
 /// simulators and boxes without push entitlements, so it stays silent.
-final class FinAppDelegate: NSObject {}
+///
+/// Its second job is SiriKit: `application(_:handlerFor:)` routes every
+/// `INSendMessageIntent` — Announce Notifications' spoken reply to a Fin
+/// communication notification in the car, or "send a message to Fin using Fin"
+/// — to `FinMessageIntentHandler`, in-process (no Intents extension; the
+/// Info.plist's `NSUserActivityTypes` declares the intent, see project.yml).
+final class FinAppDelegate: NSObject {
+    private let messageIntentHandler = FinMessageIntentHandler()
+
+    /// nil for any intent that isn't ours, which tells the system there is no
+    /// in-app handler for it.
+    fileprivate func handler(for intent: INIntent) -> Any? {
+        intent is INSendMessageIntent ? messageIntentHandler : nil
+    }
+}
 
 #if os(macOS)
 extension FinAppDelegate: NSApplicationDelegate {
@@ -31,6 +46,10 @@ extension FinAppDelegate: NSApplicationDelegate {
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
         DeviceTokenUplink.register(deviceToken: deviceToken)
+    }
+
+    func application(_ application: NSApplication, handlerFor intent: INIntent) -> Any? {
+        handler(for: intent)
     }
 }
 #else
@@ -48,6 +67,10 @@ extension FinAppDelegate: UIApplicationDelegate {
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
         DeviceTokenUplink.register(deviceToken: deviceToken)
+    }
+
+    func application(_ application: UIApplication, handlerFor intent: INIntent) -> Any? {
+        handler(for: intent)
     }
 }
 #endif
