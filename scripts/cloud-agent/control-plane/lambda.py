@@ -3875,6 +3875,7 @@ def _public_vault_entry(document):
         "keyType": document.get("keyType") or "",
         "ciphertext": document.get("ciphertext") or "",
         "updatedAt": document.get("updatedAt"),
+        "vaultKeyFingerprint": document.get("vaultKeyFingerprint") or None,
     }
 
 
@@ -3924,12 +3925,16 @@ def put_vault_key(event, key_id):
         base64.b64decode(ciphertext, validate=True)
     except (ValueError, binascii.Error):
         raise ApiError(400, "ciphertext must be base64")
+    fingerprint = body.get("vaultKeyFingerprint")
+    if fingerprint is not None and not (isinstance(fingerprint, str) and re.match(r"^[0-9a-f]{1,32}$", fingerprint)):
+        raise ApiError(400, "vaultKeyFingerprint must be a short hex digest")
     document = {
         "keyId": key_id,
         "name": name.strip()[:120],
         "keyType": key_type,
         "ciphertext": ciphertext,
         "updatedAt": _iso(_now()),
+        "vaultKeyFingerprint": fingerprint,
     }
     S3.put_object(
         Bucket=BUCKET, Key=VAULT_KEY.format(user=event["_userId"], keyId=key_id),

@@ -25,6 +25,19 @@ enum KeyVault {
     /// same slot the iPhone wrote.
     static let endpointURLKey = "fin.cloudcp.endpointURL"
 
+    /// iCloud Key-Value Storage mirror of the account's vault key (base64).
+    /// The CloudKit record (`RemoteInputPairing`) stays the source of truth for
+    /// sealing devices; the mirror exists because a device that only OPENS
+    /// entries may hold a stale or partial view of the CloudKit records, while
+    /// KVS delivers in seconds. Same trust level as the record it mirrors: the
+    /// user's iCloud, never the control plane.
+    static let vaultKeyMirrorKey = "fin.vault.key"
+
+    /// Short digest of a vault key for watermarks and diagnostics — never the key.
+    static func fingerprint(_ vaultKey: Data) -> String {
+        String(SHA256.hash(data: vaultKey).compactMap { String(format: "%02x", $0) }.joined().prefix(16))
+    }
+
     /// Domain separation for the HKDF derivation; bump with the wire format.
     static let hkdfInfo = "fin-key-vault-v1"
 
@@ -34,6 +47,9 @@ enum KeyVault {
         var keyType: String
         var ciphertext: String
         var updatedAt: String?
+        /// `KeyVault.fingerprint` of the vault key that sealed this entry, so an
+        /// opener can say which key it lacks instead of "couldn't open".
+        var vaultKeyFingerprint: String?
     }
 
     /// What one sealed entry holds. The passphrase rides alongside the PEM so an
@@ -149,11 +165,10 @@ struct KeyVaultClient {
         return try JSONDecoder().decode(Envelope.self, from: data).keys
     }
 
-    func put(keyID: UUID, name: String, keyType: String, ciphertext: String) async throws {
-        _ = try await send(try request(
-            "PUT", path: "/vault/keys/\(keyID.uuidString)",
-            body: ["name": name, "keyType": keyType, "ciphertext": ciphertext]
-        ))
+    func put(keyID: UUID, name: String, keyType: String, ciphertext: String, vaultKeyFingerprint: String? = nil) async throws {
+        var body: [String: Any] = ["name": name, "keyType": keyType, "ciphertext": ciphertext]
+        if let vaultKeyFingerprint { body["vaultKeyFingerprint"] = vaultKeyFingerprint }
+        _ = try await send(try request("PUT", path: "/vault/keys/\(keyID.uuidString)", body: body))
     }
 
     func delete(keyID: UUID) async throws {

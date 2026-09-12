@@ -27,6 +27,10 @@ final class TVCloudAccount: ObservableObject {
     /// vault key that lost the CloudKit mint race; the sealing device re-seals
     /// on its next launch (`KeyVaultSync.fingerprint`).
     @Published private(set) var keysUnopenable = 0
+    /// Diagnostic for the unopenable case: which key fingerprints sealed the
+    /// entries this TV could not open, and which fingerprints this TV holds.
+    @Published private(set) var missingFingerprints: [String] = []
+    @Published private(set) var heldFingerprints: [String] = []
     @Published private(set) var lastSyncAt: Date?
 
     static let sessionTokenKey = "fin.cloudcp.session-token"
@@ -105,19 +109,24 @@ final class TVCloudAccount: ObservableObject {
     /// `DeviceVaultKeyStore`) — that device re-seals on its next launch.
     func syncVault() async {
         phase = .syncing
-        guard let vaultKey = DeviceVaultKeyStore.existing(context: context) else {
+        let vaultKeys = DeviceVaultKeyStore.candidates(context: context)
+        guard !vaultKeys.isEmpty else {
             phase = .failed("Waiting for iCloud to deliver this account's vault key. Open Fin on your iPhone or Mac once, then Sync now.")
             return
         }
+        heldFingerprints = vaultKeys.map(KeyVault.fingerprint)
         let client = KeyVaultClient(endpoint: endpoint, token: sessionToken)
         do {
             let entries = try await client.list()
             var installed = 0, unopenable = 0
+            var missing = Set<String>()
             for entry in entries {
                 guard let keyID = UUID(uuidString: entry.keyId),
                       let keyType = SSHKeyType(rawValue: entry.keyType) else { continue }
-                guard let secret = try? KeyVault.open(entry.ciphertext, keyID: keyID, vaultKey: vaultKey) else {
+                let opened = vaultKeys.lazy.compactMap { try? KeyVault.open(entry.ciphertext, keyID: keyID, vaultKey: $0) }.first
+                guard let secret = opened else {
                     unopenable += 1
+                    missing.insert(entry.vaultKeyFingerprint ?? "unknown")
                     continue
                 }
                 do {
@@ -139,6 +148,7 @@ final class TVCloudAccount: ObservableObject {
             }
             keysInstalled = installed
             keysUnopenable = unopenable
+            missingFingerprints = missing.sorted()
             lastSyncAt = Date()
             phase = .ready
         } catch KeyVaultClient.ClientError.http(let status, _) where status == 401 {
@@ -203,6 +213,9 @@ struct TVAccountSection: View {
                     Label("\(account.keysUnopenable) key\(account.keysUnopenable == 1 ? "" : "s") in your account couldn't be opened here yet — open Fin on your iPhone or Mac once, then Sync now.",
                           systemImage: "key.slash")
                         .foregroundStyle(.orange)
+                    Text("Sealed with vault key \(account.missingFingerprints.joined(separator: ", ")); this TV holds \(account.heldFingerprints.isEmpty ? "none" : account.heldFingerprints.joined(separator: ", ")).")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 Button("Sync now") { Task { await account.syncVault() } }
             case .failed(let message):

@@ -1,6 +1,5 @@
 import Foundation
 import SwiftData
-import Crypto
 
 /// The keychain-holding side of the key vault (see `KeyVault`): every SSH key
 /// this device can read is sealed with the account's vault key and pushed to
@@ -18,9 +17,7 @@ enum KeyVaultSync {
     /// never the key), so a device whose minted key lost the CloudKit race
     /// re-seals with the winner on its next launch instead of leaving entries
     /// nobody can open.
-    nonisolated static func fingerprint(_ vaultKey: Data) -> String {
-        String(SHA256.hash(data: vaultKey).compactMap { String(format: "%02x", $0) }.joined().prefix(16))
-    }
+    nonisolated static func fingerprint(_ vaultKey: Data) -> String { KeyVault.fingerprint(vaultKey) }
 
     /// Launch-time sweep: anything imported before the vault existed, or pushed
     /// while the control plane was unconfigured, goes now. Silent on failure —
@@ -33,6 +30,7 @@ enum KeyVaultSync {
     static func pushAll(context: ModelContext, force: Bool = false) async -> (pushed: Int, readable: Int) {
         guard CloudControlPlaneConfig.isConfigured else { return (0, 0) }
         guard let vaultKey = DeviceVaultKeyStore.resolve(context: context, deviceName: "device-" + DeviceIdentity.short) else { return (0, 0) }
+        DeviceVaultKeyStore.mirror(vaultKey)
         let current = fingerprint(vaultKey)
         let keys = (try? context.fetch(FetchDescriptor<KeyMetadata>())) ?? []
         var pushed = 0, readable = 0
@@ -53,6 +51,7 @@ enum KeyVaultSync {
               let pem = String(data: pemData, encoding: .utf8),
               let vaultKey = DeviceVaultKeyStore.resolve(context: context, deviceName: "device-" + DeviceIdentity.short)
         else { return false }
+        DeviceVaultKeyStore.mirror(vaultKey)
         let passphrase = KeychainStore.loadPassphrase(for: metadata.id).flatMap { String(data: $0, encoding: .utf8) }
         do {
             let ciphertext = try KeyVault.seal(
@@ -60,7 +59,8 @@ enum KeyVaultSync {
             )
             var client = KeyVaultClient(endpoint: CloudControlPlaneConfig.endpointURL, token: CloudControlPlaneConfig.token)
             client.transport = transport
-            try await client.put(keyID: metadata.id, name: metadata.name, keyType: metadata.keyType.rawValue, ciphertext: ciphertext)
+            try await client.put(keyID: metadata.id, name: metadata.name, keyType: metadata.keyType.rawValue,
+                                 ciphertext: ciphertext, vaultKeyFingerprint: fingerprint(vaultKey))
             UserDefaults.standard.set(fingerprint(vaultKey), forKey: watermarkKey(metadata.id))
             return true
         } catch {

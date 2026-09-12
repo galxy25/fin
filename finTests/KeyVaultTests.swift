@@ -77,7 +77,7 @@ final class KeyVaultTests: XCTestCase {
 extension KeyVaultTests {
     func testFingerprintIsStableShortAndNotTheKey() {
         let key = Data((0..<32).map { UInt8($0) })
-        let fp = KeyVaultSync.fingerprint(key)
+        let fp = KeyVault.fingerprint(key)
         XCTAssertEqual(fp.count, 16)
         XCTAssertEqual(fp, KeyVaultSync.fingerprint(key))
         var other = key; other[31] ^= 1

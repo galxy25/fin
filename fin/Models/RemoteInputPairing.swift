@@ -41,9 +41,35 @@ enum DeviceVaultKeyStore {
     /// entry unopenable until sync sorted it out.
     @MainActor
     static func existing(context: ModelContext) -> Data? {
+        candidates(context: context).first
+    }
+
+    /// Every vault key this device can see — the CloudKit records in canonical
+    /// order, then the iCloud KVS mirror — for an opener to try in turn. A
+    /// device's CloudKit view can lag or differ from the sealing device's; the
+    /// entries themselves say which key sealed them (`vaultKeyFingerprint`).
+    @MainActor
+    static func candidates(context: ModelContext) -> [Data] {
         let all = (try? context.fetch(FetchDescriptor<RemoteInputPairing>())) ?? []
-        return all.filter { $0.secretData.count == 32 }
-            .min(by: { $0.id.uuidString < $1.id.uuidString })?.secretData
+        var keys = all.filter { $0.secretData.count == 32 }
+            .sorted(by: { $0.id.uuidString < $1.id.uuidString })
+            .map(\.secretData)
+        if let mirrored = NSUbiquitousKeyValueStore.default.string(forKey: KeyVault.vaultKeyMirrorKey),
+           let data = Data(base64Encoded: mirrored), data.count == 32, !keys.contains(data) {
+            keys.append(data)
+        }
+        return keys
+    }
+
+    /// Sealing devices call this after `resolve`: the canonical key rides KVS as
+    /// well, so openers converge in seconds rather than at CloudKit's pace.
+    static func mirror(_ vaultKey: Data) {
+        let store = NSUbiquitousKeyValueStore.default
+        let encoded = vaultKey.base64EncodedString()
+        if store.string(forKey: KeyVault.vaultKeyMirrorKey) != encoded {
+            store.set(encoded, forKey: KeyVault.vaultKeyMirrorKey)
+            store.synchronize()
+        }
     }
 
     /// Returns the canonical vault key, minting one if none exists yet.

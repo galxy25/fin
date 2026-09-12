@@ -1425,6 +1425,11 @@ class KeyVaultTests(unittest.TestCase):
         self.assertEqual([entry["keyId"] for entry in mine], ["0F0F0F0F-0000-4000-8000-000000000001"])
         self.assertEqual(mine[0]["ciphertext"], base64.b64encode(b"sealed").decode())
         self.assertTrue(mine[0]["updatedAt"])
+        self.assertIsNone(mine[0]["vaultKeyFingerprint"])
+        self._put("user-1", "0f0f0f0f-0000-4000-8000-000000000003", vaultKeyFingerprint="ab12cd34ab12cd34")
+        self.assertEqual(self._list("user-1")[-1]["vaultKeyFingerprint"], "ab12cd34ab12cd34")
+        with self.assertRaises(lam.ApiError):
+            self._put("user-1", "0f0f0f0f-0000-4000-8000-000000000004", vaultKeyFingerprint="not hex!")
         self.assertEqual([entry["name"] for entry in self._list("user-2")], ["tv"])
 
     def test_delete_is_idempotent_and_scoped(self):
