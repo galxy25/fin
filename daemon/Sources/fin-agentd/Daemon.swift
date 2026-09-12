@@ -298,6 +298,11 @@ final class Daemon {
     /// True from submit to outcome. Read by the site heartbeat from its own task, so
     /// a long turn reports `working` instead of going silent.
     private var isTurnInFlight = false
+    /// The heartbeat turn in flight, if the current turn is one — cancellable, so
+    /// a message claimed mid-beat preempts it (the engine returns .failed("Cancelled.")
+    /// at its next checkpoint, and the run loop treats that as "preempted", not a
+    /// failure). User and directive turns are never cancelled.
+    private var heartbeatTurnTask: Task<AgentTurnOutcome, Never>?
     /// The last titled-pane scan the heartbeat sent, for the memory compactor.
     private var lastPaneObservations: [String] = []
     /// The heartbeat's capabilities, rescanned at most every `capabilitiesScanInterval`:
@@ -1225,6 +1230,11 @@ final class Daemon {
                         }
                     }
                 )
+                await client.setClaimHandler { @MainActor [weak self] in
+                    guard let self, let task = self.heartbeatTurnTask else { return }
+                    self.log("[site] preempting the heartbeat turn for a claimed message")
+                    task.cancel()
+                }
                 await client.setURLHandler { @MainActor [weak self] urls in
                     self?.supervision?.updateURLs(
                         directiveURL: urls["supervisionDirectiveGet"], statusURL: urls["supervisionStatusPut"]
@@ -1308,6 +1318,11 @@ final class Daemon {
                         record(AgentAuditEvent(kind: "notice", text: line))
                     }
                 }
+            case .failed(let message) where message == "Cancelled.":
+                // A heartbeat preempted for a claimed message: not a failure, and the
+                // wait loop below pops that message first.
+                lastTurnAt = Date()
+                log("heartbeat turn preempted")
             case .failed(let message):
                 consecutiveFailures += 1
                 lastTurnAt = Date()
@@ -1446,9 +1461,11 @@ final class Daemon {
             inFlightDirectiveID = nil
             pendingUserMessageForDigest = nil
             isTurnInFlight = true
-            outcome = await engine.submit(
-                Self.composedHeartbeatPrompt(goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath))
-            )
+            let prompt = Self.composedHeartbeatPrompt(goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath))
+            let beatTask = Task { await engine.submit(prompt) }
+            heartbeatTurnTask = beatTask
+            outcome = await beatTask.value
+            heartbeatTurnTask = nil
             isTurnInFlight = false
         }
     }

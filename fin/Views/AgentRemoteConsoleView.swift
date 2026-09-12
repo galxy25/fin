@@ -80,6 +80,12 @@ struct AgentRemoteConsoleView: View {
         var siteName: String?
         var routedBy: String?
         var clarifyCandidates: [String] = []
+        /// True for a row this device learned about from the control plane rather
+        /// than composed itself — a voice message, or one sent from another device.
+        /// Without these, a message you spoke to Fin is invisible everywhere until
+        /// it lands in the transcript, which on a busy body can be minutes.
+        var isRemote = false
+        var source: String?
 
         enum State { case sending, sent, failed, queued, claimed, applied, answered }
     }
@@ -553,7 +559,7 @@ struct AgentRemoteConsoleView: View {
     private func cloudPendingRow(_ message: CloudPendingMessage) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                Text("You").font(.caption2).foregroundStyle(.secondary)
+                Text(message.source == "voice" ? "You (voice)" : "You").font(.caption2).foregroundStyle(.secondary)
                 switch message.state {
                 case .sending:
                     Label("sending…", systemImage: "clock")
@@ -576,7 +582,8 @@ struct AgentRemoteConsoleView: View {
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 case .claimed:
-                    Label(message.siteName.map { "\($0) has it" } ?? "picked up", systemImage: "hand.raised")
+                    Label(message.siteName.map { "\($0) has it — next in line after its current turn" } ?? "picked up",
+                          systemImage: "hand.raised")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 case .applied:
@@ -612,12 +619,12 @@ struct AgentRemoteConsoleView: View {
         return "desktopcomputer"
     }
 
-    /// Refresh presence and poll every pending row that has a control-plane id.
+    /// Refresh presence, poll every pending row that has a control-plane id, and
+    /// surface every OPEN row for this agent the control plane knows about — sent
+    /// from any device, by voice or by hand — as a pending row here too.
     private func refreshPresenceAndPending() async {
         guard usesControlPlane else { return }
         await sites.refresh()
-        let ids = cloudPending.compactMap { $0.messageID }
-        guard !ids.isEmpty else { return }
         guard case .success(let remote) = await ControlPlaneClient.listMessages(agent: agentName) else { return }
         let byID = Dictionary(remote.map { ($0.messageId, $0) }, uniquingKeysWith: { a, _ in a })
         for index in cloudPending.indices {
@@ -627,11 +634,37 @@ struct AgentRemoteConsoleView: View {
             cloudPending[index].routedBy = row.routedBy
             cloudPending[index].clarifyCandidates = row.clarifyCandidates ?? []
         }
+        let known = Set(cloudPending.compactMap { $0.messageID })
+        for row in remote where !known.contains(row.messageId) && Self.isOpen(row) {
+            guard let text = row.text, !text.isEmpty else { continue }
+            let createdAt = row.createdAt ?? Date()
+            // Already in the transcript (applied and mirrored): nothing to show.
+            if Self.relayRowIsMirrored(text: text, createdAt: createdAt, records: records) { continue }
+            var pending = CloudPendingMessage(id: UUID(), text: text, createdAt: createdAt, state: Self.pendingState(for: row))
+            pending.messageID = row.messageId
+            pending.siteName = row.targetSiteName
+            pending.routedBy = row.routedBy
+            pending.clarifyCandidates = row.clarifyCandidates ?? []
+            pending.isRemote = true
+            pending.source = row.source
+            cloudPending.append(pending)
+        }
+        cloudPending.sort { $0.createdAt < $1.createdAt }
         // Answered rows retire once the transcript shows the applied prompt —
         // same handoff as the relay rows; until then "answered" is the state.
         cloudPending.removeAll { message in
             message.state == .answered
                 && Self.relayRowIsMirrored(text: message.text, createdAt: message.createdAt, records: records)
+        }
+    }
+
+    /// A control-plane row that has not been answered yet, or was answered so
+    /// recently the transcript may not show it — worth a pending row.
+    static func isOpen(_ row: ControlPlaneClient.Message, now: Date = Date()) -> Bool {
+        switch row.state {
+        case "queued", "claimed", "applied": return true
+        case "answered": return (row.answeredAt.map { now.timeIntervalSince($0) } ?? .infinity) < 120
+        default: return false
         }
     }
 

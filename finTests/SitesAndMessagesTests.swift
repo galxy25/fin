@@ -112,6 +112,21 @@ final class SitesAndMessagesTests: XCTestCase {
 
     // MARK: - Decoders
 
+    /// The exact shape the control plane returned on 2026-09-12 16:31Z — if this
+    /// ever fails to decode, the memory view's "What Fin Sees Right Now" and the
+    /// servers list's "Fin's Computers" silently show nothing.
+    func testTheLiveSitesPayloadDecodes() throws {
+        let body = "{\"generatedAt\": \"2026-09-12T16:31:51Z\", \"sites\": [{\"siteId\": \"a4a1d987-0000-4000-8000-000000000000\", \"siteId8\": \"a4a1d987\", \"agent\": \"Fin\", \"kind\": \"resident\", \"displayName\": \"Levi's iMac\", \"priority\": 100, \"state\": \"working\", \"live\": true, \"enrolledAt\": \"2026-09-12T14:35:28Z\", \"lastHeartbeatAt\": \"2026-09-12T16:31:33Z\", \"leaseUntil\": \"2026-09-12T16:32:33Z\", \"capabilities\": {\"always_on\": true, \"tmux_sessions\": [{\"panes\": [{\"cwd\": \"pocketdj\", \"title\": \"\\u2733 Resume from last work point\", \"command\": \"2.1.235\", \"target\": \"main:0.0\"}, {\"cwd\": \"fin\", \"target\": \"main:1.0\", \"command\": \"2.1.261\", \"title\": \"\\u2733 multi-tenancy-cloud-control-plane\"}, {\"title\": \"\\u2733 composable-social-posts\", \"target\": \"main:2.0\", \"cwd\": \"africanintellect\", \"command\": \"2.1.261\"}], \"registered\": true, \"tasks\": [\"claude code\", \"inner agent\", \"coordinate\", \"mission progress\", \"report progress\", \"dev session\", \"fin project work\", \"finclaude\"], \"session\": \"main\"}], \"brain\": {\"kind\": \"openai-compatible\", \"model\": \"google/gemma-4-12b-qat\"}, \"hosts\": [{\"username\": \"deepspacenine\", \"host\": \"127.0.0.1\"}], \"daemon_version\": \"1.6.0\"}, \"runId\": \"EE4BEB26-37C3-422E-82B2-04ADD7E42380\", \"workerId\": null}, {\"siteId\": \"d36d0d0c-a44b-4d46-8e51-d1be37dada59\", \"siteId8\": \"d36d0d0c\", \"agent\": \"Fin\", \"kind\": \"byo\", \"displayName\": \"Smoke Box\", \"priority\": 50, \"state\": \"retired\", \"live\": false, \"enrolledAt\": \"2026-09-12T15:48:49Z\", \"lastHeartbeatAt\": null, \"leaseUntil\": null, \"capabilities\": {}, \"runId\": null, \"workerId\": null}]}".data(using: .utf8)!
+        guard case .success(let sites) = ControlPlaneClient.decode(ControlPlaneClient.SitesResponse.self, status: 200, body: body).map(\.sites) else {
+            return XCTFail("live payload did not decode")
+        }
+        let imac = try XCTUnwrap(sites.first { $0.displayName == "Levi's iMac" })
+        XCTAssertTrue(imac.live)
+        let panes = imac.capabilities.tmuxSessions?.first?.panes ?? []
+        XCTAssertGreaterThanOrEqual(panes.count, 1)
+        XCTAssertFalse(SiteDirectory.observationLines(sites).isEmpty)
+    }
+
     func testSitesResponseDecodesWithMinimalCapabilities() throws {
         let body = """
         {"generatedAt":"2026-09-12T14:00:00Z","sites":[{"siteId":"a4a1d987-0000-4000-8000-000000000000",

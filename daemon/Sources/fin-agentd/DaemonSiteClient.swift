@@ -102,6 +102,10 @@ actor DaemonSiteClient {
     /// launchd KeepAlive; drain = stop claiming).
     var onCommand: @Sendable (Command) async -> Void = { _ in }
 
+    func setClaimHandler(_ handler: @escaping @Sendable () async -> Void) {
+        onClaimed = handler
+    }
+
     func setURLHandler(_ handler: @escaping @Sendable ([String: String]) async -> Void) {
         onURLs = handler
     }
@@ -126,6 +130,9 @@ actor DaemonSiteClient {
     /// site whose config shipped with no presigned URLs at all gets them.
     private var urlsExpireAt: String?
     private var onURLs: (@Sendable ([String: String]) async -> Void)?
+    /// Fired after a successful claim so the daemon can preempt a heartbeat turn:
+    /// a user's message should never wait behind minutes of reflective model time.
+    private var onClaimed: (@Sendable () async -> Void)?
     private(set) var role: String = "standby"
     private(set) var ledger: Ledger
     private(set) var isDraining = false
@@ -221,6 +228,7 @@ actor DaemonSiteClient {
             ledger.held.append(.init(id: offer.id, text: offer.text, source: offer.source))
             persistLedger()
             audit("[site] claimed \(offer.id)")
+            await onClaimed?()
         case 409:
             // Another body won. Forget it; the row is theirs.
             break
