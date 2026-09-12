@@ -1894,8 +1894,7 @@ MAX_TRANSCRIPT_CHUNK_LINES = 5000
 
 def put_transcript_chunk(event):
     """PUT /transcript-chunk — {"agent", "hour": "yyyy-MM-ddTHH", "lines": [str,...]}.
-    Overwrites the named hour's chunk wholesale; the daemon is the only writer
-    for its own hour key, so this needs no conditional PUT."""
+    Merges into the named hour's chunk (see _merge_transcript_lines)."""
     body = _body(event)
     agent = str(body.get("agent") or "").strip()
     if not AGENT_NAME.match(agent):
@@ -1912,8 +1911,48 @@ def put_transcript_chunk(event):
     if len(encoded) > MAX_TRANSCRIPT_CHUNK_BYTES:
         raise ApiError(413, "chunk exceeds {} bytes".format(MAX_TRANSCRIPT_CHUNK_BYTES))
     key = TRANSCRIPT_CHUNK_KEY.format(user=event["_userId"], agent=_key_slug(agent), hour=hour)
+    # MERGE, never replace. The daemon's ring is per process, so a restart used to
+    # PUT an hour containing only the lines since the restart — and every trace
+    # from earlier in that hour was gone (live, 2026-09-12: a whole turn's
+    # reasoning and tool calls vanished after two restarts). Lines carry ids;
+    # the stored hour keeps what it had and takes what is new, newest kept
+    # when the cap bites.
+    merged = _merge_transcript_lines(_get_transcript_chunk(event["_userId"], agent, hour), lines)
+    encoded = "\n".join(merged).encode("utf-8")
     S3.put_object(Bucket=BUCKET, Key=key, Body=encoded, ContentType="application/json")
-    return _response(200, {"agent": agent, "hour": hour, "lines": len(lines)})
+    return _response(200, {"agent": agent, "hour": hour, "lines": len(merged)})
+
+
+def _transcript_line_key(line):
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return line
+    return obj.get("id") or line if isinstance(obj, dict) else line
+
+
+def _transcript_line_sort_key(line):
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return ("", "", 0)
+    if not isinstance(obj, dict):
+        return ("", "", 0)
+    return (str(obj.get("timestamp") or ""), str(obj.get("run_id") or ""), int(obj.get("sequence") or 0))
+
+
+def _merge_transcript_lines(existing, incoming):
+    """Union by line id (a line with no parseable id is keyed by its text), in
+    (timestamp, run_id, sequence) order — the app's own merge order — capped at
+    MAX_TRANSCRIPT_CHUNK_LINES with the OLDEST dropped, since the newest lines
+    are the ones a reader opening the console is waiting for."""
+    seen = {}
+    for line in existing + incoming:
+        seen[_transcript_line_key(line)] = line
+    merged = sorted(seen.values(), key=_transcript_line_sort_key)
+    if len(merged) > MAX_TRANSCRIPT_CHUNK_LINES:
+        merged = merged[-MAX_TRANSCRIPT_CHUNK_LINES:]
+    return merged
 
 
 def _list_transcript_hours(user_id, agent):

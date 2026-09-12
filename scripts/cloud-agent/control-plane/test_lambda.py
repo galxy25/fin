@@ -1587,6 +1587,37 @@ class BinaryPresignTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 404)
 
 
+
+class TranscriptChunkMergeTests(unittest.TestCase):
+    """A restart must never erase an hour's earlier traces (live, 2026-09-12)."""
+
+    def _line(self, id_, ts, seq=0, run="r1"):
+        return json.dumps({"id": id_, "timestamp": ts, "run_id": run, "sequence": seq, "kind": "reasoning", "text": id_})
+
+    def test_a_restarted_daemons_partial_hour_is_merged_not_substituted(self):
+        before = [self._line("a", "2026-09-12T16:35:15Z", 1), self._line("b", "2026-09-12T16:35:46Z", 2)]
+        after_restart = [self._line("c", "2026-09-12T16:44:01Z", 1, run="r2")]
+        merged = lam._merge_transcript_lines(before, after_restart)
+        self.assertEqual([json.loads(l)["id"] for l in merged], ["a", "b", "c"])
+
+    def test_re_put_of_the_same_ring_is_idempotent(self):
+        ring = [self._line("a", "2026-09-12T16:35:15Z", 1), self._line("b", "2026-09-12T16:35:46Z", 2)]
+        self.assertEqual(lam._merge_transcript_lines(ring, ring), lam._merge_transcript_lines([], ring))
+
+    def test_the_cap_drops_the_oldest(self):
+        orig = lam.MAX_TRANSCRIPT_CHUNK_LINES
+        lam.MAX_TRANSCRIPT_CHUNK_LINES = 2
+        self.addCleanup(setattr, lam, "MAX_TRANSCRIPT_CHUNK_LINES", orig)
+        lines = [self._line(str(i), "2026-09-12T16:0%d:00Z" % i, i) for i in range(4)]
+        merged = lam._merge_transcript_lines(lines[:2], lines[2:])
+        self.assertEqual([json.loads(l)["id"] for l in merged], ["2", "3"])
+
+    def test_unparseable_lines_survive_by_text(self):
+        merged = lam._merge_transcript_lines(["not json"], ["not json", self._line("a", "2026-09-12T16:00:00Z")])
+        self.assertEqual(merged.count("not json"), 1)
+        self.assertEqual(len(merged), 2)
+
+
 class SiteRouteRegistrationTests(unittest.TestCase):
     """Every handler in lambda.py's router also needs a route in deploy.sh's
     ROUTES heredoc, or API Gateway 404s a path the Lambda handles perfectly —
