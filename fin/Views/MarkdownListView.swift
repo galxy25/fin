@@ -9,29 +9,20 @@ struct MarkdownListView: View {
     @State private var isCreatingNew = false
     @State private var importErrorMessage: String?
     @State private var newlyCreatedDocument: MarkdownDocument?
+    #if os(macOS) || os(visionOS)
+    @Environment(\.openWindow) private var openWindow
+    // Same reasoning and pattern as AgentListView's `selectedAgentID`: a file
+    // opens as its own resizable window here (there's real value in reading a
+    // file next to a terminal session or another file, the way the agent hub
+    // already does), and selection-driven navigation is what reliably fires
+    // `openWindow` under XCUITest automation — a Button nested in a List row
+    // does not.
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedDocumentID: UUID?
+    #endif
 
     var body: some View {
-        List {
-            ForEach(documents) { document in
-                NavigationLink {
-                    MarkdownReaderView(document: document)
-                } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(document.name).font(.headline)
-                        Text(document.lastOpenedAt, style: .relative)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .accessibilityIdentifier("fileRow_\(document.id.uuidString)")
-            }
-            .onDelete { offsets in
-                for index in offsets {
-                    modelContext.delete(documents[index])
-                }
-            }
-        }
-        .listStyle(.plain)
+        list
         .accessibilityIdentifier("fileListView")
         .task { seedUITestFileIfNeeded() }
         .toolbar {
@@ -83,10 +74,68 @@ struct MarkdownListView: View {
         ) { result in
             handleCreated(result)
         }
+        #if !os(macOS) && !os(visionOS)
         .sheet(item: $newlyCreatedDocument) { document in
             NavigationStack {
                 MarkdownReaderView(document: document, startInEditMode: true)
             }
+        }
+        #endif
+    }
+
+    @ViewBuilder
+    private var list: some View {
+        #if os(macOS) || os(visionOS)
+        List(selection: $selectedDocumentID) {
+            fileRows
+        }
+        .onChange(of: selectedDocumentID) { _, newValue in
+            guard let newValue else { return }
+            openWindow(id: FinScene.markdownReader, value: newValue)
+            // Reset so selecting the SAME file again after closing its window
+            // still triggers onChange (a value "changing" to what it already was
+            // wouldn't fire otherwise).
+            selectedDocumentID = nil
+            dismiss()
+        }
+        .listStyle(.plain)
+        #else
+        List {
+            fileRows
+        }
+        .listStyle(.plain)
+        #endif
+    }
+
+    @ViewBuilder
+    private var fileRows: some View {
+        ForEach(documents) { document in
+            #if os(macOS) || os(visionOS)
+            fileRowLabel(document)
+                .tag(document.id)
+                .accessibilityIdentifier("fileRow_\(document.id.uuidString)")
+            #else
+            NavigationLink {
+                MarkdownReaderView(document: document)
+            } label: {
+                fileRowLabel(document)
+            }
+            .accessibilityIdentifier("fileRow_\(document.id.uuidString)")
+            #endif
+        }
+        .onDelete { offsets in
+            for index in offsets {
+                modelContext.delete(documents[index])
+            }
+        }
+    }
+
+    private func fileRowLabel(_ document: MarkdownDocument) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(document.name).font(.headline)
+            Text(document.lastOpenedAt, style: .relative)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -122,7 +171,16 @@ struct MarkdownListView: View {
                 let bookmarkData = try url.bookmarkData()
                 let document = MarkdownDocument(name: url.lastPathComponent, bookmarkData: bookmarkData)
                 modelContext.insert(document)
+                #if os(macOS) || os(visionOS)
+                // A brand-new file opens as its own window too, same as any other
+                // file — just without the sheet's forced edit mode (there's no
+                // per-window way to request that through `openWindow`'s plain UUID
+                // payload); it's empty either way, so hitting Edit once costs
+                // nothing a fresh sheet wouldn't have.
+                openWindow(id: FinScene.markdownReader, value: document.id)
+                #else
                 newlyCreatedDocument = document
+                #endif
             } catch {
                 importErrorMessage = error.localizedDescription
             }

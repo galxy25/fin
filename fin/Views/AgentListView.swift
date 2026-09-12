@@ -4,7 +4,7 @@ import SwiftData
 struct AgentListView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Agent.createdAt) private var agents: [Agent]
-    #if os(macOS)
+    #if os(macOS) || os(visionOS)
     @Environment(\.openWindow) private var openWindow
     // Reaching this list at all means either the standalone `.home` window or a
     // sheet presented over a terminal session (`ControlStripView`'s server-rack
@@ -65,7 +65,7 @@ struct AgentListView: View {
 
     @ViewBuilder
     private var list: some View {
-        #if os(macOS)
+        #if os(macOS) || os(visionOS)
         List(selection: $selectedAgentID) {
             ForEach(agents) { agent in
                 AgentRow(agent: agent)

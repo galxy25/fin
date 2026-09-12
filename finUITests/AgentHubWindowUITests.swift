@@ -43,6 +43,36 @@ final class AgentHubWindowUITests: XCTestCase {
         agentRow.tapCenter()
     }
 
+    /// Opening an agent's hub should open a NEW window, not take over the app's
+    /// existing one (the Agents list stays open behind it).
+    func testOpeningAgentCreatesNewWindow() throws {
+        let app = launchFinApp()
+
+        var agentsPicker = element(app, id: "homeMode_Agents")
+        if !agentsPicker.waitForExistence(timeout: 3) {
+            let serversButton = element(app, id: "controlStrip_servers")
+            XCTAssertTrue(serversButton.waitForExistence(timeout: 5))
+            serversButton.tapCenter()
+            agentsPicker = element(app, id: "homeMode_Agents")
+        }
+        XCTAssertTrue(agentsPicker.waitForExistence(timeout: 5))
+        agentsPicker.tapCenter()
+
+        let before = app.windows.count
+        let agentRow = elementStartingWith(app, prefix: "agentRow_")
+        XCTAssertTrue(agentRow.waitForExistence(timeout: 5))
+        agentRow.tapCenter()
+
+        let settingsForm = element(app, id: "agentSettingsForm")
+        XCTAssertTrue(settingsForm.waitForExistence(timeout: 5))
+
+        let after = app.windows.count
+        XCTAssertGreaterThan(
+            after, before,
+            "Opening an agent should create a new window, not replace the existing one"
+        )
+    }
+
     /// The exact live-reproduced bug: switching the hub window's sidebar selection
     /// (Settings → Logs → back to Settings) blanked the entire window (0
     /// accessibility elements, process alive, no crash/hang report) before this was

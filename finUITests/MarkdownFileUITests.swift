@@ -48,7 +48,10 @@ final class MarkdownFileUITests: XCTestCase {
         let scroll = element(app, id: "markdownReaderScroll")
         XCTAssertTrue(scroll.waitForExistence(timeout: 5), "Reader scroll view never appeared")
 
-        let window = app.windows.firstMatch
+        // The reader opens as its OWN window now (not pushed into the Files list's
+        // window), so `app.windows.firstMatch` is ambiguous between the two —
+        // find the window that actually contains the scroll view.
+        let window = app.windows.containing(.any, identifier: "markdownReaderScroll").firstMatch
         XCTAssertTrue(window.waitForExistence(timeout: 5))
 
         // Not exact equality — the window has padding/insets — but a regression
@@ -79,11 +82,35 @@ final class MarkdownFileUITests: XCTestCase {
         let scroll = element(app, id: "markdownReaderScroll")
         XCTAssertTrue(scroll.waitForExistence(timeout: 5), "Reader scroll view never reappeared after leaving Edit")
 
-        let window = app.windows.firstMatch
+        let window = app.windows.containing(.any, identifier: "markdownReaderScroll").firstMatch
         let widthRatio = scroll.frame.width / window.frame.width
         XCTAssertGreaterThan(
             widthRatio, 0.85,
             "Reader pane should still fill the window width after round-tripping Edit (ratio: \(widthRatio))"
+        )
+    }
+
+    /// Opening a file should open a NEW window, not take over the app's existing
+    /// one (the Files list stays open behind it) — mirrors the same pattern the
+    /// agent hub already uses.
+    func testOpeningFileCreatesNewWindow() throws {
+        let app = launchFinApp()
+        _ = openFilesTab(app)
+
+        let before = app.windows.count
+        let fileRow = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "fileRow_"))
+            .firstMatch
+        XCTAssertTrue(fileRow.waitForExistence(timeout: 5))
+        fileRow.tapCenter()
+
+        let scroll = element(app, id: "markdownReaderScroll")
+        XCTAssertTrue(scroll.waitForExistence(timeout: 5))
+
+        let after = app.windows.count
+        XCTAssertGreaterThan(
+            after, before,
+            "Opening a file should create a new window, not replace the existing one"
         )
     }
 }

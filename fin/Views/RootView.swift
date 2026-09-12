@@ -19,6 +19,16 @@ struct RootView: View {
     @Query(sort: \Agent.createdAt) private var agents: [Agent]
     @Query private var markdownDocuments: [MarkdownDocument]
     @Environment(\.scenePhase) private var scenePhase
+    #if os(macOS) || os(visionOS)
+    @Environment(\.openWindow) private var openWindow
+    // Multi-window platforms resume straight to HOME, not straight into the
+    // file — the file reopens in its own window instead (see
+    // MarkdownReaderWindowView), matching how opening one from the Files tab
+    // already works. Guards against re-firing `openWindow` on every re-render
+    // while `route` stays `.markdown` (e.g. an unrelated `agents`/`servers`
+    // change).
+    @State private var hasOpenedResumedMarkdownWindow = false
+    #endif
 
     @AppStorage("lastActiveServerTouchedAt") private var lastActiveServerTouchedAt: Double = 0
     @AppStorage("lastActiveMarkdownDocumentID") private var lastActiveMarkdownDocumentID: String = ""
@@ -37,20 +47,20 @@ struct RootView: View {
                 case .terminal(let server):
                     TerminalScreen(server: server)
                 case .markdown(let document):
+                    #if os(macOS) || os(visionOS)
+                    // The file itself opens in its own window (see
+                    // MarkdownReaderWindowView) rather than taking over the whole
+                    // app view — the root content stays HomeView.
+                    HomeView()
+                        .task(id: document.id) {
+                            guard !hasOpenedResumedMarkdownWindow else { return }
+                            hasOpenedResumedMarkdownWindow = true
+                            openWindow(id: FinScene.markdownReader, value: document.id)
+                        }
+                    #else
                     NavigationStack {
                         MarkdownReaderView(document: document, isRoot: true)
                     }
-                    #if os(macOS)
-                    // Same fix as HomeView's sheet-sizing comment: a fresh macOS
-                    // window sizes to its content's IDEAL size, and a `ScrollView`
-                    // wrapping a short `Text` reports a narrow ideal width — so this
-                    // root route (resuming straight to the last-opened file, the one
-                    // path into MarkdownReaderView that skips HomeView entirely)
-                    // rendered as a narrow centered rectangle instead of filling the
-                    // window until switching to Edit, where `TextEditor` is
-                    // inherently greedy about the space it's given. A resized window
-                    // persists past this once one exists — this only bites a fresh one.
-                    .frame(minWidth: 480, minHeight: 560)
                     #endif
                 case .home:
                     HomeView()
