@@ -512,11 +512,18 @@ fi
 # /devices/status` ended up handled by the Lambda but absent from API Gateway
 # (a live 404 with the code deployed). Every aws call in this loop gets
 # </dev/null; keep it that way when adding routes.
+#
+# And the existence check is ONE listing up front, matched with grep -Fx, rather
+# than a per-route JMESPath `| [0]`: once the route count crossed a page
+# boundary the CLI began paginating get-routes, `[0]` printed "None" once PER
+# PAGE, "None\nNone" no longer equalled "None", and every new route was skipped
+# as "already exists" — the third distinct way this loop has silently registered
+# nothing. A newline-separated list and an exact-line match have no such edge.
+EXISTING_ROUTES=$(aws apigatewayv2 get-routes --api-id "$API_ID" \
+  --query "Items[].RouteKey" --output text </dev/null | tr '\t' '\n')
 while read -r ROUTE_KEY; do
   [ -n "$ROUTE_KEY" ] || continue
-  EXISTING=$(aws apigatewayv2 get-routes --api-id "$API_ID" \
-    --query "Items[?RouteKey=='$ROUTE_KEY'].RouteId | [0]" --output text </dev/null)
-  if [ "$EXISTING" = "None" ] || [ -z "$EXISTING" ]; then
+  if ! printf '%s\n' "$EXISTING_ROUTES" | grep -Fxq -- "$ROUTE_KEY"; then
     aws apigatewayv2 create-route --api-id "$API_ID" --route-key "$ROUTE_KEY" \
       --target "integrations/$INTEGRATION_ID" >/dev/null </dev/null
     echo "==> Created route $ROUTE_KEY"
