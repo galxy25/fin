@@ -1302,6 +1302,267 @@ class ClaimProtocolTests(_MessagesTestCase):
         self.assertEqual(caught.exception.status, 404)
 
 
+class _PushHarness:
+    """Wires `_push_to_user` to a fake APNs: a fake httpx module, a fixed
+    bearer, and a recording `_apns_push`. Every push lands (200) unless the
+    test says otherwise, so the assertions are about payload and count."""
+
+    def __init__(self, case, tokens=(("tok-a", "user-1"),)):
+        import sys
+        import types
+
+        self.sent = []  # (environment, token, payload)
+        table = _FakeDynamoTable("token")
+        for token, user in tokens:
+            table.items[token] = {"token": token, "userId": user, "environment": "production"}
+        case.addCleanup(setattr, lam, "DEVICE_TOKENS_TABLE", lam.DEVICE_TOKENS_TABLE)
+        lam.DEVICE_TOKENS_TABLE = table
+        case.addCleanup(setattr, lam, "_apns_configured", lam._apns_configured)
+        lam._apns_configured = lambda: True
+        case.addCleanup(setattr, lam, "_apns_bearer", lam._apns_bearer)
+        lam._apns_bearer = lambda now_epoch=None: "jwt"
+        case.addCleanup(setattr, lam, "_apns_push", lam._apns_push)
+
+        def fake_push(client, environment, token, payload, bearer):
+            self.sent.append((environment, token, json.loads(json.dumps(payload))))
+            return True, ""
+
+        lam._apns_push = fake_push
+
+        class _Client:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        fake_httpx = types.ModuleType("httpx")
+        fake_httpx.Client = _Client
+        previous = sys.modules.get("httpx")
+        sys.modules["httpx"] = fake_httpx
+        case.addCleanup(lambda: sys.modules.__setitem__("httpx", previous) if previous else sys.modules.pop("httpx", None))
+
+    @property
+    def payloads(self):
+        return [payload for _, _, payload in self.sent]
+
+
+class PushPayloadTests(unittest.TestCase):
+    """Design §3.7.2: the Phase-1 APNs keys per event, all additive."""
+
+    def test_every_push_is_mutable_with_a_category_and_thread(self):
+        agent_id = str(lam.uuid.uuid4())
+        for event in lam.NOTIFY_EVENTS:
+            payload = lam._push_payload("Fin", "hi", aps_extra=lam._push_aps_extra(event, agent_id))
+            aps = payload["aps"]
+            self.assertEqual(aps["mutable-content"], 1, event)
+            self.assertEqual(aps["thread-id"], agent_id, event)
+            self.assertEqual(aps["alert"], {"title": "Fin", "body": "hi"})
+            self.assertEqual(aps["sound"], "default")
+            self.assertIn(aps["category"], (lam.PUSH_CATEGORY_INPUT, lam.PUSH_CATEGORY_REPLY))
+
+    def test_category_and_interruption_level_per_event(self):
+        expected = {
+            "request-input": ("fin.input", "time-sensitive"),
+            "agent-stalled": ("fin.input", "time-sensitive"),
+            "task-complete": ("fin.reply", None),
+            "notify": ("fin.reply", None),
+            "answered": ("fin.reply", None),
+        }
+        for event, (category, level) in expected.items():
+            extra = lam._push_aps_extra(event)
+            self.assertEqual(extra["category"], category, event)
+            self.assertEqual(extra.get("interruption-level"), level, event)
+            self.assertNotIn("thread-id", extra)
+
+    def test_unknown_or_absent_event_reads_as_notify(self):
+        for raw in (None, "", "   ", "bogus", 7):
+            self.assertEqual(lam._normalize_notify_event(raw), "notify")
+        self.assertEqual(lam._normalize_notify_event("request-input"), "request-input")
+
+    def test_fin_dict_is_only_present_when_given(self):
+        self.assertNotIn("fin", lam._push_payload("t", "b"))
+        self.assertNotIn("fin", lam._push_payload("t", "b", fin={}))
+        payload = lam._push_payload("t", "b", fin={"agentName": "Fin", "messageId": "m-1"})
+        self.assertEqual(payload["fin"], {"agentName": "Fin", "messageId": "m-1"})
+
+
+class NotifyRouteTests(_MessagesTestCase):
+    """POST /notify through the refactored fan-out: same wire contract as
+    before plus the event / messageId fields."""
+
+    def setUp(self):
+        super().setUp()
+        self.apns = _PushHarness(self)
+
+    def notify(self, user="user-1", **body):
+        payload = {"title": "Fin needs input", "body": "which branch?"}
+        payload.update(body)
+        response = lam.notify({"_userId": user, "body": json.dumps(payload)})
+        return response["statusCode"], json.loads(response["body"])
+
+    def test_request_input_carries_the_phase_one_keys(self):
+        agent_id = str(lam.uuid.uuid4())
+        status, result = self.notify(event="request-input", agent="Fin", agentID=agent_id, originDeviceID8="a4a1d987")
+        self.assertEqual((status, result["delivered"], result["failed"], result["removed"]), (200, 1, 0, 0))
+        payload = self.apns.payloads[0]
+        self.assertEqual(payload["aps"]["category"], "fin.input")
+        self.assertEqual(payload["aps"]["interruption-level"], "time-sensitive")
+        self.assertEqual(payload["aps"]["thread-id"], agent_id)
+        self.assertEqual(payload["aps"]["mutable-content"], 1)
+        self.assertEqual(payload["fin"], {"agentID": agent_id, "originDeviceID8": "a4a1d987", "agentName": "Fin"})
+
+    def test_a_pre_phase_one_daemon_body_still_pushes_as_a_plain_notify(self):
+        status, _ = self.notify()
+        self.assertEqual(status, 200)
+        aps = self.apns.payloads[0]["aps"]
+        self.assertEqual(aps["category"], "fin.reply")
+        self.assertNotIn("interruption-level", aps)
+        self.assertNotIn("thread-id", aps)
+        self.assertNotIn("fin", self.apns.payloads[0])
+
+    def test_task_complete_is_not_time_sensitive(self):
+        self.notify(event="task-complete", agent="Fin")
+        self.assertNotIn("interruption-level", self.apns.payloads[0]["aps"])
+        self.assertEqual(self.apns.payloads[0]["fin"], {"agentName": "Fin"})
+
+    def test_message_id_lands_in_the_fin_dict_and_marks_the_row(self):
+        sent = self.send("what time is it")
+        status, _ = self.notify(event="task-complete", agent="Fin", messageId=sent["messageId"])
+        self.assertEqual(status, 200)
+        self.assertEqual(self.apns.payloads[0]["fin"]["messageId"], sent["messageId"])
+        self.assertTrue(self.row(sent["messageId"]).get("pushedAt"))
+
+    def test_a_message_id_that_is_not_the_callers_is_ignored(self):
+        sent = self.send("mine", user="user-1")
+        status, _ = self.notify(user="user-2", messageId=sent["messageId"])
+        # user-2 has no tokens: no push, and user-1's row is untouched.
+        self.assertEqual(status, 200)
+        self.assertNotIn("pushedAt", self.row(sent["messageId"]))
+        self.assertEqual(self.apns.sent, [])
+        # A bogus or foreign messageId never suppresses the daemon's own push.
+        status, result = self.notify(user="user-1", messageId=sent["messageId"].replace("m-", "m-0"))
+        self.assertEqual((status, result["delivered"]), (200, 1))
+
+    def test_a_message_already_pushed_by_its_ack_suppresses_the_daemon_push(self):
+        sent = self.send("what time is it")
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied")
+        self.ack(self.imac, sent["messageId"], "answered", replyPreview="noon")
+        self.assertEqual(len(self.apns.sent), 1)
+        status, result = self.notify(event="task-complete", agent="Fin", messageId=sent["messageId"])
+        self.assertEqual((status, result["delivered"], result.get("suppressed")), (200, 0, True))
+        self.assertEqual(len(self.apns.sent), 1, "the ack's push stands; the daemon's is the duplicate")
+        # Without a messageId the same daemon push is not a duplicate of anything.
+        status, result = self.notify(event="task-complete", agent="Fin")
+        self.assertEqual((status, result["delivered"]), (200, 1))
+
+    def test_no_tokens_is_a_200_with_a_note_and_502_when_nothing_lands(self):
+        status, result = self.notify(user="user-2")
+        self.assertEqual((status, result["delivered"]), (200, 0))
+        self.assertIn("note", result)
+        lam._apns_push = lambda *args: (False, "TooManyRequests")
+        status, result = self.notify()
+        self.assertEqual((status, result["reasons"]), (502, ["TooManyRequests"]))
+
+    def test_503_without_an_apns_key(self):
+        lam._apns_configured = lambda: False
+        with self.assertRaises(lam.ApiError) as caught:
+            self.notify()
+        self.assertEqual(caught.exception.status, 503)
+
+    def test_a_site_token_may_still_notify(self):
+        lam._require_site_scope({"_siteId": "site-a"}, "POST", ["notify"])
+
+
+class AnsweredPushTests(_MessagesTestCase):
+    """Design §3.7.3: the answered ack pushes the reply once, best-effort."""
+
+    def setUp(self):
+        super().setUp()
+        self.apns = _PushHarness(self)
+
+    def answer(self, text="what time is it", preview="It is noon.", **ack_body):
+        sent = self.send(text)
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied", runId="run-1")
+        response = self.ack(self.imac, sent["messageId"], "answered", replyPreview=preview, **ack_body)
+        return sent["messageId"], response
+
+    def test_answered_pushes_the_reply_exactly_once(self):
+        agent_id = str(lam.uuid.uuid4())
+        message_id, response = self.answer(agentID=agent_id)
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(len(self.apns.sent), 1)
+        payload = self.apns.payloads[0]
+        self.assertEqual(payload["aps"]["alert"], {"title": "Fin", "body": "It is noon."})
+        self.assertEqual(payload["aps"]["category"], "fin.reply")
+        self.assertEqual(payload["aps"]["thread-id"], agent_id)
+        self.assertEqual(payload["aps"]["mutable-content"], 1)
+        self.assertNotIn("interruption-level", payload["aps"])
+        self.assertEqual(payload["fin"], {"agentName": "Fin", "messageId": message_id, "agentID": agent_id})
+        self.assertTrue(self.row(message_id)["pushedAt"])
+        # A duplicate ack is a 409 and, separately, can never push again.
+        with self.assertRaises(lam.ApiError):
+            self.ack(self.imac, message_id, "answered", replyPreview="It is noon.")
+        self.assertEqual(len(self.apns.sent), 1)
+
+    def test_a_second_push_is_impossible_even_if_the_row_is_re_answered(self):
+        message_id, _ = self.answer()
+        self.assertEqual(len(self.apns.sent), 1)
+        # Simulate the storage-level rewind a bug could produce: pushedAt wins anyway.
+        self.row(message_id)["state"] = "applied"
+        self.ack(self.imac, message_id, "answered", replyPreview="again")
+        self.assertEqual(len(self.apns.sent), 1)
+
+    def test_the_daemons_task_complete_push_suppresses_the_ack_push(self):
+        sent = self.send("deploy it")
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied")
+        lam.notify({"_userId": "user-1", "body": json.dumps({
+            "title": "Fin: task complete", "body": "TASK COMPLETE", "agent": "Fin",
+            "event": "task-complete", "messageId": sent["messageId"],
+        })})
+        self.assertEqual(len(self.apns.sent), 1)
+        self.ack(self.imac, sent["messageId"], "answered", replyPreview="TASK COMPLETE")
+        self.assertEqual(len(self.apns.sent), 1, "one push per message, the daemon's")
+        self.assertEqual(self.apns.payloads[0]["aps"]["alert"]["title"], "Fin: task complete")
+
+    def test_no_preview_means_no_push(self):
+        sent = self.send("hmm")
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied")
+        self.ack(self.imac, sent["messageId"], "answered", replyPreview="   ")
+        self.assertEqual(self.apns.sent, [])
+        self.assertNotIn("pushedAt", self.row(sent["messageId"]))
+
+    def test_a_push_failure_never_fails_the_ack(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("apns is down")
+        self.addCleanup(setattr, lam, "_push_to_user", lam._push_to_user)
+        lam._push_to_user = boom
+        message_id, response = self.answer()
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(self.row(message_id)["state"], "answered")
+
+    def test_apns_not_configured_never_fails_the_ack(self):
+        lam._apns_configured = lambda: False
+        message_id, response = self.answer()
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(self.apns.sent, [])
+
+    def test_the_push_is_not_gated_on_voice(self):
+        for source in ("app", "voice"):
+            sent = self.send("q " + source, source=source)
+            self.claim(self.imac, sent["messageId"])
+            self.ack(self.imac, sent["messageId"], "applied")
+            self.ack(self.imac, sent["messageId"], "answered", replyPreview="a")
+        self.assertEqual(len(self.apns.sent), 2)
+
+
 class HeartbeatDispatchTests(_MessagesTestCase):
     def test_the_primary_is_offered_an_unaddressed_message(self):
         self.beat(self.imac)

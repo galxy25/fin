@@ -1448,6 +1448,10 @@ final class Daemon {
                 lastTurnAt = Date()
                 lastAssistantPreview = String(text.prefix(200))
                 log("agent: \(text)")
+                // Kept past the ack so a task-complete push below can name the
+                // message it answers — the control plane pushes each message's
+                // reply once, whichever of the ack or this push gets there first.
+                let answeredMessageID = inFlightSiteMessageID
                 if let id = inFlightSiteMessageID {
                     inFlightSiteMessageID = nil
                     await siteClient?.markAnswered(id, replyPreview: text)
@@ -1458,7 +1462,7 @@ final class Daemon {
                 if AgentTurnLogic.containsTaskComplete(text) {
                     let ledgerGoals = await goalsLedger?.document.goals
                     if Self.taskCompleteIsTrustworthy(goals: ledgerGoals) {
-                        notify(event: "task-complete", message: text)
+                        notify(event: "task-complete", message: text, messageID: answeredMessageID)
                         // Resident or not, the supervisor's next status read says
                         // "task-complete": on the exit path from the PUT here, on the
                         // resident path because `idleStateName` holds that state until new
@@ -1885,9 +1889,9 @@ final class Daemon {
     /// configured, and the shell hook when `notifyCommand` is. Both fire when both are
     /// present; failures on either are logged and swallowed — a broken notifier must
     /// never take down the agent.
-    private func notify(event: String, message: String) {
+    private func notify(event: String, message: String, messageID: String? = nil) {
         if let client = notifyClient {
-            lastNotifyTask = Task { await client.send(event: event, message: message) }
+            lastNotifyTask = Task { await client.send(event: event, message: message, messageID: messageID) }
         }
         runNotifyCommand(event: event, message: message)
     }

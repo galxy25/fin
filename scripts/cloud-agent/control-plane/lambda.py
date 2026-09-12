@@ -1430,41 +1430,71 @@ def put_device_token(event):
     })
 
 
-def notify(event):
-    """POST /notify — {"title", "body", "agent"?, "agentID"?, "originDeviceID8"?}:
-    one APNs alert to every registered device. The response reports counts and
-    APNs reason strings only — never a token, never the auth key, never the JWT."""
+# The daemon's event vocabulary on POST /notify. Anything else (including an
+# absent field — every pre-Phase-1 daemon) is treated as a plain "notify".
+NOTIFY_EVENTS = ("request-input", "task-complete", "agent-stalled", "notify", "answered")
+# The events a human is being ASKED something by: they ride Announce's default
+# "Time Sensitive and Direct Messages" filter in the car, so they get the
+# time-sensitive interruption level (design §3.3 step 6). Nothing else does —
+# a chatty task-complete must not break through a Focus.
+NOTIFY_INPUT_EVENTS = ("request-input", "agent-stalled")
+# UNNotificationCategory identifiers the app registers (design §5.1): fin.input
+# for "needs you", fin.reply for everything the agent says back — both carry a
+# text-input reply action, the category only changes the wording around it.
+PUSH_CATEGORY_INPUT = "fin.input"
+PUSH_CATEGORY_REPLY = "fin.reply"
+
+
+def _normalize_notify_event(raw):
+    event = str(raw or "").strip()
+    return event if event in NOTIFY_EVENTS else "notify"
+
+
+def _push_aps_extra(event, agent_id=""):
+    """The APNs `aps` keys a Phase-1 (communication-notification) push adds on
+    top of the alert: the category the app's reply action hangs off, the
+    per-agent thread, and — for the two "needs you" events only — the
+    time-sensitive level. Old app builds ignore every one of these."""
+    extra = {
+        "category": PUSH_CATEGORY_INPUT if event in NOTIFY_INPUT_EVENTS else PUSH_CATEGORY_REPLY,
+    }
+    if agent_id:
+        extra["thread-id"] = agent_id
+    if event in NOTIFY_INPUT_EVENTS:
+        extra["interruption-level"] = "time-sensitive"
+    return extra
+
+
+def _push_payload(title, body, fin=None, aps_extra=None):
+    """The APNs JSON for one alert. `mutable-content: 1` is what routes the
+    push through the app's Notification Service Extension, which turns it into
+    a communication notification (design §3.3 step 3); without it the NSE is
+    never invoked and the push is a plain alert — the pre-Phase-1 behaviour."""
+    aps = {"alert": {"title": title, "body": body}, "sound": "default", "mutable-content": 1}
+    aps.update(aps_extra or {})
+    payload = {"aps": aps}
+    if fin:
+        # Same "fin" dict shape a local (on-device) notification's userInfo
+        # carries — AgentNotificationService.didReceive reads either one the
+        # same way. originDeviceID8 tells it this push did NOT originate on
+        # the receiving device, so a tap routes to the remote conversation
+        # instead of assuming local origin (see AgentNotificationService.swift).
+        payload["fin"] = dict(fin)
+    return payload
+
+
+def _push_to_user(user_id, title, body, fin=None, aps_extra=None):
+    """One APNs alert to every device token `user_id` has registered — the
+    fan-out behind POST /notify and the answered-message push in ack_message.
+    Returns {"delivered", "failed", "removed", "reasons"} (plus a "note" when
+    the user has no tokens at all); raises ApiError 503 when APNs is not
+    configured and 500 when the bundle can't sign. Callers decide what an
+    empty delivery means: the route answers 502, an ack shrugs. Nothing here
+    ever logs or returns a token, the auth key, or the JWT."""
     if not _apns_configured():
         raise ApiError(503, "APNs key is not configured; redeploy with FIN_APNS_KEY_PATH set (see control-plane/README.md)")
-    body = _body(event)
-
-    title = str(body.get("title") or "").strip()
-    if not title:
-        raise ApiError(400, "title must be a non-empty string")
-    text = str(body.get("body") or "").strip()
-    if not text:
-        raise ApiError(400, "body must be a non-empty string")
-    # A push is a summary; overlong input is truncated, not refused — the sender
-    # is an unattended daemon with nobody there to shorten and retry.
-    title = title[:MAX_NOTIFY_TITLE_LENGTH]
-    text = text[:MAX_NOTIFY_BODY_LENGTH]
-
-    agent = str(body.get("agent") or "").strip()
-    if agent and not AGENT_NAME.match(agent):
-        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
-
-    # Neither is secret and both are best-effort: a malformed value here just
-    # means the eventual tap can't deep-link (same tolerant-parse philosophy as
-    # the app's own AgentSignalSubscriber.openTarget), never a hard failure of
-    # the push itself.
-    agent_id = str(body.get("agentID") or "").strip()
-    try:
-        agent_id = str(uuid.UUID(agent_id)) if agent_id else ""
-    except ValueError:
-        agent_id = ""
-    origin_device_id8 = str(body.get("originDeviceID8") or "").strip()
-    if not DEVICE_ID8.match(origin_device_id8):
-        origin_device_id8 = ""
+    title = str(title or "").strip()[:MAX_NOTIFY_TITLE_LENGTH]
+    body = str(body or "").strip()[:MAX_NOTIFY_BODY_LENGTH]
 
     # Was unscoped — every registered device token, account-wide — a real
     # cross-tenant push leak once there is more than one user. Every device
@@ -1472,13 +1502,13 @@ def notify(event):
     rows = _scan(
         table=DEVICE_TOKENS_TABLE,
         FilterExpression="userId = :user",
-        ExpressionAttributeValues={":user": event["_userId"]},
+        ExpressionAttributeValues={":user": user_id},
     )
     if not rows:
-        return _response(200, {
-            "delivered": 0, "failed": 0, "removed": 0,
+        return {
+            "delivered": 0, "failed": 0, "removed": 0, "reasons": [],
             "note": "no device tokens registered; launch the app once with the control plane configured",
-        })
+        }
 
     try:
         import httpx  # vendored by deploy.sh
@@ -1492,16 +1522,7 @@ def notify(event):
         LOG.exception("APNs provider JWT signing failed")
         raise ApiError(500, "APNs provider token signing failed; check the deployed APNS_* environment")
 
-    payload = {"aps": {"alert": {"title": title, "body": text}, "sound": "default"}}
-    if agent_id:
-        # Same "fin" dict shape a local (on-device) notification's userInfo
-        # carries — AgentNotificationService.didReceive reads either one the
-        # same way. originDeviceID8 tells it this push did NOT originate on
-        # the receiving device, so a tap routes to the remote conversation
-        # instead of assuming local origin (see AgentNotificationService.swift).
-        payload["fin"] = {"agentID": agent_id}
-        if origin_device_id8:
-            payload["fin"]["originDeviceID8"] = origin_device_id8
+    payload = _push_payload(title, body, fin=fin, aps_extra=aps_extra)
 
     delivered, removed, failures = 0, 0, []
     with httpx.Client(http2=True, timeout=APNS_REQUEST_TIMEOUT) as client:
@@ -1533,14 +1554,127 @@ def notify(event):
             else:
                 failures.append(reason)
 
-    LOG.info("notify: delivered %d, failed %d, removed %d", delivered, len(failures), removed)
-    # 502 when tokens exist but nothing got through, so an unattended caller's
-    # audit trail records the outage instead of a hollow success.
-    return _response(200 if delivered else 502, {
+    LOG.info("push: delivered %d, failed %d, removed %d", delivered, len(failures), removed)
+    return {
         "delivered": delivered,
         "failed": len(failures),
         "removed": removed,
         "reasons": sorted(set(failures)),
+    }
+
+
+def _mark_message_pushed(user_id, message_id, now=None):
+    """Claims the one push a fin-messages row is allowed (design §3.7.3): a
+    conditional SET of pushedAt that succeeds exactly once per messageId, so
+    the daemon's task-complete /notify and the answered ack — in either order
+    — produce one push between them. Returns True when this caller won the
+    right to push, False when the row was already pushed, and None when the
+    row isn't the caller's, doesn't exist, or storage failed (the caller then
+    decides: an ack has nothing to push about, a /notify pushes anyway — its
+    push stands on its own). Never raises."""
+    if not message_id:
+        return None
+    try:
+        row = MESSAGES_TABLE.get_item(Key={"messageId": message_id}).get("Item")
+        if not row or row.get("userId") != user_id:
+            return None
+        MESSAGES_TABLE.update_item(
+            Key={"messageId": message_id},
+            UpdateExpression="SET pushedAt = :now",
+            ConditionExpression="userId = :user AND attribute_not_exists(pushedAt)",
+            ExpressionAttributeValues={":now": _iso(now or _now()), ":user": user_id},
+        )
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        LOG.warning("pushedAt update failed for %s: %s", message_id, _scrub(exc))
+        return None
+    except Exception as exc:  # noqa: BLE001 - dedupe must never take the caller down
+        LOG.warning("pushedAt update failed for %s: %s", message_id, _scrub(exc))
+        return None
+
+
+def notify(event):
+    """POST /notify — {"title", "body", "agent"?, "agentID"?, "originDeviceID8"?,
+    "event"?, "messageId"?}: one APNs alert to every registered device. `event`
+    (one of NOTIFY_EVENTS; absent or unknown reads as "notify") picks the
+    category / interruption level; `messageId` names the fin-messages row this
+    push answers, so the row's own answered-ack push is suppressed (one push per
+    message). The response reports counts and APNs reason strings only — never
+    a token, never the auth key, never the JWT."""
+    if not _apns_configured():
+        raise ApiError(503, "APNs key is not configured; redeploy with FIN_APNS_KEY_PATH set (see control-plane/README.md)")
+    body = _body(event)
+
+    title = str(body.get("title") or "").strip()
+    if not title:
+        raise ApiError(400, "title must be a non-empty string")
+    text = str(body.get("body") or "").strip()
+    if not text:
+        raise ApiError(400, "body must be a non-empty string")
+    # A push is a summary; overlong input is truncated, not refused — the sender
+    # is an unattended daemon with nobody there to shorten and retry.
+    title = title[:MAX_NOTIFY_TITLE_LENGTH]
+    text = text[:MAX_NOTIFY_BODY_LENGTH]
+
+    agent = str(body.get("agent") or "").strip()
+    if agent and not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+
+    # Neither is secret and both are best-effort: a malformed value here just
+    # means the eventual tap can't deep-link (same tolerant-parse philosophy as
+    # the app's own AgentSignalSubscriber.openTarget), never a hard failure of
+    # the push itself.
+    agent_id = str(body.get("agentID") or "").strip()
+    try:
+        agent_id = str(uuid.UUID(agent_id)) if agent_id else ""
+    except ValueError:
+        agent_id = ""
+    origin_device_id8 = str(body.get("originDeviceID8") or "").strip()
+    if not DEVICE_ID8.match(origin_device_id8):
+        origin_device_id8 = ""
+    push_event = _normalize_notify_event(body.get("event"))
+    message_id = str(body.get("messageId") or "").strip()
+    if not MESSAGE_ID_RE.match(message_id):
+        message_id = ""
+
+    fin = {}
+    if agent_id:
+        fin["agentID"] = agent_id
+        if origin_device_id8:
+            fin["originDeviceID8"] = origin_device_id8
+    if agent:
+        fin["agentName"] = agent
+    if message_id:
+        fin["messageId"] = message_id
+
+    # One push per message (design §3.7.3): the daemon acks `answered` before
+    # it POSTs its task-complete push, so the ack push normally wins and this
+    # one is the duplicate — unless the ack never happened, in which case this
+    # push claims the row and the ack's push is the one suppressed. Claimed
+    # before APNs is tried, not after: two pushes for one message is the
+    # failure this guards against, and a retry is the daemon's call.
+    if message_id and _mark_message_pushed(event["_userId"], message_id) is False:
+        LOG.info("notify: %s already pushed, suppressed", message_id)
+        return _response(200, {
+            "delivered": 0, "failed": 0, "removed": 0, "suppressed": True,
+            "note": "this messageId was already pushed to the owner's devices",
+        })
+    result = _push_to_user(
+        event["_userId"], title, text,
+        fin=fin or None,
+        aps_extra=_push_aps_extra(push_event, agent_id),
+    )
+    if "note" in result:
+        return _response(200, {"delivered": 0, "failed": 0, "removed": 0, "note": result["note"]})
+    # 502 when tokens exist but nothing got through, so an unattended caller's
+    # audit trail records the outage instead of a hollow success.
+    return _response(200 if result["delivered"] else 502, {
+        "delivered": result["delivered"],
+        "failed": result["failed"],
+        "removed": result["removed"],
+        "reasons": result["reasons"],
     })
 
 
@@ -3414,9 +3548,11 @@ def claim_message(event, message_id):
 
 
 def ack_message(event, message_id):
-    """§6.3 steps 5–6: {state: applied|answered, runId?, replyPreview?}. Only
-    the claimant may ack, and only forward (queued/claimed → applied →
-    answered) — a late duplicate ack is a 409, not a rewind."""
+    """§6.3 steps 5–6: {state: applied|answered, runId?, replyPreview?,
+    agentID?}. Only the claimant may ack, and only forward (queued/claimed →
+    applied → answered) — a late duplicate ack is a 409, not a rewind. An
+    answered ack with a replyPreview also pushes the reply to the owner's
+    devices (design §3.7.3), best-effort and at most once per message."""
     site = _acting_site(event)
     row = _owned_message(event, message_id)
     if not _same_agent(site, row):
@@ -3463,7 +3599,44 @@ def ack_message(event, message_id):
         raise
     if state == "applied" and row.get("source") == "legacy":
         _trim_legacy_inbox(row["userId"], row["agent"], message_id)
+    if state == "answered" and ":preview" in values:
+        _push_answered_reply(row, message_id, values[":preview"], body, now)
     return _response(200, {"messageId": message_id, "state": state})
+
+
+def _push_answered_reply(row, message_id, preview, body, now):
+    """The Phase-1 "Fin talks back" push (design §3.3 step 2): title = agent
+    name, body = the reply preview, category fin.reply, so the app's NSE can
+    turn it into a communication notification Siri announces in the car.
+    Deliberately NOT gated on source == "voice" — that would drop replies to
+    app / Mac-terminal questions. Dedupe is by messageId: pushedAt is claimed
+    conditionally, so a daemon that already POSTed /notify with this messageId
+    (its task-complete push) wins and this is a no-op, and a second answered
+    ack can never push again. Every failure is logged and swallowed — the ack
+    itself has already committed and must report that honestly."""
+    try:
+        if _mark_message_pushed(row["userId"], message_id, now) is not True:
+            return
+        agent_name = str(row.get("agent") or "").strip() or "Fin"
+        agent_id = str(body.get("agentID") or "").strip()
+        try:
+            agent_id = str(uuid.UUID(agent_id)) if agent_id else ""
+        except ValueError:
+            agent_id = ""
+        fin = {"agentName": agent_name, "messageId": message_id}
+        if agent_id:
+            fin["agentID"] = agent_id
+        result = _push_to_user(
+            row["userId"], agent_name, preview,
+            fin=fin, aps_extra=_push_aps_extra("answered", agent_id),
+        )
+        LOG.info("answered push for %s: delivered %d, failed %d", message_id, result["delivered"], result["failed"])
+    except ApiError as exc:
+        # 503 (APNs not configured) / 500 (bundle can't sign): the reply still
+        # reaches the app through GET /messages; only the announcement is lost.
+        LOG.warning("answered push for %s skipped: %s", message_id, exc.message)
+    except Exception as exc:  # noqa: BLE001 - a push must never fail the ack
+        LOG.warning("answered push for %s failed: %s", message_id, _scrub(exc))
 
 
 def register_message(event, message_id):

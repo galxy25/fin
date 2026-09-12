@@ -88,22 +88,30 @@ final class DaemonNotifyClient {
         return String(redacted.prefix(maxMessageLength)) + "…"
     }
 
-    /// The `/notify` contract: `{"agent", "body", "title"}` required, plus
+    /// The `/notify` contract: `{"agent", "body", "title", "event"}` required, plus
     /// `"agentID"`/`"originDeviceID8"` when the daemon has them — the Lambda
     /// forwards those into the APNs payload's `fin` dict so a tap on the
     /// resulting push can deep-link (see `AgentNotificationService`), instead
-    /// of just opening the app cold. Omitted (not sent as null) when absent,
-    /// so an unpaired daemon's push is byte-identical to before this existed.
+    /// of just opening the app cold — and `"messageId"` when the push reports on
+    /// a claimed control-plane message, so the Lambda pushes that message's
+    /// reply once (the daemon's task-complete push and the answered ack's push
+    /// dedupe on it, design §3.7.3). `event` (`request-input` / `task-complete` /
+    /// `agent-stalled` / `notify`) picks the APNs category and interruption level
+    /// (`fin.input` + time-sensitive for the two "needs you" events). Optional
+    /// keys are omitted (not sent as null) when absent.
     static func requestBody(
-        title: String, body: String, agentName: String,
-        agentID: UUID? = nil, originDeviceID8: String = ""
+        title: String, body: String, agentName: String, event: String = "notify",
+        agentID: UUID? = nil, originDeviceID8: String = "", messageID: String? = nil
     ) -> Data? {
-        var object: [String: Any] = ["title": title, "body": body, "agent": agentName]
+        var object: [String: Any] = ["title": title, "body": body, "agent": agentName, "event": event]
         if let agentID {
             object["agentID"] = agentID.uuidString
         }
         if !originDeviceID8.isEmpty {
             object["originDeviceID8"] = originDeviceID8
+        }
+        if let messageID, !messageID.isEmpty {
+            object["messageId"] = messageID
         }
         return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
@@ -114,11 +122,15 @@ final class DaemonNotifyClient {
     /// a dead control plane must never take down the agent. Returns whether the post
     /// actually succeeded, so a caller that needs the real outcome (not just "handed
     /// off") can report it honestly instead of assuming delivery.
+    /// `messageID` names the control-plane message this push reports on (the
+    /// task-complete push for a claimed message); nil for everything else.
     @discardableResult
-    func send(event: String, message: String) async -> Bool {
+    func send(event: String, message: String, messageID: String? = nil) async -> Bool {
         await deliver(
             title: Self.title(event: event, agentName: agentName),
-            body: Self.alertBody(message)
+            body: Self.alertBody(message),
+            event: event,
+            messageID: messageID
         )
     }
 
@@ -135,7 +147,8 @@ final class DaemonNotifyClient {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return await deliver(
             title: redactedTitle.isEmpty ? agentName : redactedTitle,
-            body: Self.alertBody(body)
+            body: Self.alertBody(body),
+            event: "notify"
         )
     }
 
@@ -145,7 +158,7 @@ final class DaemonNotifyClient {
     /// only on a confirmed 2xx response — every other outcome (bad URL, transport error,
     /// non-2xx) is false, audited, and swallowed.
     @discardableResult
-    private func deliver(title: String, body: String) async -> Bool {
+    private func deliver(title: String, body: String, event: String, messageID: String? = nil) async -> Bool {
         var base = endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") { base.removeLast() }
         guard !base.isEmpty, let url = URL(string: base + "/notify") else {
@@ -161,8 +174,10 @@ final class DaemonNotifyClient {
             title: title,
             body: body,
             agentName: agentName,
+            event: event,
             agentID: agentID,
-            originDeviceID8: originDeviceID8
+            originDeviceID8: originDeviceID8,
+            messageID: messageID
         )
         do {
             let response = try await post(request)

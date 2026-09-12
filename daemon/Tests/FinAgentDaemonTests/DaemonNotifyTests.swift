@@ -58,7 +58,46 @@ final class DaemonNotifyClientTests: XCTestCase {
         XCTAssertEqual(object["title"] as? String, "Nimbus needs input")
         XCTAssertEqual(object["body"] as? String, "Which branch should I deploy?")
         XCTAssertEqual(object["agent"] as? String, "Nimbus")
-        XCTAssertEqual(object.count, 3, "the contract has exactly three keys")
+        XCTAssertEqual(object["event"] as? String, "request-input")
+        XCTAssertNil(object["messageId"], "a request-input push is not the message's one reply push")
+        XCTAssertEqual(object.count, 4, "the contract has exactly four keys: title, body, agent, event")
+    }
+
+    /// A task-complete push for a claimed message names it, so the Lambda can
+    /// dedupe it against the answered ack's own push (one push per message).
+    func testTaskCompleteForAClaimedMessageCarriesTheMessageID() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        }
+
+        await client.send(event: "task-complete", message: "TASK COMPLETE", messageID: "m-4f0c")
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(captured?.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(object["event"] as? String, "task-complete")
+        XCTAssertEqual(object["messageId"] as? String, "m-4f0c")
+        XCTAssertEqual(object.count, 5, "title, body, agent, event, messageId")
+    }
+
+    /// The model's notify tool is a plain "notify" event on the wire: no
+    /// messageId (it is never the message's reply push) and never time-sensitive.
+    func testSendDirectIsANotifyEvent() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        }
+
+        await client.sendDirect(title: "Deploy done", body: "main is live on prod.")
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(captured?.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(object["event"] as? String, "notify")
+        XCTAssertNil(object["messageId"])
     }
 
     /// An unpaired daemon (no agentID) omits both new keys rather than sending
@@ -79,7 +118,7 @@ final class DaemonNotifyClientTests: XCTestCase {
         )
         XCTAssertNil(object["agentID"])
         XCTAssertNil(object["originDeviceID8"])
-        XCTAssertEqual(object.count, 3)
+        XCTAssertEqual(object.count, 4)
     }
 
     /// A daemon paired to an Agent record (the normal case) includes both —
@@ -100,7 +139,7 @@ final class DaemonNotifyClientTests: XCTestCase {
         )
         XCTAssertEqual(object["agentID"] as? String, agentID.uuidString)
         XCTAssertEqual(object["originDeviceID8"] as? String, "a4a1d987")
-        XCTAssertEqual(object.count, 5, "title, body, agent, agentID, originDeviceID8")
+        XCTAssertEqual(object.count, 6, "title, body, agent, event, agentID, originDeviceID8")
     }
 
     /// The model's `notify` tool authors its own title, so `sendDirect` must push that
@@ -122,7 +161,7 @@ final class DaemonNotifyClientTests: XCTestCase {
         XCTAssertEqual(object["title"] as? String, "Deploy done")
         XCTAssertEqual(object["body"] as? String, "main is live on prod.")
         XCTAssertEqual(object["agent"] as? String, "Nimbus")
-        XCTAssertEqual(object.count, 3, "the contract still has exactly three keys")
+        XCTAssertEqual(object.count, 4, "the contract still has exactly four keys: title, body, agent, event")
     }
 
     /// An empty headline falls back to the agent name, so a lock screen always shows

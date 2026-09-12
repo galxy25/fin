@@ -288,12 +288,28 @@ alert out to every stored token.
 
 - **Routes.** `PUT /device-tokens` takes `{"token": "<hex>", "platform":
   "iOS|macOS|visionOS", "deviceName"?: "…"}`; the token is validated as hex and
-  lowercased. `POST /notify` takes `{"title", "body", "agent"?}` — overlong
-  title/body are truncated (the sender is an unattended daemon with nobody
-  there to shorten and retry), and the 200/502 body reports `{"delivered",
-  "failed", "removed", "reasons"}`: counts and APNs reason strings only, never
-  a token. 502 means tokens exist but nothing got through, so the daemon's
-  audit trail records the outage.
+  lowercased. `POST /notify` takes `{"title", "body", "agent"?, "agentID"?,
+  "originDeviceID8"?, "event"?, "messageId"?}` — overlong title/body are
+  truncated (the sender is an unattended daemon with nobody there to shorten
+  and retry), and the 200/502 body reports `{"delivered", "failed", "removed",
+  "reasons"}`: counts and APNs reason strings only, never a token. 502 means
+  tokens exist but nothing got through, so the daemon's audit trail records
+  the outage. `event` is one of `request-input`, `task-complete`,
+  `agent-stalled`, `notify`, `answered` (absent/unknown reads as `notify`) and
+  picks the APNs `category` (`fin.input` for the two "needs you" events, which
+  also get `interruption-level: time-sensitive`; `fin.reply` otherwise).
+  Every push carries `mutable-content: 1` (routes it through the app's
+  notification service extension), `thread-id: <agentID>` when known, and a
+  custom `fin` dict with `agentID`/`originDeviceID8`/`agentName`/`messageId`
+  as available. `messageId` names the `fin-messages` row the push reports on:
+  the control plane pushes each message's reply **once** — the answered ack
+  (`POST /messages/{id}/ack {"state":"answered","replyPreview":…}`) pushes
+  title = agent name, body = the preview, category `fin.reply`, and whichever
+  of that ack or a `/notify` carrying the same `messageId` arrives first wins;
+  the other is suppressed (`"suppressed": true` on `/notify`; silently on the
+  ack, whose push is best-effort and never fails the ack). Not gated on the
+  message's `source`: a reply to an app-typed question pushes the same way a
+  voice one does.
 - **Transport.** APNs' token-based HTTP/2 API. The stdlib has no HTTP/2 client
   and APNs speaks nothing else, so `deploy.sh` vendors `httpx[http2]` into the
   Lambda zip, plus `ecdsa` to sign the ES256 provider JWT — all pure python,
