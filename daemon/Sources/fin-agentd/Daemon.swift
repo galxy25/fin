@@ -322,8 +322,11 @@ final class Daemon {
             "brain": ["kind": "openai-compatible", "model": config.agent.modelIdentifier],
             "hosts": [["host": config.server.host, "username": config.server.username]],
         ]
-        if let session, !isTurnInFlight {
-            // Not mid-turn: the turn's own tool calls share the exec-channel budget.
+        if let session, !isTurnInFlight || cachedCapabilitiesAt == nil {
+            // Not mid-turn (the turn's own tool calls share the exec-channel budget)
+            // — except the very first scan, which is worth one channel even mid-turn:
+            // the launch turn on a local model runs for minutes, and until it ends
+            // the app would otherwise show a computer with no panes at all.
             let commandLine = TmuxSessionRead.commandLine(TmuxSessionInventory.paneTitlesArguments())
             if let result = try? await session.runFixedCommand(
                 commandLine, maxResponseBytes: TmuxSessionRead.maxResponseBytes
