@@ -93,12 +93,21 @@ struct AgentRemoteConsoleView: View {
     /// Presence across every site, shared with the servers list and the memory
     /// view through one cache. The header folds it to one line.
     @ObservedObject private var sites = SiteDirectory.shared
+    /// Control-plane rows by id, for provenance: which device sent a prompt, by
+    /// what input, and when — joined to transcript user lines via in_reply_to.
+    @State private var remoteMessages: [String: ControlPlaneClient.Message] = [:]
+    /// Turns whose steps (reasoning, tool calls, results) are expanded. Default
+    /// view is input and output only; tap a reply to open its steps.
+    @State private var expandedTurns: Set<String> = []
 
     init(agent: Agent, reader: AgentMirrorReader = AgentMirrorReader()) {
         self.agentID = agent.id
         self.agentName = agent.name
         self.reader = reader
-        self.isCloudHosted = !agent.hostsLocally
+        // With a control plane, THE conversation is the cloud transcript (every body
+        // writes to it), merged with this device's own mirror — whatever the agent's
+        // hosting mode says. Without one, the old rule: cloud-hosted reads the cloud.
+        self.isCloudHosted = !agent.hostsLocally || CloudControlPlaneConfig.isConfigured
         let id = agent.id
         _relayMessages = Query(
             filter: #Predicate<AgentRelayMessage> { $0.agentID == id },
@@ -269,10 +278,10 @@ struct AgentRemoteConsoleView: View {
                     if records.isEmpty {
                         emptyState
                     }
-                    ForEach(records) { record in
-                        recordRow(record)
+                    ForEach(turns) { turn in
+                        turnView(turn)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .id(record.id)
+                            .id(turn.id)
                     }
                     ForEach(visibleRelayRows) { message in
                         relayRow(message)
@@ -297,7 +306,7 @@ struct AgentRemoteConsoleView: View {
 
     private func scrollToLatest(_ proxy: ScrollViewProxy) {
         if let last = visibleRelayRows.last.map({ AnyHashable($0.id) })
-            ?? records.last.map({ AnyHashable($0.id) }) {
+            ?? turns.last.map({ AnyHashable($0.id) }) {
             proxy.scrollTo(last, anchor: .bottom)
         }
     }
@@ -369,6 +378,161 @@ struct AgentRemoteConsoleView: View {
         return hasLoaded
             ? "Waiting for the hosting device's mirrored log files to arrive from iCloud Drive — retried every few seconds. If nothing appears, the hosting device may have mirroring off or no activity in the last two days."
             : "Reading the agent's mirrored logs from iCloud Drive."
+    }
+
+    // MARK: - Turns
+
+    /// One exchange: the prompt, the steps the agent took, and its reply. The
+    /// default rendering is prompt + reply; the steps open on tap. A heartbeat
+    /// (the agent's own reflective tick) has no prompt of yours and collapses to
+    /// one quiet line.
+    struct Turn: Identifiable {
+        let id: String
+        let prompt: AgentMirrorRecord?
+        let steps: [AgentMirrorRecord]
+        let reply: AgentMirrorRecord?
+        let isHeartbeat: Bool
+    }
+
+    /// Pure: group a merged transcript into turns. A turn opens at a user line
+    /// (or a turnStarted with no user line); everything until the next opener is
+    /// its steps; the reply is the last assistant line with real text.
+    static func turns(from records: [AgentMirrorRecord]) -> [Turn] {
+        var turns: [Turn] = []
+        var prompt: AgentMirrorRecord?
+        var steps: [AgentMirrorRecord] = []
+        var open = false
+        func close() {
+            guard open else { return }
+            let replyIndex = steps.lastIndex { $0.kind == .assistantMessage && !$0.text.isEmpty && $0.text != "(tool call only)" }
+            let reply = replyIndex.map { steps[$0] }
+            var middle = steps
+            if let replyIndex { middle.remove(at: replyIndex) }
+            let id = prompt?.id ?? middle.first?.id ?? reply?.id ?? UUID().uuidString
+            turns.append(Turn(id: id, prompt: prompt, steps: middle, reply: reply,
+                              isHeartbeat: prompt?.text.hasPrefix("[heartbeat]") ?? false))
+            prompt = nil; steps = []; open = false
+        }
+        for record in records {
+            switch record.kind {
+            case .userMessage:
+                close(); prompt = record; open = true
+            case .turnStarted:
+                if !open || !steps.isEmpty { close(); open = true }
+            default:
+                if !open { open = true }
+                steps.append(record)
+            }
+        }
+        close()
+        return turns
+    }
+
+    private var turns: [Turn] { Self.turns(from: records) }
+
+    @ViewBuilder
+    private func turnView(_ turn: Turn) -> some View {
+        if turn.isHeartbeat {
+            Button {
+                toggle(turn)
+            } label: {
+                Label("heartbeat check · \(turn.steps.count) steps", systemImage: "waveform.path.ecg")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .buttonStyle(.plain)
+            if expandedTurns.contains(turn.id) {
+                turnSteps(turn)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                if let prompt = turn.prompt {
+                    promptRow(prompt)
+                }
+                if expandedTurns.contains(turn.id) {
+                    turnSteps(turn)
+                }
+                if let reply = turn.reply {
+                    Button { toggle(turn) } label: {
+                        recordRow(reply)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("turnReply")
+                } else if !turn.steps.isEmpty {
+                    Button { toggle(turn) } label: {
+                        Label(expandedTurns.contains(turn.id) ? "working…" : "working… · \(turn.steps.count) steps so far",
+                              systemImage: "gearshape.2")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                if !turn.steps.isEmpty, turn.reply != nil {
+                    Button {
+                        toggle(turn)
+                    } label: {
+                        Text(expandedTurns.contains(turn.id) ? "hide \(turn.steps.count) steps" : "\(turn.steps.count) steps — reasoning, tool calls, results")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("turnStepsToggle")
+                }
+            }
+        }
+    }
+
+    private func turnSteps(_ turn: Turn) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(turn.steps) { record in
+                recordRow(record)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.leading, 10)
+        .overlay(alignment: .leading) { Rectangle().fill(.quaternary).frame(width: 2) }
+    }
+
+    private func toggle(_ turn: Turn) {
+        if expandedTurns.contains(turn.id) { expandedTurns.remove(turn.id) } else { expandedTurns.insert(turn.id) }
+    }
+
+    /// "You · voice · from Levi's iPhone · 4:27 PM": when, from which device, and
+    /// by what input — joined to the control-plane row via in_reply_to; a line
+    /// with no row still shows its time and the body that applied it.
+    private func promptRow(_ record: AgentMirrorRecord) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(Self.provenance(for: record, messages: remoteMessages, sites: sites.sites))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(record.text)
+        }
+        .accessibilityIdentifier("promptRow")
+    }
+
+    static func provenance(for record: AgentMirrorRecord, messages: [String: ControlPlaneClient.Message],
+                           sites: [FinSite], now: Date = Date()) -> String {
+        var parts = ["You"]
+        let row = record.inReplyTo.flatMap { messages[$0] }
+        if let source = row?.source {
+            parts.append(source == "voice" ? "voice" : (source == "app" ? "in app" : source))
+        }
+        if let author = row?.authorSiteId8 {
+            let name = sites.first { $0.siteId8 == author }?.displayName ?? "device \(author)"
+            parts.append("from \(name)")
+        } else if let site = record.siteName {
+            parts.append("applied on \(site)")
+        }
+        let sent = row?.createdAt ?? record.timestamp
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.doesRelativeDateFormatting = true
+        formatter.dateStyle = Calendar.current.isDateInToday(sent) ? .none : .short
+        formatter.timeStyle = .short
+        parts.append(formatter.string(from: sent))
+        return parts.joined(separator: " · ")
     }
 
     @ViewBuilder
@@ -627,6 +791,7 @@ struct AgentRemoteConsoleView: View {
         await sites.refresh()
         guard case .success(let remote) = await ControlPlaneClient.listMessages(agent: agentName) else { return }
         let byID = Dictionary(remote.map { ($0.messageId, $0) }, uniquingKeysWith: { a, _ in a })
+        remoteMessages = byID
         for index in cloudPending.indices {
             guard let id = cloudPending[index].messageID, let row = byID[id] else { continue }
             cloudPending[index].state = Self.pendingState(for: row)
@@ -826,7 +991,15 @@ struct AgentRemoteConsoleView: View {
                 // knows where to page from next.
                 oldestLoadedHourIndex = Self.initialOldestLoadedHourIndex(hourCount: page.hours.count)
             }
-            loaded = AgentMirrorReader.merge([earlierRecords, latestWindowRecords])
+            let reader = self.reader
+            let name = agentName
+            let id = agentID
+            // On-device turns (this phone hosting Fin for a while) live only in the
+            // mirror; the merged conversation is both, deduped by id.
+            let mirrored = await Task.detached(priority: .utility) {
+                reader.loadRecent(agentName: name, agentID: id, days: 2)
+            }.value
+            loaded = AgentMirrorReader.merge([earlierRecords, latestWindowRecords, mirrored])
         } else {
             let reader = self.reader
             let name = agentName

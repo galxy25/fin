@@ -195,6 +195,49 @@ final class SitesAndMessagesTests: XCTestCase {
         XCTAssertEqual(groups[0].sites.map(\.siteId8), ["imac0000", "cloud000"])
     }
 
+    // MARK: - Turns and provenance
+
+    private func rec(_ id: String, _ kind: AgentLogKind, _ text: String, at: TimeInterval, replyTo: String? = nil, site: String? = nil) -> AgentMirrorRecord {
+        AgentMirrorRecord(id: id, kind: kind, text: text, timestamp: Date(timeIntervalSince1970: at), sequence: 0, runID: "r", siteName: site, inReplyTo: replyTo)
+    }
+
+    func testTurnsCollapseToPromptStepsReply() {
+        let turns = AgentRemoteConsoleView.turns(from: [
+            rec("u1", .userMessage, "do x", at: 1),
+            rec("t1", .turnStarted, "[turn] started", at: 1),
+            rec("r1", .reasoning, "thinking", at: 2),
+            rec("c1", .toolCall, "read_session", at: 3),
+            rec("o1", .toolResult, "output", at: 4),
+            rec("a0", .assistantMessage, "(tool call only)", at: 4),
+            rec("a1", .assistantMessage, "done x", at: 5),
+            rec("u2", .userMessage, "[heartbeat] Mission tick", at: 10),
+            rec("a2", .assistantMessage, "all quiet", at: 11),
+        ])
+        XCTAssertEqual(turns.count, 2)
+        XCTAssertEqual(turns[0].prompt?.id, "u1")
+        XCTAssertEqual(turns[0].reply?.text, "done x")
+        XCTAssertEqual(turns[0].steps.map(\.id), ["r1", "c1", "o1", "a0"], "the reply is not a step; the tool-call-only line is")
+        XCTAssertTrue(turns[1].isHeartbeat)
+    }
+
+    func testATurnStillWorkingHasStepsAndNoReply() {
+        let turns = AgentRemoteConsoleView.turns(from: [
+            rec("u1", .userMessage, "do y", at: 1), rec("r1", .reasoning, "…", at: 2),
+        ])
+        XCTAssertEqual(turns.count, 1)
+        XCTAssertNil(turns[0].reply)
+        XCTAssertEqual(turns[0].steps.count, 1)
+    }
+
+    func testProvenanceNamesInputDeviceAndTime() throws {
+        let row = try ControlPlaneClient.decoder.decode(ControlPlaneClient.Message.self, from: #"{"messageId":"m-1","state":"answered","source":"voice","authorSiteId8":"ph0ne000","createdAt":"2026-09-12T16:27:41Z"}"#.data(using: .utf8)!)
+        let phone = site("Levi's iPhone", id8: "ph0ne000", kind: "app")
+        let line = AgentRemoteConsoleView.provenance(for: rec("u1", .userMessage, "x", at: 0, replyTo: "m-1"), messages: ["m-1": row], sites: [phone])
+        XCTAssertTrue(line.hasPrefix("You · voice · from Levi's iPhone · "), line)
+        let plain = AgentRemoteConsoleView.provenance(for: rec("u2", .userMessage, "x", at: 0, site: "Levi's iMac"), messages: [:], sites: [])
+        XCTAssertTrue(plain.hasPrefix("You · applied on Levi's iMac · "), plain)
+    }
+
     // MARK: - Mirror merge
 
     private func record(_ id: String, kind: AgentLogKind = .userMessage, text: String = "t", at: TimeInterval, site: String? = nil, name: String? = nil, replyTo: String? = nil) -> AgentMirrorRecord {

@@ -32,7 +32,7 @@ struct AgentHubWindowView: View {
             case .settings: return "Settings"
             case .logs: return "Logs & Traces"
             case .memory: return "Memory"
-            case .remote: return "Remote"
+            case .remote: return CloudControlPlaneConfig.isConfigured ? "Conversation" : "Remote"
             case .artifacts: return "Artifacts"
             case .key: return "Fin's Key"
             }
@@ -43,7 +43,7 @@ struct AgentHubWindowView: View {
             case .settings: return "gearshape"
             case .logs: return "list.bullet.rectangle"
             case .memory: return "brain"
-            case .remote: return "antenna.radiowaves.left.and.right"
+            case .remote: return CloudControlPlaneConfig.isConfigured ? "bubble.left.and.bubble.right" : "antenna.radiowaves.left.and.right"
             case .artifacts: return "externaldrive"
             case .key: return "key"
             }
@@ -105,7 +105,7 @@ struct AgentHubWindowView: View {
             Section("What's going on") {
                 sidebarRow(.logs)
                 sidebarRow(.memory)
-                if sessionManager.isRemotelyHosted(agent) {
+                if sessionManager.isRemotelyHosted(agent) || CloudControlPlaneConfig.isConfigured {
                     sidebarRow(.remote)
                 }
                 sidebarRow(.artifacts)

@@ -3245,6 +3245,7 @@ def _public_message(row):
         "clarifyCandidates": row.get("clarifyCandidates") or [],
         "claimedBy": row.get("claimedBy"),
         "claimedAt": row.get("claimedAt"),
+        "authorSiteId8": row.get("authorSiteId8"),
         "appliedAt": row.get("appliedAt"),
         "appliedRunId": row.get("appliedRunId"),
         "answeredAt": row.get("answeredAt"),

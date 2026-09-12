@@ -114,9 +114,29 @@ final class AppSiteClient: ObservableObject {
 
     // MARK: - Heartbeat + claims
 
+    /// The agent this device speaks for when it hosts no runtime: Fin, the one
+    /// conversation. A phone with no live terminal still IS a site — it shows in
+    /// Fin's Computers and in presence, it just claims nothing.
+    var defaultAgentName = "Fin"
+
     func beat() async {
-        guard let target = targetProvider() else { return }
-        guard await ensureEnrolled(agentName: target.agentName), let siteID, let siteToken else { return }
+        let target = targetProvider()
+        guard await ensureEnrolled(agentName: target?.agentName ?? defaultAgentName), let siteID, let siteToken else { return }
+        guard let target else {
+            let body: [String: Any] = [
+                "schema": 2, "state": "idle", "wantsPrimary": false, "held": [], "unacked": [],
+                "capabilities": ["kind": "app", "hosts_runtime": false,
+                                 "app_build": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""],
+            ]
+            if let (status, _) = await siteRequest("POST", "/sites/\(siteID)/heartbeat", body: body, siteID: siteID, token: siteToken),
+               !(200...299).contains(status) {
+                lastError = "heartbeat HTTP \(status)"
+                if status == 401 { forgetIdentity() }
+            } else {
+                lastError = nil
+            }
+            return
+        }
         // Answered acks first: a reply that landed since the last beat.
         let replies = target.assistantReplies()
         for index in held.indices.reversed() {
@@ -138,13 +158,7 @@ final class AppSiteClient: ObservableObject {
         ]
         guard let (status, data) = await siteRequest("POST", "/sites/\(siteID)/heartbeat", body: body, siteID: siteID, token: siteToken) else { return }
         guard (200...299).contains(status) else {
-            if status == 401 {
-                // Token revoked (retired in the app, or re-enrolled elsewhere): forget it
-                // and enroll afresh next beat.
-                self.siteID = nil; self.siteToken = nil
-                UserDefaults.standard.removeObject(forKey: Self.siteIDKey)
-                try? KeychainStore.saveLocalSecret("", forKey: Self.siteTokenKey)
-            }
+            if status == 401 { forgetIdentity() }
             lastError = "heartbeat HTTP \(status)"
             return
         }
@@ -165,6 +179,14 @@ final class AppSiteClient: ObservableObject {
             _ = await siteRequest("POST", "/messages/\(id)/ack", body: ["state": "applied"], siteID: siteID, token: siteToken)
             audit("[site] applied message \(id.prefix(10)) from the control plane")
         }
+    }
+
+    /// Token revoked (retired in the app, or re-enrolled elsewhere): forget it and
+    /// enroll afresh next beat.
+    private func forgetIdentity() {
+        siteID = nil; siteToken = nil
+        UserDefaults.standard.removeObject(forKey: Self.siteIDKey)
+        try? KeychainStore.saveLocalSecret("", forKey: Self.siteTokenKey)
     }
 
     private func siteRequest(_ method: String, _ path: String, body: [String: Any], siteID: String, token: String) async -> (Int, Data)? {

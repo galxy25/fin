@@ -33,12 +33,16 @@ struct AgentHubView: View {
                 } label: {
                     Label("Memory", systemImage: "brain")
                 }
-                if sessionManager.isRemotelyHosted(agent) {
+                if sessionManager.isRemotelyHosted(agent) || CloudControlPlaneConfig.isConfigured {
+                    // With a control plane this is THE conversation — every body's
+                    // turns, merged — whichever device happens to host a runtime.
                     NavigationLink {
                         AgentRemoteConsoleView(agent: agent)
                     } label: {
-                        Label("Remote", systemImage: "antenna.radiowaves.left.and.right")
+                        Label(CloudControlPlaneConfig.isConfigured ? "Conversation" : "Remote",
+                              systemImage: CloudControlPlaneConfig.isConfigured ? "bubble.left.and.bubble.right" : "antenna.radiowaves.left.and.right")
                     }
+                    .accessibilityIdentifier("hubConversationRow")
                 }
                 NavigationLink {
                     ArtifactsView()

@@ -125,6 +125,7 @@ enum ControlPlaneClient {
         let targetSiteName: String?
         let clarifyCandidates: [String]?
         let claimedBy: String?
+        let authorSiteId8: String?
         let appliedAt: Date?
         let answeredAt: Date?
         let replyPreview: String?
