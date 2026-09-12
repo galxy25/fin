@@ -47,10 +47,12 @@ enum ScreenshotFixtures {
         where agentNames.contains(agent.name) {
             context.delete(agent)
         }
+        #if !os(tvOS)
         for document in (try? context.fetch(FetchDescriptor<MarkdownDocument>())) ?? []
         where documentNames.contains(document.name) || document.name == "ui-test-fixture.md" {
             context.delete(document)
         }
+        #endif
         try? context.save()
     }
 
@@ -62,7 +64,11 @@ enum ScreenshotFixtures {
         guard isEnabled else { return }
         seedServers(context)
         seedAgents(context)
+        #if !os(tvOS)
+        // MarkdownDocument is a local-only model the tvOS target deliberately
+        // omits (no Files feature there), so it isn't in fin-tv's schema.
         seedDocuments(context)
+        #endif
         try? context.save()
     }
 
@@ -132,6 +138,7 @@ enum ScreenshotFixtures {
         )
     }
 
+    #if !os(tvOS)
     private static func seedDocuments(_ context: ModelContext) {
         let existing = (try? context.fetch(FetchDescriptor<MarkdownDocument>())) ?? []
         guard existing.isEmpty else { return }
@@ -185,4 +192,5 @@ enum ScreenshotFixtures {
             context.insert(MarkdownDocument(name: name, bookmarkData: bookmark))
         }
     }
+    #endif
 }

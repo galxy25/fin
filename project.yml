@@ -158,6 +158,12 @@ targets:
           - RemoteInputPairing.swift
           - AppTheme.swift
           - DeviceIdentity.swift
+      # Screenshot fixtures, so a tvOS capture shows a populated server list
+      # rather than the "No Servers Yet" empty state a simulator (no iCloud
+      # account) always lands on. Inert unless FIN_SCREENSHOT_MODE=1.
+      - path: fin/Support
+        includes:
+          - ScreenshotFixtures.swift
       - path: fin/Persistence/KeychainStore.swift
       - path: fin/RemoteInput
       - path: daemon/Sources/FinAgentCore/TerminalEventLog.swift

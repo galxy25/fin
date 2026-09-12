@@ -60,6 +60,12 @@ struct FinTVApp: App {
         let manager = TVSessionManager()
         let context = container.mainContext
 
+        // App Store screenshot capture only (FIN_SCREENSHOT_MODE=1). A tvOS
+        // simulator has no iCloud account, so without this every capture is the
+        // "No Servers Yet" empty state — see ScreenshotFixtures.
+        ScreenshotFixtures.seedIfNeeded(context)
+        ScreenshotFixtures.cleanup(context)
+
         // Same join as the iOS app: Server.keyID -> KeyMetadata (synced) -> key
         // material in THIS device's Keychain. tvOS never receives iCloud Keychain
         // items, so the material gets here via the companion's provisioning path.
