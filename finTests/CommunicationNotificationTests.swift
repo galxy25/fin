@@ -109,6 +109,64 @@ final class CommunicationNotificationTests: XCTestCase {
                      "a name alone can't address the legacy inbox")
     }
 
+    /// The control plane ↔ app contract, pinned from the other side in
+    /// scripts/cloud-agent/control-plane/test_lambda.py
+    /// (`test_the_ack_push_carries_what_the_app_needs_to_reply_and_deep_link`):
+    /// this is the EXACT `fin` dict the Lambda's answered-ack push carries once
+    /// the acking site (daemon or app) sends `agentID` + `originDeviceID8`.
+    /// It must be tappable (parseFinPayload), replyable (replyTarget), and it
+    /// must say the reply did not originate on this device.
+    func testTheControlPlanesAckPushIsReplyableAndTappable() {
+        let agentID = UUID()
+        let userInfo: [AnyHashable: Any] = [
+            "aps": ["alert": ["title": "Fin", "body": "It is noon."], "category": "fin.reply",
+                    "thread-id": agentID.uuidString.lowercased(), "mutable-content": 1],
+            "fin": ["agentName": "Fin", "messageId": "m-4f0c1234-0000-4000-8000-000000000000",
+                    "agentID": agentID.uuidString.lowercased(), "originDeviceID8": "a4a1d987"],
+        ]
+        let parsed = AgentNotificationService.parseFinPayload(userInfo)
+        XCTAssertEqual(parsed?.agentID, agentID, "a tap deep-links on the lowercased uuid the Lambda emits")
+        XCTAssertEqual(parsed?.originDeviceID8, "a4a1d987", "the reply came from the answering device, not this one")
+        XCTAssertEqual(parsed?.messageID, "m-4f0c1234-0000-4000-8000-000000000000")
+        let target = AgentNotificationService.replyTarget(from: userInfo)
+        XCTAssertEqual(target?.agentID, agentID)
+        XCTAssertEqual(target?.agentName, "Fin")
+    }
+
+    /// The two halves of the "skip the answering device" rule share one value:
+    /// the token registration's `deviceId8` and the answered ack's
+    /// `originDeviceID8` are both `DeviceIdentity.short`, and the ack names the
+    /// agent so the push it triggers is addressable (the test above).
+    @MainActor
+    func testAnsweredAckAndTokenRegistrationNameTheSameDevice() throws {
+        let agentID = UUID()
+        let ack = AppSiteClient.answeredAckBody(replyPreview: String(repeating: "x", count: 600), agentID: agentID)
+        XCTAssertEqual(ack["state"] as? String, "answered")
+        XCTAssertEqual((ack["replyPreview"] as? String)?.count, 500)
+        XCTAssertEqual(ack["agentID"] as? String, agentID.uuidString)
+        XCTAssertEqual(ack["originDeviceID8"] as? String, DeviceIdentity.short)
+        XCTAssertEqual(DeviceIdentity.short.count, 8)
+
+        let request = try XCTUnwrap(DeviceTokenUplink.request(
+            tokenHex: "ab", platform: "iOS", deviceName: " ", deviceID8: DeviceIdentity.short,
+            endpoint: "https://cp.example/", bearer: "t"
+        ))
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(object["deviceId8"] as? String, DeviceIdentity.short)
+        XCTAssertNil(object["deviceName"], "blank names are omitted, not sent empty")
+        XCTAssertEqual(Set(object.keys), ["token", "platform", "deviceId8"])
+        // A pre-Phase-1 shape (no device id) is still the same three-key contract.
+        let legacy = try XCTUnwrap(DeviceTokenUplink.request(
+            tokenHex: "ab", platform: "iOS", deviceName: nil, endpoint: "https://cp.example", bearer: "t"
+        ))
+        let legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(legacy.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(Set(legacyObject.keys), ["token", "platform"])
+    }
+
     // MARK: - Foreground dedupe
 
     func testForegroundSuppressesOnlyEchoedReplyPushes() {

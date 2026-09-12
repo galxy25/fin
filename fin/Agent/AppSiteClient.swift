@@ -144,13 +144,19 @@ final class AppSiteClient: ObservableObject {
             guard let atSubmit = entry.repliesAtSubmit, !answered.contains(entry.id),
                   replies.count > atSubmit, !target.isBusy() else { continue }
             answered.insert(entry.id)
-            // The control plane pushes a `fin.reply` notification back to every
-            // device on this ack — including this one. This device already showed
-            // the turn (it hosted it), so mark the id BEFORE the ack goes out and
-            // `AgentNotificationService.willPresent` drops the echo.
+            // The control plane pushes a `fin.reply` notification to the user's
+            // OTHER devices on this ack: `originDeviceID8` names this device (it
+            // hosted the turn and already showed the reply — its local banner or
+            // the visible conversation), so its own tokens — registered with the
+            // same `deviceId8` by `DeviceTokenUplink` — are left out of the
+            // fan-out. `agentID` is what lets a tap deep-link and a typed Reply be
+            // addressed on the receiving device (`AgentNotificationService`).
+            // Belt and braces: mark the id BEFORE the ack goes out so, if a token
+            // registered by an older build still echoes the push back here,
+            // `AgentNotificationService.willPresent` drops it.
             AgentNotificationService.shared.markSurfacedLocally(messageID: entry.id)
             _ = await siteRequest("POST", "/messages/\(entry.id)/ack",
-                                  body: ["state": "answered", "replyPreview": String(replies.latest.prefix(500))],
+                                  body: Self.answeredAckBody(replyPreview: replies.latest, agentID: target.agentID),
                                   siteID: siteID, token: siteToken)
             held.remove(at: index)
         }
@@ -184,6 +190,20 @@ final class AppSiteClient: ObservableObject {
             _ = await siteRequest("POST", "/messages/\(id)/ack", body: ["state": "applied"], siteID: siteID, token: siteToken)
             audit("[site] applied message \(id.prefix(10)) from the control plane")
         }
+    }
+
+    /// The answered ack: `{state, replyPreview, agentID, originDeviceID8}` — the
+    /// same shape the daemon's `DaemonSiteClient.answeredAckBody` sends, so the
+    /// control plane's reply push is identical whichever body answered. Pure.
+    nonisolated static func answeredAckBody(
+        replyPreview: String, agentID: UUID, originDeviceID8: String = DeviceIdentity.short
+    ) -> [String: Any] {
+        [
+            "state": "answered",
+            "replyPreview": String(replyPreview.prefix(500)),
+            "agentID": agentID.uuidString,
+            "originDeviceID8": originDeviceID8,
+        ]
     }
 
     /// Token revoked (retired in the app, or re-enrolled elsewhere): forget it and

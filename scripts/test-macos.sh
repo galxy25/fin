@@ -47,8 +47,13 @@ echo "▶ build-for-testing (macOS, unsigned)…"
 # Override the project's automatic signing → build unsigned, then ad-hoc sign
 # below. (See the header: `-allowProvisioningUpdates` can't replace this on a Mac
 # whose UDID isn't registered + has no dev.levischoen.fin Mac Development profile.)
+# -skipPackagePluginValidation: SwiftTerm ships a build-tool plugin that headless
+# xcodebuild refuses to run until it has been trusted in Xcode's GUI — per package
+# checkout path, so every fresh worktree / derived dir fails at "Validate plug-in
+# SwiftTermBuildInfoPlugin" without it.
 xcodebuild build-for-testing -project fin.xcodeproj -scheme fin \
-  -destination 'platform=macOS' -derivedDataPath "$DERIVED" \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath "$DERIVED" \
+  -skipPackagePluginValidation -skipMacroValidation \
   CODE_SIGNING_ALLOWED=NO >/dev/null
 
 PRODUCTS="$DERIVED/Build/Products/Debug"
@@ -98,5 +103,6 @@ echo "▶ test-without-building (macOS)…"
 # empty — safe under `set -u` on bash 3.2 (macOS), where a bare "${arr[@]}"
 # would otherwise trip "unbound variable".
 xcodebuild test-without-building -project fin.xcodeproj -scheme fin \
-  -destination 'platform=macOS' -derivedDataPath "$DERIVED" \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath "$DERIVED" \
+  -skipPackagePluginValidation -skipMacroValidation \
   ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
