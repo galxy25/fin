@@ -237,7 +237,12 @@ targets:
     # same-named-window addressing) for exactly the kind of "does this window stay
     # populated after an interaction" question this exists to answer.
     type: bundle.ui-testing
-    platform: macOS
+    # macOS is the primary destination (see above); iOS is supported so the
+    # App Store screenshot-capture suite can drive the iPhone/iPad simulators
+    # through the same XCUITest path rather than a second, unproven mechanism.
+    # Scope any run with -only-testing: — the macOS window tests are not
+    # meaningful on iOS.
+    supportedDestinations: [macOS, iOS]
     sources:
       - path: finUITests
     dependencies:

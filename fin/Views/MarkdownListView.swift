@@ -195,6 +195,10 @@ struct MarkdownListView: View {
     /// never runs for a real user.
     private func seedUITestFileIfNeeded() {
         guard ProcessInfo.processInfo.environment["FIN_UI_TESTING"] != nil else { return }
+        // Screenshot capture runs with both flags set; its own richer fixtures
+        // (ScreenshotFixtures) stand in, and this bare test file has no business
+        // appearing on a product page.
+        guard !ScreenshotFixtures.isEnabled else { return }
         guard !documents.contains(where: { $0.name == "ui-test-fixture.md" }) else { return }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ui-test-fixture.md")
         let fixtureText = """

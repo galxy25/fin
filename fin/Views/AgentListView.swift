@@ -95,6 +95,7 @@ struct AgentListView: View {
                 } label: {
                     AgentRow(agent: agent)
                 }
+                .accessibilityIdentifier("agentRow_\(agent.id.uuidString)")
             }
             .onDelete(perform: deleteAgents)
         }

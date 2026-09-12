@@ -128,6 +128,11 @@ struct FinApp: App {
         let manager = SessionManager()
         let context = container.mainContext
 
+        // App Store screenshot capture only (FIN_SCREENSHOT_MODE=1); a no-op for
+        // every real launch. See ScreenshotFixtures for why empty-state captures
+        // were worth fixing.
+        ScreenshotFixtures.seedIfNeeded(context)
+
         manager.resolveCredentials = { server in
             guard let keyID = server.keyID else { return nil }
             let descriptor = FetchDescriptor<KeyMetadata>(predicate: #Predicate { $0.id == keyID })
