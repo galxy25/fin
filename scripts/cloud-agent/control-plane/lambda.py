@@ -1405,15 +1405,32 @@ def put_device_token(event):
         raise ApiError(400, "deviceName must be a string")
     device_name = (device_name or "").strip()[:MAX_DEVICE_NAME_LENGTH]
 
+    # The registering device's own `DeviceIdentity.short` (8 hex) — the same
+    # value that device puts in `originDeviceID8` when it acks a message as
+    # answered, so the ack's reply push can leave this device's tokens out
+    # (design §3.7.3 "skip when the answering site is the foreground device").
+    # Optional: a pre-Phase-1 build never sends it, and its pushes dedupe the
+    # old way (the app drops the echo in willPresent).
+    device_id8 = str(body.get("deviceId8") or "").strip().lower()
+    if device_id8 and not DEVICE_ID8.match(device_id8):
+        raise ApiError(400, "deviceId8 must be 8 lowercase hex characters")
+
     updated_at = _iso(_now())
-    names = {"#platform": "platform", "#updated": "updatedAt", "#name": "deviceName", "#user": "userId"}
+    names = {"#platform": "platform", "#updated": "updatedAt", "#name": "deviceName",
+             "#user": "userId", "#device": "deviceId8"}
     values = {":platform": platform, ":updated": updated_at, ":user": event["_userId"]}
     expression = "SET #platform = :platform, #updated = :updated, #user = :user"
+    if device_id8:
+        expression += ", #device = :device"
+        values[":device"] = device_id8
+    removes = [] if device_id8 else ["#device"]
     if device_name:
         expression += ", #name = :name"
         values[":name"] = device_name
     else:
-        expression += " REMOVE #name"
+        removes.append("#name")
+    if removes:
+        expression += " REMOVE " + ", ".join(removes)
     DEVICE_TOKENS_TABLE.update_item(
         Key={"token": token},
         UpdateExpression=expression,
@@ -1483,14 +1500,18 @@ def _push_payload(title, body, fin=None, aps_extra=None):
     return payload
 
 
-def _push_to_user(user_id, title, body, fin=None, aps_extra=None):
+def _push_to_user(user_id, title, body, fin=None, aps_extra=None, exclude_device_id8=""):
     """One APNs alert to every device token `user_id` has registered — the
     fan-out behind POST /notify and the answered-message push in ack_message.
+    `exclude_device_id8` leaves out the tokens one device registered under that
+    `deviceId8` (design §3.7.3: the device that answered a turn already showed
+    the reply — it hosted it — so its own ack must not echo back to it).
     Returns {"delivered", "failed", "removed", "reasons"} (plus a "note" when
-    the user has no tokens at all); raises ApiError 503 when APNs is not
-    configured and 500 when the bundle can't sign. Callers decide what an
-    empty delivery means: the route answers 502, an ack shrugs. Nothing here
-    ever logs or returns a token, the auth key, or the JWT."""
+    the user has no tokens at all, or none besides the excluded device's);
+    raises ApiError 503 when APNs is not configured and 500 when the bundle
+    can't sign. Callers decide what an empty delivery means: the route answers
+    502, an ack shrugs. Nothing here ever logs or returns a token, the auth
+    key, or the JWT."""
     if not _apns_configured():
         raise ApiError(503, "APNs key is not configured; redeploy with FIN_APNS_KEY_PATH set (see control-plane/README.md)")
     title = str(title or "").strip()[:MAX_NOTIFY_TITLE_LENGTH]
@@ -1509,6 +1530,13 @@ def _push_to_user(user_id, title, body, fin=None, aps_extra=None):
             "delivered": 0, "failed": 0, "removed": 0, "reasons": [],
             "note": "no device tokens registered; launch the app once with the control plane configured",
         }
+    if exclude_device_id8:
+        rows = [row for row in rows if row.get("deviceId8") != exclude_device_id8]
+        if not rows:
+            return {
+                "delivered": 0, "failed": 0, "removed": 0, "reasons": [],
+                "note": "the only registered device is the one that answered; nothing to push",
+            }
 
     try:
         import httpx  # vendored by deploy.sh
@@ -1595,6 +1623,32 @@ def _mark_message_pushed(user_id, message_id, now=None):
         return None
 
 
+def _release_message_push(user_id, message_id, now):
+    """Gives back a `_mark_message_pushed` claim whose push reached nobody: a
+    conditional REMOVE of pushedAt guarded by the exact stamp this caller
+    wrote, so it never un-claims a push somebody else won in between. Without
+    this, a failed ack push would blackhole the reply — the daemon's later
+    task-complete /notify with the same messageId would be "suppressed" (a 200
+    it reads as delivered) while nothing ever reached a device. Never raises.
+    Residual window, accepted: a /notify that arrives while the ack's push is
+    still in flight is suppressed, and if that push THEN fails nothing re-fires
+    it — two simultaneous pushes and an APNs outage in the same second."""
+    if not message_id:
+        return
+    try:
+        MESSAGES_TABLE.update_item(
+            Key={"messageId": message_id},
+            UpdateExpression="REMOVE pushedAt",
+            ConditionExpression="userId = :user AND pushedAt = :claimed",
+            ExpressionAttributeValues={":user": user_id, ":claimed": _iso(now)},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            LOG.warning("pushedAt release failed for %s: %s", message_id, _scrub(exc))
+    except Exception as exc:  # noqa: BLE001 - never take the caller down
+        LOG.warning("pushedAt release failed for %s: %s", message_id, _scrub(exc))
+
+
 def notify(event):
     """POST /notify — {"title", "body", "agent"?, "agentID"?, "originDeviceID8"?,
     "event"?, "messageId"?}: one APNs alert to every registered device. `event`
@@ -1652,20 +1706,35 @@ def notify(event):
     # One push per message (design §3.7.3): the daemon acks `answered` before
     # it POSTs its task-complete push, so the ack push normally wins and this
     # one is the duplicate — unless the ack never happened, in which case this
-    # push claims the row and the ack's push is the one suppressed. Claimed
-    # before APNs is tried, not after: two pushes for one message is the
-    # failure this guards against, and a retry is the daemon's call.
-    if message_id and _mark_message_pushed(event["_userId"], message_id) is False:
+    # push claims the row and the ack's push is the one suppressed. The
+    # request-input push for a claimed message claims the row the same way:
+    # the time-sensitive question is the push worth keeping, not the closing
+    # text's fin.reply. Claimed before APNs is tried (two pushes for one
+    # message is the failure this guards against) and GIVEN BACK when nothing
+    # lands, so `suppressed` below always means "a push for this message
+    # already reached a device (or is in flight)" — never "a push was tried".
+    now = _now()
+    user_id = event["_userId"]
+    claim = _mark_message_pushed(user_id, message_id, now) if message_id else None
+    claimed = claim is True  # None (foreign/unknown row, storage trouble): push anyway
+    if claim is False:
         LOG.info("notify: %s already pushed, suppressed", message_id)
         return _response(200, {
             "delivered": 0, "failed": 0, "removed": 0, "suppressed": True,
             "note": "this messageId was already pushed to the owner's devices",
         })
-    result = _push_to_user(
-        event["_userId"], title, text,
-        fin=fin or None,
-        aps_extra=_push_aps_extra(push_event, agent_id),
-    )
+    try:
+        result = _push_to_user(
+            user_id, title, text,
+            fin=fin or None,
+            aps_extra=_push_aps_extra(push_event, agent_id),
+        )
+    except BaseException:
+        if claimed:
+            _release_message_push(user_id, message_id, now)
+        raise
+    if claimed and not result["delivered"]:
+        _release_message_push(user_id, message_id, now)
     if "note" in result:
         return _response(200, {"delivered": 0, "failed": 0, "removed": 0, "note": result["note"]})
     # 502 when tokens exist but nothing got through, so an unattended caller's
@@ -3611,32 +3680,58 @@ def _push_answered_reply(row, message_id, preview, body, now):
     Deliberately NOT gated on source == "voice" — that would drop replies to
     app / Mac-terminal questions. Dedupe is by messageId: pushedAt is claimed
     conditionally, so a daemon that already POSTed /notify with this messageId
-    (its task-complete push) wins and this is a no-op, and a second answered
-    ack can never push again. Every failure is logged and swallowed — the ack
-    itself has already committed and must report that honestly."""
+    (its request-input or task-complete push) wins and this is a no-op, and a
+    second answered ack can never push again. A claim whose push reached
+    nobody is given back (`_release_message_push`), so the daemon's later
+    /notify for the same message still lands instead of being suppressed.
+
+    The ack body's `agentID` and `originDeviceID8` are what make the push
+    USABLE on the app side: `fin.agentID` (+ `thread-id`) is what a tap
+    deep-links on and what a typed Reply is addressed to
+    (`AgentNotificationService.replyTarget` needs id AND name), and
+    `originDeviceID8` names the answering device — its own tokens are left out
+    of the fan-out (it hosted the turn and already showed the reply) and the
+    field tells every other device the reply did not originate locally.
+    Every failure is logged and swallowed — the ack itself has already
+    committed and must report that honestly."""
+    user_id = row["userId"]
+    claimed = False
     try:
-        if _mark_message_pushed(row["userId"], message_id, now) is not True:
+        if _mark_message_pushed(user_id, message_id, now) is not True:
             return
+        claimed = True
         agent_name = str(row.get("agent") or "").strip() or "Fin"
         agent_id = str(body.get("agentID") or "").strip()
         try:
             agent_id = str(uuid.UUID(agent_id)) if agent_id else ""
         except ValueError:
             agent_id = ""
+        origin_device_id8 = str(body.get("originDeviceID8") or "").strip()
+        if not DEVICE_ID8.match(origin_device_id8):
+            origin_device_id8 = ""
         fin = {"agentName": agent_name, "messageId": message_id}
         if agent_id:
             fin["agentID"] = agent_id
+        if origin_device_id8:
+            fin["originDeviceID8"] = origin_device_id8
         result = _push_to_user(
-            row["userId"], agent_name, preview,
+            user_id, agent_name, preview,
             fin=fin, aps_extra=_push_aps_extra("answered", agent_id),
+            exclude_device_id8=origin_device_id8,
         )
         LOG.info("answered push for %s: delivered %d, failed %d", message_id, result["delivered"], result["failed"])
+        if not result["delivered"]:
+            _release_message_push(user_id, message_id, now)
     except ApiError as exc:
         # 503 (APNs not configured) / 500 (bundle can't sign): the reply still
         # reaches the app through GET /messages; only the announcement is lost.
         LOG.warning("answered push for %s skipped: %s", message_id, exc.message)
+        if claimed:
+            _release_message_push(user_id, message_id, now)
     except Exception as exc:  # noqa: BLE001 - a push must never fail the ack
         LOG.warning("answered push for %s failed: %s", message_id, _scrub(exc))
+        if claimed:
+            _release_message_push(user_id, message_id, now)
 
 
 def register_message(event, message_id):

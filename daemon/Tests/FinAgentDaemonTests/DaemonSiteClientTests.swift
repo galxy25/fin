@@ -21,12 +21,14 @@ final class DaemonSiteClientTests: XCTestCase {
     /// captured arrays without Sendable ceremony.
     private func makeClient(
         state: String = "idle",
+        agentID: UUID? = nil, originDeviceID8: String = "",
         onCommand: @escaping @MainActor (DaemonSiteClient.Command) -> Void = { _ in },
         _ handler: @escaping @MainActor (URLRequest) -> (Int, String)
     ) async -> DaemonSiteClient {
         let client = DaemonSiteClient(
             siteID: "A4A1D987-0000-4000-8000-000000000000", displayName: "Levi's iMac", token: "site-secret",
             heartbeatSeconds: 20, endpointURL: "https://cp.example/", ledgerPath: ledgerPath,
+            agentID: agentID, originDeviceID8: originDeviceID8,
             audit: { _ in }
         )
         await client.configure(
@@ -135,6 +137,40 @@ final class DaemonSiteClientTests: XCTestCase {
         XCTAssertEqual(acks.value[0]["runId"] as? String, "run-9")
         XCTAssertEqual(acks.value[1]["state"] as? String, "answered")
         XCTAssertFalse((acks.value[1]["replyPreview"] as? String ?? "").contains("ZmFrZS1zZWNyZXQ"), "the preview leaves the machine — redact it")
+        // Unpaired daemon: the optional fields are omitted, never sent as null.
+        XCTAssertNil(acks.value[1]["agentID"])
+        XCTAssertNil(acks.value[1]["originDeviceID8"])
+    }
+
+    /// The control plane's reply push is only usable on the app side (tap
+    /// deep-link, typed Reply, thread-id) when the ack names the agent, and
+    /// only skips this device's own tokens when the ack names the device —
+    /// so a paired daemon sends both on every answered ack.
+    @MainActor
+    func testAnsweredAckNamesTheAgentAndTheAnsweringDevice() async {
+        let agentID = UUID()
+        let acks = Box<[[String: Any]]>([])
+        let client = await makeClient(agentID: agentID, originDeviceID8: "a4a1d987") { request in
+            if request.url!.path.hasSuffix("/ack") {
+                acks.value.append((try? JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any]) ?? [:])
+            }
+            return (200, "{}")
+        }
+        await client.markAnswered("m-7", replyPreview: "done")
+        XCTAssertEqual(acks.value.count, 1)
+        XCTAssertEqual(acks.value[0]["state"] as? String, "answered")
+        XCTAssertEqual(acks.value[0]["replyPreview"] as? String, "done")
+        XCTAssertEqual(acks.value[0]["agentID"] as? String, agentID.uuidString)
+        XCTAssertEqual(acks.value[0]["originDeviceID8"] as? String, "a4a1d987")
+        XCTAssertEqual(acks.value[0].count, 4, "state, replyPreview, agentID, originDeviceID8")
+    }
+
+    func testAnsweredAckBodyOmitsUnknownFieldsAndRedacts() {
+        let body = DaemonSiteClient.answeredAckBody(
+            replyPreview: "api_key=ZmFrZS1zZWNyZXQtdmFsdWUtZm9yLXRlc3Rpbmc0MjQy", agentID: nil, originDeviceID8: ""
+        )
+        XCTAssertEqual(Set(body.keys), ["state", "replyPreview"])
+        XCTAssertFalse((body["replyPreview"] as? String ?? "").contains("ZmFrZS1zZWNyZXQ"))
     }
 
     @MainActor

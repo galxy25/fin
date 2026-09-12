@@ -139,14 +139,29 @@ actor DaemonSiteClient {
     private var lastFailureAuditAt: [String: Date] = [:]
     private var loop: Task<Void, Never>?
 
+    /// The app-side Agent UUID this body speaks for (`config.agentID`), sent
+    /// on the answered ack so the control plane's reply push carries
+    /// `fin.agentID` + `thread-id` — without it the app can neither deep-link a
+    /// tap nor address a typed Reply (`AgentNotificationService.replyTarget`
+    /// needs id AND name). Nil for an unpaired daemon: the push still lands.
+    let agentID: UUID?
+    /// This Mac's `DeviceIdentity.short`-equivalent (`config.deviceToken8`),
+    /// sent on the answered ack as `originDeviceID8`: the control plane leaves
+    /// this device's own tokens out of the reply fan-out and tells every other
+    /// device the reply did not originate locally. Empty = not sent.
+    let originDeviceID8: String
+
     init(
         siteID: String, displayName: String, token: String, heartbeatSeconds: Int?,
-        endpointURL: String, ledgerPath: String, audit: @escaping (String) -> Void
+        endpointURL: String, ledgerPath: String, agentID: UUID? = nil, originDeviceID8: String = "",
+        audit: @escaping (String) -> Void
     ) {
         self.siteID = siteID.lowercased()
         self.siteID8 = String(siteID.lowercased().prefix(8))
         self.displayName = displayName
         self.token = token
+        self.agentID = agentID
+        self.originDeviceID8 = originDeviceID8
         self.heartbeatSeconds = max(5, heartbeatSeconds ?? Self.defaultHeartbeatSeconds)
         self.endpointURL = endpointURL
         self.ledgerPath = ledgerPath
@@ -261,10 +276,26 @@ actor DaemonSiteClient {
         }
     }
 
+    /// The answered ack: `{state, replyPreview}` plus `agentID` /
+    /// `originDeviceID8` when known (omitted, never null, when not) — the two
+    /// fields that make the control plane's reply push usable on the app side.
+    /// Pure and tested (`DaemonSiteClientTests`).
+    static func answeredAckBody(
+        replyPreview: String, agentID: UUID?, originDeviceID8: String
+    ) -> [String: Any] {
+        var body: [String: Any] = [
+            "state": "answered",
+            "replyPreview": String(MemoryRedactor.redact(replyPreview).prefix(500)),
+        ]
+        if let agentID { body["agentID"] = agentID.uuidString }
+        if !originDeviceID8.isEmpty { body["originDeviceID8"] = originDeviceID8 }
+        return body
+    }
+
     func markAnswered(_ id: String, replyPreview: String) async {
-        let preview = String(MemoryRedactor.redact(replyPreview).prefix(500))
         guard let (status, _) = await post(
-            "/messages/\(id)/ack", body: ["state": "answered", "replyPreview": preview]
+            "/messages/\(id)/ack",
+            body: Self.answeredAckBody(replyPreview: replyPreview, agentID: agentID, originDeviceID8: originDeviceID8)
         ) else { return }
         if !(200..<300).contains(status), status != 409 {
             registerFailure("[site] ack answered \(id) failed: HTTP \(status)")

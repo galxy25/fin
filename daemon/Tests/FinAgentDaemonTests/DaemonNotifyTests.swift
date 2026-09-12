@@ -59,8 +59,29 @@ final class DaemonNotifyClientTests: XCTestCase {
         XCTAssertEqual(object["body"] as? String, "Which branch should I deploy?")
         XCTAssertEqual(object["agent"] as? String, "Nimbus")
         XCTAssertEqual(object["event"] as? String, "request-input")
-        XCTAssertNil(object["messageId"], "a request-input push is not the message's one reply push")
+        XCTAssertNil(object["messageId"], "no claimed message in flight: nothing to name")
         XCTAssertEqual(object.count, 4, "the contract has exactly four keys: title, body, agent, event")
+    }
+
+    /// A request_input during a claimed message's turn names the message too:
+    /// the time-sensitive question is the one push that message gets, and the
+    /// Lambda suppresses the answered ack's fin.reply (which would otherwise
+    /// restate the question minutes later) — design §3.7.3.
+    func testRequestInputForAClaimedMessageCarriesTheMessageID() async throws {
+        var captured: URLRequest?
+        let client = makeClient { request in
+            captured = request
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        }
+
+        await client.send(event: "request-input", message: "Which branch?", messageID: "m-4f0c")
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(captured?.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(object["event"] as? String, "request-input")
+        XCTAssertEqual(object["messageId"] as? String, "m-4f0c")
+        XCTAssertEqual(object.count, 5, "title, body, agent, event, messageId")
     }
 
     /// A task-complete push for a claimed message names it, so the Lambda can

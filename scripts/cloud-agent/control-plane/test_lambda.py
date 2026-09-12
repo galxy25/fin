@@ -796,12 +796,14 @@ class _FakeDynamoTable:
         raise AssertionError("unsupported expression: " + expr)
 
     def _apply_update(self, item, update, names, values):
-        rest = update
+        rest = update.strip()
         remove = None
-        if " REMOVE " in rest:
+        if rest.startswith("REMOVE "):
+            rest, remove = "", rest[len("REMOVE "):]
+        elif " REMOVE " in rest:
             rest, remove = rest.split(" REMOVE ", 1)
-        assert rest.startswith("SET "), update
-        for clause in rest[4:].split(", "):
+        assert not rest or rest.startswith("SET "), update
+        for clause in rest[4:].split(", ") if rest else []:
             field, _, value = clause.partition(" = ")
             field = names.get(field.strip(), field.strip())
             item[field] = values[value.strip()]
@@ -1474,6 +1476,44 @@ class NotifyRouteTests(_MessagesTestCase):
             self.notify()
         self.assertEqual(caught.exception.status, 503)
 
+    def test_a_502_gives_the_claim_back_so_the_ack_push_can_still_fire(self):
+        sent = self.send("deploy it")
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied")
+        lam._apns_push = lambda *args: (False, "TooManyRequests")
+        status, _ = self.notify(event="task-complete", agent="Fin", messageId=sent["messageId"])
+        self.assertEqual(status, 502)
+        self.assertNotIn("pushedAt", self.row(sent["messageId"]), "a push that reached nobody holds no claim")
+        # APNs recovers; the answered ack's push is not suppressed by the failed one.
+        self.apns.sent.clear()
+        lam._apns_push = lambda client, environment, token, payload, bearer: (
+            self.apns.sent.append((environment, token, payload)) or (True, ""))
+        self.ack(self.imac, sent["messageId"], "answered", replyPreview="done")
+        self.assertEqual(len(self.apns.sent), 1)
+        self.assertTrue(self.row(sent["messageId"]).get("pushedAt"))
+
+    def test_no_tokens_gives_the_claim_back(self):
+        sent = self.send("hello", user="user-2")
+        status, result = self.notify(user="user-2", messageId=sent["messageId"])
+        self.assertEqual((status, result["delivered"]), (200, 0))
+        self.assertIn("note", result)
+        self.assertNotIn("pushedAt", self.row(sent["messageId"]))
+
+    def test_a_request_input_push_claims_the_message_so_the_closing_reply_is_not_pushed_twice(self):
+        # Daemon: a claimed message, the model calls request_input (a time-sensitive
+        # fin.input push naming the message), then finishes the turn with text that
+        # restates the question; the answered ack must NOT push that text again.
+        sent = self.send("ship it")
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied")
+        status, result = self.notify(event="request-input", agent="Fin", messageId=sent["messageId"])
+        self.assertEqual((status, result["delivered"]), (200, 1))
+        self.ack(self.imac, sent["messageId"], "answered", replyPreview="Which branch should I ship?")
+        self.assertEqual(len(self.apns.sent), 1, "one push per message: the question, not its restatement")
+        aps = self.apns.payloads[0]["aps"]
+        self.assertEqual((aps["category"], aps["interruption-level"]), ("fin.input", "time-sensitive"))
+        self.assertEqual(self.apns.payloads[0]["fin"]["messageId"], sent["messageId"])
+
     def test_a_site_token_may_still_notify(self):
         lam._require_site_scope({"_siteId": "site-a"}, "POST", ["notify"])
 
@@ -1539,20 +1579,83 @@ class AnsweredPushTests(_MessagesTestCase):
         self.assertEqual(self.apns.sent, [])
         self.assertNotIn("pushedAt", self.row(sent["messageId"]))
 
-    def test_a_push_failure_never_fails_the_ack(self):
+    def test_a_push_failure_never_fails_the_ack_and_leaves_the_row_pushable(self):
         def boom(*args, **kwargs):
             raise RuntimeError("apns is down")
         self.addCleanup(setattr, lam, "_push_to_user", lam._push_to_user)
+        real_push = lam._push_to_user
         lam._push_to_user = boom
         message_id, response = self.answer()
         self.assertEqual(response["statusCode"], 200)
         self.assertEqual(self.row(message_id)["state"], "answered")
+        self.assertNotIn("pushedAt", self.row(message_id), "a failed push must not blackhole the reply")
+        # The daemon's task-complete /notify for the same message then delivers
+        # instead of being suppressed as "already pushed".
+        lam._push_to_user = real_push
+        response = lam.notify({"_userId": "user-1", "body": json.dumps({
+            "title": "Fin: task complete", "body": "TASK COMPLETE", "agent": "Fin",
+            "event": "task-complete", "messageId": message_id,
+        })})
+        result = json.loads(response["body"])
+        self.assertEqual((response["statusCode"], result["delivered"], result.get("suppressed")), (200, 1, None))
+        self.assertTrue(self.row(message_id).get("pushedAt"))
 
-    def test_apns_not_configured_never_fails_the_ack(self):
+    def test_apns_not_configured_never_fails_the_ack_and_holds_no_claim(self):
         lam._apns_configured = lambda: False
         message_id, response = self.answer()
         self.assertEqual(response["statusCode"], 200)
         self.assertEqual(self.apns.sent, [])
+        self.assertNotIn("pushedAt", self.row(message_id))
+
+    def test_a_push_that_reaches_nobody_gives_the_claim_back(self):
+        lam._apns_push = lambda *args: (False, "TooManyRequests")
+        message_id, response = self.answer()
+        self.assertEqual(response["statusCode"], 200)
+        self.assertNotIn("pushedAt", self.row(message_id))
+
+    def test_the_answering_device_is_left_out_of_the_fan_out(self):
+        # Two devices: the iMac (which hosted the turn and registered its token
+        # with its deviceId8) and a phone. The ack names the iMac; only the phone
+        # is pushed, and the payload says where the reply came from.
+        self.apns = _PushHarness(self, tokens=(("tok-imac", "user-1"), ("tok-phone", "user-1")))
+        lam.DEVICE_TOKENS_TABLE.items["tok-imac"]["deviceId8"] = "a4a1d987"
+        agent_id = str(lam.uuid.uuid4())
+        message_id, _ = self.answer(agentID=agent_id, originDeviceID8="a4a1d987")
+        self.assertEqual([token for _, token, _ in self.apns.sent], ["tok-phone"])
+        self.assertEqual(self.apns.payloads[0]["fin"], {
+            "agentName": "Fin", "messageId": message_id, "agentID": agent_id, "originDeviceID8": "a4a1d987",
+        })
+        self.assertTrue(self.row(message_id).get("pushedAt"))
+
+    def test_only_the_answering_device_registered_means_nothing_to_push_and_no_claim(self):
+        lam.DEVICE_TOKENS_TABLE.items["tok-a"]["deviceId8"] = "a4a1d987"
+        message_id, _ = self.answer(originDeviceID8="a4a1d987")
+        self.assertEqual(self.apns.sent, [])
+        self.assertNotIn("pushedAt", self.row(message_id))
+
+    def test_a_malformed_origin_device_is_ignored_not_fatal(self):
+        message_id, response = self.answer(originDeviceID8="not-hex!")
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(len(self.apns.sent), 1)
+        self.assertNotIn("originDeviceID8", self.apns.payloads[0]["fin"])
+
+    def test_the_ack_push_carries_what_the_app_needs_to_reply_and_deep_link(self):
+        """The app-side contract (AgentNotificationService.replyTarget /
+        parseFinPayload, finTests/CommunicationNotificationTests
+        testTheControlPlanesAckPushIsReplyableAndTappable): a typed Reply needs
+        BOTH fin.agentID and fin.agentName, a tap needs fin.agentID, and the
+        NSE threads on aps.thread-id. The daemon and the app both send agentID
+        + originDeviceID8 on the answered ack; this pins the resulting shape."""
+        agent_id = str(lam.uuid.uuid4())
+        message_id, _ = self.answer(agentID=agent_id, originDeviceID8="a4a1d987")
+        payload = self.apns.payloads[0]
+        self.assertEqual(payload["aps"]["thread-id"], agent_id)
+        self.assertEqual(payload["aps"]["category"], "fin.reply")
+        self.assertEqual(payload["aps"]["mutable-content"], 1)
+        self.assertEqual(set(payload["fin"]), {"agentName", "messageId", "agentID", "originDeviceID8"})
+        self.assertEqual(json.dumps(payload["fin"], sort_keys=True), json.dumps({
+            "agentID": agent_id, "agentName": "Fin", "messageId": message_id, "originDeviceID8": "a4a1d987",
+        }, sort_keys=True))
 
     def test_the_push_is_not_gated_on_voice(self):
         for source in ("app", "voice"):
@@ -1561,6 +1664,39 @@ class AnsweredPushTests(_MessagesTestCase):
             self.ack(self.imac, sent["messageId"], "applied")
             self.ack(self.imac, sent["messageId"], "answered", replyPreview="a")
         self.assertEqual(len(self.apns.sent), 2)
+
+
+class DeviceTokenRegistrationTests(unittest.TestCase):
+    """PUT /device-tokens with the Phase-1 `deviceId8`: stored when sent so an
+    answered ack from that device can leave its own tokens out, dropped when a
+    (pre-Phase-1) re-registration omits it, rejected when malformed."""
+
+    def setUp(self):
+        self.table = _FakeDynamoTable("token")
+        self.addCleanup(setattr, lam, "DEVICE_TOKENS_TABLE", lam.DEVICE_TOKENS_TABLE)
+        lam.DEVICE_TOKENS_TABLE = self.table
+
+    def put(self, **body):
+        payload = {"token": "ab" * 32, "platform": "iOS"}
+        payload.update(body)
+        response = lam.put_device_token({"_userId": "user-1", "body": json.dumps(payload)})
+        return response["statusCode"], json.loads(response["body"])
+
+    def test_device_id8_is_stored_lowercased_and_dropped_when_omitted(self):
+        status, _ = self.put(deviceId8="A4A1D987", deviceName="Levi's iPhone")
+        self.assertEqual(status, 200)
+        row = self.table.items["ab" * 32]
+        self.assertEqual((row["deviceId8"], row["userId"], row["deviceName"]), ("a4a1d987", "user-1", "Levi's iPhone"))
+        self.put()
+        row = self.table.items["ab" * 32]
+        self.assertNotIn("deviceId8", row)
+        self.assertNotIn("deviceName", row)
+
+    def test_a_malformed_device_id8_is_a_400(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            self.put(deviceId8="zz")
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(self.table.items, {})
 
 
 class HeartbeatDispatchTests(_MessagesTestCase):

@@ -444,6 +444,10 @@ final class Daemon {
     /// way an answer reaches a headless daemon), mirroring the app's
     /// suppress-on-request_input semantics at daemon scale.
     private(set) var awaitingUserInput = false
+    /// The control-plane message the in-flight turn is answering, for the
+    /// `answered` ack — and for the request-input push, which names it so the
+    /// control plane pushes that message once (the question, not the reply).
+    private var inFlightSiteMessageID: String?
     /// True after TASK COMPLETE under `stayResident`: the work is done, so beats would
     /// only re-run a finished task, but the process, the SSH session and the poll loop
     /// all stay up for the next message. Cleared when one arrives.
@@ -1049,7 +1053,11 @@ final class Daemon {
         engine.onRequestInput = { [weak self] question in
             guard let self else { return }
             self.log("request_input: \(question)")
-            self.notify(event: "request-input", message: question)
+            // Names the claimed message (when this turn is answering one) so the
+            // control plane counts THIS time-sensitive question as the message's
+            // one push and suppresses the answered ack's fin.reply — the model's
+            // closing text usually just restates the question (design §3.7.3).
+            self.notify(event: "request-input", message: question, messageID: self.inFlightSiteMessageID)
             self.pauseHeartbeatForUserInput()
         }
         // The model's monitor tool drives the daemon's own heartbeat loop.
@@ -1323,6 +1331,8 @@ final class Daemon {
                     heartbeatSeconds: site.heartbeatSeconds,
                     endpointURL: block.endpointURL,
                     ledgerPath: siteLedgerPath,
+                    agentID: agentID,
+                    originDeviceID8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
                     audit: { [weak self] line in
                         self?.log(line)
                         self?.record(AgentAuditEvent(kind: "notice", text: line))
@@ -1397,8 +1407,6 @@ final class Daemon {
         // recordTurnInEpisodicMemory — only a genuinely submitted message does there).
         var pendingUserMessageForDigest: String? = config.task
 
-        /// The control-plane message a turn is answering, for the `answered` ack.
-        var inFlightSiteMessageID: String?
         var outcome: AgentTurnOutcome
         if let held = await siteClient?.nextHeldMessage() {
             // A message claimed before a restart (or during the connect) beats the
