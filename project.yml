@@ -154,6 +154,7 @@ targets:
           - RemoteInputPairing.swift
           - AppTheme.swift
           - DeviceIdentity.swift
+          - AgentLogKind.swift
       # Screenshot fixtures, so a tvOS capture shows a populated server list
       # rather than the "No Servers Yet" empty state a simulator (no iCloud
       # account) always lands on. Inert unless FIN_SCREENSHOT_MODE=1.
@@ -165,6 +166,11 @@ targets:
       # the Sign in with Apple exchange that earns the TV its own session token.
       - path: fin/Vault
       - path: fin/Agent/AppleSignInClient.swift
+      # Agent mode: the same transcript lines and turn grouping the iPhone's
+      # remote console uses, plus the shared control-key table.
+      - path: fin/Agent/AgentMirrorRecord.swift
+      - path: fin/Agent/TranscriptTurns.swift
+      - path: fin/Terminal/TerminalControlKeys.swift
       - path: daemon/Sources/FinAgentCore/TerminalEventLog.swift
     dependencies:
       - package: Citadel
