@@ -2147,6 +2147,11 @@ final class AgentRuntime: ObservableObject {
 
         let profile = memory.readCumulative()
         let perHitCap = onDevice ? 400 : 1500
+        // TODO: mirror crossDeviceStatusProvider block, see DaemonMemoryConsolidator —
+        // this compaction has no "extra labeled section" seam yet (the daemon's is a
+        // three-piece "Current profile:" / optional sections / "Recent conversations:"
+        // shape); wiring cross-device status here means doing that refactor first, out
+        // of scope for the per-device-status-key change that introduced the daemon side.
         var input = "Current profile:\n" + (profile.isEmpty ? "(none)" : profile) + "\n\nRecent conversations:"
         for hit in recent {
             let content = hit.content.count > perHitCap
