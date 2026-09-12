@@ -41,17 +41,53 @@ enum DeviceTokenUplink {
             logger.warning("device-token upload skipped: control plane URL is not a valid URL")
             return
         }
-        Task {
-            guard let (_, response) = try? await URLSession.shared.data(for: request) else {
-                logger.warning("device-token upload failed: network error")
-                return
-            }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard (200..<300).contains(status) else {
-                logger.warning("device-token upload failed: HTTP \(status)")
-                return
-            }
+        Task { _ = await upload(request, label: "device-token") }
+    }
+
+    /// Live Activity tokens (design §3.4) ride the same route with a `kind`:
+    /// `activity-start` for the per-device push-to-start token, `activity-update`
+    /// for one running activity's update token (with its `activityId`). The
+    /// control plane keeps them in the same table and out of the alert
+    /// fan-out — see lambda.py `put_device_token` / `_push_live_activity`.
+    /// Returns whether the upload landed, so the controller can log once.
+    @discardableResult
+    static func registerLiveActivityToken(_ token: Data, kind: String, activityID: String?) async -> Bool {
+        guard CloudControlPlaneConfig.isConfigured else { return false }
+        guard let request = request(
+            tokenHex: hex(token),
+            platform: platform,
+            deviceName: deviceName,
+            deviceID8: DeviceIdentity.short,
+            kind: kind,
+            activityID: activityID,
+            endpoint: CloudControlPlaneConfig.endpointURL,
+            bearer: CloudControlPlaneConfig.token
+        ) else {
+            logger.warning("\(kind) token upload skipped: control plane URL is not a valid URL")
+            return false
         }
+        return await upload(request, label: kind)
+    }
+
+    /// The one transport, replaceable in tests. Returns the HTTP status, or
+    /// nil for a transport error. Logs a status code at most — never the
+    /// token or the endpoint.
+    static var transport: (URLRequest) async -> Int? = { request in
+        guard let (_, response) = try? await URLSession.shared.data(for: request) else { return nil }
+        return (response as? HTTPURLResponse)?.statusCode ?? 0
+    }
+
+    /// Internal (not private) so a test can drive it through a stubbed `transport`.
+    static func upload(_ request: URLRequest, label: String) async -> Bool {
+        guard let status = await transport(request) else {
+            logger.warning("\(label) token upload failed: network error")
+            return false
+        }
+        guard (200..<300).contains(status) else {
+            logger.warning("\(label) token upload failed: HTTP \(status)")
+            return false
+        }
+        return true
     }
 
     // MARK: - Wire shape (pure, testable)
@@ -63,7 +99,7 @@ enum DeviceTokenUplink {
     }
 
     /// The `/device-tokens` contract: `{"token", "platform", "deviceName"?,
-    /// "deviceId8"?}`. `deviceName` is omitted when blank rather than sent
+    /// "deviceId8"?, "kind"?, "activityId"?}`. `deviceName` is omitted when blank rather than sent
     /// empty. `deviceId8` is this device's `DeviceIdentity.short` — the same
     /// value `AppSiteClient` puts in `originDeviceID8` when it acks a turn it
     /// hosted as answered, which is how the control plane knows to leave THIS
@@ -73,6 +109,8 @@ enum DeviceTokenUplink {
         platform: String,
         deviceName: String?,
         deviceID8: String = "",
+        kind: String? = nil,
+        activityID: String? = nil,
         endpoint: String,
         bearer: String
     ) -> URLRequest? {
@@ -83,6 +121,10 @@ enum DeviceTokenUplink {
         let trimmedName = deviceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !trimmedName.isEmpty { object["deviceName"] = trimmedName }
         if !deviceID8.isEmpty { object["deviceId8"] = deviceID8 }
+        // Absent for the plain APNs alert token (the pre-Phase-2 shape, which the
+        // control plane reads as kind "alert"); present for Live Activity tokens.
+        if let kind, !kind.isEmpty { object["kind"] = kind }
+        if let activityID, !activityID.isEmpty { object["activityId"] = activityID }
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
         request.setValue("Bearer \(bearer)", forHTTPHeaderField: "authorization")

@@ -844,6 +844,9 @@ class _FakeDynamoTable:
         self._apply_update(item, UpdateExpression, names, values)
         return {"Attributes": dict(item)} if ReturnValues == "ALL_NEW" else {}
 
+    def delete_item(self, Key):
+        self.items.pop(Key[self.key], None)
+
     def scan(self, FilterExpression=None, ExpressionAttributeValues=None,
              ExpressionAttributeNames=None, **kwargs):
         rows = list(self.items.values())
@@ -1350,9 +1353,14 @@ class _PushHarness:
         import types
 
         self.sent = []  # (environment, token, payload)
+        self.headers = []  # (push_type, topic) per send; ("alert", None) for the five-arg alert form
         table = _FakeDynamoTable("token")
-        for token, user in tokens:
-            table.items[token] = {"token": token, "userId": user, "environment": "production"}
+        for entry in tokens:
+            token, user = entry[0], entry[1]
+            row = {"token": token, "userId": user, "environment": "production"}
+            if len(entry) > 2:
+                row.update(entry[2])
+            table.items[token] = row
         case.addCleanup(setattr, lam, "DEVICE_TOKENS_TABLE", lam.DEVICE_TOKENS_TABLE)
         lam.DEVICE_TOKENS_TABLE = table
         case.addCleanup(setattr, lam, "_apns_configured", lam._apns_configured)
@@ -1361,8 +1369,9 @@ class _PushHarness:
         lam._apns_bearer = lambda now_epoch=None: "jwt"
         case.addCleanup(setattr, lam, "_apns_push", lam._apns_push)
 
-        def fake_push(client, environment, token, payload, bearer):
+        def fake_push(client, environment, token, payload, bearer, *extra):
             self.sent.append((environment, token, json.loads(json.dumps(payload))))
+            self.headers.append(tuple(extra) if extra else ("alert", None))
             return True, ""
 
         lam._apns_push = fake_push
@@ -2803,6 +2812,218 @@ class ThreadRouteRegistrationTests(SiteRouteRegistrationTests):
         self.assertIn("dynamodb:Query", sid)
         self.assertIn("dynamodb:PutItem", sid)
         self.assertIn("AttributeName=seq,KeyType=RANGE", self.deploy_sh)
+
+
+class PresenceFoldTests(unittest.TestCase):
+    """The Lambda's copy of FinPresence.fold: needs-input beats working beats
+    idle; only live sites count; nothing live is asleep."""
+
+    def site(self, state, name, live=True):
+        lease = lam._now() + timedelta(seconds=60 if live else -60)
+        return {"state": state, "displayName": name, "leaseUntil": _iso(lease)}
+
+    def test_precedence_and_liveness(self):
+        self.assertEqual(lam._presence_fold([]), ("asleep", ""))
+        self.assertEqual(lam._presence_fold([self.site("idle", "iMac")]), ("idle", ""))
+        self.assertEqual(lam._presence_fold([self.site("working", "iMac")]), ("working", "iMac"))
+        self.assertEqual(
+            lam._presence_fold([self.site("working", "Cloud"), self.site("needs-input", "iMac")]),
+            ("needsInput", "iMac"),
+        )
+        self.assertEqual(lam._presence_fold([self.site("working", "iMac", live=False)]), ("asleep", ""))
+        retired = self.site("retired", "old")
+        self.assertEqual(lam._presence_fold([retired, self.site("task-complete", "iMac")]), ("idle", ""))
+
+    def test_content_state_mirrors_the_apps_vocabulary(self):
+        now = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
+        state = lam._activity_content_state("working", "Levi's iMac", now)
+        self.assertEqual(state, {
+            "headline": "Fin is working", "detail": "on Levi's iMac", "glyph": "gearshape.2",
+            "status": "working", "updatedAt": now.timestamp(),
+        })
+        asleep = lam._activity_content_state("asleep", "", now)
+        self.assertEqual((asleep["status"], asleep["detail"], asleep["glyph"]), ("idle", None, "moon.zzz"))
+        answered = lam._answered_content_state("  " + "x" * 200, now)
+        self.assertEqual((answered["status"], answered["headline"], len(answered["detail"])), ("answered", "Fin answered", 120))
+
+
+class LiveActivityPayloadTests(unittest.TestCase):
+    def test_update_start_and_end_shapes(self):
+        now = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
+        state = lam._activity_content_state("needsInput", "iMac", now)
+        update = lam._live_activity_payload("update", state, alert={"title": "t", "body": "b"}, now=now)
+        self.assertEqual(set(update), {"aps"})
+        self.assertEqual(update["aps"]["event"], "update")
+        self.assertEqual(update["aps"]["timestamp"], int(now.timestamp()))
+        self.assertEqual(update["aps"]["content-state"], state)
+        self.assertEqual(update["aps"]["alert"], {"title": "t", "body": "b"})
+        self.assertNotIn("attributes-type", update["aps"])
+        self.assertNotIn("dismissal-date", update["aps"])
+        start = lam._live_activity_payload("start", state, attributes={"agentName": "Fin", "agentID": ""}, now=now)
+        self.assertEqual(start["aps"]["attributes-type"], "FinActivityAttributes")
+        self.assertEqual(start["aps"]["attributes"], {"agentName": "Fin", "agentID": ""})
+        end = lam._live_activity_payload("end", state, now=now)
+        self.assertEqual(end["aps"]["dismissal-date"], int(now.timestamp()) + 120)
+
+
+class LiveActivityPushTests(_MessagesTestCase):
+    """_push_live_activity's token selection and the heartbeat / ack hooks.
+    Tokens: the iPhone has a push-to-start token and one running activity's
+    update token; the iPad only a push-to-start token; the Mac an alert."""
+
+    TOPIC = "dev.levischoen.fin.push-type.liveactivity"
+
+    def setUp(self):
+        super().setUp()
+        self.apns = _PushHarness(self, tokens=(
+            ("tok-mac-alert", "user-1", {"deviceId8": "aaaaaaaa"}),
+            ("tok-phone-start", "user-1", {"kind": "activity-start", "deviceId8": "bbbbbbbb"}),
+            ("tok-phone-update", "user-1", {"kind": "activity-update", "deviceId8": "bbbbbbbb", "activityId": "act-1"}),
+            ("tok-pad-start", "user-1", {"kind": "activity-start", "deviceId8": "cccccccc"}),
+            ("tok-other-update", "user-2", {"kind": "activity-update", "deviceId8": "dddddddd"}),
+        ))
+
+    def sent_to(self, token):
+        return [(p, h) for (_, t, p), h in zip(self.apns.sent, self.apns.headers) if t == token]
+
+    def test_update_reaches_running_activities_and_starts_the_rest(self):
+        state = lam._activity_content_state("working", "iMac")
+        summary = lam._push_live_activity("user-1", state, "update", attributes={"agentName": "Fin", "agentID": ""})
+        self.assertEqual((summary["delivered"], summary["started"], summary["failed"]), (1, 1, 0))
+        tokens = sorted(t for _, t, _ in self.apns.sent)
+        self.assertEqual(tokens, ["tok-pad-start", "tok-phone-update"])
+        (payload, headers), = self.sent_to("tok-phone-update")
+        self.assertEqual(headers, ("liveactivity", self.TOPIC))
+        self.assertEqual(payload["aps"]["event"], "update")
+        self.assertEqual(payload["aps"]["content-state"]["headline"], "Fin is working")
+        (payload, headers), = self.sent_to("tok-pad-start")
+        self.assertEqual(headers, ("liveactivity", self.TOPIC))
+        self.assertEqual(payload["aps"]["event"], "start")
+        self.assertEqual(payload["aps"]["attributes-type"], "FinActivityAttributes")
+        # Never the alert token, never another user's activity.
+        self.assertEqual(self.sent_to("tok-mac-alert"), [])
+        self.assertEqual(self.sent_to("tok-other-update"), [])
+
+    def test_a_dead_update_token_falls_back_to_that_devices_start_token(self):
+        def push(client, environment, token, payload, bearer, *extra):
+            self.apns.sent.append((environment, token, payload))
+            self.apns.headers.append(tuple(extra))
+            return (False, "Unregistered") if token == "tok-phone-update" else (True, "")
+        lam._apns_push = push
+        summary = lam._push_live_activity("user-1", lam._activity_content_state("working", "iMac"), "update")
+        self.assertEqual((summary["delivered"], summary["removed"], summary["started"]), (0, 1, 2))
+        self.assertNotIn("tok-phone-update", lam.DEVICE_TOKENS_TABLE.items)
+        self.assertEqual(sorted(t for _, t, _ in self.apns.sent), ["tok-pad-start", "tok-phone-start", "tok-phone-update"])
+
+    def test_end_pushes_to_running_activities_only_and_spends_their_tokens(self):
+        summary = lam._push_live_activity("user-1", lam._activity_content_state("idle"), "end")
+        self.assertEqual((summary["delivered"], summary["started"]), (1, 0))
+        self.assertEqual([t for _, t, _ in self.apns.sent], ["tok-phone-update"])
+        self.assertIn("dismissal-date", self.apns.payloads[0]["aps"])
+        self.assertNotIn("tok-phone-update", lam.DEVICE_TOKENS_TABLE.items)
+        self.assertIn("tok-phone-start", lam.DEVICE_TOKENS_TABLE.items)
+
+    def test_a_start_is_not_repeated_inside_the_cooldown(self):
+        state = lam._activity_content_state("working", "iMac")
+        lam._push_live_activity("user-1", state, "update")
+        lam._push_live_activity("user-1", state, "update")
+        self.assertEqual([t for _, t, _ in self.apns.sent if t == "tok-pad-start"], ["tok-pad-start"])
+        lam.DEVICE_TOKENS_TABLE.items["tok-pad-start"]["startedAt"] = _iso(lam._now() - timedelta(minutes=11))
+        lam._push_live_activity("user-1", state, "update")
+        self.assertEqual([t for _, t, _ in self.apns.sent if t == "tok-pad-start"], ["tok-pad-start"] * 2)
+
+    def test_update_without_start_if_missing_never_starts(self):
+        summary = lam._push_live_activity("user-1", lam._answered_content_state("done"), "update", start_if_missing=False)
+        self.assertEqual((summary["delivered"], summary["started"]), (1, 0))
+        self.assertEqual([t for _, t, _ in self.apns.sent], ["tok-phone-update"])
+
+    def test_never_raises(self):
+        lam._apns_push = lambda *args: (_ for _ in ()).throw(RuntimeError("boom"))
+        summary = lam._push_live_activity("user-1", lam._activity_content_state("working"), "update")
+        self.assertEqual(summary["note"], "failed")
+        self.assertEqual(lam._push_live_activity("user-1", {}, "bogus")["note"], "unknown event")
+        lam._apns_configured = lambda: False
+        self.assertEqual(lam._push_live_activity("user-1", {}, "update")["note"], "APNs not configured")
+
+    def test_alert_fan_out_ignores_activity_tokens(self):
+        result = lam._push_to_user("user-1", "Fin", "hello")
+        self.assertEqual(result["delivered"], 1)
+        self.assertEqual([t for _, t, _ in self.apns.sent], ["tok-mac-alert"])
+        self.assertEqual(self.apns.headers, [("alert", None)])
+
+    # -- heartbeat hook -----------------------------------------------------
+
+    def activity_events(self):
+        return [(t, p["aps"]["event"], p["aps"]["content-state"]["status"]) for _, t, p in self.apns.sent]
+
+    def test_a_presence_change_on_heartbeat_pushes_once_per_transition(self):
+        self.beat(self.imac, state="working")
+        self.assertEqual(self.activity_events(), [
+            ("tok-phone-update", "update", "working"), ("tok-pad-start", "start", "working"),
+        ])
+        # The iPad was sent a start; until its app registers the activity's
+        # update token (or the cooldown lapses) it gets no second tile.
+        self.assertTrue(lam.DEVICE_TOKENS_TABLE.items["tok-pad-start"]["startedAt"])
+        # Same state again: no fold change, nothing sent.
+        self.beat(self.imac, state="working")
+        self.beat(self.cloud, state="working")  # still "working" overall
+        self.assertEqual(len(self.apns.sent), 2)
+        # needs-input on the cloud box now wins the fold.
+        self.beat(self.cloud, state="needs-input")
+        self.assertEqual(self.activity_events()[2:], [("tok-phone-update", "update", "needsInput")])
+        self.assertEqual(self.apns.payloads[2]["aps"]["alert"]["title"], "Fin needs your input")
+        self.assertEqual(self.apns.payloads[2]["aps"]["content-state"]["detail"], "on Cloud computer")
+        # Cloud goes idle, the iMac is still working: back to working.
+        self.beat(self.cloud, state="idle")
+        self.assertEqual(self.activity_events()[3:], [("tok-phone-update", "update", "working")])
+        # Everyone idle: end, lingering.
+        self.beat(self.imac, state="idle")
+        self.assertEqual(self.activity_events()[4:], [("tok-phone-update", "end", "idle")])
+        self.assertIn("dismissal-date", self.apns.payloads[4]["aps"])
+
+    def test_a_push_failure_never_fails_the_heartbeat(self):
+        self.addCleanup(setattr, lam, "_push_live_activity", lam._push_live_activity)
+        lam._push_live_activity = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+        result = self.beat(self.imac, state="working")
+        self.assertIn("leaseUntil", result)
+        self.assertEqual(lam.SITES_TABLE.items[self.imac["siteId"]]["state"], "working")
+
+    # -- answered ack hook ----------------------------------------------------
+
+    def test_an_answered_ack_updates_running_activities_only(self):
+        sent = self.send("what time is it")
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied", runId="run-1")
+        self.apns.sent.clear()
+        self.apns.headers.clear()
+        response = self.ack(self.imac, sent["messageId"], "answered", replyPreview="It is noon.")
+        self.assertEqual(response["statusCode"], 200)
+        activity = [(t, p) for (_, t, p), h in zip(self.apns.sent, self.apns.headers) if h[0] == "liveactivity"]
+        self.assertEqual([t for t, _ in activity], ["tok-phone-update"])
+        self.assertEqual(activity[0][1]["aps"]["content-state"]["status"], "answered")
+        self.assertEqual(activity[0][1]["aps"]["content-state"]["detail"], "It is noon.")
+        # The alert push (Phase 1) still went to the alert token, and only there.
+        alerts = [t for (_, t, _), h in zip(self.apns.sent, self.apns.headers) if h[0] == "alert"]
+        self.assertEqual(alerts, ["tok-mac-alert"])
+
+
+class LiveActivityTokenRegistrationTests(DeviceTokenRegistrationTests):
+    def test_kind_and_activity_id_are_stored_and_validated(self):
+        status, body = self.put(kind="activity-update", activityId="act-1", deviceId8="bbbbbbbb")
+        self.assertEqual((status, body["kind"]), (200, "activity-update"))
+        row = self.table.items["ab" * 32]
+        self.assertEqual((row["kind"], row["activityId"]), ("activity-update", "act-1"))
+        # Re-registering the same bytes as a plain alert token drops both.
+        self.put()
+        row = self.table.items["ab" * 32]
+        self.assertEqual(row["kind"], "alert")
+        self.assertNotIn("activityId", row)
+        with self.assertRaises(lam.ApiError) as caught:
+            self.put(kind="livestream")
+        self.assertEqual(caught.exception.status, 400)
+        with self.assertRaises(lam.ApiError) as caught:
+            self.put(kind="activity-start", activityId="act-1")
+        self.assertEqual(caught.exception.status, 400)
 
 
 if __name__ == "__main__":
