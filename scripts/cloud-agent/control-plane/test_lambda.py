@@ -2287,6 +2287,81 @@ class ThreadAssignmentTests(_ThreadsTestCase):
         self.ack(self.imac, another["messageId"], "applied", threadId=other["messageId"], threadReason="x" * 100)
         self.assertEqual(len(self.row(another["messageId"])["threadReason"]), lam.MAX_THREAD_REASON_CHARS)
 
+    # The turn-end fallback (docs/THREADS.md §2): the daemon only learns which pane
+    # a turn relayed into once the turn has run, so the ANSWERED ack may carry the
+    # proposal the applied ack could not.
+
+    def test_the_site_may_propose_a_thread_on_the_answered_ack(self):
+        root = self.send("send the PDF to the claw session")
+        later = self.send("did it finish?")
+        self.claim(self.imac, later["messageId"])
+        self.ack(self.imac, later["messageId"], "applied")
+        self.assertEqual(self.row(later["messageId"])["threadId"], later["messageId"], "rooted alone at applied time")
+        response = self.ack(self.imac, later["messageId"], "answered", replyPreview="it did",
+                            threadId=root["messageId"], threadReason="pane:main:2.0")
+        self.assertEqual(json.loads(response["body"])["threadId"], root["messageId"])
+        row = self.row(later["messageId"])
+        self.assertEqual((row["state"], row["threadId"], row["threadReason"]), ("answered", root["messageId"], "pane:main:2.0"))
+        on_root = self.events.for_thread(root["messageId"])
+        assigned = [e for e in on_root if e["kind"] == "thread.assigned" and e["detail"]["messageId"] == later["messageId"]]
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(assigned[0]["detail"], {
+            "messageId": later["messageId"], "threadId": root["messageId"], "reason": "pane:main:2.0",
+        })
+        answered = [e for e in on_root if e["kind"] == "message.answered"]
+        self.assertEqual([e["detail"]["messageId"] for e in answered], [later["messageId"]],
+                         "the answered event lands on the thread the message moved to")
+        # The thread view still shows the member's early life (queued/claimed/applied
+        # under its own id) — the timeline pulls those in.
+        status, body = self.get_thread(root["messageId"])
+        self.assertEqual(status, 200)
+        self.assertIn("message.applied", [e["kind"] for e in body["events"]])
+
+    def test_an_answered_proposal_is_validated_like_an_applied_one(self):
+        theirs = self.send("not yours", user="user-2")
+        mine = self.send("mine")
+        self.claim(self.imac, mine["messageId"])
+        self.ack(self.imac, mine["messageId"], "applied")
+        with self.assertRaises(lam.ApiError) as caught:
+            self.ack(self.imac, mine["messageId"], "answered", replyPreview="done", threadId=theirs["messageId"])
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(self.row(mine["messageId"])["state"], "applied", "a refused proposal answers nothing")
+
+    def test_explicit_membership_beats_an_answered_proposal_too(self):
+        root = self.send("root")
+        elsewhere = self.send("elsewhere")
+        reply = self.send("reply", threadId=root["messageId"])
+        self.claim(self.imac, reply["messageId"])
+        self.ack(self.imac, reply["messageId"], "applied")
+        self.ack(self.imac, reply["messageId"], "answered", replyPreview="done",
+                 threadId=elsewhere["messageId"], threadReason="pane:x:1")
+        self.assertEqual(self.row(reply["messageId"])["threadId"], root["messageId"])
+        kinds_elsewhere = self.kinds(elsewhere["messageId"])
+        self.assertNotIn("message.answered", kinds_elsewhere)
+        assigned = [e for e in self.events.for_thread(root["messageId"]) if e["kind"] == "thread.assigned"]
+        self.assertEqual([e["detail"]["reason"] for e in assigned], ["explicit"], "one decision, logged once")
+
+    def test_re_proposing_the_thread_the_row_is_already_in_is_not_a_transition(self):
+        root = self.send("root")
+        later = self.send("later")
+        self.claim(self.imac, later["messageId"])
+        self.ack(self.imac, later["messageId"], "applied", threadId=root["messageId"], threadReason="pane:main:2.0")
+        self.ack(self.imac, later["messageId"], "answered", replyPreview="done",
+                 threadId=root["messageId"], threadReason="pane:main:2.0")
+        assigned = [e for e in self.events.for_thread(root["messageId"])
+                    if e["kind"] == "thread.assigned" and e["detail"]["messageId"] == later["messageId"]]
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(self.kinds(root["messageId"])[-1], "message.answered")
+
+    def test_an_answered_ack_without_a_proposal_keeps_the_thread_and_logs_no_assignment(self):
+        sent = self.send("alone")
+        self.claim(self.imac, sent["messageId"])
+        self.ack(self.imac, sent["messageId"], "applied")
+        self.ack(self.imac, sent["messageId"], "answered", replyPreview="done")
+        kinds = self.kinds(sent["messageId"])
+        self.assertEqual(kinds.count("thread.assigned"), 1, "only the applied-time decision")
+        self.assertEqual(kinds[-1], "message.answered")
+
     def test_the_public_message_carries_thread_pushed_and_claimed_stamps(self):
         message_id = self.lifecycle()
         public = lam._public_message(self.row(message_id))

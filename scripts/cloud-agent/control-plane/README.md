@@ -214,6 +214,11 @@ may propose `threadId` (+ `threadReason`, ≤ 40 chars, e.g. `pane:main:2.0`)
 for a message that relayed into the same pane as an earlier request; explicit
 membership chosen by the sender always wins. The decision is logged once per
 message as `thread.assigned` with reason `explicit | <threadReason> | root`.
+The `answered` ack may carry the same `threadId` + `threadReason` — the daemon's
+turn-end fallback, since which pane a turn relayed into is only known once it
+has run — validated the same way; a proposal naming the thread the row is
+already in is not a transition and logs nothing, a real move logs a second
+`thread.assigned` on the new thread before `message.answered`.
 
 **Events** (`fin-thread-events`, hash `threadId`, range `seq`, TTL 30 days) —
 one row per transition, written only by the Lambda, `seq` allocated by an

@@ -68,6 +68,26 @@ actor DaemonSiteClient {
             let id: String
             let text: String
             let source: String
+            /// The thread the control plane put the message in at claim time
+            /// (docs/THREADS.md §2) — its root's id, or its own id when it roots
+            /// a thread of its own. Nil for a ledger written before threads
+            /// existed; the daemon then reads the message as its own root.
+            var threadID: String?
+
+            init(id: String, text: String, source: String, threadID: String? = nil) {
+                self.id = id
+                self.text = text
+                self.source = source
+                self.threadID = threadID
+            }
+
+            /// Whether the sender chose the thread (a reply inside a thread view):
+            /// then the control plane keeps that membership whatever the daemon
+            /// proposes, so there is nothing for the pane match to decide.
+            var hasExplicitThread: Bool {
+                guard let threadID, !threadID.isEmpty else { return false }
+                return threadID != id
+            }
         }
 
         init(held: [HeldMessage] = [], unacked: [String] = []) {
@@ -235,12 +255,17 @@ actor DaemonSiteClient {
     // MARK: - Claim / hold / apply / ack
 
     private func claim(_ offer: Offer) async {
-        guard let (status, _) = await post(
+        guard let (status, data) = await post(
             "/messages/\(offer.id)/claim", body: ["leaseSeconds": Self.claimLeaseSeconds]
         ) else { return }
         switch status {
         case 200..<300:
-            ledger.held.append(.init(id: offer.id, text: offer.text, source: offer.source))
+            // The claim answers with the public row, thread included; the heartbeat's
+            // offer does not carry it.
+            ledger.held.append(.init(
+                id: offer.id, text: offer.text, source: offer.source,
+                threadID: Self.threadID(inResponse: data)
+            ))
             persistLedger()
             audit("[site] claimed \(offer.id)")
             await onClaimed?()
@@ -263,25 +288,46 @@ actor DaemonSiteClient {
         return message
     }
 
-    func markApplied(_ id: String, runID: String?) async {
+    /// A thread proposal for an ack (docs/THREADS.md §2): the thread the daemon
+    /// believes this message belongs to, and why (`pane:<target>` — the request
+    /// relayed into the same pane as an earlier one). The control plane validates
+    /// the id, keeps an explicit membership over it, and logs the decision.
+    struct ThreadProposal: Equatable {
+        let threadID: String
+        let reason: String
+    }
+
+    /// The applied ack, with the pre-turn thread proposal when the daemon has
+    /// one. Returns the thread the control plane settled on (its `threadId`),
+    /// or nil when the ack did not go through — the daemon's pane map records
+    /// what the control plane confirmed, never what was merely proposed.
+    @discardableResult
+    func markApplied(_ id: String, runID: String?, thread: ThreadProposal? = nil) async -> String? {
         var body: [String: Any] = ["state": "applied"]
         if let runID { body["runId"] = runID }
-        guard let (status, _) = await post("/messages/\(id)/ack", body: body) else { return }
+        if let thread {
+            body["threadId"] = thread.threadID
+            body["threadReason"] = thread.reason
+        }
+        guard let (status, data) = await post("/messages/\(id)/ack", body: body) else { return nil }
         if (200..<300).contains(status) || status == 409 {
             // 409 = already past applied (a restart re-acked it via `unacked`).
             ledger.unacked.removeAll { $0 == id }
             persistLedger()
-        } else {
-            registerFailure("[site] ack applied \(id) failed: HTTP \(status)")
+            return Self.threadID(inResponse: data)
         }
+        registerFailure("[site] ack applied \(id) failed: HTTP \(status)")
+        return nil
     }
 
     /// The answered ack: `{state, replyPreview}` plus `agentID` /
     /// `originDeviceID8` when known (omitted, never null, when not) — the two
-    /// fields that make the control plane's reply push usable on the app side.
+    /// fields that make the control plane's reply push usable on the app side —
+    /// and `threadId` / `threadReason` when the turn's pane relays settled the
+    /// thread only after the applied ack had gone (the turn-end fallback).
     /// Pure and tested (`DaemonSiteClientTests`).
     static func answeredAckBody(
-        replyPreview: String, agentID: UUID?, originDeviceID8: String
+        replyPreview: String, agentID: UUID?, originDeviceID8: String, thread: ThreadProposal? = nil
     ) -> [String: Any] {
         var body: [String: Any] = [
             "state": "answered",
@@ -289,17 +335,38 @@ actor DaemonSiteClient {
         ]
         if let agentID { body["agentID"] = agentID.uuidString }
         if !originDeviceID8.isEmpty { body["originDeviceID8"] = originDeviceID8 }
+        if let thread {
+            body["threadId"] = thread.threadID
+            body["threadReason"] = thread.reason
+        }
         return body
     }
 
-    func markAnswered(_ id: String, replyPreview: String) async {
-        guard let (status, _) = await post(
+    /// Returns the thread the control plane settled on, nil when the ack did
+    /// not go through (same contract as `markApplied`).
+    @discardableResult
+    func markAnswered(_ id: String, replyPreview: String, thread: ThreadProposal? = nil) async -> String? {
+        guard let (status, data) = await post(
             "/messages/\(id)/ack",
-            body: Self.answeredAckBody(replyPreview: replyPreview, agentID: agentID, originDeviceID8: originDeviceID8)
-        ) else { return }
-        if !(200..<300).contains(status), status != 409 {
-            registerFailure("[site] ack answered \(id) failed: HTTP \(status)")
+            body: Self.answeredAckBody(
+                replyPreview: replyPreview, agentID: agentID, originDeviceID8: originDeviceID8, thread: thread
+            )
+        ) else { return nil }
+        if (200..<300).contains(status) || status == 409 {
+            return Self.threadID(inResponse: data)
         }
+        registerFailure("[site] ack answered \(id) failed: HTTP \(status)")
+        return nil
+    }
+
+    /// The `threadId` of a claim or ack response body, nil when absent — an older
+    /// control plane answers without one and the daemon treats the message as
+    /// its own root.
+    nonisolated static func threadID(inResponse data: Data) -> String? {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let threadID = object["threadId"] as? String, !threadID.isEmpty
+        else { return nil }
+        return threadID
     }
 
     // MARK: - update

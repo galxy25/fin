@@ -311,6 +311,18 @@ final class Daemon {
     /// Panes the current user turn sent to (from the engine's audit events); after the
     /// turn the daemon writes one follow-up goal per target.
     private var sendSessionTargetsThisTurn: [String] = []
+    /// The thread (docs/THREADS.md) the message turn in flight is stamped with: its
+    /// pushes (request-input, task-complete, the model's notify tool) and follow-up
+    /// goals carry it. Nil during heartbeat and directive turns.
+    private var inFlightThreadID: String?
+    /// The turn-end pane-match proposal for the message in flight (`settleThread`),
+    /// carried on the answered ack — the fallback when no pre-turn signal named the
+    /// pane. Nil when the applied ack already said everything.
+    private var inFlightThreadProposal: DaemonSiteClient.ThreadProposal?
+    /// Which thread last relayed into which pane, for the pane match (§2). Loaded
+    /// from its sibling file on first use, written after every message turn that
+    /// sent to a pane.
+    private lazy var paneThreads = DaemonPaneThreadMap.load(from: paneThreadsPath)
     /// Same, but for a given mode — the run loop switches to `.task` before a user
     /// turn and back to `.mission` after it.
     private var setPromptMode: ((PromptMode) -> Void)?
@@ -462,12 +474,23 @@ final class Daemon {
     /// reaching the next turn.
     private func settleInFlightMessage(_ preview: String) async {
         guard let id = inFlightSiteMessageID else { return }
-        inFlightSiteMessageID = nil
-        inFlightSiteMessageText = nil
+        let proposal = inFlightThreadProposal
         let line = "[site] message \(id.prefix(10)) settled without an answer: \(preview)"
         log(line)
         record(AgentAuditEvent(kind: "notice", text: line))
-        await siteClient?.markAnswered(id, replyPreview: preview)
+        clearInFlightMessage()
+        await siteClient?.markAnswered(id, replyPreview: preview, thread: proposal)
+    }
+
+    /// The message turn is over, whatever its outcome: nothing recorded from here
+    /// on belongs to it — the next transcript line carries no thread, the next push
+    /// names no message.
+    private func clearInFlightMessage() {
+        inFlightSiteMessageID = nil
+        inFlightSiteMessageText = nil
+        inFlightThreadID = nil
+        inFlightThreadProposal = nil
+        transcript?.endMessageTurn()
     }
     /// True after TASK COMPLETE under `stayResident`: the work is done, so beats would
     /// only re-run a finished task, but the process, the SSH session and the poll loop
@@ -637,12 +660,16 @@ final class Daemon {
 
     /// After a user turn: one follow-up goal per pane it sent to, so the next mission
     /// tick reads the pane and notifies the user with the outcome.
-    private func recordFollowUps(request: String, source: String?, messageID: String) async {
+    /// `threadID` is the thread the request settled in (docs/THREADS.md), stamped on
+    /// each goal so the control plane's `goal.followup` event joins it.
+    private func recordFollowUps(request: String, source: String?, messageID: String, threadID: String? = nil) async {
         let targets = sendSessionTargetsThisTurn
         sendSessionTargetsThisTurn = []
         guard !targets.isEmpty, let goalsLedger else { return }
         for target in targets {
-            let goal = GoalsTick.followUpGoal(request: request, target: target, source: source, messageID: messageID + "-" + target)
+            let goal = GoalsTick.followUpGoal(
+                request: request, target: target, source: source, messageID: messageID, threadID: threadID
+            )
             do {
                 try await goalsLedger.addGoal(goal)
                 let line = "[goals] follow-up recorded: \(goal.id) — read \(target), notify the user when done"
@@ -653,6 +680,142 @@ final class Daemon {
             }
         }
         await goalsSync?.syncSoon()
+    }
+
+    // MARK: - Message turns and threads (docs/THREADS.md)
+
+    /// One claimed control-plane message's turn, from the thread it is stamped with
+    /// to the thread it settles in — shared by the held-at-launch path and the run
+    /// loop. The sequence is the one both paths always ran (ack `applied` right
+    /// after submit begins, follow-ups after the turn), with the thread decisions
+    /// of docs/THREADS.md §2 around it:
+    ///
+    /// 1. At submit, every transcript line of the turn is stamped with the thread:
+    ///    the pre-turn pane match when the request names a registered session whose
+    ///    one fresh pane already has a thread, else the row's own thread (explicit,
+    ///    or its own id). A pre-turn match rides on the applied ack.
+    /// 2. At turn end, `settleThread` looks at the panes the turn actually sent to;
+    ///    when they name a newer thread than the one stamped, the lines are
+    ///    restamped and the answered ack carries the proposal.
+    private func runMessageTurn(
+        _ message: DaemonSiteClient.Ledger.HeldMessage, text: String, engine: AgentTurnEngine
+    ) async -> AgentTurnOutcome {
+        let preTurn = message.hasExplicitThread ? nil : preTurnThreadProposal(for: text)
+        let submitThread = preTurn?.threadID ?? message.threadID ?? message.id
+        inFlightThreadID = submitThread
+        inFlightThreadProposal = nil
+        transcript?.beginMessageTurn(messageID: message.id, threadID: submitThread)
+        if let preTurn {
+            let line = "[threads] \(message.id.prefix(10)) joins \(preTurn.threadID.prefix(10)) before the turn (\(preTurn.reason))"
+            log(line)
+            record(AgentAuditEvent(kind: "notice", text: line))
+        }
+        inFlightSiteMessageID = message.id
+        inFlightSiteMessageText = message.text
+        retriedDecisionAnswer = false
+        isTurnInFlight = true
+        // Ack `applied` right after submit begins, not after the turn ends: the
+        // window between submit and ack is the one at-least-once window the design
+        // admits, and the shorter it is the rarer a double apply.
+        let runID = transcript?.runID.uuidString
+        async let ack: String? = siteClient?.markApplied(message.id, runID: runID, thread: preTurn) ?? nil
+        sendSessionTargetsThisTurn = []
+        setPromptMode?(.task)
+        let outcome = await engine.submit(Self.userTurnPrompt(text, source: message.source), displayText: text)
+        setPromptMode?(.mission)
+        // The control plane's answer to the applied ack is the thread the lines were
+        // effectively stamped with (an explicit membership it kept, a proposal it
+        // took); an ack that never went through leaves the submit-time stamp.
+        let stamped = await ack ?? submitThread
+        let settled = await settleThread(for: message, stamped: stamped)
+        await recordFollowUps(request: text, source: message.source, messageID: message.id, threadID: settled)
+        isTurnInFlight = false
+        return outcome
+    }
+
+    /// The pre-turn thread signal, or nil when there is none reliable enough. The
+    /// only pre-turn knowledge of a request's pane the daemon has is the routing
+    /// registry's name rule (`SessionRouter.namedRegisteredSessions`): the request
+    /// names exactly one registered tmux session, that session is live in the last
+    /// pane scan, and exactly one of its panes relayed within the pane-match window
+    /// — then that pane's thread is proposed on the applied ack. A vocabulary-score
+    /// route, a session with several fresh panes, no registry, or the message row's
+    /// `targetSiteId` (a SITE, never a pane) are not pre-turn answers; the turn-end
+    /// pane match decides those.
+    private func preTurnThreadProposal(for request: String) -> DaemonSiteClient.ThreadProposal? {
+        guard let target = Self.preTurnPaneTarget(
+            request: request,
+            registry: RegistryDocument.loadIfPresent(at: URL(fileURLWithPath: routingRegistryPath)),
+            liveSessions: Self.liveSessions(paneInventoryFileURL: URL(fileURLWithPath: paneInventoryPath)),
+            paneThreads: paneThreads
+        ), let proposal = paneThreads.proposal(for: [target]) else { return nil }
+        return .init(threadID: proposal.threadID, reason: proposal.reason)
+    }
+
+    /// Pure: the one pane a request is known to target before its turn runs, or nil.
+    nonisolated static func preTurnPaneTarget(
+        request: String, registry: RegistryDocument?, liveSessions: [String],
+        paneThreads: DaemonPaneThreadMap, now: Date = Date()
+    ) -> String? {
+        guard let registry else { return nil }
+        let named = SessionRouter.namedRegisteredSessions(in: request, registry: registry)
+        guard named.count == 1, let session = named.first, liveSessions.contains(session) else { return nil }
+        let fresh = paneThreads.freshTargets(inSession: session, now: now)
+        return fresh.count == 1 ? fresh.first : nil
+    }
+
+    /// The tmux sessions of the last pane scan (`pane-inventory.json`, lines of
+    /// "session:window.pane folder — title"), in first-seen order.
+    nonisolated static func liveSessions(paneInventoryFileURL: URL) -> [String] {
+        guard let data = try? Data(contentsOf: paneInventoryFileURL),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let lines = object["lines"] as? [String]
+        else { return [] }
+        var sessions: [String] = []
+        for line in lines {
+            guard let target = line.split(separator: " ", maxSplits: 1).first,
+                  let session = target.split(separator: ":", maxSplits: 1).first.map(String.init),
+                  !session.isEmpty, !sessions.contains(session)
+            else { continue }
+            sessions.append(session)
+        }
+        return sessions
+    }
+
+    /// The turn-end half of the pane match. `stamped` is the thread the turn's lines
+    /// carry. When the turn relayed into a pane whose last thread is within the window
+    /// and is not `stamped` — and the sender did not choose the thread — the lines are
+    /// restamped (`DaemonTranscriptUplink.restampThread`) and the answered ack will
+    /// carry the proposal (`inFlightThreadProposal`). Every pane the turn sent to is
+    /// then remembered under the thread the message finally belongs to, which is
+    /// returned. Reason vocabulary on the wire: `pane:<target>`; a turn that relayed
+    /// nowhere, or into panes with no fresh thread, keeps its stamp (`root` on the
+    /// control plane's side, logged here the same way).
+    private func settleThread(for message: DaemonSiteClient.Ledger.HeldMessage, stamped: String) async -> String {
+        let targets = sendSessionTargetsThisTurn
+        var settled = stamped
+        if !message.hasExplicitThread, let proposal = paneThreads.proposal(for: targets), proposal.threadID != stamped {
+            settled = proposal.threadID
+            inFlightThreadID = settled
+            inFlightThreadProposal = .init(threadID: proposal.threadID, reason: proposal.reason)
+            let restamped = await transcript?.restampThread(to: settled) ?? []
+            let line = "[threads] \(message.id.prefix(10)) joins \(settled.prefix(10)) after the turn "
+                + "(\(proposal.reason)); \(restamped.count) lines restamped"
+            log(line)
+            record(AgentAuditEvent(kind: "notice", text: line))
+        } else if !targets.isEmpty {
+            let reason = settled == message.id ? DaemonPaneThreadMap.rootReason : "kept"
+            log("[threads] \(message.id.prefix(10)) stays in \(settled.prefix(10)) (\(reason)); panes: \(targets.joined(separator: ", "))")
+        }
+        if !targets.isEmpty {
+            paneThreads.record(targets: targets, threadID: settled)
+            do {
+                try paneThreads.save(to: paneThreadsPath)
+            } catch {
+                log("[threads] could not save the pane map: \(error.localizedDescription.prefix(120))")
+            }
+        }
+        return settled
     }
 
     /// The prompt a user's message is submitted as. The model sees this; the audit
@@ -771,6 +934,11 @@ final class Daemon {
     /// The last titled-pane scan, for the prompt (written by `siteCapabilities`).
     var paneInventoryPath: String {
         (auditLogPath as NSString).deletingLastPathComponent + "/pane-inventory.json"
+    }
+
+    /// The pane → thread memory (`DaemonPaneThreadMap`), beside the pane inventory.
+    var paneThreadsPath: String {
+        (auditLogPath as NSString).deletingLastPathComponent + "/" + DaemonPaneThreadMap.standardFileName
     }
 
     var goalsSyncStatePath: String {
@@ -1081,7 +1249,10 @@ final class Daemon {
             // control plane counts THIS time-sensitive question as the message's
             // one push and suppresses the answered ack's fin.reply — the model's
             // closing text usually just restates the question (design §3.7.3).
-            self.notify(event: "request-input", message: question, messageID: self.inFlightSiteMessageID)
+            self.notify(
+                event: "request-input", message: question,
+                messageID: self.inFlightSiteMessageID, threadID: self.inFlightThreadID
+            )
             self.pauseHeartbeatForUserInput()
         }
         // The model's monitor tool drives the daemon's own heartbeat loop.
@@ -1437,20 +1608,8 @@ final class Daemon {
             // launch task: the user is waiting on it, and "say hello and wait" is not.
             let text = held.text.trimmingCharacters(in: .whitespacesAndNewlines)
             log("applying held message \(held.id) before the launch task: \(text)")
-            transcript?.pendingInReplyTo = held.id
             pendingUserMessageForDigest = text
-            inFlightSiteMessageID = held.id
-            inFlightSiteMessageText = held.text
-            retriedDecisionAnswer = false
-            isTurnInFlight = true
-            async let ack: Void = siteClient?.markApplied(held.id, runID: transcript?.runID.uuidString) ?? ()
-            sendSessionTargetsThisTurn = []
-            setPromptMode?(.task)
-            outcome = await engine.submit(Self.userTurnPrompt(text, source: held.source), displayText: text)
-            setPromptMode?(.mission)
-            await recordFollowUps(request: text, source: held.source, messageID: held.id)
-            await ack
-            isTurnInFlight = false
+            outcome = await runMessageTurn(held, text: text, engine: engine)
         } else if config.task.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // No launch turn at all. A resident site has nothing to say at boot, and a
             // launch turn — even "say hello and wait" — sits as the first user turn of
@@ -1505,10 +1664,11 @@ final class Daemon {
                 // message it answers — the control plane pushes each message's
                 // reply once, whichever of the ack or this push gets there first.
                 let answeredMessageID = inFlightSiteMessageID
+                let answeredThreadID = inFlightThreadID
                 if let id = inFlightSiteMessageID {
-                    inFlightSiteMessageID = nil
-                    inFlightSiteMessageText = nil
-                    await siteClient?.markAnswered(id, replyPreview: text)
+                    let proposal = inFlightThreadProposal
+                    clearInFlightMessage()
+                    await siteClient?.markAnswered(id, replyPreview: text, thread: proposal)
                 }
                 if let userMessage = pendingUserMessageForDigest {
                     recordTurnInEpisodicMemory(userMessage: userMessage, answer: text)
@@ -1516,7 +1676,7 @@ final class Daemon {
                 if AgentTurnLogic.containsTaskComplete(text) {
                     let ledgerGoals = await goalsLedger?.document.goals
                     if Self.taskCompleteIsTrustworthy(goals: ledgerGoals) {
-                        notify(event: "task-complete", message: text, messageID: answeredMessageID)
+                        notify(event: "task-complete", message: text, messageID: answeredMessageID, threadID: answeredThreadID)
                         // Resident or not, the supervisor's next status read says
                         // "task-complete": on the exit path from the PUT here, on the
                         // resident path because `idleStateName` holds that state until new
@@ -1559,6 +1719,10 @@ final class Daemon {
                 lastTurnAt = Date()
                 lastError = message
                 log("turn failed (\(consecutiveFailures) in a row): \(message)")
+                // The stall push below names the thread of the message that failed,
+                // captured before settling clears it.
+                let failedMessageID = inFlightSiteMessageID
+                let failedThreadID = inFlightThreadID
                 await settleInFlightMessage("Fin couldn't finish: \(String(message.prefix(160)))")
                 if let id = inFlightDirectiveID {
                     // The id was marked applied before the submit (at-most-once by
@@ -1581,7 +1745,11 @@ final class Daemon {
                         lastNotifiedAt: StallNotifyMarker.lastNotifiedAt(at: stallNotifyStatePath),
                         now: now
                     ) {
-                        notify(event: "agent-stalled", message: "fin-agentd giving up after 5 consecutive failed turns: \(message)")
+                        notify(
+                            event: "agent-stalled",
+                            message: "fin-agentd giving up after 5 consecutive failed turns: \(message)",
+                            messageID: failedMessageID, threadID: failedThreadID
+                        )
                         StallNotifyMarker.recordNotified(at: stallNotifyStatePath, now: now)
                     }
                     await fail("5 consecutive turn failures; last: \(message)")
@@ -1652,23 +1820,8 @@ final class Daemon {
                 if !heartbeatEnabled { _ = armMonitor(requestedSeconds: 0) }
                 let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 log("applying message \(message.id) (\(message.source)): \(text)")
-                transcript?.pendingInReplyTo = message.id
                 pendingUserMessageForDigest = text
-                inFlightSiteMessageID = message.id
-                inFlightSiteMessageText = message.text
-                retriedDecisionAnswer = false
-                isTurnInFlight = true
-                // Ack `applied` right after submit begins, not after the turn ends:
-                // the window between submit and ack is the one at-least-once window
-                // the design admits, and the shorter it is the rarer a double apply.
-                async let ack: Void = siteClient?.markApplied(message.id, runID: transcript?.runID.uuidString) ?? ()
-                sendSessionTargetsThisTurn = []
-                setPromptMode?(.task)
-                outcome = await engine.submit(Self.userTurnPrompt(text, source: message.source), displayText: text)
-                setPromptMode?(.mission)
-                await recordFollowUps(request: text, source: message.source, messageID: message.id)
-                await ack
-                isTurnInFlight = false
+                outcome = await runMessageTurn(message, text: text, engine: engine)
                 inFlightDirectiveID = nil
                 continue
             }
@@ -1953,9 +2106,11 @@ final class Daemon {
     /// configured, and the shell hook when `notifyCommand` is. Both fire when both are
     /// present; failures on either are logged and swallowed — a broken notifier must
     /// never take down the agent.
-    private func notify(event: String, message: String, messageID: String? = nil) {
+    private func notify(event: String, message: String, messageID: String? = nil, threadID: String? = nil) {
         if let client = notifyClient {
-            lastNotifyTask = Task { await client.send(event: event, message: message, messageID: messageID) }
+            lastNotifyTask = Task {
+                await client.send(event: event, message: message, messageID: messageID, threadID: threadID)
+            }
         }
         runNotifyCommand(event: event, message: message)
     }
@@ -2452,7 +2607,9 @@ final class Daemon {
             return notifyOutcome(commandLaunched: commandLaunched, hasClient: false, confirmed: nil)
         }
 
-        let sendTask = Task { await client.sendDirect(title: title, body: body) }
+        // A push composed mid-message-turn belongs to that message's thread.
+        let threadID = inFlightThreadID
+        let sendTask = Task { await client.sendDirect(title: title, body: body, threadID: threadID) }
         lastNotifyTask = sendTask
 
         let confirmed = await firstToFinish(sendTask, timeoutSeconds: Self.notifyToolTimeoutSeconds)

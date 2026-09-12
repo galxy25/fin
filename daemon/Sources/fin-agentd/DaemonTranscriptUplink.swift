@@ -151,8 +151,15 @@ final class DaemonTranscriptUplink {
     /// happened yet — the turn just started).
     func record(_ event: AgentAuditEvent) {
         sequence += 1
-        guard let line = mirrorLine(for: event, sequence: sequence) else { return }
+        let id = UUID().uuidString
+        guard let line = mirrorLine(for: event, sequence: sequence, id: id) else { return }
         let hour = Self.hourKey(for: event.timestamp)
+        if pendingThreadID != nil {
+            turnLines.append((id, hour, line))
+            if turnLines.count > maxLines {
+                turnLines.removeFirst(turnLines.count - maxLines)
+            }
+        }
         if let previousHour = currentHour, previousHour != hour, isDirty {
             let completedLines = lines
             isDirty = false
@@ -188,12 +195,44 @@ final class DaemonTranscriptUplink {
     /// by the next `userMessage` line so that line carries `in_reply_to`, which is how
     /// the app collapses a message two bodies both applied. Cleared after one use.
     var pendingInReplyTo: String?
+    /// The thread (docs/THREADS.md §2) the message turn in flight belongs to. Set by
+    /// the run loop alongside `pendingInReplyTo` and — unlike it — held for the WHOLE
+    /// turn: every line mirrored while it is set carries `thread_id`, so the pane's
+    /// side (`send_session` / `read_session` lines) and Fin's reasoning land in the
+    /// thread, not just the user line. `beginMessageTurn` sets it, `endMessageTurn`
+    /// clears it; a heartbeat turn runs with it nil and its lines carry no thread.
+    private(set) var pendingThreadID: String?
+    /// The lines mirrored under the current `pendingThreadID`, in order, with the hour
+    /// chunk each went into — what `restampThread` rewrites. Bounded by `maxLines`
+    /// like the ring.
+    private(set) var turnLines: [(id: String, hour: String, line: String)] = []
+
+    /// Called by the run loop right before it submits a control-plane message:
+    /// the user line answers `messageID`, and every line of the turn carries
+    /// `threadID` (the message's own id when it roots a thread of its own).
+    func beginMessageTurn(messageID: String, threadID: String) {
+        pendingInReplyTo = messageID
+        pendingThreadID = threadID
+        turnLines = []
+    }
+
+    /// Called once the turn's outcome has been handled (acked, follow-ups recorded):
+    /// lines from here on — the next heartbeat's — carry no thread.
+    func endMessageTurn() {
+        pendingInReplyTo = nil
+        pendingThreadID = nil
+        turnLines = []
+    }
 
     /// One mirror line. Internal so the format tests can assert on it without staging a
     /// flush.
     func mirrorLine(for event: AgentAuditEvent, sequence: Int) -> String? {
+        mirrorLine(for: event, sequence: sequence, id: UUID().uuidString)
+    }
+
+    private func mirrorLine(for event: AgentAuditEvent, sequence: Int, id: String) -> String? {
         var object: [String: Any] = [
-            "id": UUID().uuidString,
+            "id": id,
             "run_id": runID.uuidString,
             "sequence": sequence,
             "timestamp": Self.timestampFormatter.string(from: event.timestamp),
@@ -214,13 +253,73 @@ final class DaemonTranscriptUplink {
         }
         if let siteID8 { object["site_id8"] = siteID8 }
         if let siteName { object["site_name"] = siteName }
+        if let target = event.target, !target.isEmpty { object["target"] = target }
         if event.kind == "userMessage", let reply = pendingInReplyTo {
             object["in_reply_to"] = reply
             pendingInReplyTo = nil
         }
+        if let threadID = pendingThreadID, !threadID.isEmpty {
+            object["thread_id"] = threadID
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         else { return nil }
         return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Rewrites every line of the turn in flight with `threadID` and sends the
+    /// rewritten lines up again — the turn-end fallback of docs/THREADS.md §2: the
+    /// pane a turn relayed into is only known once the turn has run, and when that
+    /// pane names a newer thread than the one the turn was stamped with at submit,
+    /// the lines move. The control plane's chunk merge is last-write-wins per line
+    /// id (`_merge_transcript_lines`), so re-PUTting the same ids with the corrected
+    /// `thread_id` is the whole mechanism; nothing is duplicated. Lines still in the
+    /// current hour's ring are replaced in place (the post-turn flush carries them);
+    /// lines that rolled into a completed hour are PUT under that hour now. Returns
+    /// the ids restamped, in order, for the audit trail and the tests.
+    @discardableResult
+    func restampThread(to threadID: String) async -> [String] {
+        guard !threadID.isEmpty, !turnLines.isEmpty else { return [] }
+        var restamped: [String] = []
+        var completedHours: [String: [String]] = [:]
+        var ringByID: [String: Int] = [:]
+        for (index, line) in lines.enumerated() {
+            if let id = Self.lineID(line) { ringByID[id] = index }
+        }
+        for (position, entry) in turnLines.enumerated() {
+            guard var object = (try? JSONSerialization.jsonObject(with: Data(entry.line.utf8))) as? [String: Any]
+            else { continue }
+            object["thread_id"] = threadID
+            guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            else { continue }
+            let rewritten = String(decoding: data, as: UTF8.self)
+            turnLines[position] = (entry.id, entry.hour, rewritten)
+            restamped.append(entry.id)
+            if entry.hour == currentHour, let index = ringByID[entry.id] {
+                lines[index] = rewritten
+                isDirty = true
+            } else {
+                completedHours[entry.hour, default: []].append(rewritten)
+            }
+        }
+        pendingThreadID = threadID
+        for (hour, hourLines) in completedHours {
+            await flush(hour: hour, lines: hourLines)
+        }
+        return restamped
+    }
+
+    /// The `id` of one mirror line, nil for anything unparseable.
+    static func lineID(_ line: String) -> String? {
+        guard let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+        else { return nil }
+        return object["id"] as? String
+    }
+
+    /// The `thread_id` of one mirror line, nil when it carries none.
+    static func threadID(ofLine line: String) -> String? {
+        guard let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+        else { return nil }
+        return object["thread_id"] as? String
     }
 
     // MARK: - Uplink

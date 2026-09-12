@@ -91,6 +91,12 @@ public struct Goal: Codable, Equatable, Sendable {
     public var source: String?
     public var createdAt: String?
     public var updates: [Update]
+    /// The thread (docs/THREADS.md) the goal belongs to — the request it follows up —
+    /// so the control plane's `goal.followup` event lands on that thread instead of
+    /// being guessed from the goal id's tail. Nil for goals with no originating request.
+    public var threadID: String?
+    /// The control-plane message id of that request, when the goal has one.
+    public var messageID: String?
 
     enum CodingKeys: String, CodingKey {
         case id, title, state, priority, why
@@ -99,6 +105,8 @@ public struct Goal: Codable, Equatable, Sendable {
         case tags, source
         case createdAt = "created_at"
         case updates
+        case threadID = "thread_id"
+        case messageID = "message_id"
     }
 
     public init(
@@ -112,7 +120,9 @@ public struct Goal: Codable, Equatable, Sendable {
         tags: [String] = [],
         source: String? = nil,
         createdAt: String? = Update.timestamp(),
-        updates: [Update] = []
+        updates: [Update] = [],
+        threadID: String? = nil,
+        messageID: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -125,6 +135,8 @@ public struct Goal: Codable, Equatable, Sendable {
         self.source = source
         self.createdAt = createdAt
         self.updates = updates
+        self.threadID = threadID
+        self.messageID = messageID
     }
 
     /// Lenient by hand: the ledger is user-editable working memory, and the tick only
@@ -144,6 +156,8 @@ public struct Goal: Codable, Equatable, Sendable {
         source = try container.decodeIfPresent(String.self, forKey: .source)
         createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt)
         updates = try container.decodeIfPresent([Update].self, forKey: .updates) ?? []
+        threadID = try container.decodeIfPresent(String.self, forKey: .threadID)
+        messageID = try container.decodeIfPresent(String.self, forKey: .messageID)
     }
 
     // MARK: - Decision helpers (mirroring policy_baseline.py)
@@ -236,7 +250,13 @@ public enum GoalsTick {
     /// recorded the hand-off, so no tick read the pane and the user got the PDF but
     /// never the "done" notification. The daemon knows exactly what was sent where,
     /// so it records the goal itself — the model is not asked to remember to.
-    public static func followUpGoal(request: String, target: String, source: String?, messageID: String) -> Goal {
+    ///
+    /// `threadID` is the thread the request belongs to (docs/THREADS.md §2), stamped on
+    /// the goal as `thread_id` so the control plane's `goal.followup` event joins that
+    /// thread; `messageID` rides along as `message_id`.
+    public static func followUpGoal(
+        request: String, target: String, source: String?, messageID: String, threadID: String? = nil
+    ) -> Goal {
         let idTail = messageID.replacingOccurrences(of: "m-", with: "").prefix(8)
         let short = request.count > 80 ? String(request.prefix(77)) + "…" : request
         let via = source == "voice" ? "by voice" : "in the app"
@@ -253,7 +273,9 @@ public enum GoalsTick {
                 + "just say hello. If it is still working, do nothing this tick. If it needs something from "
                 + "the user, tell the user with notify.",
             tags: ["followup", "send_session"],
-            source: "daemon"
+            source: "daemon",
+            threadID: threadID,
+            messageID: messageID
         )
     }
 

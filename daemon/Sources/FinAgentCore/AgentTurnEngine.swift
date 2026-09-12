@@ -79,6 +79,13 @@ public struct AgentAuditEvent: Codable, Sendable {
     /// 1/0 for every line regardless of real retry activity.
     public var attempt: Int
     public var retryCount: Int
+    /// The pane a `send_session` / `read_session` tool call addressed, as the
+    /// validated `session:window[.pane]` target (docs/THREADS.md §2). Structured so
+    /// the cloud transcript's `target` field — and the control plane's `relay.sent` /
+    /// `relay.read` thread events built from it — never depend on parsing the prose
+    /// in `text`. Nil on every other event, including a `read_session` with no name
+    /// (a session listing addresses no pane).
+    public var target: String?
 
     public init(
         kind: String,
@@ -87,7 +94,8 @@ public struct AgentAuditEvent: Codable, Sendable {
         toolArguments: String? = nil,
         isFailure: Bool = false,
         attempt: Int = 1,
-        retryCount: Int = 0
+        retryCount: Int = 0,
+        target: String? = nil
     ) {
         self.timestamp = Date()
         self.kind = kind
@@ -97,6 +105,7 @@ public struct AgentAuditEvent: Codable, Sendable {
         self.isFailure = isFailure
         self.attempt = attempt
         self.retryCount = retryCount
+        self.target = target
     }
 }
 
@@ -290,7 +299,8 @@ public final class AgentTurnEngine {
         _ text: String,
         toolName: String? = nil,
         toolArguments: String? = nil,
-        isFailure: Bool = false
+        isFailure: Bool = false,
+        target: String? = nil
     ) {
         guard !text.isEmpty else { return }
         audit(AgentAuditEvent(
@@ -300,7 +310,8 @@ public final class AgentTurnEngine {
             toolArguments: toolArguments,
             isFailure: isFailure,
             attempt: currentAttempt,
-            retryCount: currentRetryCount
+            retryCount: currentRetryCount,
+            target: target
         ))
     }
 
@@ -785,7 +796,7 @@ public final class AgentTurnEngine {
         record(
             "toolCall",
             name.map { "read_session: \($0) (\(lines) lines)" } ?? "read_session: list sessions",
-            toolName: toolName, toolArguments: rawArguments
+            toolName: toolName, toolArguments: rawArguments, target: name
         )
         guard let onReadSession else {
             let message = "Error: read_session is not available in this runtime — there is no way "
@@ -875,7 +886,7 @@ public final class AgentTurnEngine {
             "toolCall",
             "send_session: \(target) (\(text.count) chars"
                 + (awaitSeconds > 0 ? ", waiting up to \(awaitSeconds)s" : "") + ")",
-            toolName: toolName, toolArguments: rawArguments
+            toolName: toolName, toolArguments: rawArguments, target: target
         )
         guard let onSendSession else {
             let message = "Error: send_session is not available in this runtime — there is no "

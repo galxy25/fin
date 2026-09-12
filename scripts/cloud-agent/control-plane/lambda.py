@@ -3802,6 +3802,17 @@ def ack_message(event, message_id):
         if isinstance(preview, str) and preview.strip():
             update += ", replyPreview = :preview"
             values[":preview"] = preview.strip()[:MAX_REPLY_PREVIEW_CHARS]
+        # The turn-end fallback of docs/THREADS.md §2: the pane a turn relayed
+        # into is only known once the turn has run, so the site may propose the
+        # thread on the answered ack too. Same validation and precedence as at
+        # applied time; a proposal naming the thread the row is already in is
+        # not a transition and logs nothing.
+        proposed_id, proposed_reason, proposed = _decide_thread(row, body)
+        if proposed and proposed_id != _thread_of(row):
+            update += ", threadId = :thread, threadReason = :reason"
+            values[":thread"] = proposed_id
+            values[":reason"] = proposed_reason
+            thread_id, thread_reason = proposed_id, proposed_reason
     try:
         MESSAGES_TABLE.update_item(
             Key={"messageId": message_id},
@@ -3832,6 +3843,12 @@ def ack_message(event, message_id):
     pushed = False
     if ":preview" in values:
         pushed = _push_answered_reply(row, message_id, values[":preview"], body, now)
+    if thread_reason is not None:
+        _thread_event(row["userId"], thread_id, "thread.assigned", "system", {
+            "messageId": message_id,
+            "threadId": thread_id,
+            "reason": thread_reason,
+        }, now=now)
     _thread_event(row["userId"], thread_id, "message.answered", actor, {
         "messageId": message_id,
         "siteId8": site.get("siteId8"),

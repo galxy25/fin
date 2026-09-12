@@ -324,6 +324,18 @@ public enum SessionRouter {
         )
     }
 
+    /// The registered sessions `query` names outright (rule 3 of `decide`, on its
+    /// own): whole-word mentions, in registry order, without duplicates. The one
+    /// routing signal precise enough to act on BEFORE a turn runs — a vocabulary
+    /// score is a guess about the session, a name is the user saying it.
+    public static func namedRegisteredSessions(in query: String, registry: RegistryDocument) -> [String] {
+        var named: [String] = []
+        for entry in registry.sessions where !named.contains(entry.session) && wordMentioned(entry.session, in: query) {
+            named.append(entry.session)
+        }
+        return named
+    }
+
     /// Whole-word, case-insensitive mention — names and phrases are escaped so a
     /// registry entry can never smuggle regex syntax into the match.
     private static func wordMentioned(_ name: String, in query: String) -> Bool {

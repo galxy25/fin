@@ -97,11 +97,15 @@ final class DaemonNotifyClient {
     /// reply once (the daemon's task-complete push and the answered ack's push
     /// dedupe on it, design §3.7.3). `event` (`request-input` / `task-complete` /
     /// `agent-stalled` / `notify`) picks the APNs category and interruption level
-    /// (`fin.input` + time-sensitive for the two "needs you" events). Optional
+    /// (`fin.input` + time-sensitive for the two "needs you" events). `"threadId"`
+    /// names the thread (docs/THREADS.md §2) the push belongs to — the one the
+    /// message turn in flight is stamped with — so the Lambda records `notify.sent`
+    /// on it and the APNs `thread-id` groups the Lock Screen by request. Optional
     /// keys are omitted (not sent as null) when absent.
     static func requestBody(
         title: String, body: String, agentName: String, event: String = "notify",
-        agentID: UUID? = nil, originDeviceID8: String = "", messageID: String? = nil
+        agentID: UUID? = nil, originDeviceID8: String = "", messageID: String? = nil,
+        threadID: String? = nil
     ) -> Data? {
         var object: [String: Any] = ["title": title, "body": body, "agent": agentName, "event": event]
         if let agentID {
@@ -113,6 +117,9 @@ final class DaemonNotifyClient {
         if let messageID, !messageID.isEmpty {
             object["messageId"] = messageID
         }
+        if let threadID, !threadID.isEmpty {
+            object["threadId"] = threadID
+        }
         return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
@@ -123,14 +130,16 @@ final class DaemonNotifyClient {
     /// actually succeeded, so a caller that needs the real outcome (not just "handed
     /// off") can report it honestly instead of assuming delivery.
     /// `messageID` names the control-plane message this push reports on (the
-    /// task-complete push for a claimed message); nil for everything else.
+    /// task-complete push for a claimed message); nil for everything else. `threadID`
+    /// is that message's thread, when the daemon knows it.
     @discardableResult
-    func send(event: String, message: String, messageID: String? = nil) async -> Bool {
+    func send(event: String, message: String, messageID: String? = nil, threadID: String? = nil) async -> Bool {
         await deliver(
             title: Self.title(event: event, agentName: agentName),
             body: Self.alertBody(message),
             event: event,
-            messageID: messageID
+            messageID: messageID,
+            threadID: threadID
         )
     }
 
@@ -141,14 +150,15 @@ final class DaemonNotifyClient {
     /// swallow-and-throttle failure discipline, and the same real-outcome return, as
     /// `send(event:)`.
     @discardableResult
-    func sendDirect(title: String, body: String) async -> Bool {
+    func sendDirect(title: String, body: String, threadID: String? = nil) async -> Bool {
         let redactedTitle = MemoryRedactor.redact(title)
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return await deliver(
             title: redactedTitle.isEmpty ? agentName : redactedTitle,
             body: Self.alertBody(body),
-            event: "notify"
+            event: "notify",
+            threadID: threadID
         )
     }
 
@@ -158,7 +168,9 @@ final class DaemonNotifyClient {
     /// only on a confirmed 2xx response — every other outcome (bad URL, transport error,
     /// non-2xx) is false, audited, and swallowed.
     @discardableResult
-    private func deliver(title: String, body: String, event: String, messageID: String? = nil) async -> Bool {
+    private func deliver(
+        title: String, body: String, event: String, messageID: String? = nil, threadID: String? = nil
+    ) async -> Bool {
         var base = endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") { base.removeLast() }
         guard !base.isEmpty, let url = URL(string: base + "/notify") else {
@@ -177,7 +189,8 @@ final class DaemonNotifyClient {
             event: event,
             agentID: agentID,
             originDeviceID8: originDeviceID8,
-            messageID: messageID
+            messageID: messageID,
+            threadID: threadID
         )
         do {
             let response = try await post(request)
