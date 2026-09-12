@@ -69,9 +69,12 @@ struct AgentMemoryView: View {
                     + "into every system prompt.")
             }
 
-            if CloudControlPlaneConfig.isConfigured {
-                Section {
-                    if sites.sites.isEmpty {
+            Section {
+                if !CloudControlPlaneConfig.isConfigured {
+                    Text("Set up the control plane in Hosting settings to see what Fin\u{2019}s computers are doing.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } else if sites.sites.isEmpty {
                         Text(sites.lastError.map { "Couldn't reach the control plane: \($0)" }
                             ?? "No computers have checked in yet.")
                             .font(.callout)
@@ -81,15 +84,14 @@ struct AgentMemoryView: View {
                             siteRow(site)
                         }
                     }
-                } header: {
-                    Text("What Fin Sees Right Now")
-                } footer: {
-                    Text("Each computer Fin lives on reports what its terminal sessions are doing. "
-                        + "This is observed, dated, and folded into the profile above; the panes "
-                        + "themselves are the freshest signal.")
-                }
-                .accessibilityIdentifier("memoryRightNowSection")
+            } header: {
+                Text("What Fin Sees Right Now")
+            } footer: {
+                Text("Each computer Fin lives on reports what its terminal sessions are doing. "
+                    + "This is observed, dated, and folded into the profile above; the panes "
+                    + "themselves are the freshest signal.")
             }
+            .accessibilityIdentifier("memoryRightNowSection")
 
             Section {
                 if recentEpisodic.isEmpty {

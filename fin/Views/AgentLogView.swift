@@ -31,6 +31,12 @@ struct AgentLogView: View {
     @Query private var entries: [AgentLogEntry]
 
     @State private var kindFilter: AgentLogKind?
+    /// The mission's traces from every body Fin runs in — the cloud transcript's
+    /// reasoning, tool calls, results and replies — merged with this device's own
+    /// runtime log. Live, 2026-09-12: Logs read only this device's SwiftData rows,
+    /// so every filter answered "no matching events" for a mission the iMac
+    /// daemon had just run. Never inserted into the store: display-only objects.
+    @State private var cloudEntries: [AgentLogEntry] = []
     @State private var expandedRuns: Set<UUID> = []
     @State private var didSetInitialExpansion = false
     @State private var exportURL: URL?
@@ -45,11 +51,16 @@ struct AgentLogView: View {
         )
     }
 
+    /// Local runtime rows plus the cloud transcript's, newest first.
+    private var allEntries: [AgentLogEntry] {
+        (entries + cloudEntries).sorted { $0.timestamp > $1.timestamp }
+    }
+
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 14) {
-                if !entries.isEmpty {
-                    SummaryPanel(runs: runs, entries: entries)
+                if !allEntries.isEmpty {
+                    SummaryPanel(runs: runs, entries: allEntries)
                     filterBar
                 }
                 ForEach(runs) { run in
@@ -81,12 +92,59 @@ struct AgentLogView: View {
         }
         .sheet(item: $exportURL) { ExportSheet(url: $0) }
         .task {
-            guard !didSetInitialExpansion else { return }
-            didSetInitialExpansion = true
-            // Most recent trajectory open, older ones collapsed — the common case is
-            // checking what just happened.
-            if let newest = runs.first { expandedRuns.insert(newest.id) }
+            await refreshCloudTraces()
+            if !didSetInitialExpansion {
+                didSetInitialExpansion = true
+                // Most recent trajectory open, older ones collapsed — the common case is
+                // checking what just happened.
+                if let newest = runs.first { expandedRuns.insert(newest.id) }
+            }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { return }
+                await refreshCloudTraces()
+            }
         }
+    }
+
+    /// The latest cloud transcript window (this hour merged with the previous), as
+    /// display-only log entries; every kind, since traces are the point here.
+    private func refreshCloudTraces() async {
+        guard CloudControlPlaneConfig.isConfigured else { return }
+        let page = await CloudAgentChannel.fetchTranscriptChunks(agentName: agent.name)
+        guard !page.records.isEmpty else { return }
+        cloudEntries = page.records.map { Self.logEntry(from: $0, agent: agent) }
+    }
+
+    static func logEntry(from record: AgentMirrorRecord, agent: Agent) -> AgentLogEntry {
+        let entry = AgentLogEntry(record: AgentLogRecord(
+            agentID: agent.id,
+            agentName: agent.name,
+            serverName: record.siteName ?? record.siteID8 ?? "cloud",
+            runID: runUUID(record.runID),
+            sequence: record.sequence,
+            kind: record.kind,
+            text: record.text,
+            toolName: record.toolName
+        ))
+        entry.timestamp = record.timestamp
+        return entry
+    }
+
+    /// The transcript's run id is a string (a UUID from the daemon, "BACKFILL-16"
+    /// from a backfill); the log groups by UUID. Deterministic so a refresh keeps
+    /// the same run cards.
+    static func runUUID(_ raw: String) -> UUID {
+        if let uuid = UUID(uuidString: raw) { return uuid }
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in raw.utf8 { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
+        let hi = hash, lo = hash &* 0x9E3779B97F4A7C15
+        return UUID(uuid: (
+            UInt8(hi >> 56), UInt8(truncatingIfNeeded: hi >> 48), UInt8(truncatingIfNeeded: hi >> 40), UInt8(truncatingIfNeeded: hi >> 32),
+            UInt8(truncatingIfNeeded: hi >> 24), UInt8(truncatingIfNeeded: hi >> 16), UInt8(truncatingIfNeeded: hi >> 8), UInt8(truncatingIfNeeded: hi),
+            UInt8(truncatingIfNeeded: lo >> 56), UInt8(truncatingIfNeeded: lo >> 48), UInt8(truncatingIfNeeded: lo >> 40), UInt8(truncatingIfNeeded: lo >> 32),
+            UInt8(truncatingIfNeeded: lo >> 24), UInt8(truncatingIfNeeded: lo >> 16), UInt8(truncatingIfNeeded: lo >> 8), UInt8(truncatingIfNeeded: lo)
+        ))
     }
 
     // MARK: Data shaping
@@ -94,7 +152,7 @@ struct AgentLogView: View {
     /// Entries grouped into trajectories, newest run first, steps within a run in the
     /// order they actually happened.
     private var runs: [AgentRun] {
-        let source = kindFilter.map { filter in entries.filter { $0.kind == filter } } ?? entries
+        let source = kindFilter.map { filter in allEntries.filter { $0.kind == filter } } ?? allEntries
         var order: [UUID] = []
         var grouped: [UUID: [AgentLogEntry]] = [:]
         for entry in source {
@@ -157,13 +215,13 @@ struct AgentLogView: View {
                 } label: {
                     Label("Export JSONL", systemImage: "square.and.arrow.up")
                 }
-                .disabled(entries.isEmpty)
+                .disabled(allEntries.isEmpty)
                 Button(role: .destructive) {
                     showingClearConfirmation = true
                 } label: {
                     Label("Clear Logs", systemImage: "trash")
                 }
-                .disabled(entries.isEmpty)
+                .disabled(allEntries.isEmpty)
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
@@ -172,7 +230,7 @@ struct AgentLogView: View {
 
     @ViewBuilder
     private var emptyOverlay: some View {
-        if entries.isEmpty {
+        if allEntries.isEmpty {
             ContentUnavailableView(
                 "No Activity Yet",
                 systemImage: "list.bullet.rectangle",
@@ -197,7 +255,7 @@ struct AgentLogView: View {
 
     /// Oldest-first, which is the order a training pipeline reads a trajectory in.
     private func exportJSONL() {
-        let ordered = entries.sorted {
+        let ordered = allEntries.sorted {
             $0.timestamp == $1.timestamp ? $0.sequence < $1.sequence : $0.timestamp < $1.timestamp
         }
         let body = ordered.compactMap { $0.jsonlLine() }.joined(separator: "\n")
