@@ -135,6 +135,40 @@ enum FinPresence: Equatable {
     }
 }
 
+/// True inside a unit-test host. View tasks that would otherwise reach the
+/// control plane no-op here: a render test must never depend on the network,
+/// and — live, 2026-09-12 — an async fetch finishing after a render test had
+/// torn its window down trapped inside SwiftData's @Query observer.
+enum TestHost {
+    static let isUnitTest = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        || ProcessInfo.processInfo.environment["FIN_UI_TESTING"] != nil
+}
+
+/// The cloud transcript's records for one agent, for the Logs view — an
+/// observable store rather than view state, so a fetch that lands after the
+/// view is gone updates nothing that SwiftUI still owns.
+@MainActor
+final class CloudTraceStore: ObservableObject {
+    @Published private(set) var records: [AgentMirrorRecord] = []
+    private var loop: Task<Void, Never>?
+
+    func start(agentName: String) {
+        guard loop == nil, CloudControlPlaneConfig.isConfigured, !TestHost.isUnitTest else { return }
+        loop = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                let page = await CloudAgentChannel.fetchTranscriptChunks(agentName: agentName)
+                if !page.records.isEmpty { self.records = page.records }
+                try? await Task.sleep(for: .seconds(15))
+            }
+        }
+    }
+
+    func stop() {
+        loop?.cancel()
+        loop = nil
+    }
+}
+
 /// A short-lived cache over `GET /sites`, shared by every view that shows
 /// presence, so the console, the servers list, and the memory view don't each
 /// hammer the control plane on their own refresh cadence.
@@ -154,6 +188,7 @@ final class SiteDirectory: ObservableObject {
     /// throws; an unconfigured control plane yields an empty list quietly.
     @discardableResult
     func refresh(force: Bool = false, now: Date = Date()) async -> [FinSite] {
+        if TestHost.isUnitTest { return sites }
         if !force, let fetchedAt, now.timeIntervalSince(fetchedAt) < Self.cacheLifetime { return sites }
         if let inFlight { return await inFlight.value }
         let task = Task<[FinSite], Never> {

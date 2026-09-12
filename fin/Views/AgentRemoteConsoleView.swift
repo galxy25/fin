@@ -787,7 +787,7 @@ struct AgentRemoteConsoleView: View {
     /// surface every OPEN row for this agent the control plane knows about — sent
     /// from any device, by voice or by hand — as a pending row here too.
     private func refreshPresenceAndPending() async {
-        guard usesControlPlane else { return }
+        guard usesControlPlane, !TestHost.isUnitTest else { return }
         await sites.refresh()
         guard case .success(let remote) = await ControlPlaneClient.listMessages(agent: agentName) else { return }
         let byID = Dictionary(remote.map { ($0.messageId, $0) }, uniquingKeysWith: { a, _ in a })

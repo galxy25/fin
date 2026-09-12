@@ -36,7 +36,7 @@ struct AgentLogView: View {
     /// runtime log. Live, 2026-09-12: Logs read only this device's SwiftData rows,
     /// so every filter answered "no matching events" for a mission the iMac
     /// daemon had just run. Never inserted into the store: display-only objects.
-    @State private var cloudEntries: [AgentLogEntry] = []
+    @StateObject private var cloudTraces = CloudTraceStore()
     @State private var expandedRuns: Set<UUID> = []
     @State private var didSetInitialExpansion = false
     @State private var exportURL: URL?
@@ -52,8 +52,9 @@ struct AgentLogView: View {
     }
 
     /// Local runtime rows plus the cloud transcript's, newest first.
-    private var allEntries: [AgentLogEntry] {
-        (entries + cloudEntries).sorted { $0.timestamp > $1.timestamp }
+    private var allEntries: [LogItem] {
+        (entries.map(LogItem.init) + cloudTraces.records.map(LogItem.init(record:)))
+            .sorted { $0.timestamp > $1.timestamp }
     }
 
     var body: some View {
@@ -91,44 +92,18 @@ struct AgentLogView: View {
             Text("This deletes \(entries.count) recorded event(s). It can't be undone.")
         }
         .sheet(item: $exportURL) { ExportSheet(url: $0) }
+        .onAppear { cloudTraces.start(agentName: agent.name) }
+        .onDisappear { cloudTraces.stop() }
         .task {
-            await refreshCloudTraces()
-            if !didSetInitialExpansion {
-                didSetInitialExpansion = true
-                // Most recent trajectory open, older ones collapsed — the common case is
-                // checking what just happened.
-                if let newest = runs.first { expandedRuns.insert(newest.id) }
-            }
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(15))
-                guard !Task.isCancelled else { return }
-                await refreshCloudTraces()
-            }
+            guard !didSetInitialExpansion else { return }
+            didSetInitialExpansion = true
+            // Most recent trajectory open, older ones collapsed — the common case is
+            // checking what just happened.
+            if let newest = runs.first { expandedRuns.insert(newest.id) }
         }
-    }
-
-    /// The latest cloud transcript window (this hour merged with the previous), as
-    /// display-only log entries; every kind, since traces are the point here.
-    private func refreshCloudTraces() async {
-        guard CloudControlPlaneConfig.isConfigured else { return }
-        let page = await CloudAgentChannel.fetchTranscriptChunks(agentName: agent.name)
-        guard !page.records.isEmpty else { return }
-        cloudEntries = page.records.map { Self.logEntry(from: $0, agent: agent) }
-    }
-
-    static func logEntry(from record: AgentMirrorRecord, agent: Agent) -> AgentLogEntry {
-        let entry = AgentLogEntry(record: AgentLogRecord(
-            agentID: agent.id,
-            agentName: agent.name,
-            serverName: record.siteName ?? record.siteID8 ?? "cloud",
-            runID: runUUID(record.runID),
-            sequence: record.sequence,
-            kind: record.kind,
-            text: record.text,
-            toolName: record.toolName
-        ))
-        entry.timestamp = record.timestamp
-        return entry
+        .onChange(of: cloudTraces.records.count) { _, _ in
+            if expandedRuns.isEmpty, let newest = runs.first { expandedRuns.insert(newest.id) }
+        }
     }
 
     /// The transcript's run id is a string (a UUID from the daemon, "BACKFILL-16"
@@ -154,7 +129,7 @@ struct AgentLogView: View {
     private var runs: [AgentRun] {
         let source = kindFilter.map { filter in allEntries.filter { $0.kind == filter } } ?? allEntries
         var order: [UUID] = []
-        var grouped: [UUID: [AgentLogEntry]] = [:]
+        var grouped: [UUID: [LogItem]] = [:]
         for entry in source {
             if grouped[entry.runID] == nil { order.append(entry.runID) }
             grouped[entry.runID, default: []].append(entry)
@@ -258,7 +233,7 @@ struct AgentLogView: View {
         let ordered = allEntries.sorted {
             $0.timestamp == $1.timestamp ? $0.sequence < $1.sequence : $0.timestamp < $1.timestamp
         }
-        let body = ordered.compactMap { $0.jsonlLine() }.joined(separator: "\n")
+        let body = ordered.compactMap(\.jsonl).joined(separator: "\n")
         guard !body.isEmpty else { return }
 
         let safeName = agent.name.isEmpty
@@ -273,9 +248,68 @@ struct AgentLogView: View {
 
 // MARK: - Run model
 
+/// One log row for display — a plain value, never a SwiftData object. Both
+/// sources map onto it: this device's `AgentLogEntry` rows and the cloud
+/// transcript's records. Live, 2026-09-12: holding cloud rows as un-inserted
+/// `AgentLogEntry` @Model objects trapped inside SwiftData's @Query observer on
+/// the next context save (test host crash, and the same hazard in the app).
+struct LogItem: Identifiable {
+    let id: UUID
+    let runID: UUID
+    let sequence: Int
+    let timestamp: Date
+    let kind: AgentLogKind
+    let text: String
+    let toolName: String?
+    let toolArguments: String?
+    let disposition: AgentToolDisposition?
+    let serverName: String
+    let attempt: Int
+    let retryCount: Int
+    let isFailure: Bool
+    let promptTokens: Int?
+    let completionTokens: Int?
+    let totalTokens: Int?
+    let latencyMS: Int?
+    let timeToFirstTokenMS: Int?
+    let reasoningMS: Int?
+    let toolDurationMS: Int?
+    let approvalWaitMS: Int?
+    let interTokenMeanMS: Double?
+    /// The export line: the stored row's own JSONL, or a plain rendering of a
+    /// cloud row.
+    let jsonl: String?
+
+    init(_ e: AgentLogEntry) {
+        id = e.id; runID = e.runID; sequence = e.sequence; timestamp = e.timestamp; kind = e.kind
+        text = e.text; toolName = e.toolName; toolArguments = e.toolArguments; disposition = e.disposition
+        serverName = e.serverName; attempt = e.attempt; retryCount = e.retryCount; isFailure = e.isFailure
+        promptTokens = e.promptTokens; completionTokens = e.completionTokens; totalTokens = e.totalTokens
+        latencyMS = e.latencyMS; timeToFirstTokenMS = e.timeToFirstTokenMS; reasoningMS = e.reasoningMS
+        toolDurationMS = e.toolDurationMS; approvalWaitMS = e.approvalWaitMS; interTokenMeanMS = e.interTokenMeanMS
+        jsonl = e.jsonlLine()
+    }
+
+    init(record r: AgentMirrorRecord) {
+        id = UUID(uuidString: r.id) ?? AgentLogView.runUUID("line:" + r.id)
+        runID = AgentLogView.runUUID(r.runID); sequence = r.sequence; timestamp = r.timestamp; kind = r.kind
+        text = r.text; toolName = r.toolName; toolArguments = nil; disposition = nil
+        serverName = r.siteName ?? r.siteID8 ?? "cloud"; attempt = 1; retryCount = 0
+        isFailure = r.kind == .error
+        promptTokens = nil; completionTokens = nil; totalTokens = nil; latencyMS = nil
+        timeToFirstTokenMS = nil; reasoningMS = nil; toolDurationMS = nil; approvalWaitMS = nil; interTokenMeanMS = nil
+        let object: [String: Any] = [
+            "id": r.id, "run_id": r.runID, "sequence": r.sequence, "kind": r.kind.rawValue, "text": r.text,
+            "timestamp": AgentMirrorRecord.timestampFormatter.string(from: r.timestamp),
+            "site_id8": r.siteID8 ?? "", "site_name": r.siteName ?? "", "tool_name": r.toolName ?? "",
+        ]
+        jsonl = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) }
+    }
+}
+
 private struct AgentRun: Identifiable {
     let id: UUID
-    let entries: [AgentLogEntry]
+    let entries: [LogItem]
 
     var startedAt: Date { entries.first?.timestamp ?? Date() }
     var serverName: String { entries.first?.serverName ?? "" }
@@ -304,7 +338,7 @@ private struct AgentRun: Identifiable {
 
 private struct SummaryPanel: View {
     let runs: [AgentRun]
-    let entries: [AgentLogEntry]
+    let entries: [LogItem]
 
     var body: some View {
         VStack(spacing: 10) {
@@ -463,7 +497,7 @@ private struct RunCard: View {
 // MARK: - Trace row
 
 private struct TraceRow: View {
-    let entry: AgentLogEntry
+    let entry: LogItem
     let isFirst: Bool
     let isLast: Bool
 
@@ -564,7 +598,7 @@ private struct TraceRow: View {
     }
 
     @ViewBuilder
-    private func body(for entry: AgentLogEntry) -> some View {
+    private func body(for entry: LogItem) -> some View {
         let isCode = entry.kind == .toolCall || entry.kind == .toolResult
         Text(entry.text)
             .font(isCode ? .system(.caption, design: .monospaced) : .callout)

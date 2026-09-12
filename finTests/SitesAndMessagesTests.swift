@@ -240,12 +240,12 @@ final class SitesAndMessagesTests: XCTestCase {
 
     // MARK: - Logs: cloud traces
 
-    func testCloudRecordsBecomeLogEntriesGroupedByRun() {
-        let agent = Agent(name: "Fin", provider: .appleOnDevice)
-        let a = AgentLogView.logEntry(from: rec("r1", .reasoning, "thinking", at: 100, site: "Levi's iMac"), agent: agent)
+    func testCloudRecordsBecomeLogItemsGroupedByRun() {
+        let a = LogItem(record: rec("r1", .reasoning, "thinking", at: 100, site: "Levi's iMac"))
         XCTAssertEqual(a.kind, .reasoning)
         XCTAssertEqual(a.serverName, "Levi's iMac")
         XCTAssertEqual(a.timestamp, Date(timeIntervalSince1970: 100), "the transcript's time, not now")
+        XCTAssertNotNil(a.jsonl)
         XCTAssertEqual(AgentLogView.runUUID("BACKFILL-16"), AgentLogView.runUUID("BACKFILL-16"), "deterministic")
         XCTAssertNotEqual(AgentLogView.runUUID("BACKFILL-16"), AgentLogView.runUUID("BACKFILL-15"))
         XCTAssertEqual(AgentLogView.runUUID("6FDD720A-0000-4000-8000-000000000000"), UUID(uuidString: "6FDD720A-0000-4000-8000-000000000000"))
