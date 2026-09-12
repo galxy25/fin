@@ -308,6 +308,9 @@ final class Daemon {
     /// `run()` has the pieces. The pane picture changes every minute; the prompt
     /// the launch composed would otherwise describe the machine as it was then.
     private var refreshSystemPrompt: (() -> Void)?
+    /// Same, but for a given mode — the run loop switches to `.task` before a user
+    /// turn and back to `.mission` after it.
+    private var setPromptMode: ((PromptMode) -> Void)?
     /// The last titled-pane scan the heartbeat sent, for the memory compactor.
     private var lastPaneObservations: [String] = []
     /// The heartbeat's capabilities, rescanned at most every `capabilitiesScanInterval`:
@@ -523,7 +526,8 @@ final class Daemon {
         profileFileURL: URL? = nil,
         notifyAvailable: Bool = false,
         tmuxGuard: TmuxSendGuard = .unenforced,
-        paneInventoryFileURL: URL? = nil
+        paneInventoryFileURL: URL? = nil,
+        mode: PromptMode = .mission
     ) -> String {
         var prompt = base
         if let registry = RegistryDocument.loadIfPresent(at: registryFileURL),
@@ -554,10 +558,14 @@ final class Daemon {
         if let section = tmuxGuard.promptSection {
             prompt += "\n\n" + section
         }
-        if let goalsLedgerFileURL,
+        if mode == .mission,
+           let goalsLedgerFileURL,
            let ledger = LedgerDocument.loadIfPresent(at: goalsLedgerFileURL),
            let section = GoalsTick.promptSection(ledger: ledger) {
             prompt += "\n\n" + section
+        }
+        if mode == .task {
+            prompt += "\n\n" + taskModeSection
         }
         // The shared cumulative profile `DaemonMemoryConsolidator` keeps cached
         // locally — same strictly-additive discipline: a fresh install with nothing
@@ -581,6 +589,20 @@ final class Daemon {
         }
         return prompt
     }
+
+    /// Which prompt the engine runs under. A HEARTBEAT is mission mode: the ledger,
+    /// the tick rules, the profile. A USER MESSAGE is task mode: the same tools and
+    /// machine picture, but NO mission ledger and NO tick rules — live, four times on
+    /// 2026-09-12, a 12B model under the full stack read a concrete request as an
+    /// ingest tick and answered "what are the goals?". The ledger is for between
+    /// messages; when the user speaks, the message is the whole job.
+    enum PromptMode { case mission, task }
+
+    static let taskModeSection = "Right now: the user has sent you a message. That message is your entire job "
+        + "for this turn. Use the tools to do it (read_session to find a pane by its folder or title, "
+        + "send_session to give another agent's pane an instruction, send_input for your own shell), "
+        + "then answer with what you did and what you saw. Do not create, update, or discuss goals in "
+        + "this turn; do not describe your role; do not ask what the mission is."
 
     /// The prompt a user's message is submitted as. The model sees this; the audit
     /// trail and cloud transcript record the user's exact words (`displayText`).
@@ -989,6 +1011,14 @@ final class Daemon {
                 paneInventoryFileURL: paneURL
             ))
         }
+        setPromptMode = { [weak engine] mode in
+            guard let engine else { return }
+            engine.refreshSystemPrompt(Self.composedSystemPrompt(
+                base: basePrompt, registryFileURL: registryURL, goalsLedgerFileURL: ledgerURL,
+                profileFileURL: profileURL, notifyAvailable: notifyAvailable, tmuxGuard: tmuxGuard,
+                paneInventoryFileURL: paneURL, mode: mode
+            ))
+        }
 
         // The model's request_input tool: record + notify — the engine already wrote the
         // question into the audit trail as the tool call, this surfaces it to a human.
@@ -1356,7 +1386,9 @@ final class Daemon {
             inFlightSiteMessageID = held.id
             isTurnInFlight = true
             async let ack: Void = siteClient?.markApplied(held.id, runID: transcript?.runID.uuidString) ?? ()
+            setPromptMode?(.task)
             outcome = await engine.submit(Self.userTurnPrompt(text, source: held.source), displayText: text)
+            setPromptMode?(.mission)
             await ack
             isTurnInFlight = false
         } else {
@@ -1528,7 +1560,9 @@ final class Daemon {
                 // the window between submit and ack is the one at-least-once window
                 // the design admits, and the shorter it is the rarer a double apply.
                 async let ack: Void = siteClient?.markApplied(message.id, runID: transcript?.runID.uuidString) ?? ()
+                setPromptMode?(.task)
                 outcome = await engine.submit(Self.userTurnPrompt(text, source: message.source), displayText: text)
+                setPromptMode?(.mission)
                 await ack
                 isTurnInFlight = false
                 inFlightDirectiveID = nil
@@ -1552,7 +1586,9 @@ final class Daemon {
                 inFlightDirectiveID = directive.id
                 pendingUserMessageForDigest = text
                 isTurnInFlight = true
+                setPromptMode?(.task)
                 outcome = await engine.submit(Self.userTurnPrompt(text, source: nil), displayText: text)
+                setPromptMode?(.mission)
                 isTurnInFlight = false
                 await inboxLockClient?.release()
                 continue
