@@ -383,6 +383,11 @@ extension SessionRouter {
             if !entry.tasks.isEmpty {
                 line += " — tasks: \(entry.tasks.joined(separator: ", "))"
             }
+            // The freshest "what is it doing" signal, rendered here so the model
+            // sees it on the next turn rather than after a 24h profile compaction.
+            if let note = entry.activityNote, !note.isEmpty {
+                line += " — currently: \(note)"
+            }
             return line
         }
         // Guidance text tracks evals/tmux-routing/prompts/router.md (round-3
@@ -618,7 +623,19 @@ public actor SessionRoutingRegistry {
     ) throws {
         if let index = document.sessions.firstIndex(where: { $0.session == session }) {
             guard document.sessions[index].createdByFin else {
+                // A session the user registered by hand keeps every word of what
+                // they wrote — but discovery may still tell it WHERE its coding
+                // agent lives. Without this, the one session Levi actually works in
+                // (hand-registered "main") never gets a pane target, so the
+                // activity summarizer never reads it, which is the opposite of the
+                // point. Set once, never overwritten.
+                var changed = false
+                if document.sessions[index].agentPaneTarget == nil, let agentPaneTarget {
+                    document.sessions[index].agentPaneTarget = agentPaneTarget
+                    changed = true
+                }
                 if !discoveredTasks.isEmpty { try appendTasks(discoveredTasks, toSession: session) }
+                else if changed { try save() }
                 return
             }
             var entry = document.sessions[index]

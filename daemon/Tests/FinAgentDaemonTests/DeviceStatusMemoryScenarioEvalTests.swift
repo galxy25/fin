@@ -172,7 +172,7 @@ final class DeviceStatusMemoryScenarioEvalTests: XCTestCase {
             + "\n- MacBook — idle, working on Fin, last seen 3m ago"
             + "\n- iPhone — thinking, working on Fin, last seen 20m ago"
             + "\n- iPad — awaitingApproval, working on Fin, last seen 1h ago"
-            + "\n\nRecent conversations:\n\nDeploy target\nprod-east"
+            + "\n\nRecent conversations:\n\nDeploy target (2026-09-09)\nprod-east"
         XCTAssertEqual(input, expected, "3-device block must render exactly one line per device, in the provider's order")
         print("EVAL[3-device compaction input]:\n\(input ?? "nil")")
     }
@@ -186,7 +186,7 @@ final class DeviceStatusMemoryScenarioEvalTests: XCTestCase {
         let input = await drive(consolidator, transportOverride: baseTransport)
         XCTAssertEqual(
             input,
-            "Current profile:\nexisting profile text\n\nRecent conversations:\n\nDeploy target\nprod-east",
+            "Current profile:\nexisting profile text\n\nRecent conversations:\n\nDeploy target (2026-09-09)\nprod-east",
             "an empty (but non-nil) cross-device result must omit the 'Other devices right now:' section entirely, not print it with zero lines"
         )
         print("EVAL[0-other-devices compaction input]:\n\(input ?? "nil")")
@@ -198,7 +198,7 @@ final class DeviceStatusMemoryScenarioEvalTests: XCTestCase {
         let input = await drive(consolidator, transportOverride: baseTransport)
         XCTAssertEqual(
             input,
-            "Current profile:\nexisting profile text\n\nOther devices right now:\n- MacBook — idle, working on Fin, last seen 3m ago\n\nRecent conversations:\n\nDeploy target\nprod-east"
+            "Current profile:\nexisting profile text\n\nOther devices right now:\n- MacBook — idle, working on Fin, last seen 3m ago\n\nRecent conversations:\n\nDeploy target (2026-09-09)\nprod-east"
         )
         print("EVAL[1-device compaction input]:\n\(input ?? "nil")")
     }

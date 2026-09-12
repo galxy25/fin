@@ -293,7 +293,14 @@ struct FinApp: App {
         // with that check in place. Real users always run a properly-signed
         // build with no launch environment override, so this changes nothing
         // for them.
-        if ProcessInfo.processInfo.environment["FIN_UI_TESTING"] == nil {
+        //
+        // The UNIT-test host is the other case: there the tests run inside this
+        // very process, so `XCTestConfigurationFilePath` IS set — and the host is
+        // signed by scripts/test-macos.sh without the CloudKit entitlement, so the
+        // same trap fires at bootstrap and no test ever runs (seen live 2026-09-12:
+        // "test runner crashed before establishing connection").
+        let environment = ProcessInfo.processInfo.environment
+        if environment["FIN_UI_TESTING"] == nil, environment["XCTestConfigurationFilePath"] == nil {
             Task { [weak manager] in
                 let subscriber = AgentSignalSubscriber()
                 subscriber.onSubscriptionAudit = { message in

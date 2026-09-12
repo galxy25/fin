@@ -63,6 +63,11 @@ final class DaemonMemoryConsolidator {
     /// build or an install with no control-plane config) = cross-device awareness off;
     /// compact() behaves byte-identically to before this property existed.
     var crossDeviceStatusProvider: (() async -> [String])?
+    /// Optional live pane inventory — one line per tmux pane naming what it is
+    /// doing (the pane title, which coding agents set to their current task),
+    /// from `DaemonSiteClient`'s last capability scan. The freshest and most
+    /// literal "what is each pane up to" signal there is; nil = not reported.
+    var terminalPanesProvider: (() async -> [String])?
 
     private var lastCacheRefreshAt: Date?
     private var lastConsolidationAttemptAt: Date?
@@ -142,32 +147,29 @@ final class DaemonMemoryConsolidator {
         // this one was still fetching candidates or waiting on the claim.
         guard case .found(let profile) = await memory.readProfile() else { return }
 
-        var input = "Current profile:\n" + (profile.content.isEmpty ? "(none)" : profile.content)
+        // Shared contract with the app's compactor (`ProfileCompaction`): every
+        // input dated, observations labeled apart from conversation, current work
+        // time-boxed in the instruction, and pruning allowed by the guard.
+        var observed: [ProfileCompaction.ObservedSection] = []
+        if let terminalPanesProvider {
+            observed.append(.init(title: "Terminal panes right now (observed)", lines: await terminalPanesProvider()))
+        }
         if let sessionActivityNotesProvider {
-            let notes = await sessionActivityNotesProvider()
-            if !notes.isEmpty {
-                input += "\n\nSession activity (from live terminal sessions Fin tracks):"
-                for note in notes { input += "\n- \(note)" }
-            }
+            observed.append(.init(
+                title: "Session activity (from live terminal sessions Fin tracks)",
+                lines: await sessionActivityNotesProvider()
+            ))
         }
         if let crossDeviceStatusProvider {
-            let lines = await crossDeviceStatusProvider()
-            if !lines.isEmpty {
-                input += "\n\nOther devices right now:"
-                for line in lines { input += "\n- \(line)" }
-            }
+            observed.append(.init(title: "Other devices right now", lines: await crossDeviceStatusProvider()))
         }
-        input += "\n\nRecent conversations:"
-        for hit in hits {
-            let content = hit.content.count > Self.perHitCap
-                ? "…" + String(hit.content.suffix(Self.perHitCap))
-                : hit.content
-            input += "\n\n\(hit.title)\n\(content)"
-        }
-        let instruction = "Merge into a concise user profile: their ongoing tasks, goals, "
-            + "preferences, styles, tastes, and durable environment/topology facts (e.g. "
-            + "machines, tmux sessions, what each is for). Keep under 1500 characters. "
-            + "Output only the updated profile text."
+        let input = ProfileCompaction.input(
+            currentProfile: profile.content,
+            observed: observed,
+            conversations: hits.map { .init(title: $0.title, date: $0.updatedAt, content: $0.content) },
+            perConversationCap: Self.perHitCap
+        )
+        let instruction = ProfileCompaction.instruction()
 
         do {
             let text = try await completion(instruction, input)
@@ -194,8 +196,6 @@ final class DaemonMemoryConsolidator {
     /// model's failure mode the daemon never hits (it always talks to an
     /// OpenAI-compatible endpoint).
     nonisolated static func acceptableProfile(_ candidate: String, replacing existing: String) -> Bool {
-        guard candidate.count >= 40, !candidate.contains("(none)") else { return false }
-        if existing.count > 200, candidate.count < existing.count * 3 / 10 { return false }
-        return true
+        ProfileCompaction.acceptable(candidate, replacing: existing)
     }
 }

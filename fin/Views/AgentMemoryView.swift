@@ -13,6 +13,12 @@ struct AgentMemoryView: View {
     let agent: Agent
 
     @Query private var memories: [AgentMemory]
+    /// What Fin's computers reported in their last heartbeat — the dated,
+    /// observed half of memory, next to the distilled profile. Fed by the same
+    /// `SiteDirectory` cache the console and servers list use; renders nothing
+    /// (not even a spinner) when no control plane is configured, so the
+    /// store-only render tests stay honest.
+    @ObservedObject private var sites = SiteDirectory.shared
 
     init(agent: Agent) {
         self.agent = agent
@@ -63,6 +69,28 @@ struct AgentMemoryView: View {
                     + "into every system prompt.")
             }
 
+            if CloudControlPlaneConfig.isConfigured {
+                Section {
+                    if sites.sites.isEmpty {
+                        Text(sites.lastError.map { "Couldn't reach the control plane: \($0)" }
+                            ?? "No computers have checked in yet.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(sites.sites.filter { $0.state != "retired" }) { site in
+                            siteRow(site)
+                        }
+                    }
+                } header: {
+                    Text("What Fin Sees Right Now")
+                } footer: {
+                    Text("Each computer Fin lives on reports what its terminal sessions are doing. "
+                        + "This is observed, dated, and folded into the profile above; the panes "
+                        + "themselves are the freshest signal.")
+                }
+                .accessibilityIdentifier("memoryRightNowSection")
+            }
+
             Section {
                 if recentEpisodic.isEmpty {
                     Text("No conversations remembered in the last \(agent.memoryViewDays) days.")
@@ -83,6 +111,80 @@ struct AgentMemoryView: View {
         #if os(iOS) || os(visionOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        .task {
+            guard CloudControlPlaneConfig.isConfigured else { return }
+            await sites.refresh()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(20))
+                guard !Task.isCancelled else { return }
+                await sites.refresh()
+            }
+        }
+    }
+
+    /// One computer: name, status, and one line per tmux pane naming what it is
+    /// doing (the pane title, which coding agents set to their current task),
+    /// plus any model-written session note. Display names only — never a host
+    /// or an id.
+    private func siteRow(_ site: FinSite) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: site.kindGlyph)
+                    .font(.caption)
+                    .foregroundStyle(site.live ? Color.green : Color.secondary)
+                Text(site.displayName)
+                    .font(.subheadline.weight(.medium))
+                Text("· \(site.statusLabel)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                if let at = site.lastHeartbeatAt {
+                    Text(at.formatted(.relative(presentation: .named)))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            let sessions = site.capabilities.tmuxSessions ?? []
+            if sessions.isEmpty {
+                Text(site.live ? "No terminal sessions reported." : "Last report is stale.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            ForEach(sessions, id: \.session) { session in
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(session.panes ?? [], id: \.target) { pane in
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(pane.target)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Text(paneSummary(pane))
+                                .font(.caption)
+                        }
+                    }
+                    if (session.panes ?? []).isEmpty {
+                        Text("tmux \(session.session)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    if let note = session.activityNote, !note.isEmpty {
+                        Text(note)
+                            .font(.caption)
+                            .italic()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityIdentifier("memorySite_\(site.siteId8)")
+    }
+
+    private func paneSummary(_ pane: FinSite.Capabilities.TmuxSession.Pane) -> String {
+        var parts: [String] = []
+        if let cwd = pane.cwd, let last = cwd.split(separator: "/").last { parts.append(String(last)) }
+        if let title = pane.title, !title.isEmpty { parts.append(title) }
+        else if let command = pane.command, !command.isEmpty { parts.append(command) }
+        return parts.isEmpty ? "idle shell" : parts.joined(separator: " — ")
     }
 
     private func episodicRow(_ memory: AgentMemory) -> some View {

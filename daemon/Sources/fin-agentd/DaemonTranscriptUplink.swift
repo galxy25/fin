@@ -180,6 +180,15 @@ final class DaemonTranscriptUplink {
         lines.joined(separator: "\n")
     }
 
+    /// Which body this is (docs/SITES.md §7): stamped on every line so the app's
+    /// merged transcript can say "on Levi's iMac". Nil until the daemon has a site.
+    var siteID8: String?
+    var siteName: String?
+    /// Set by the run loop right before it submits a control-plane message; consumed
+    /// by the next `userMessage` line so that line carries `in_reply_to`, which is how
+    /// the app collapses a message two bodies both applied. Cleared after one use.
+    var pendingInReplyTo: String?
+
     /// One mirror line. Internal so the format tests can assert on it without staging a
     /// flush.
     func mirrorLine(for event: AgentAuditEvent, sequence: Int) -> String? {
@@ -202,6 +211,12 @@ final class DaemonTranscriptUplink {
         if let toolName = event.toolName { object["tool_name"] = toolName }
         if let toolArguments = event.toolArguments {
             object["tool_arguments"] = MemoryRedactor.redact(toolArguments)
+        }
+        if let siteID8 { object["site_id8"] = siteID8 }
+        if let siteName { object["site_name"] = siteName }
+        if event.kind == "userMessage", let reply = pendingInReplyTo {
+            object["in_reply_to"] = reply
+            pendingInReplyTo = nil
         }
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         else { return nil }

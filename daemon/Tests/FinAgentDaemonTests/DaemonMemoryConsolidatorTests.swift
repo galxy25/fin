@@ -192,7 +192,8 @@ final class DaemonMemoryConsolidatorTests: XCTestCase {
         }
         consolidator.completion = { instruction, input in
             completionInput = input
-            XCTAssertTrue(instruction.contains("Merge into a concise user profile"))
+            XCTAssertTrue(instruction.contains("Rewrite the user profile"), "the shared ProfileCompaction instruction")
+            XCTAssertTrue(instruction.contains("Today is "), "the instruction must date itself")
             return "Levi is working on Fin; prefers direct, concise answers and end-to-end verification."
         }
 
@@ -265,10 +266,12 @@ final class DaemonMemoryConsolidatorTests: XCTestCase {
 
         await consolidator.run(refreshCache: false, attemptConsolidation: true)
 
+        // No observed section of any kind when every provider is nil — and the
+        // conversation carries its date (ProfileCompaction dates every input).
         XCTAssertEqual(
             completionInput,
-            "Current profile:\nexisting profile text\n\nRecent conversations:\n\nDeploy target\nprod-east",
-            "byte-identical to the pre-change baseline when the provider is unset"
+            "Current profile:\nexisting profile text\n\nRecent conversations:\n\nDeploy target (2026-09-09)\nprod-east",
+            "no observed sections when every provider is unset"
         )
     }
 

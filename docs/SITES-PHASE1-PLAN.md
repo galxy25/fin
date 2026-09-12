@@ -31,6 +31,21 @@ design in two places where the world moved after that document was written.
    status lane instead of inventing a parallel one. `fin/sites/{agent}/{siteId8}/`
    becomes the per-run transcript home only.
 
+## Status (2026-09-12)
+
+| slice | state |
+|---|---|
+| 1a registry | **deployed, live-verified** — iMac enrolled as `a4a1d987-0000-…`, wins primary |
+| 1b messages + election | **deployed, live-verified** — claim/ack/register, routing, eligibility |
+| 1c daemon 1.6.0 | **built** — `DaemonSiteClient` actor, `config.site`, pane-title capabilities, held/unacked ledger, `site_id8`/`in_reply_to` on transcript lines; dated compaction |
+| 1d app | **built** — `ControlPlaneClient`, `SiteDirectory`/`FinPresence`, Fin's computers, presence header, `/messages` send with queued→claimed→applied→answered rows, memory view "What Fin Sees Right Now", voice via `/messages` |
+
+Deferred from the design, on purpose: presigned-URL refresh over the heartbeat
+(the daemon keeps its provisioned URLs and the launchd refresh job); the `update`
+command (Phase 2); `finSite` in the push payload (a tap already deep-links by
+agent, and the conversation is one merged transcript); per-run transcript keys
+(superseded by hourly chunks before this work started).
+
 ## Sub-phases
 
 Phase 1 as written in SITES.md is one commit-sized bullet list covering three

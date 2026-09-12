@@ -89,3 +89,103 @@ public enum TmuxSessionInventory {
         }.sorted { $0.session < $1.session }   // deterministic order for tests/audit lines
     }
 }
+
+// MARK: - Pane titles (docs/SITES.md §3.3 capabilities)
+
+extension TmuxSessionInventory {
+    /// A second fixed argv for the site heartbeat: the same `list-panes -a` over the
+    /// DEFAULT socket, plus the pane TITLE — which coding agents (Claude Code among
+    /// them) set to the task they are currently on. That title is the cheapest and
+    /// most literal "what is this pane doing" signal there is: no model call, no
+    /// scrollback capture, dated by the heartbeat that carried it.
+    public static let paneTitlesFormat = "#{session_name}\t#{window_index}.#{pane_index}\t"
+        + "#{pane_title}\t#{pane_current_command}\t#{pane_current_path}"
+
+    public static func paneTitlesArguments() -> [String] {
+        ["tmux", "list-panes", "-a", "-F", paneTitlesFormat]
+    }
+
+    public struct TitledPane: Equatable, Sendable {
+        public let session: String
+        public let target: String       // "session:window.pane"
+        public let title: String
+        public let currentCommand: String
+        public let cwd: String
+
+        public init(session: String, target: String, title: String, currentCommand: String, cwd: String) {
+            self.session = session
+            self.target = target
+            self.title = title
+            self.currentCommand = currentCommand
+            self.cwd = cwd
+        }
+    }
+
+    /// Tolerant like `parsePanes`. A title equal to the hostname (tmux's default when
+    /// nothing set one) is blanked, so a bare shell reads as untitled rather than as
+    /// "doing <hostname>".
+    public static func parseTitledPanes(_ raw: String, hostname: String? = nil) -> [TitledPane] {
+        raw.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count == 5 else { return nil }
+            var title = String(fields[2]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if let hostname, title == hostname { title = "" }
+            return TitledPane(
+                session: String(fields[0]),
+                target: "\(fields[0]):\(fields[1])",
+                title: title,
+                currentCommand: String(fields[3]),
+                cwd: String(fields[4])
+            )
+        }
+    }
+
+    /// The heartbeat's `tmux_sessions` value: one entry per session, its panes with
+    /// titles, plus the registry's task vocabulary and activity note when the session
+    /// is registered. Titles and notes pass through `MemoryRedactor` — a pane title is
+    /// whatever a program chose to put there, and this leaves the machine.
+    public static func capabilitySessions(
+        panes: [TitledPane],
+        registry: RegistryDocument?
+    ) -> [[String: Any]] {
+        var order: [String] = []
+        var grouped: [String: [TitledPane]] = [:]
+        for pane in panes {
+            if grouped[pane.session] == nil { order.append(pane.session) }
+            grouped[pane.session, default: []].append(pane)
+        }
+        return order.map { session in
+            var entry: [String: Any] = ["session": session]
+            entry["panes"] = (grouped[session] ?? []).map { pane -> [String: Any] in
+                var d: [String: Any] = ["target": pane.target, "command": pane.currentCommand]
+                if !pane.title.isEmpty { d["title"] = MemoryRedactor.redact(pane.title) }
+                // The cwd's last path component only — enough to say "fin" or
+                // "pocketdj", never a full home-directory path.
+                if let last = pane.cwd.split(separator: "/").last { d["cwd"] = String(last) }
+                return d
+            }
+            if let registered = registry?.sessions.first(where: { $0.session == session }) {
+                entry["registered"] = true
+                if !registered.tasks.isEmpty { entry["tasks"] = registered.tasks }
+                if let note = registered.activityNote, !note.isEmpty {
+                    entry["activity_note"] = MemoryRedactor.redact(note)
+                }
+                if let at = registered.activityNoteUpdatedAt { entry["note_at"] = at }
+            } else {
+                entry["registered"] = false
+            }
+            return entry
+        }
+    }
+
+    /// The compaction's "Terminal panes right now" lines, from the same data:
+    /// "main:1.0 fin — multi-tenancy-cloud-control-plane".
+    public static func observationLines(panes: [TitledPane]) -> [String] {
+        panes.map { pane in
+            var line = pane.target
+            if let last = pane.cwd.split(separator: "/").last { line += " \(last)" }
+            line += " — " + (pane.title.isEmpty ? pane.currentCommand : MemoryRedactor.redact(pane.title))
+            return line
+        }
+    }
+}

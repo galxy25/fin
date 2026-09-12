@@ -2121,15 +2121,13 @@ final class AgentRuntime: ObservableObject {
     /// won't start a turn that resets run attribution underneath it.
     private var isConsolidating = false
 
-    /// Guards the wholesale profile replacement: a refusal, an echo of the "(none)"
-    /// placeholder the prompt itself injects, or a drastic shrink keeps the old profile.
+    /// Guards the wholesale profile replacement: the shared `ProfileCompaction`
+    /// rule (refusals, placeholder echoes, and an UNSTRUCTURED drastic shrink are
+    /// rejected; a structured rewrite may prune freely) plus the on-device
+    /// model's degenerate-repetition check, which only this path can hit.
     nonisolated static func acceptableConsolidatedProfile(_ candidate: String, replacing existing: String) -> Bool {
-        guard candidate.count >= 40,
-              !candidate.contains("(none)"),
-              !AppleOnDeviceBackend.looksDegenerate(candidate) else { return false }
-        // A shrink past 70% of a substantial profile is a bad reply, not a distillation.
-        if existing.count > 200, candidate.count < existing.count * 3 / 10 { return false }
-        return true
+        guard !AppleOnDeviceBackend.looksDegenerate(candidate) else { return false }
+        return ProfileCompaction.acceptable(candidate, replacing: existing)
     }
 
     /// Distills recent episodic memories into the single cumulative user profile, at most
@@ -2147,21 +2145,26 @@ final class AgentRuntime: ObservableObject {
 
         let profile = memory.readCumulative()
         let perHitCap = onDevice ? 400 : 1500
-        // TODO: mirror crossDeviceStatusProvider block, see DaemonMemoryConsolidator —
-        // this compaction has no "extra labeled section" seam yet (the daemon's is a
-        // three-piece "Current profile:" / optional sections / "Recent conversations:"
-        // shape); wiring cross-device status here means doing that refactor first, out
-        // of scope for the per-device-status-key change that introduced the daemon side.
-        var input = "Current profile:\n" + (profile.isEmpty ? "(none)" : profile) + "\n\nRecent conversations:"
-        for hit in recent {
-            let content = hit.content.count > perHitCap
-                ? "…" + String(hit.content.suffix(perHitCap))
-                : hit.content
-            input += "\n\n\(hit.title)\n\(content)"
+        // Same contract as the daemon's compactor (`ProfileCompaction`): dated
+        // conversations, an observed "what Fin's computers are doing" section
+        // from the site directory, and an instruction that time-boxes current
+        // work — so the one shared profile is rewritten by one rule wherever
+        // the compaction happens to run.
+        var observed: [ProfileCompaction.ObservedSection] = []
+        if CloudControlPlaneConfig.isConfigured {
+            let sites = await SiteDirectory.shared.refresh()
+            let lines = SiteDirectory.observationLines(sites)
+            if !lines.isEmpty {
+                observed.append(.init(title: "Fin's computers right now (observed)", lines: lines))
+            }
         }
-        let instruction = "Merge into a concise user profile: their ongoing tasks, goals, "
-            + "preferences, styles, tastes. Keep under 1500 characters. Output only the "
-            + "updated profile text."
+        let input = ProfileCompaction.input(
+            currentProfile: profile,
+            observed: observed,
+            conversations: recent.map { .init(title: $0.title, date: $0.updatedAt, content: $0.content) },
+            perConversationCap: perHitCap
+        )
+        let instruction = ProfileCompaction.instruction()
 
         // Pacing only, stamped before the attempt so a persistently failing backend
         // can't retry every turn; the per-record markers carry the actual progress.

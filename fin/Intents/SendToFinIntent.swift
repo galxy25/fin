@@ -29,6 +29,22 @@ enum FinVoiceIntentCore {
         case failure(IntentDialog)
     }
 
+    /// Delivery: `POST /messages` when a control plane is configured (the row is
+    /// what `AskFinIntent` polls for `answered`), else the legacy presigned
+    /// inbox append. Returns the control-plane message id when there is one.
+    static func deliver(agentID: UUID, agentName: String, text: String) async -> (delivered: Bool, messageID: String?) {
+        if CloudControlPlaneConfig.isConfigured {
+            let id = ControlPlaneClient.newMessageID()
+            let context = ControlPlaneClient.MessageContext(source: "voice")
+            switch await ControlPlaneClient.sendMessage(agent: agentName, text: text, messageID: id, context: context) {
+            case .success: return (true, id)
+            case .failure: return (false, nil)
+            }
+        }
+        let delivered = await CloudAgentChannel.sendMessage(agentID: agentID, agentName: agentName, text: text)
+        return (delivered, nil)
+    }
+
     /// Validates the dictated text and resolves the delivery target once, for
     /// whichever intent asked. Returns plain value types (never the `@Model`
     /// itself) so a caller can hop off the main actor to poll S3 afterward.
@@ -44,19 +60,26 @@ enum FinVoiceIntentCore {
         guard trimmed.count <= CloudAgentChannel.maxTextLength else {
             return .failure("That message is too long to send.")
         }
-        // Target resolution, deliberately dumb for v1: the user's cloud-hosted
-        // agent, preferring one literally named "Fin" if several exist. A picker
-        // parameter (AppEntity over agents) is the obvious v2 once more than one
-        // cloud agent is a real configuration.
-        let cloudRaw = AgentHostingMode.cloud.rawValue
-        let descriptor = FetchDescriptor<Agent>(
-            predicate: #Predicate { $0.hostingModeRaw == cloudRaw }
-        )
-        let cloudAgents = (try? container.mainContext.fetch(descriptor)) ?? []
-        guard let index = preferredTargetIndex(cloudAgentNames: cloudAgents.map(\.name)) else {
-            return .failure("No cloud-hosted agent is set up. In Fin, set an agent's hosting to Cloud Harness first.")
+        // Target resolution. With a control plane configured, the user talks to
+        // Fin — one name, one conversation — whatever body happens to be up, so
+        // hosting mode is not a filter (docs/SITES.md §4 "Voice"). Without one,
+        // the legacy rule: the cloud-hosted agent, preferring one named "Fin".
+        let candidates: [Agent]
+        if CloudControlPlaneConfig.isConfigured {
+            candidates = (try? container.mainContext.fetch(FetchDescriptor<Agent>())) ?? []
+        } else {
+            let cloudRaw = AgentHostingMode.cloud.rawValue
+            let descriptor = FetchDescriptor<Agent>(
+                predicate: #Predicate { $0.hostingModeRaw == cloudRaw }
+            )
+            candidates = (try? container.mainContext.fetch(descriptor)) ?? []
         }
-        let agent = cloudAgents[index]
+        guard let index = preferredTargetIndex(cloudAgentNames: candidates.map(\.name)) else {
+            return .failure(CloudControlPlaneConfig.isConfigured
+                ? "No agent is set up yet. Open Fin and add one first."
+                : "No cloud-hosted agent is set up. In Fin, set an agent's hosting to Cloud Harness first.")
+        }
+        let agent = candidates[index]
         return .ready(agentID: agent.id, agentName: agent.name, text: trimmed)
     }
 
@@ -138,9 +161,9 @@ struct SendToFinIntent: AppIntent {
         case .failure(let dialog):
             return .result(dialog: dialog)
         case .ready(let agentID, let agentName, let text):
-            let delivered = await CloudAgentChannel.sendMessage(
+            let delivered = await FinVoiceIntentCore.deliver(
                 agentID: agentID, agentName: agentName, text: text
-            )
+            ).delivered
             return .result(
                 dialog: delivered
                     ? IntentDialog("Sent to \(agentName).")
@@ -194,7 +217,7 @@ struct AskFinIntent: AppIntent {
                     .filter { $0.kind == .assistantMessage }
                     .map(\.id)
             )
-            let delivered = await CloudAgentChannel.sendMessage(
+            let (delivered, messageID) = await FinVoiceIntentCore.deliver(
                 agentID: agentID, agentName: agentName, text: text
             )
             guard delivered else {
@@ -204,6 +227,14 @@ struct AskFinIntent: AppIntent {
             }
             for _ in 0..<Self.replyPollCount {
                 try? await Task.sleep(nanoseconds: Self.replyPollInterval)
+                // The control-plane row answers first when there is one: its
+                // replyPreview is exactly the assistant's reply to THIS message,
+                // with no transcript diffing needed.
+                if let messageID,
+                   case .success(let row) = await ControlPlaneClient.messageState(messageID),
+                   row.state == "answered", let preview = row.replyPreview, !preview.isEmpty {
+                    return .result(dialog: IntentDialog("\(FinVoiceIntentCore.spokenSummary(preview))"))
+                }
                 let transcript = await CloudAgentChannel.fetchTranscript(
                     agentID: agentID, agentName: agentName
                 )

@@ -1,0 +1,325 @@
+import Foundation
+import FinAgentCore
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+/// This body's presence on the control plane (docs/SITES.md §3.3, §6.3): the
+/// 20-second heartbeat, and the claim/hold/apply/ack protocol for messages the
+/// heartbeat offers.
+///
+/// Runs on its OWN task, independent of the turn loop — that is the whole
+/// reason it exists as a separate client. Today's status uplink only runs in
+/// the wait between turns, and a multi-tool turn on a local 12B model takes
+/// minutes, so the site working hardest is exactly the one that looks dead to
+/// every lease. Here `state: "working"` goes up every beat while a turn runs.
+///
+/// What it does NOT do: apply messages. It claims them at receipt (so the
+/// conversation stays with a busy primary instead of drifting to a standby)
+/// and holds them; the daemon's run loop pops `nextHeldMessage()` between
+/// turns, submits, and acks through `markApplied`/`markAnswered`. Held and
+/// unacked ids persist in a small sibling ledger so a restart resumes them —
+/// `unacked` is the crash-recovery list §6.4 describes.
+///
+/// An `actor`, deliberately not `@MainActor`: the daemon is one main-actor
+/// class whose turn loop holds that actor for the length of a turn's synchronous
+/// stretches, so a main-actor heartbeat task would inherit the exact starvation
+/// it exists to fix. Its providers are `@Sendable` and awaited, so the daemon
+/// answers them on its own actor when it can.
+actor DaemonSiteClient {
+    static let requestTimeout: TimeInterval = 10
+    static let failureAuditWindow: TimeInterval = 5 * 60
+    static let defaultHeartbeatSeconds = 20
+    static let claimLeaseSeconds = 120
+
+    struct Offer: Equatable {
+        let id: String
+        let text: String
+        let source: String
+    }
+
+    struct Command: Equatable {
+        let id: String
+        let kind: String
+    }
+
+    /// One heartbeat's answer, decoded tolerantly: every field optional, unknown
+    /// keys ignored, so a newer control plane never breaks an older daemon.
+    struct HeartbeatResponse: Equatable {
+        var role: String?
+        var leaseUntil: String?
+        var heartbeatSeconds: Int?
+        var messages: [Offer]
+        var commands: [Command]
+        var urlsExpireAt: String?
+    }
+
+    /// `held` = claimed, not yet submitted. `unacked` = submitted, `applied` ack
+    /// not yet confirmed. Both survive a restart; the first heartbeat after one
+    /// carries `unacked` so the control plane acks them under our claim before
+    /// any other body can be offered them.
+    struct Ledger: Codable, Equatable {
+        var held: [HeldMessage]
+        var unacked: [String]
+
+        struct HeldMessage: Codable, Equatable {
+            let id: String
+            let text: String
+            let source: String
+        }
+
+        init(held: [HeldMessage] = [], unacked: [String] = []) {
+            self.held = held
+            self.unacked = unacked
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            held = try container.decodeIfPresent([HeldMessage].self, forKey: .held) ?? []
+            unacked = try container.decodeIfPresent([String].self, forKey: .unacked) ?? []
+        }
+    }
+
+    nonisolated let siteID: String
+    nonisolated let siteID8: String
+    nonisolated let displayName: String
+    nonisolated let heartbeatSeconds: Int
+    private let endpointURL: String
+    private let token: String
+    private let ledgerPath: String
+    private let audit: (String) -> Void
+
+    /// Injected so tests never touch the network.
+    var transport: @Sendable (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) }
+    /// What this body is doing right now — "working" while a turn is in flight.
+    var stateProvider: @Sendable () async -> String = { "idle" }
+    /// The heartbeat's `capabilities`; nil entries are omitted.
+    var capabilitiesProvider: @Sendable () async -> [String: Any] = { [:] }
+    var runID: String?
+    /// Delivered commands, handled by the daemon (restart = exit 0 under
+    /// launchd KeepAlive; drain = stop claiming).
+    var onCommand: @Sendable (Command) async -> Void = { _ in }
+
+    func configure(
+        runID: String?,
+        transport: (@Sendable (URLRequest) async throws -> (Data, URLResponse))? = nil,
+        state: @escaping @Sendable () async -> String,
+        capabilities: @escaping @Sendable () async -> [String: Any],
+        onCommand: @escaping @Sendable (Command) async -> Void
+    ) {
+        self.runID = runID
+        if let transport { self.transport = transport }
+        self.stateProvider = state
+        self.capabilitiesProvider = capabilities
+        self.onCommand = onCommand
+    }
+
+    private(set) var role: String = "standby"
+    private(set) var ledger: Ledger
+    private(set) var isDraining = false
+    private var lastFailureAuditAt: [String: Date] = [:]
+    private var loop: Task<Void, Never>?
+
+    init(
+        siteID: String, displayName: String, token: String, heartbeatSeconds: Int?,
+        endpointURL: String, ledgerPath: String, audit: @escaping (String) -> Void
+    ) {
+        self.siteID = siteID.lowercased()
+        self.siteID8 = String(siteID.lowercased().prefix(8))
+        self.displayName = displayName
+        self.token = token
+        self.heartbeatSeconds = max(5, heartbeatSeconds ?? Self.defaultHeartbeatSeconds)
+        self.endpointURL = endpointURL
+        self.ledgerPath = ledgerPath
+        self.audit = audit
+        self.ledger = Self.loadLedger(from: ledgerPath)
+    }
+
+    // MARK: - The loop
+
+    func start() {
+        guard loop == nil else { return }
+        let seconds = heartbeatSeconds
+        loop = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                await self.beat()
+                try? await Task.sleep(for: .seconds(seconds))
+            }
+        }
+    }
+
+    func stop() {
+        loop?.cancel()
+        loop = nil
+    }
+
+    /// One heartbeat: renew, report, claim what was offered, run commands.
+    func beat() async {
+        var body: [String: Any] = [
+            "schema": 2,
+            "state": await stateProvider(),
+            "wantsPrimary": !isDraining,
+            "held": ledger.held.map(\.id),
+            "unacked": ledger.unacked,
+            "capabilities": await capabilitiesProvider(),
+            // The daemon keeps its config-provisioned presigned URLs (refreshed by
+            // the launchd refresh job), so it never asks the heartbeat to re-sign.
+            "urlsExpireAt": "2999-01-01T00:00:00Z",
+        ]
+        if let runID { body["runId"] = runID }
+
+        guard let (status, data) = await post("/sites/\(siteID)/heartbeat", body: body) else { return }
+        guard (200..<300).contains(status) else {
+            registerFailure("[site] heartbeat failed: HTTP \(status)")
+            return
+        }
+        let response = Self.decodeHeartbeat(data)
+        let newRole = response.role ?? "standby"
+        if newRole != role {
+            audit("[site] role: \(newRole)")
+            role = newRole
+        }
+        // An unacked id the control plane has now acked (it did so before answering
+        // this beat) is done; the ledger no longer needs to carry it.
+        if !ledger.unacked.isEmpty {
+            ledger.unacked = []
+            persistLedger()
+        }
+        for offer in response.messages where !ledger.held.contains(where: { $0.id == offer.id }) {
+            guard !isDraining else { break }
+            await claim(offer)
+        }
+        for command in response.commands {
+            audit("[site] command \(command.kind) (\(command.id))")
+            if command.kind == "drain" { isDraining = true }
+            await onCommand(command)
+        }
+    }
+
+    // MARK: - Claim / hold / apply / ack
+
+    private func claim(_ offer: Offer) async {
+        guard let (status, _) = await post(
+            "/messages/\(offer.id)/claim", body: ["leaseSeconds": Self.claimLeaseSeconds]
+        ) else { return }
+        switch status {
+        case 200..<300:
+            ledger.held.append(.init(id: offer.id, text: offer.text, source: offer.source))
+            persistLedger()
+            audit("[site] claimed \(offer.id)")
+        case 409:
+            // Another body won. Forget it; the row is theirs.
+            break
+        default:
+            registerFailure("[site] claim \(offer.id) failed: HTTP \(status)")
+        }
+    }
+
+    /// The run loop's pop: the oldest held message moves to `unacked` in one
+    /// atomic ledger write BEFORE the caller submits it — the same
+    /// mark-before-submit at-most-once discipline the directive channel keeps.
+    func nextHeldMessage() -> Ledger.HeldMessage? {
+        guard !ledger.held.isEmpty else { return nil }
+        let message = ledger.held.removeFirst()
+        ledger.unacked.append(message.id)
+        persistLedger()
+        return message
+    }
+
+    func markApplied(_ id: String, runID: String?) async {
+        var body: [String: Any] = ["state": "applied"]
+        if let runID { body["runId"] = runID }
+        guard let (status, _) = await post("/messages/\(id)/ack", body: body) else { return }
+        if (200..<300).contains(status) || status == 409 {
+            // 409 = already past applied (a restart re-acked it via `unacked`).
+            ledger.unacked.removeAll { $0 == id }
+            persistLedger()
+        } else {
+            registerFailure("[site] ack applied \(id) failed: HTTP \(status)")
+        }
+    }
+
+    func markAnswered(_ id: String, replyPreview: String) async {
+        let preview = String(MemoryRedactor.redact(replyPreview).prefix(500))
+        guard let (status, _) = await post(
+            "/messages/\(id)/ack", body: ["state": "answered", "replyPreview": preview]
+        ) else { return }
+        if !(200..<300).contains(status), status != 409 {
+            registerFailure("[site] ack answered \(id) failed: HTTP \(status)")
+        }
+    }
+
+    // MARK: - Wire shape (pure, tested)
+
+    nonisolated static func decodeHeartbeat(_ data: Data) -> HeartbeatResponse {
+        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let messages = (object["messages"] as? [[String: Any]] ?? []).compactMap { entry -> Offer? in
+            guard let id = entry["id"] as? String, let text = entry["text"] as? String else { return nil }
+            return Offer(id: id, text: text, source: entry["source"] as? String ?? "app")
+        }
+        let commands = (object["commands"] as? [[String: Any]] ?? []).compactMap { entry -> Command? in
+            guard let id = entry["id"] as? String, let kind = entry["kind"] as? String else { return nil }
+            return Command(id: id, kind: kind)
+        }
+        return HeartbeatResponse(
+            role: object["role"] as? String,
+            leaseUntil: object["leaseUntil"] as? String,
+            heartbeatSeconds: object["heartbeatSeconds"] as? Int,
+            messages: messages,
+            commands: commands,
+            urlsExpireAt: object["urlsExpireAt"] as? String
+        )
+    }
+
+    // MARK: - Transport
+
+    private func post(_ path: String, body: [String: Any]) async -> (Int, Data)? {
+        var base = endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while base.hasSuffix("/") { base.removeLast() }
+        guard let url = URL(string: base + path) else {
+            registerFailure("[site] control plane URL is not a valid URL")
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = Self.requestTimeout
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        request.setValue(siteID, forHTTPHeaderField: "X-Fin-Site")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        do {
+            let (data, response) = try await transport(request)
+            return ((response as? HTTPURLResponse)?.statusCode ?? 0, data)
+        } catch {
+            let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            registerFailure("[site] \(path) unreachable: \(text.prefix(160))")
+            return nil
+        }
+    }
+
+    private func registerFailure(_ line: String) {
+        let key = String(line.prefix(40))
+        let now = Date()
+        if let last = lastFailureAuditAt[key], now.timeIntervalSince(last) < Self.failureAuditWindow { return }
+        lastFailureAuditAt[key] = now
+        audit(line)
+    }
+
+    // MARK: - Ledger file
+
+    nonisolated static func loadLedger(from path: String) -> Ledger {
+        guard let data = FileManager.default.contents(atPath: path),
+              let ledger = try? JSONDecoder().decode(Ledger.self, from: data)
+        else { return Ledger() }
+        return ledger
+    }
+
+    private func persistLedger() {
+        do {
+            let data = try JSONEncoder().encode(ledger)
+            try data.write(to: URL(fileURLWithPath: ledgerPath), options: .atomic)
+        } catch {
+            registerFailure("[site] ledger write failed: \(error.localizedDescription.prefix(120))")
+        }
+    }
+}

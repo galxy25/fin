@@ -70,9 +70,23 @@ struct AgentRemoteConsoleView: View {
         let text: String
         let createdAt: Date
         var state: State
+        /// The control-plane message id when the send went through `POST
+        /// /messages` (nil for the legacy presigned-inbox path). It is minted
+        /// BEFORE the send so a retry is a no-op server-side, and it is what
+        /// `refreshPendingStates` polls.
+        var messageID: String?
+        /// Progress reported by the control plane: queued → claimed → applied →
+        /// answered, plus who has it. Nil until the first poll.
+        var siteName: String?
+        var routedBy: String?
+        var clarifyCandidates: [String] = []
 
-        enum State { case sending, sent, failed }
+        enum State { case sending, sent, failed, queued, claimed, applied, answered }
     }
+
+    /// Presence across every site, shared with the servers list and the memory
+    /// view through one cache. The header folds it to one line.
+    @ObservedObject private var sites = SiteDirectory.shared
 
     init(agent: Agent, reader: AgentMirrorReader = AgentMirrorReader()) {
         self.agentID = agent.id
@@ -122,19 +136,46 @@ struct AgentRemoteConsoleView: View {
                 memorySync = AgentMemorySyncService(context: modelContext)
             }
             await refresh()
+            await refreshPresenceAndPending()
             memorySync?.syncIfDue(agentID: agentID, agentName: agentName)
             // Auto-refresh while visible; cancelled with the view.
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(10))
                 guard !Task.isCancelled else { return }
                 await refresh()
+                await refreshPresenceAndPending()
                 memorySync?.syncIfDue(agentID: agentID, agentName: agentName)
             }
         }
     }
 
+    /// With a control plane, the header is ONE line about Fin — never a per-site
+    /// strip, never a worker button. "Wake a cloud computer" appears only when no
+    /// body is reachable: that is the one moment a cloud launch is the answer.
+    private var usesControlPlane: Bool { isCloudHosted && CloudControlPlaneConfig.isConfigured }
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if usesControlPlane {
+                let presence = sites.presence
+                HStack(spacing: 6) {
+                    Image(systemName: presence.glyph)
+                        .font(.caption)
+                    Text(presence.headline)
+                        .font(.caption.weight(.medium))
+                    if let detail = presence.detail {
+                        Text(detail)
+                            .font(.caption2)
+                    }
+                    Spacer(minLength: 0)
+                    if presence == .asleep {
+                        startWorkerButton(title: "Wake a cloud computer")
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                }
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("finPresenceHeader")
+            } else {
             HStack(spacing: 6) {
                 Image(systemName: isCloudHosted ? "cloud" : "antenna.radiowaves.left.and.right")
                     .font(.caption)
@@ -153,6 +194,7 @@ struct AgentRemoteConsoleView: View {
                 }
             }
             .foregroundStyle(.secondary)
+            }
             // The result lives here, not next to either button: both affordances
             // launch the same worker, and the header is on screen in both states.
             if let workerOutcome {
@@ -280,7 +322,7 @@ struct AgentRemoteConsoleView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if isCloudHosted {
+            if isCloudHosted, !usesControlPlane {
                 // An empty cloud transcript most often means no worker is up
                 // yet — this is the screen where starting one belongs.
                 startWorkerButton(title: "Start Cloud Worker")
@@ -336,7 +378,18 @@ struct AgentRemoteConsoleView: View {
                 Text(record.text)
             }
         case .assistantMessage:
-            Text(record.text)
+            if let siteName = record.siteName ?? record.siteID8 {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: Self.siteGlyph(record))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 3)
+                        .help("on \(siteName) · \(record.timestamp.formatted(.relative(presentation: .named)))")
+                    Text(record.text)
+                }
+            } else {
+                Text(record.text)
+            }
         case .toolCall where record.toolName == "notify":
             // A notification the agent sent the owner is the whole point of this
             // screen for a "what's the cloud agent up to" check-in — plain
@@ -515,9 +568,70 @@ struct AgentRemoteConsoleView: View {
                           systemImage: "exclamationmark.triangle")
                         .font(.caption2)
                         .foregroundStyle(.orange)
+                case .queued:
+                    Label(message.routedBy == "clarify"
+                          ? "which computer? \(message.clarifyCandidates.joined(separator: " / "))"
+                          : (message.siteName.map { "queued for \($0)" } ?? "queued — waiting for a computer"),
+                          systemImage: "tray")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                case .claimed:
+                    Label(message.siteName.map { "\($0) has it" } ?? "picked up", systemImage: "hand.raised")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                case .applied:
+                    Label(message.siteName.map { "\($0) is on it" } ?? "working on it", systemImage: "gearshape.2")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                case .answered:
+                    Label("answered", systemImage: "checkmark.circle")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
             Text(message.text)
+        }
+        .accessibilityIdentifier("pendingMessageRow")
+    }
+
+    /// Fold one control-plane row into a pending row's render state. Pure.
+    static func pendingState(for remote: ControlPlaneClient.Message) -> CloudPendingMessage.State {
+        switch remote.state {
+        case "claimed": return .claimed
+        case "applied": return .applied
+        case "answered": return .answered
+        default: return .queued
+        }
+    }
+
+    static func siteGlyph(_ record: AgentMirrorRecord) -> String {
+        // The transcript line carries no kind; the directory does. Cloud
+        // workers get the cloud, phones the phone, everything else a desktop.
+        let sites = SiteDirectory.shared.sites
+        if let site = sites.first(where: { $0.siteId8 == record.siteID8 }) { return site.kindGlyph }
+        return "desktopcomputer"
+    }
+
+    /// Refresh presence and poll every pending row that has a control-plane id.
+    private func refreshPresenceAndPending() async {
+        guard usesControlPlane else { return }
+        await sites.refresh()
+        let ids = cloudPending.compactMap { $0.messageID }
+        guard !ids.isEmpty else { return }
+        guard case .success(let remote) = await ControlPlaneClient.listMessages(agent: agentName) else { return }
+        let byID = Dictionary(remote.map { ($0.messageId, $0) }, uniquingKeysWith: { a, _ in a })
+        for index in cloudPending.indices {
+            guard let id = cloudPending[index].messageID, let row = byID[id] else { continue }
+            cloudPending[index].state = Self.pendingState(for: row)
+            cloudPending[index].siteName = row.targetSiteName
+            cloudPending[index].routedBy = row.routedBy
+            cloudPending[index].clarifyCandidates = row.clarifyCandidates ?? []
+        }
+        // Answered rows retire once the transcript shows the applied prompt —
+        // same handoff as the relay rows; until then "answered" is the state.
+        cloudPending.removeAll { message in
+            message.state == .answered
+                && Self.relayRowIsMirrored(text: message.text, createdAt: message.createdAt, records: records)
         }
     }
 
@@ -608,12 +722,38 @@ struct AgentRemoteConsoleView: View {
             ))
             return
         }
-        let pending = CloudPendingMessage(
+        var pending = CloudPendingMessage(
             id: UUID(), text: text, createdAt: Date(), state: .sending
         )
-        cloudPending.append(pending)
         let agentID = self.agentID
         let agentName = self.agentName
+        if usesControlPlane {
+            // docs/SITES.md §6.3 step 1: the id is minted here so a retry is a
+            // server-side no-op, and the row can poll its own progress.
+            let messageID = ControlPlaneClient.newMessageID()
+            pending.messageID = messageID
+            cloudPending.append(pending)
+            Task {
+                let context = ControlPlaneClient.MessageContext(
+                    source: "app", activeSessionNames: Self.activeSessionNames()
+                )
+                let result = await ControlPlaneClient.sendMessage(
+                    agent: agentName, text: text, messageID: messageID, context: context
+                )
+                guard let index = cloudPending.firstIndex(where: { $0.id == pending.id }) else { return }
+                switch result {
+                case .success(let row):
+                    cloudPending[index].state = Self.pendingState(for: row)
+                    cloudPending[index].siteName = row.targetSiteName
+                    cloudPending[index].routedBy = row.routedBy
+                    cloudPending[index].clarifyCandidates = row.clarifyCandidates ?? []
+                case .failure:
+                    cloudPending[index].state = .failed
+                }
+            }
+            return
+        }
+        cloudPending.append(pending)
         Task {
             let delivered = await CloudAgentChannel.sendMessage(
                 agentID: agentID,
@@ -624,6 +764,15 @@ struct AgentRemoteConsoleView: View {
                 cloudPending[index].state = delivered ? .sent : .failed
             }
         }
+    }
+
+    /// The tmux sessions this device currently has open, as routing context:
+    /// a message composed while looking at "main" is probably about "main".
+    private static func activeSessionNames() -> [String] {
+        // The remote console has no terminal of its own; the control strip's
+        // sessions are the app's. Kept as a seam for when that context is
+        // plumbed through — an empty list routes by text and primary alone.
+        []
     }
 
     // MARK: - Loading

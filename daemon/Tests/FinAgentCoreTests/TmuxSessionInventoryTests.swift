@@ -102,3 +102,44 @@ final class TmuxSessionInventoryTests: XCTestCase {
         XCTAssertEqual(TmuxSessionInventory.groupBySession(panes).map(\.session), ["alpha", "zeta"])
     }
 }
+
+final class TmuxPaneTitlesTests: XCTestCase {
+    private let raw = "main\t0.0\t✳ Resume from last work point\tnode\t/Users/x/forges/levi/pocketdj\n"
+        + "main\t1.0\t✳ multi-tenancy-cloud-control-plane\tnode\t/Users/x/forges/levi/fin\n"
+        + "scratch\t0.0\tlevis-imac\tfish\t/Users/x\n"
+        + "garbage line without tabs\n"
+
+    func testParsesTitlesAndBlanksTheHostnameDefault() {
+        let panes = TmuxSessionInventory.parseTitledPanes(raw, hostname: "levis-imac")
+        XCTAssertEqual(panes.count, 3)
+        XCTAssertEqual(panes[0].target, "main:0.0")
+        XCTAssertEqual(panes[1].title, "✳ multi-tenancy-cloud-control-plane")
+        XCTAssertEqual(panes[2].title, "", "tmux's hostname default is not a task")
+    }
+
+    func testCapabilitySessionsGroupPanesAndNeverCarryAFullPath() throws {
+        let panes = TmuxSessionInventory.parseTitledPanes(raw, hostname: "levis-imac")
+        var registry = RegistryDocument()
+        registry.sessions = [SessionRegistration(session: "main", tasks: ["fin project work"], activityNote: "Shipping sites")]
+        let sessions = TmuxSessionInventory.capabilitySessions(panes: panes, registry: registry)
+        XCTAssertEqual(sessions.map { $0["session"] as? String }, ["main", "scratch"])
+        let main = sessions[0]
+        XCTAssertEqual(main["registered"] as? Bool, true)
+        XCTAssertEqual(main["tasks"] as? [String], ["fin project work"])
+        XCTAssertEqual(main["activity_note"] as? String, "Shipping sites")
+        let mainPanes = try XCTUnwrap(main["panes"] as? [[String: Any]])
+        XCTAssertEqual(mainPanes.map { $0["cwd"] as? String }, ["pocketdj", "fin"])
+        let serialized = String(decoding: try JSONSerialization.data(withJSONObject: sessions), as: UTF8.self)
+        XCTAssertFalse(serialized.contains("/Users/"), "a full path must never leave the machine")
+        XCTAssertEqual(sessions[1]["registered"] as? Bool, false)
+    }
+
+    func testObservationLinesReadLikeTheMemoryViewRows() {
+        let panes = TmuxSessionInventory.parseTitledPanes(raw, hostname: "levis-imac")
+        XCTAssertEqual(TmuxSessionInventory.observationLines(panes: panes), [
+            "main:0.0 pocketdj — ✳ Resume from last work point",
+            "main:1.0 fin — ✳ multi-tenancy-cloud-control-plane",
+            "scratch:0.0 x — fish",
+        ])
+    }
+}

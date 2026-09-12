@@ -165,7 +165,10 @@ final class DaemonDirectiveClient {
     /// confined with no way to read out of it: no `read_session`, no guard, and a shell
     /// that can neither see nor drive the human's sessions. `install.sh`'s version floor is
     /// what stops that, and it can only stop it if this string moves.
-    static let daemonVersion = "1.5.0"
+    /// 1.6.0: the sites contract (docs/SITES.md Phase 1c) — `config.site`, the
+    /// independent heartbeat, claim/hold/ack, `site_id8`/`in_reply_to` on
+    /// transcript lines. Additive; a 1.5.0 config still runs unchanged.
+    static let daemonVersion = "1.6.0"
     /// The ONE status that means "no such object" on a first-run read. S3 answers 404
     /// for a missing key when the signer may `s3:ListBucket` — the control plane's and
     /// the operator's signers hold it for exactly that reason (control-plane commit

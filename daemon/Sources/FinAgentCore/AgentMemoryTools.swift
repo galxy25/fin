@@ -14,10 +14,14 @@ public enum AgentRememberOutcome: Equatable, Sendable {
 public struct AgentRecallHit: Equatable, Sendable {
     public let title: String
     public let content: String
+    /// When the entry was last updated, so compaction can date it. Optional:
+    /// a `recall` search result never needed it and still doesn't.
+    public let updatedAt: Date?
 
-    public init(title: String, content: String) {
+    public init(title: String, content: String, updatedAt: Date? = nil) {
         self.title = title
         self.content = content
+        self.updatedAt = updatedAt
     }
 }
 

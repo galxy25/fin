@@ -52,6 +52,7 @@ Beyond `server`, `agent`, and `task`, every field is optional:
 | `supervision` | — | The S3 channel (below) |
 | `transcript` | — | The cloud transcript (below) |
 | `controlPlane` | — | Endpoint + bearer token of the serverless control plane; turns notify events into APNs pushes (below) |
+| `site` | — | This body's identity on the control plane (below); requires `controlPlane` |
 
 Inside `server`, `connectCommand` (typed into the shell once the PTY is up — on a resident
 site `exec tmux -L <socket> new-session -A -s <session> \; set status off`, which is where the
@@ -676,6 +677,41 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
   not a first run, nothing seeded` on a 1.3.0 box that never applied a directive — the
   launch that also writes that box its empty ledger. A 403 on either URL is only ever
   `[s3] poll failed: HTTP 403` / `[s3] inbox poll failed: HTTP 403`, first run included.
+
+## Site (one Fin, many bodies)
+
+```json
+"site": {
+  "id": "a4a1d987-0000-4000-8000-000000000000",   // from POST /sites/enroll
+  "kind": "resident",                              // ec2 | resident | byo | app
+  "displayName": "Levi's iMac",                    // the only name the app ever shows
+  "token": "<siteToken>",                          // the SITE token, not the operator bearer
+  "heartbeatSeconds": 20                           // optional
+}
+```
+
+With the block, `DaemonSiteClient` (an actor, on its own task so a long turn
+never goes silent) heartbeats `POST /sites/{id}/heartbeat` with `state`
+(`working` while a turn runs, `needs-input` while waiting on the user, else
+`idle`/`task-complete`), the ids it holds and has not yet acked, and its
+capabilities — daemon version, brain, and `tmux_sessions`: every session on the
+DEFAULT tmux socket with each pane's **title** (coding agents set it to their
+current task), command, and cwd's last component, rescanned at most once a
+minute so the heartbeat never spends an exec channel per beat. The registry's
+task vocabulary and activity note ride along when the session is registered.
+
+Messages the heartbeat offers are claimed at receipt and held in
+`fin-agentd-site.json` (`held` / `unacked`). The run loop pops the oldest held
+message between turns, moves it to `unacked` in one atomic write, submits it,
+acks `applied`, and acks `answered` with a redacted preview when the turn ends.
+A restart sends `unacked` on its first beat so the control plane finishes those
+acks before any other body can be offered the same message. Commands: `restart`
+and `stop` exit 0 (launchd respawns); `drain` stops claiming and drops the
+primary bid.
+
+Transcript lines gain `site_id8`, `site_name`, and — on a user line the daemon
+applied from the queue — `in_reply_to`, which is how the app collapses a message
+two bodies both applied.
 
 ## Cloud transcript
 

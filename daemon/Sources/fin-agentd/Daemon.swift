@@ -175,6 +175,19 @@ struct DaemonConfig: Decodable {
         var knownAgentProcesses: [String]?
     }
 
+    /// This body's identity on the control plane (docs/SITES.md §9), written by the
+    /// installer from `POST /sites/enroll`. Present = the daemon heartbeats as a
+    /// site, claims messages from its queue, and stamps `site_id8` on transcript
+    /// lines. Absent = exactly the pre-sites daemon. `token` is the SITE token (not
+    /// the operator bearer) and must never reach a log line.
+    struct SiteConfig: Decodable {
+        var id: String
+        var kind: String?
+        var displayName: String?
+        var token: String
+        var heartbeatSeconds: Int?
+    }
+
     var server: ServerConfig
     var agent: AgentConfig
     /// The initial instruction submitted the moment the session is up.
@@ -204,6 +217,8 @@ struct DaemonConfig: Decodable {
     /// Optional session-activity block; see `SessionActivityConfig`. Opt-in, off by
     /// default — see that struct's doc comment.
     var sessionActivity: SessionActivityConfig?
+    /// Optional site block; see `SiteConfig`.
+    var site: SiteConfig?
 
     static let defaultDeviceToken8 = "cloud001"
     static let defaultTranscriptFlushSeconds = 15
@@ -277,6 +292,54 @@ final class Daemon {
     private(set) var supervision: DaemonDirectiveClient?
     /// The cloud transcript uplink; nil when the config has no `transcript` block.
     private var transcript: DaemonTranscriptUplink?
+    /// The site heartbeat + claim protocol; nil without `config.site`.
+    private var siteClient: DaemonSiteClient?
+    /// True from submit to outcome. Read by the site heartbeat from its own task, so
+    /// a long turn reports `working` instead of going silent.
+    private var isTurnInFlight = false
+    /// The last titled-pane scan the heartbeat sent, for the memory compactor.
+    private var lastPaneObservations: [String] = []
+    /// The heartbeat's capabilities, rescanned at most every `capabilitiesScanInterval`:
+    /// every scan is an exec channel on the SSH connection, and `runFixedCommand`
+    /// recycles the whole connection after enough abandoned ones (OpenSSH
+    /// MaxSessions) — so the 20 s heartbeat must not open one per beat.
+    private var cachedCapabilities: [String: Any] = [:]
+    private var cachedCapabilitiesAt: Date?
+    static let capabilitiesScanInterval: TimeInterval = 60
+
+    /// Static facts plus the titled-pane inventory over the DEFAULT tmux socket, the
+    /// same fixed-argv exec channel `read_session` uses. A machine without tmux
+    /// reports no sessions; the heartbeat never fails for it.
+    private func siteCapabilities(
+        session: HeadlessTerminalSession?, registry: SessionRoutingRegistry?, hostname: String
+    ) async -> [String: Any] {
+        if let at = cachedCapabilitiesAt, Date().timeIntervalSince(at) < Self.capabilitiesScanInterval {
+            return cachedCapabilities
+        }
+        var caps: [String: Any] = [
+            "daemon_version": DaemonDirectiveClient.daemonVersion,
+            "always_on": config.stayResident ?? false,
+            "brain": ["kind": "openai-compatible", "model": config.agent.modelIdentifier],
+            "hosts": [["host": config.server.host, "username": config.server.username]],
+        ]
+        if let session, !isTurnInFlight {
+            // Not mid-turn: the turn's own tool calls share the exec-channel budget.
+            let commandLine = TmuxSessionRead.commandLine(TmuxSessionInventory.paneTitlesArguments())
+            if let result = try? await session.runFixedCommand(
+                commandLine, maxResponseBytes: TmuxSessionRead.maxResponseBytes
+            ) {
+                let panes = TmuxSessionInventory.parseTitledPanes(result.output, hostname: hostname)
+                let document = await registry?.document
+                caps["tmux_sessions"] = TmuxSessionInventory.capabilitySessions(panes: panes, registry: document)
+                lastPaneObservations = TmuxSessionInventory.observationLines(panes: panes)
+            }
+        } else if let previous = cachedCapabilities["tmux_sessions"] {
+            caps["tmux_sessions"] = previous
+        }
+        cachedCapabilities = caps
+        cachedCapabilitiesAt = Date()
+        return caps
+    }
     /// The push-notification client; nil when the config has no `controlPlane` block.
     private var notifyClient: DaemonNotifyClient?
     /// The memory sync client (remember/recall); nil when the config has no
@@ -549,6 +612,14 @@ final class Daemon {
             .deletingLastPathComponent()
             .appendingPathComponent(RegistryDocument.standardFileName)
             .path
+    }
+
+    /// The site client's held/unacked ledger (docs/SITES.md §6.3), a sibling of the
+    /// directive ledger rather than two more keys inside it: the two files have
+    /// different writers on different tasks, and one atomic write per owner is
+    /// simpler than a shared file with a lock.
+    var siteLedgerPath: String {
+        (auditLogPath as NSString).deletingLastPathComponent + "/fin-agentd-site.json"
     }
 
     /// The goals ledger sits in that same state directory, under the basename the app
@@ -1065,6 +1136,55 @@ final class Daemon {
                 log("session-activity tracking enabled: inventory every \(inventoryInterval)s, "
                     + "activity notes every \(activityInterval)s")
             }
+
+            if let site = config.site {
+                let client = DaemonSiteClient(
+                    siteID: site.id,
+                    displayName: site.displayName ?? config.server.host,
+                    token: site.token,
+                    heartbeatSeconds: site.heartbeatSeconds,
+                    endpointURL: block.endpointURL,
+                    ledgerPath: siteLedgerPath,
+                    audit: { [weak self] line in
+                        self?.log(line)
+                        self?.record(AgentAuditEvent(kind: "notice", text: line))
+                    }
+                )
+                let registry = sessionRoutingRegistry
+                let hostname = ProcessInfo.processInfo.hostName
+                let runID = transcript?.runID.uuidString
+                await client.configure(
+                    runID: runID,
+                    state: { @MainActor [weak self] in
+                        guard let self else { return "idle" }
+                        if self.isTurnInFlight { return "working" }
+                        if self.awaitingUserInput { return "needs-input" }
+                        return self.idleStateName
+                    },
+                    capabilities: { @MainActor [weak self, weak session] in
+                        guard let self else { return [:] }
+                        return await self.siteCapabilities(session: session, registry: registry, hostname: hostname)
+                    },
+                    onCommand: { @MainActor [weak self] command in
+                        guard let self else { return }
+                        switch command.kind {
+                        case "restart", "stop":
+                            // launchd KeepAlive respawns an exit 0; a real "stay down"
+                            // needs launchctl, which is the installer's job, not the daemon's.
+                            self.log("[site] \(command.kind) requested — exiting for launchd to respawn")
+                            self.shutdown(exitCode: 0)
+                        default:
+                            break // drain is handled inside the client; update is Phase 2
+                        }
+                    }
+                )
+                transcript?.siteID8 = client.siteID8
+                transcript?.siteName = client.displayName
+                memoryConsolidator?.terminalPanesProvider = { [weak self] in self?.lastPaneObservations ?? [] }
+                siteClient = client
+                await client.start()
+                log("site heartbeat enabled: \(client.displayName) (\(client.siteID8)) every \(client.heartbeatSeconds)s")
+            }
         }
 
         var consecutiveFailures = 0
@@ -1082,7 +1202,11 @@ final class Daemon {
         var pendingUserMessageForDigest: String? = config.task
 
         log("submitting task: \(config.task)")
+        isTurnInFlight = true
         var outcome = await engine.submit(config.task)
+        isTurnInFlight = false
+        /// The control-plane message a turn is answering, for the `answered` ack.
+        var inFlightSiteMessageID: String?
 
         while !shuttingDown {
             switch outcome {
@@ -1091,6 +1215,10 @@ final class Daemon {
                 lastTurnAt = Date()
                 lastAssistantPreview = String(text.prefix(200))
                 log("agent: \(text)")
+                if let id = inFlightSiteMessageID {
+                    inFlightSiteMessageID = nil
+                    await siteClient?.markAnswered(id, replyPreview: text)
+                }
                 if let userMessage = pendingUserMessageForDigest {
                     recordTurnInEpisodicMemory(userMessage: userMessage, answer: text)
                 }
@@ -1175,8 +1303,16 @@ final class Daemon {
             // heartbeat disarmed — or suspended after TASK COMPLETE under stayResident —
             // the daemon idles here indefinitely, polling if configured.
             var nextDirective: DaemonRemoteDirective?
+            var nextSiteMessage: DaemonSiteClient.Ledger.HeldMessage?
             let beatAt = Date().addingTimeInterval(TimeInterval(heartbeatSeconds))
             while !shuttingDown {
+                // Control-plane messages this body claimed (docs/SITES.md §6.3 step 5)
+                // come first: the claim already excluded every other body, so they
+                // never wait behind a directive poll.
+                if let held = await siteClient?.nextHeldMessage() {
+                    nextSiteMessage = held
+                    break
+                }
                 if let supervision, supervision.pollIsDue {
                     let pending = await supervision.poll()
                     await supervision.putStatus(await statusSnapshot(state: idleStateName))
@@ -1210,6 +1346,26 @@ final class Daemon {
                 }
             }
 
+            if let message = nextSiteMessage {
+                resumeForIncomingMessage()
+                if !heartbeatEnabled { _ = armMonitor(requestedSeconds: 0) }
+                let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                log("applying message \(message.id) (\(message.source)): \(text)")
+                transcript?.pendingInReplyTo = message.id
+                pendingUserMessageForDigest = text
+                inFlightSiteMessageID = message.id
+                isTurnInFlight = true
+                // Ack `applied` right after submit begins, not after the turn ends:
+                // the window between submit and ack is the one at-least-once window
+                // the design admits, and the shorter it is the rarer a double apply.
+                async let ack: Void = siteClient?.markApplied(message.id, runID: transcript?.runID.uuidString) ?? ()
+                outcome = await engine.submit(text)
+                await ack
+                isTurnInFlight = false
+                inFlightDirectiveID = nil
+                continue
+            }
+
             if let directive = nextDirective {
                 supervision?.markApplied(directive.id)
                 // A directive or inbox message is how the user's answer arrives; lift
@@ -1226,7 +1382,9 @@ final class Daemon {
                 log("applying directive \(directive.id): \(text)")
                 inFlightDirectiveID = directive.id
                 pendingUserMessageForDigest = text
+                isTurnInFlight = true
                 outcome = await engine.submit(text)
+                isTurnInFlight = false
                 await inboxLockClient?.release()
                 continue
             }
@@ -1234,9 +1392,11 @@ final class Daemon {
             log("heartbeat")
             inFlightDirectiveID = nil
             pendingUserMessageForDigest = nil
+            isTurnInFlight = true
             outcome = await engine.submit(
                 Self.composedHeartbeatPrompt(goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath))
             )
+            isTurnInFlight = false
         }
     }
 

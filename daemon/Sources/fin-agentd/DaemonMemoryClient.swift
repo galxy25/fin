@@ -248,10 +248,12 @@ final class DaemonMemoryClient {
         let sorted = entries.sorted { lhs, rhs in
             ((lhs["updatedAt"] as? String) ?? "") > ((rhs["updatedAt"] as? String) ?? "")
         }
+        let formatter = ISO8601DateFormatter()
         return sorted.prefix(max(0, limit)).map { entry in
             AgentRecallHit(
                 title: entry["title"] as? String ?? "",
-                content: entry["content"] as? String ?? ""
+                content: entry["content"] as? String ?? "",
+                updatedAt: (entry["updatedAt"] as? String).flatMap { formatter.date(from: $0) }
             )
         }
     }

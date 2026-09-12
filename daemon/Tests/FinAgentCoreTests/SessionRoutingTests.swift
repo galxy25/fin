@@ -290,8 +290,10 @@ final class SessionRoutingTests: XCTestCase {
             tasks: ["fin"], registeredBy: "levi", createdByFin: false
         ))
 
-        // A scan sees this session running a plain shell now — must not downgrade kind,
-        // rewrite cwd, or set a pane target on a hand-registered entry.
+        // A scan sees this session running a plain shell now — must not downgrade kind
+        // or rewrite cwd on a hand-registered entry. It MAY attach the pane target
+        // (once): that is how the activity summarizer learns where a hand-registered
+        // coding-agent session's agent lives.
         try await store.observeDiscoveredSession(
             session: "fin", kind: "shell", cwd: "/somewhere/else",
             agent: nil, agentPaneTarget: "fin:0.0",
@@ -303,7 +305,14 @@ final class SessionRoutingTests: XCTestCase {
         let entry = doc.sessions[0]
         XCTAssertEqual(entry.kind, "coding-agent", "kind must stay as the human set it")
         XCTAssertEqual(entry.cwd, "~/forges/levi/fin", "cwd must stay as the human set it")
-        XCTAssertNil(entry.agentPaneTarget, "a hand-registered entry never gets a pane target")
+        XCTAssertEqual(entry.agentPaneTarget, "fin:0.0", "discovery may tell a hand-registered entry where its agent lives")
+        // …but never overwrites one already set.
+        try await store.observeDiscoveredSession(
+            session: "fin", kind: "shell", cwd: nil, agent: nil, agentPaneTarget: "fin:9.9",
+            registeredBy: "fin-agentd (auto)"
+        )
+        let after = await store.document
+        XCTAssertEqual(after.sessions[0].agentPaneTarget, "fin:0.0")
         // Vocabulary IS allowed to grow additively — same rule a successful route uses.
         XCTAssertEqual(entry.tasks, ["fin", "widget"])
     }
