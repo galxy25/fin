@@ -135,6 +135,57 @@ allow-list in `_require_site_scope` is deny-by-default and is the entire
 boundary, since a site token attaches its owner's `userId` exactly like a
 session token does. Revoke one by re-enrolling (rotates) or retiring (destroys).
 
+## Messages (the claim protocol)
+
+Phase 1b of `docs/SITES.md`. A message is applied by **at most one body**; the
+thing that decides which is a conditional write on the message row, never
+"whoever polled first". Roles (primary/standby) route; claims exclude.
+
+```sh
+# send (operator/session token). messageId is optional; supply your own
+# m-<uuid> and a retry is a no-op. context is optional routing context.
+curl -sS -X POST "$API/messages" -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"agent":"Fin","text":"what is the main session doing?","source":"app",
+       "context":{"device_id8":"a4a1d987","activeSessionNames":["main"],"siteHint":null}}'
+# -> {messageId, state:"queued", routedBy:"hint"|"context"|"primary"|"clarify"|null,
+#     pinSiteId?, targetSiteId?, targetSiteName?, clarifyCandidates:[...]}
+
+# poll one, or list the newest 50 for the console
+curl -sS "$API/messages/<messageId>" -H "$AUTH"
+curl -sS "$API/messages?agent=Fin" -H "$AUTH"
+```
+
+Routing (`_pin_for`, pure): a `siteHint` naming a live site pins to it; else
+the text plus `activeSessionNames` is matched whole-word against every live
+site's `capabilities.tmux_sessions[].session|tasks` — exactly one match pins,
+several yield `routedBy: "clarify"` with candidate display names, none leaves
+the row unpinned and targeted at the live primary. No live site at all still
+queues the row; the app shows Fin asleep.
+
+The site side, all with the site token + `X-Fin-Site`:
+
+```sh
+# the heartbeat carries the queue: wantsPrimary, held ids (leases renewed),
+# unacked ids (acked under claimedBy=me before anyone else is offered them),
+# and returns role, the eligible messages[], and legacyInboxGet for the primary
+curl -sS -X POST "$API/sites/<siteId>/heartbeat" -H "$SAUTH" -H "X-Fin-Site: <siteId>" \
+  -d '{"state":"working","wantsPrimary":true,"held":["m-…"],"unacked":[]}'
+
+curl -sS -X POST "$API/messages/<id>/claim"    -d '{"leaseSeconds":120}'   # 200 {granted:true} | 409
+curl -sS -X POST "$API/messages/<id>/ack"      -d '{"state":"applied","runId":"…"}'
+curl -sS -X POST "$API/messages/<id>/ack"      -d '{"state":"answered","replyPreview":"…"}'
+curl -sS -X POST "$API/messages/<id>/register" -d '{"text":"…"}'   # legacy-inbox lane, primary only
+```
+
+Eligibility per heartbeat (`_eligible`, pure): a `queued` row, or a `claimed`
+one whose lease lapsed, is offered to site X iff it is pinned to X; or unpinned
+and targeted at X; or unpinned with a dead/absent target and X is primary; or
+no primary is alive at all and X is. Acks only move forward and only from the
+claimant; an applied row can never be reclaimed however stale its lease.
+
+`create_worker` no longer resets `fin/inbox/{agent}.json`. The sweep marks a
+site silent for three leases `stale` — never terminates it.
+
 ## Auto-provisioning
 
 The app lets any agent be set to Cloud Harness and delivers mail to its
