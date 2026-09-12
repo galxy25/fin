@@ -102,7 +102,24 @@ TEMPLATE_URL_TTL_SECONDS = 7 * 24 * 3600
 # more than one user that would merge every user's directives into one
 # object — silent data corruption, not just a leak — so these are per-user too.
 SUPERVISION_DIRECTIVE_KEY = "users/{user}/fin/directives.json"
-SUPERVISION_STATUS_KEY = "users/{user}/fin/status.json"
+
+# Per-device supervision status: one object per (user, device), keyed by the
+# app's 8-hex device id — NOT under fin/sites/, which is already load-bearing
+# for a different, agent-scoped shape (fin/sites/{agent}/{site8}/status.json,
+# see provision-config.sh and _known_last_turn_ats). This root is device-scoped
+# and deliberately separate to avoid an ambiguous prefix listing and a
+# (however unlikely) name collision between an agent slug and a device id.
+DEVICE_STATUS_KEY = "users/{user}/fin/devices/{device}/status.json"
+DEVICE_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+# The pre-per-device key, still live. Every client build shipped before
+# deviceId8 existed asks for kind supervisionStatus WITHOUT one, and those
+# builds are out in the world (TestFlight, App Store) for as long as it takes
+# users to update — so this is a fallback, not dead code. Rejecting those
+# requests instead would break status uplink on every existing install the
+# moment this Lambda deploys, which is a worse outage than the account-wide
+# key it replaces. Retire it only once no client is still asking.
+LEGACY_SUPERVISION_STATUS_KEY = "users/{user}/fin/status.json"
 
 
 def _key_slug(agent):
@@ -1027,6 +1044,7 @@ def presign(event):
     body = _body(event)
 
     agent = str(body.get("agent") or "").strip()
+    device_id8 = str(body.get("deviceId8") or "").strip().lower()
 
     requested = body.get("kinds")
     if requested is None:
@@ -1065,7 +1083,19 @@ def presign(event):
         elif kind == "supervisionDirective":
             urls["supervisionDirectiveGet"] = _presign("get_object", SUPERVISION_DIRECTIVE_KEY.format(user=user_id))
         elif kind == "supervisionStatus":
-            urls["supervisionStatusPut"] = _presign("put_object", SUPERVISION_STATUS_KEY.format(user=user_id))
+            # Absent deviceId8 => a pre-per-device client; hand it the flat key it
+            # has always written to. Present-but-malformed is a real client bug and
+            # still rejected, so a typo can't silently land in the legacy object.
+            if not device_id8:
+                urls["supervisionStatusPut"] = _presign(
+                    "put_object", LEGACY_SUPERVISION_STATUS_KEY.format(user=user_id)
+                )
+            elif not DEVICE_ID_RE.match(device_id8):
+                raise ApiError(400, "deviceId8 must be an 8-character lowercase hex device id")
+            else:
+                urls["supervisionStatusPut"] = _presign(
+                    "put_object", DEVICE_STATUS_KEY.format(user=user_id, device=device_id8)
+                )
 
     now = _now()
     return _response(200, {
@@ -2438,6 +2468,81 @@ def delete_artifact(event, path):
     return _response(200, {"path": path, "deleted": True})
 
 
+# --- device status (per-device supervision aggregation) ---------------------
+#
+# A Lambda route, not a client-side S3 list+get: presigning ListObjectsV2 would
+# hand the client bucket-wide listing credentials (scoped only by a StringLike
+# prefix condition — harder to reason about than a bearer-token route) and
+# still cost N follow-up presigned GETs for one screen's worth of data. This
+# route matches list_artifacts's shape and is callable identically by the app
+# and the daemon (both already speak the plain-bearer-token relay for
+# /memory and /artifacts).
+
+DEVICE_STATUS_PREFIX = "users/{user}/fin/devices/"
+MAX_DEVICE_STATUS_ITEMS = 200
+
+
+def list_device_status(event):
+    """GET /devices/status — every device's last-known supervision status for the
+    CALLER's account, read back from users/{user}/fin/devices/*/status.json. Mirrors
+    list_artifacts's paginate-and-cap S3 listing, but also GETs and parses each object
+    (small, capped JSON) rather than returning bare paths: callers (memory compaction,
+    a future cross-device UI) want the content."""
+    user_id = event["_userId"]
+    prefix = DEVICE_STATUS_PREFIX.format(user=user_id)
+    keys, token = [], None
+    while len(keys) < MAX_DEVICE_STATUS_ITEMS:
+        kwargs = {
+            "Bucket": BUCKET, "Prefix": prefix,
+            "MaxKeys": min(1000, MAX_DEVICE_STATUS_ITEMS - len(keys)),
+        }
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = S3.list_objects_v2(**kwargs)
+        for entry in page.get("Contents", []):
+            if entry["Key"].endswith("/status.json"):
+                keys.append(entry["Key"])
+        token = page.get("NextContinuationToken")
+        if not token:
+            break
+
+    devices = []
+    for key in keys:
+        device_id8 = key[len(prefix):].split("/", 1)[0]  # path segment is authoritative
+        try:
+            raw = S3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+            status = json.loads(raw)
+        except (ClientError, ValueError):
+            continue
+        if not isinstance(status, dict):
+            continue
+        status["device_id8"] = device_id8  # overwrite any self-reported mismatch
+        devices.append(status)
+    # Fold in the legacy flat object too: until every client writes per-device,
+    # some devices' only status lives there, and omitting it would make the
+    # aggregation silently incomplete exactly during the migration it exists for.
+    # Its own body carries device_id8, so it self-identifies; a device that has
+    # since written a per-device object wins (its entry is already in `devices`).
+    seen = {d.get("device_id8") for d in devices}
+    try:
+        raw = S3.get_object(
+            Bucket=BUCKET, Key=LEGACY_SUPERVISION_STATUS_KEY.format(user=user_id)
+        )["Body"].read()
+        legacy = json.loads(raw)
+        if isinstance(legacy, dict) and legacy.get("device_id8") not in seen:
+            legacy["legacy_flat_key"] = True
+            devices.append(legacy)
+    except Exception:
+        # Deliberately broad: this whole block is a best-effort augmentation for
+        # the migration window, and the object is ABSENT in the common case (no
+        # pre-per-device client has written since the account was created). No
+        # failure reading it — missing key, malformed body, transient S3 error —
+        # is worth failing the caller's whole device list over.
+        pass
+    devices.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
+    return _response(200, {"generatedAt": _iso(_now()), "devices": devices})
+
+
 # --- entry point -------------------------------------------------------------
 
 
@@ -2493,6 +2598,8 @@ def _route(event):
         return get_memory_profile(event)
     if method == "PUT" and parts == ["memory", "profile"]:
         return put_memory_profile(event)
+    if method == "GET" and parts == ["devices", "status"]:
+        return list_device_status(event)
     if method == "GET" and parts == ["artifacts"]:
         return list_artifacts(event)
     if method == "GET" and len(parts) >= 2 and parts[0] == "artifacts":

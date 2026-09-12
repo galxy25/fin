@@ -49,7 +49,9 @@ enum PresignedURLService {
         case malformedResponse
     }
 
-    static func vend(agent: String?, kinds: [Kind] = Kind.allCases) async -> Result<Grant, Failure> {
+    static func vend(
+        agent: String?, deviceID8: String? = nil, kinds: [Kind] = Kind.allCases
+    ) async -> Result<Grant, Failure> {
         guard CloudControlPlaneConfig.isConfigured else { return .failure(.notConfigured) }
         var base = CloudControlPlaneConfig.endpointURL
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -66,6 +68,9 @@ enum PresignedURLService {
         var payload: [String: Any] = ["kinds": kinds.map(\.rawValue)]
         if let agent = agent?.trimmingCharacters(in: .whitespacesAndNewlines), !agent.isEmpty {
             payload["agent"] = agent
+        }
+        if let deviceID8, !deviceID8.isEmpty {
+            payload["deviceId8"] = deviceID8
         }
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
 
@@ -123,7 +128,7 @@ enum PresignedURLService {
     /// in-memory ETag stays valid and no poller restart is warranted.
     @discardableResult
     static func refreshSupervisionURLs() async -> Bool {
-        switch await vend(agent: nil, kinds: [.supervisionDirective, .supervisionStatus]) {
+        switch await vend(agent: nil, deviceID8: DeviceIdentity.short, kinds: [.supervisionDirective, .supervisionStatus]) {
         case .success(let grant):
             RemoteSupervisionConfig.applyPresigned(
                 directiveGet: grant.supervisionDirectiveGet,

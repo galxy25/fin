@@ -12,6 +12,7 @@ Run: python3 test_lambda.py
 
 import base64
 import importlib.util
+import json
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -476,6 +477,252 @@ class WorkerListingScopingTests(unittest.TestCase):
         lam._live_workers("user-z")
         call = lam.TABLE.scan_calls[0]
         self.assertEqual(call["ExpressionAttributeValues"][":user"], "user-z")
+
+
+class DeviceStatusIamPolicySanityTests(unittest.TestCase):
+    """Sanity-checks the IAM policy diff reported alongside the per-device status key
+    change (deploy.sh's DeviceStatusWrite Sid): does the new statement's Resource ARN
+    pattern actually match the new key format lambda.py mints (a common copy-paste
+    mistake — e.g. forgetting a `/*/` segment or matching the OLD single-file key), and
+    does an existing ListBucket/GetObject condition already cover the new prefix (so no
+    statement was silently missed)."""
+
+    @classmethod
+    def setUpClass(cls):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "deploy.sh")) as f:
+            cls.deploy_sh = f.read()
+
+    @staticmethod
+    def _arn_to_regex(pattern):
+        # IAM ARN / StringLike wildcards: '*' matches any run of characters,
+        # including '/'. $BUCKET / $REGION / $ACCOUNT are shell interpolations,
+        # not real wildcards, so pin them to a placeholder that can't collide
+        # with a real key segment before quoting the rest.
+        import re as _re
+        pattern = pattern.replace("$BUCKET", "\0BUCKET\0")
+        escaped = _re.escape(pattern).replace(_re.escape("*"), ".*")
+        escaped = escaped.replace(_re.escape("\0BUCKET\0"), "test-bucket")
+        return _re.compile("^" + escaped + "$")
+
+    def _find_resource(self, sid, action_hint):
+        """Pulls the Resource value(s) out of the one JSON-ish statement block whose
+        Sid matches, by locating the block's braces textually (the policy is built as
+        an f-string-flavored heredoc, not real JSON, until $VARS are substituted, so a
+        real JSON parser can't be pointed at it directly)."""
+        import re as _re
+        block_start = self.deploy_sh.index('"Sid": "%s"' % sid)
+        block_open = self.deploy_sh.rindex("{", 0, block_start)
+        depth = 0
+        i = block_open
+        while True:
+            if self.deploy_sh[i] == "{":
+                depth += 1
+            elif self.deploy_sh[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        block = self.deploy_sh[block_open:i + 1]
+        self.assertIn(action_hint, block, "Sid %r doesn't cover the expected action" % sid)
+        resources = _re.findall(r'"arn:aws:s3:::\$BUCKET/[^"]*"', block)
+        self.assertTrue(resources, "no S3 Resource ARNs found in Sid %r's block" % sid)
+        return [r.strip('"') for r in resources]
+
+    def test_device_status_write_resource_matches_the_new_per_device_key_format(self):
+        resources = self._find_resource("DeviceStatusWrite", "s3:PutObject")
+        candidate_key = "test-bucket/" + lam.DEVICE_STATUS_KEY.format(user="user-abc", device="11112222")
+        matched = [r for r in resources if self._arn_to_regex(r).match("arn:aws:s3:::" + candidate_key)]
+        self.assertTrue(
+            matched,
+            "DeviceStatusWrite's Resource %r does not match a real DEVICE_STATUS_KEY "
+            "(%r) — this is exactly the copy-paste-mistake shape to catch (wrong "
+            "segment count, or still pointing at the old shared status.json key)."
+            % (resources, candidate_key)
+        )
+
+    def test_device_status_write_resource_does_not_still_match_the_old_shared_key(self):
+        # Regression against "renamed the Sid but left the Resource pointing at the
+        # single shared file" — the whole point of the per-device key change was that
+        # two devices no longer share one object.
+        resources = self._find_resource("DeviceStatusWrite", "s3:PutObject")
+        old_shared_key = "test-bucket/users/user-abc/fin/status.json"
+        matched = [r for r in resources if self._arn_to_regex(r).match("arn:aws:s3:::" + old_shared_key)]
+        self.assertFalse(matched, "DeviceStatusWrite must not still match the old single shared-file key")
+
+    def test_agent_objects_get_covers_the_new_devices_prefix(self):
+        resources = self._find_resource("AgentObjects", "s3:GetObject")
+        candidate_key = "test-bucket/" + lam.DEVICE_STATUS_KEY.format(user="user-abc", device="11112222")
+        matched = [r for r in resources if self._arn_to_regex(r).match("arn:aws:s3:::" + candidate_key)]
+        self.assertTrue(matched, "no existing GetObject Resource covers the new devices/ prefix — "
+                                  "the daemon's /devices/status route (S3.get_object per device) would 403")
+
+    def test_see_missing_agent_objects_listbucket_condition_covers_the_new_prefix(self):
+        import re as _re
+        block_start = self.deploy_sh.index('"Sid": "SeeMissingAgentObjects"')
+        block_open = self.deploy_sh.rindex("{", 0, block_start)
+        depth, i = 0, block_open
+        while True:
+            if self.deploy_sh[i] == "{":
+                depth += 1
+            elif self.deploy_sh[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        block = self.deploy_sh[block_open:i + 1]
+        prefixes = _re.findall(r'"(users/\*|fin/agentd/\*)"', block)
+        self.assertTrue(prefixes, "expected a users/* (or fin/agentd/*) StringLike prefix condition")
+        device_status_prefix = lam.DEVICE_STATUS_PREFIX.format(user="user-abc")
+        matched = [
+            p for p in prefixes
+            if _re.match("^" + _re.escape(p).replace(r"\*", ".*") + "$", device_status_prefix)
+        ]
+        self.assertTrue(
+            matched,
+            "no ListBucket StringLike prefix condition (%r) covers the new device-status "
+            "list prefix (%r) — list_device_status's list_objects_v2 call would 403"
+            % (prefixes, device_status_prefix)
+        )
+
+
+class ListDeviceStatusTests(unittest.TestCase):
+    """`GET /devices/status` — the aggregation/read path: lists every
+    users/{user}/fin/devices/*/status.json object for the caller and GETs each one.
+    Covers eval scenarios (a) two devices' independently-written objects don't clobber
+    each other, (b) the read path enumerates + fetches multiple device documents, and
+    the 0-devices-ever-registered edge of (c)."""
+
+    class _FakeS3:
+        def __init__(self, objects):
+            # objects: {key: json-bytes-or-str}
+            self.objects = objects
+            self.list_calls = []
+            self.get_calls = []
+
+        def list_objects_v2(self, **kwargs):
+            self.list_calls.append(kwargs)
+            prefix = kwargs.get("Prefix", "")
+            keys = sorted(k for k in self.objects if k.startswith(prefix))
+            return {"Contents": [{"Key": k} for k in keys]}
+
+        def get_object(self, **kwargs):
+            self.get_calls.append(kwargs)
+            key = kwargs["Key"]
+            body = self.objects[key]
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+
+            class _Body:
+                def read(_self):
+                    return body
+            return {"Body": _Body()}
+
+    def setUp(self):
+        self._orig_s3 = lam.S3
+        self.addCleanup(lambda: setattr(lam, "S3", self._orig_s3))
+
+    def test_two_devices_written_under_distinct_keys_both_survive_aggregation(self):
+        # Two devices, each having PUT its OWN object — the schema's whole point.
+        key_a = lam.DEVICE_STATUS_KEY.format(user="user-1", device="aaaa1111")
+        key_b = lam.DEVICE_STATUS_KEY.format(user="user-1", device="bbbb2222")
+        lam.S3 = self._FakeS3({
+            key_a: json.dumps({"device": "iMac", "state": "idle", "updated_at": "2026-09-11T20:00:00Z"}),
+            key_b: json.dumps({"device": "MacBook Air", "state": "thinking", "updated_at": "2026-09-11T20:02:00Z"}),
+        })
+        result = lam.list_device_status({"_userId": "user-1"})
+        body = json.loads(result["body"]) if isinstance(result.get("body"), str) else result["body"]
+        devices = {d["device_id8"]: d for d in body["devices"]}
+        self.assertEqual(set(devices), {"aaaa1111", "bbbb2222"})
+        self.assertEqual(devices["aaaa1111"]["device"], "iMac")
+        self.assertEqual(devices["aaaa1111"]["state"], "idle")
+        self.assertEqual(devices["bbbb2222"]["device"], "MacBook Air")
+        self.assertEqual(devices["bbbb2222"]["state"], "thinking")
+
+    def test_device_id8_is_taken_from_the_key_path_not_the_documents_own_field(self):
+        # "status["device_id8"] = device_id8  # overwrite any self-reported mismatch" —
+        # pin that the path segment wins even when the document disagrees with it.
+        key = lam.DEVICE_STATUS_KEY.format(user="user-1", device="11112222")
+        lam.S3 = self._FakeS3({
+            key: json.dumps({"device": "MacBook", "device_id8": "wrongwrong", "state": "idle", "updated_at": "2026-09-11T20:00:00Z"}),
+        })
+        result = lam.list_device_status({"_userId": "user-1"})
+        body = json.loads(result["body"])
+        self.assertEqual(body["devices"][0]["device_id8"], "11112222")
+
+    def test_zero_devices_ever_registered_returns_an_empty_list_not_an_error(self):
+        lam.S3 = self._FakeS3({})
+        result = lam.list_device_status({"_userId": "user-1"})
+        self.assertEqual(result["statusCode"], 200)
+        body = json.loads(result["body"])
+        self.assertEqual(body["devices"], [])
+
+    def test_malformed_device_document_is_skipped_not_fatal(self):
+        good_key = lam.DEVICE_STATUS_KEY.format(user="user-1", device="11112222")
+        bad_key = lam.DEVICE_STATUS_KEY.format(user="user-1", device="22223333")
+        lam.S3 = self._FakeS3({
+            good_key: json.dumps({"device": "MacBook", "state": "idle", "updated_at": "2026-09-11T20:00:00Z"}),
+            bad_key: "not json at all",
+        })
+        result = lam.list_device_status({"_userId": "user-1"})
+        body = json.loads(result["body"])
+        self.assertEqual(len(body["devices"]), 1)
+        self.assertEqual(body["devices"][0]["device_id8"], "11112222")
+
+    def test_listing_is_scoped_to_the_callers_own_user_prefix(self):
+        mine = lam.DEVICE_STATUS_KEY.format(user="user-1", device="11112222")
+        theirs = lam.DEVICE_STATUS_KEY.format(user="user-2", device="99998888")
+        lam.S3 = self._FakeS3({
+            mine: json.dumps({"device": "Mine", "state": "idle", "updated_at": "2026-09-11T20:00:00Z"}),
+            theirs: json.dumps({"device": "TheirMac", "state": "idle", "updated_at": "2026-09-11T20:00:00Z"}),
+        })
+        result = lam.list_device_status({"_userId": "user-1"})
+        body = json.loads(result["body"])
+        self.assertEqual([d["device_id8"] for d in body["devices"]], ["11112222"])
+
+
+class PresignSupervisionStatusBackCompatTests(unittest.TestCase):
+    """Every client build shipped before `deviceId8` existed asks for kind
+    supervisionStatus without one. Those builds stay installed for as long as it
+    takes users to update, so the per-device migration must not turn their status
+    uplink into a hard error — these pin that it doesn't."""
+
+    def setUp(self):
+        self._orig = lam._presign
+        self.signed = []
+
+        def fake_presign(method, key):
+            self.signed.append((method, key))
+            return "https://example.invalid/{}".format(key)
+
+        lam._presign = fake_presign
+        self.addCleanup(lambda: setattr(lam, "_presign", self._orig))
+
+    def _presign_event(self, body):
+        return {"_userId": "user-1", "body": json.dumps(body)}
+
+    def test_absent_device_id_falls_back_to_the_legacy_flat_key(self):
+        lam.presign(self._presign_event({"kinds": ["supervisionStatus"]}))
+        self.assertEqual(
+            self.signed, [("put_object", "users/user-1/fin/status.json")]
+        )
+
+    def test_valid_device_id_uses_the_per_device_key(self):
+        lam.presign(
+            self._presign_event({"kinds": ["supervisionStatus"], "deviceId8": "a4a1d987"})
+        )
+        self.assertEqual(
+            self.signed,
+            [("put_object", "users/user-1/fin/devices/a4a1d987/status.json")],
+        )
+
+    def test_malformed_device_id_is_still_rejected_rather_than_silently_legacy(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.presign(
+                self._presign_event({"kinds": ["supervisionStatus"], "deviceId8": "nope"})
+            )
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(self.signed, [])
 
 
 if __name__ == "__main__":

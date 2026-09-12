@@ -57,6 +57,12 @@ final class DaemonMemoryConsolidator {
     /// apart from "I observed this in a terminal." nil (default) = session-activity
     /// tracking is off; compact() behaves exactly as it did before this property existed.
     var sessionActivityNotesProvider: (() async -> [String])?
+    /// Optional cross-device status snapshot (`DaemonDeviceStatusClient.otherDevices`),
+    /// folded into the compaction prompt as its own labeled section — same "own section,
+    /// own label" seam as `sessionActivityNotesProvider`. nil (default, e.g. an older
+    /// build or an install with no control-plane config) = cross-device awareness off;
+    /// compact() behaves byte-identically to before this property existed.
+    var crossDeviceStatusProvider: (() async -> [String])?
 
     private var lastCacheRefreshAt: Date?
     private var lastConsolidationAttemptAt: Date?
@@ -142,6 +148,13 @@ final class DaemonMemoryConsolidator {
             if !notes.isEmpty {
                 input += "\n\nSession activity (from live terminal sessions Fin tracks):"
                 for note in notes { input += "\n- \(note)" }
+            }
+        }
+        if let crossDeviceStatusProvider {
+            let lines = await crossDeviceStatusProvider()
+            if !lines.isEmpty {
+                input += "\n\nOther devices right now:"
+                for line in lines { input += "\n- \(line)" }
             }
         }
         input += "\n\nRecent conversations:"

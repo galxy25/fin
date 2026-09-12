@@ -205,6 +205,73 @@ final class DaemonMemoryConsolidatorTests: XCTestCase {
         XCTAssertTrue(auditLines().contains { $0.contains("merged 1 conversation") })
     }
 
+    // MARK: - run: cross-device status section
+
+    func testCompactionIncludesCrossDeviceStatusSectionWhenProviderIsSet() async throws {
+        let old = ISO8601DateFormatter().string(from: Date(timeIntervalSinceNow: -25 * 60 * 60))
+        var completionInput: String?
+        let (consolidator, _) = makeConsolidator { request in
+            let path = request.url?.path ?? ""
+            if path.hasSuffix("/lock") {
+                if request.httpMethod == "DELETE" { return self.ok(#"{"released":true}"#, for: request) }
+                return self.ok(#"{"holder":"abcd1234","claimedAt":"2026-09-08T00:00:00Z"}"#, for: request)
+            }
+            if path.hasSuffix("/profile"), request.httpMethod == "PUT" {
+                return self.ok(#"{"content":"ok","updatedAt":"2026-09-09T00:00:00Z"}"#, for: request)
+            }
+            if request.url?.absoluteString.contains("/memory?agent=") == true {
+                return self.ok(#"{"entries":[{"id":"m-1","title":"Deploy target","content":"prod-east","updatedAt":"2026-09-09T00:00:00Z"}]}"#, for: request)
+            }
+            return self.ok(self.profileBody(content: "existing profile text", updatedAt: old), for: request)
+        }
+        consolidator.completion = { _, input in
+            completionInput = input
+            return "Levi is working on Fin; prefers direct, concise answers and end-to-end verification."
+        }
+        consolidator.crossDeviceStatusProvider = { ["MacBook — idle, working on Fin, last seen 3m ago"] }
+
+        await consolidator.run(refreshCache: false, attemptConsolidation: true)
+
+        XCTAssertTrue(
+            completionInput?.contains(
+                "\n\nOther devices right now:\n- MacBook — idle, working on Fin, last seen 3m ago\n\nRecent conversations:"
+            ) ?? false,
+            "pins the exact section ordering and label text; got: \(completionInput ?? "nil")"
+        )
+    }
+
+    func testCompactionInputIsUnchangedWhenCrossDeviceStatusProviderIsNilByDefault() async throws {
+        let old = ISO8601DateFormatter().string(from: Date(timeIntervalSinceNow: -25 * 60 * 60))
+        var completionInput: String?
+        let (consolidator, _) = makeConsolidator { request in
+            let path = request.url?.path ?? ""
+            if path.hasSuffix("/lock") {
+                if request.httpMethod == "DELETE" { return self.ok(#"{"released":true}"#, for: request) }
+                return self.ok(#"{"holder":"abcd1234","claimedAt":"2026-09-08T00:00:00Z"}"#, for: request)
+            }
+            if path.hasSuffix("/profile"), request.httpMethod == "PUT" {
+                return self.ok(#"{"content":"ok","updatedAt":"2026-09-09T00:00:00Z"}"#, for: request)
+            }
+            if request.url?.absoluteString.contains("/memory?agent=") == true {
+                return self.ok(#"{"entries":[{"id":"m-1","title":"Deploy target","content":"prod-east","updatedAt":"2026-09-09T00:00:00Z"}]}"#, for: request)
+            }
+            return self.ok(self.profileBody(content: "existing profile text", updatedAt: old), for: request)
+        }
+        consolidator.completion = { _, input in
+            completionInput = input
+            return "Levi is working on Fin; prefers direct, concise answers and end-to-end verification."
+        }
+        // crossDeviceStatusProvider left at its default nil — opt-in-safety pin.
+
+        await consolidator.run(refreshCache: false, attemptConsolidation: true)
+
+        XCTAssertEqual(
+            completionInput,
+            "Current profile:\nexisting profile text\n\nRecent conversations:\n\nDeploy target\nprod-east",
+            "byte-identical to the pre-change baseline when the provider is unset"
+        )
+    }
+
     func testRunReleasesTheLockEvenWhenTheModelReturnsUnusableText() async throws {
         let old = ISO8601DateFormatter().string(from: Date(timeIntervalSinceNow: -25 * 60 * 60))
         var lockMethods: [String] = []

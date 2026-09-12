@@ -258,6 +258,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/inbox/*"
     },
     {
+      "Sid": "DeviceStatusWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/devices/*/status.json"
+    },
+    {
       "Sid": "SupervisionStatusWrite",
       "Effect": "Allow",
       "Action": "s3:PutObject",

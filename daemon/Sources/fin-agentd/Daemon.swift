@@ -290,6 +290,10 @@ final class Daemon {
     /// this daemon's own prompt-injection cache fresh; nil when the config has no
     /// `controlPlane` block — same gate as the other memory-adjacent clients.
     private var memoryConsolidator: DaemonMemoryConsolidator?
+    /// Backs `memoryConsolidator.crossDeviceStatusProvider`; held here (not just
+    /// captured weak in the closure) so it isn't deallocated the moment `launch()`
+    /// returns. Nil when the config has no `controlPlane` block.
+    private var deviceStatusClient: DaemonDeviceStatusClient?
     /// The session-routing registry, opened for `SessionInventoryScanner`/
     /// `SessionActivitySummarizer` to write into; nil unless `config.sessionActivity`
     /// is present. (The routing PROMPT reads its own copy of the same file via
@@ -992,6 +996,26 @@ final class Daemon {
                 }
             )
             log("profile compaction enabled: control plane /memory/profile, cache at \(profileCachePath)")
+
+            // Cross-device awareness for the same compaction prompt: "what is
+            // happening on my other devices right now," folded in as its own
+            // section next to session activity. Unconditional (not gated behind
+            // `sessionActivity`) since this doesn't depend on tmux at all.
+            deviceStatusClient = DaemonDeviceStatusClient(
+                endpointURL: block.endpointURL, token: block.token,
+                audit: { [weak self] line in
+                    self?.log(line)
+                    self?.record(AgentAuditEvent(kind: "notice", text: line))
+                }
+            )
+            let ownDeviceID8 = config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8
+            memoryConsolidator?.crossDeviceStatusProvider = { [weak self] in
+                guard let deviceStatusClient = self?.deviceStatusClient else { return [] }
+                let now = Date()
+                let others = await deviceStatusClient.otherDevices(excludingDeviceID8: ownDeviceID8, now: now)
+                return others.map { DaemonDeviceStatusClient.formatLine($0, now: now) }
+            }
+            log("cross-device status awareness enabled: control plane /devices/status")
 
             // Live session inventory + per-coding-agent activity notes — opt-in (see
             // `DaemonConfig.SessionActivityConfig`'s doc comment): a config with no
