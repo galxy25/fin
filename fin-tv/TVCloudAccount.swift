@@ -150,39 +150,49 @@ final class TVCloudAccount: ObservableObject {
 /// iCloud and the identity from the Apple ID this TV is already signed into.
 struct TVAccountSection: View {
     @EnvironmentObject private var account: TVCloudAccount
+    @StateObject private var signIn = TVAppleSignIn()
+    @Query private var servers: [Server]
+    @Query private var agents: [Agent]
+    @Query private var keys: [KeyMetadata]
+
+    /// Everything this TV holds for the account: servers and agents arrive via
+    /// CloudKit, SSH keys via the vault. One line, so "synced" means all of it.
+    private var syncedSummary: String {
+        func count(_ n: Int, _ noun: String) -> String { "\(n) \(noun)\(n == 1 ? "" : "s")" }
+        return [count(servers.count, "server"), count(agents.count, "agent"), count(account.keysInstalled, "key")]
+            .joined(separator: ", ")
+    }
 
     var body: some View {
         Section {
             switch account.phase {
             case .waitingForEndpoint:
-                Label("Waiting for iCloud to deliver your Fin cloud settings from your iPhone or Mac.",
+                Label("Waiting for iCloud to deliver your Fin account settings from your iPhone or Mac.",
                       systemImage: "icloud.and.arrow.down")
                     .foregroundStyle(.secondary)
             case .needsSignIn:
-                SignInWithAppleButton(.signIn) { request in
-                    request.requestedScopes = []
-                } onCompletion: { result in
-                    account.handleSignIn(result)
+                // A native SwiftUI Button, not `SignInWithAppleButton`: on tvOS the
+                // Apple-drawn button inside a List row is not a focusable control, so
+                // the row takes the click and the request never starts (1.0.1 field
+                // report: "click sign in with apple and nothing happens").
+                Button {
+                    signIn.start { result in account.handleSignIn(result) }
+                } label: {
+                    Label("Sign in with Apple", systemImage: "apple.logo")
                 }
-                .signInWithAppleButtonStyle(.white)
-                .frame(maxWidth: 480, minHeight: 60)
-                Text("Sign in once and the SSH keys from your other Fin devices arrive here on their own.")
+                Text("Sign in once and your Fin account — servers, agents, keys, and the cloud brain — follows you here on its own.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             case .syncing:
                 HStack(spacing: 14) {
                     ProgressView()
-                    Text("Fetching your keys…")
+                    Text("Syncing your Fin account…")
                         .foregroundStyle(.secondary)
                 }
             case .ready:
-                Label(
-                    account.keysInstalled == 1 ? "1 key installed from your account."
-                        : "\(account.keysInstalled) keys installed from your account.",
-                    systemImage: "checkmark.icloud"
-                )
-                .foregroundStyle(.secondary)
-                Button("Refresh keys") { Task { await account.syncVault() } }
+                Label("Synced with your Fin account: \(syncedSummary).", systemImage: "checkmark.icloud")
+                    .foregroundStyle(.secondary)
+                Button("Sync now") { Task { await account.syncVault() } }
             case .failed(let message):
                 Label(message, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
@@ -191,5 +201,40 @@ struct TVAccountSection: View {
         } header: {
             Text("Fin Account")
         }
+    }
+}
+
+/// Runs the Sign in with Apple request from a plain button press. tvOS shows
+/// its own full-screen prompt (continue with the Apple ID this TV is signed
+/// into), so no button chrome is required — only a controller with a
+/// presentation anchor.
+@MainActor
+final class TVAppleSignIn: NSObject, ObservableObject,
+    ASAuthorizationControllerDelegate, ASAuthorizationControllerPresentationContextProviding {
+    private var completion: ((Result<ASAuthorization, Error>) -> Void)?
+    private var controller: ASAuthorizationController?
+
+    func start(_ completion: @escaping (Result<ASAuthorization, Error>) -> Void) {
+        self.completion = completion
+        let request = ASAuthorizationAppleIDProvider().createRequest()
+        request.requestedScopes = []
+        let controller = ASAuthorizationController(authorizationRequests: [request])
+        controller.delegate = self
+        controller.presentationContextProvider = self
+        self.controller = controller
+        controller.performRequests()
+    }
+
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithAuthorization authorization: ASAuthorization) {
+        completion?(.success(authorization)); completion = nil; self.controller = nil
+    }
+
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
+        completion?(.failure(error)); completion = nil; self.controller = nil
+    }
+
+    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.flatMap(\.windows).first(where: \.isKeyWindow) ?? scenes.first?.windows.first ?? UIWindow()
     }
 }
