@@ -483,13 +483,20 @@ if [ "$INTEGRATION_ID" = "None" ] || [ -z "$INTEGRATION_ID" ]; then
   echo "==> Created AWS_PROXY integration $INTEGRATION_ID"
 fi
 
+# `aws` reads stdin, and stdin here IS the heredoc the loop is iterating — left
+# unredirected it swallows the remaining route lines, so a deploy silently
+# registers only the first not-yet-existing route and every later one is skipped
+# until some future run happens to reach it. That is exactly how `GET
+# /devices/status` ended up handled by the Lambda but absent from API Gateway
+# (a live 404 with the code deployed). Every aws call in this loop gets
+# </dev/null; keep it that way when adding routes.
 while read -r ROUTE_KEY; do
   [ -n "$ROUTE_KEY" ] || continue
   EXISTING=$(aws apigatewayv2 get-routes --api-id "$API_ID" \
-    --query "Items[?RouteKey=='$ROUTE_KEY'].RouteId | [0]" --output text)
+    --query "Items[?RouteKey=='$ROUTE_KEY'].RouteId | [0]" --output text </dev/null)
   if [ "$EXISTING" = "None" ] || [ -z "$EXISTING" ]; then
     aws apigatewayv2 create-route --api-id "$API_ID" --route-key "$ROUTE_KEY" \
-      --target "integrations/$INTEGRATION_ID" >/dev/null
+      --target "integrations/$INTEGRATION_ID" >/dev/null </dev/null
     echo "==> Created route $ROUTE_KEY"
   fi
 done <<'ROUTES'
@@ -515,6 +522,7 @@ POST /memory
 GET /memory
 PUT /memory/profile
 GET /memory/profile
+GET /devices/status
 PUT /memory/profile/lock
 DELETE /memory/profile/lock
 GET /artifacts
