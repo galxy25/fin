@@ -99,6 +99,17 @@ prerequisite for "Fin says: … Want to reply?".
    video) for the App Store review notes, and note any phrase Siri misrouted
    (e.g. to Messages) so the phrase list can be tuned.
 
+## One breath: "Search Fin for …" / "Ask Fin about …"
+
+App Shortcut phrases cannot carry free text, so "Ask Fin, are the evals green?"
+said in one go does not match "Ask Fin". Since the search intent landed, Siri's
+in-app-search grammar does: "**Search Fin for** whether the evals are green",
+"**Ask Fin about** the iMac", "**Find** the daemon status **in Fin**". The query
+goes to the agent as a question. Apple's search intent has to open the app, so
+the phone comes forward to the conversation (the CarPlay screen is unaffected)
+and the answer arrives as a Fin message that Announce reads aloud. "Ask Fin"
+(two-step) is the form that speaks a quick answer inline.
+
 ## If Siri asks "who do you want to send it to?"
 
 Siri routed the request to Messages. That happens with "Tell Fin …" or "Send a

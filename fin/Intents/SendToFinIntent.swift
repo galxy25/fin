@@ -162,6 +162,58 @@ enum FinVoiceIntentCore {
         }
         return head + "…"
     }
+
+    private static let replyPollCount = 4
+    private static let replyPollInterval: UInt64 = 2_000_000_000
+
+    /// Ask the agent and speak the answer — shared by `AskFinIntent` and the
+    /// in-app-search entry point (`SearchFinIntent`), so every one-breath and
+    /// two-step phrasing behaves identically. ~8s of polling (4 × 2s): long
+    /// enough that a warm agent's reply is spoken back, short enough that the
+    /// assistant session never appears to stall.
+    @MainActor
+    static func askAndSpeak(message: String) async -> IntentDialog {
+        switch prepare(message: message, container: FinSharedState.modelContainer) {
+        case .failure(let dialog):
+            return dialog
+        case .ready(let agentID, let agentName, let text):
+            // Snapshot the assistant lines already in the transcript so the poll
+            // below only reads back a GENUINELY new reply, not whatever Fin last
+            // said before this question.
+            let knownIDs = Set(
+                (await CloudAgentChannel.fetchTranscript(agentID: agentID, agentName: agentName))
+                    .filter { $0.kind == .assistantMessage }
+                    .map(\.id)
+            )
+            let (delivered, messageID) = await deliver(
+                agentID: agentID, agentName: agentName, text: text
+            )
+            guard delivered else {
+                return IntentDialog("Couldn't reach \(agentName) — check the app's cloud settings and try again.")
+            }
+            for _ in 0..<replyPollCount {
+                try? await Task.sleep(nanoseconds: replyPollInterval)
+                // The control-plane row answers first when there is one: its
+                // replyPreview is exactly the assistant's reply to THIS message,
+                // with no transcript diffing needed.
+                if let messageID,
+                   case .success(let row) = await ControlPlaneClient.messageState(messageID),
+                   row.state == "answered", let preview = row.replyPreview, !preview.isEmpty {
+                    return IntentDialog("\(spokenSummary(preview))")
+                }
+                let transcript = await CloudAgentChannel.fetchTranscript(
+                    agentID: agentID, agentName: agentName
+                )
+                if let reply = newReply(in: transcript, knownIDs: knownIDs) {
+                    // Interpolate (not `IntentDialog(_:)`) — IntentDialog builds from
+                    // a runtime String only via string interpolation, not a plain init.
+                    return IntentDialog("\(spokenSummary(reply))")
+                }
+            }
+            return IntentDialog("Sent to \(agentName). It'll reply in the app.")
+        }
+    }
+
 }
 
 /// "Talk to Fin" → dictated text lands in the cloud agent's inbox.
@@ -236,54 +288,9 @@ struct AskFinIntent: AppIntent {
         Summary("Ask Fin \(\.$message)")
     }
 
-    /// ~8s total (4 × 2s). Long enough that a warm agent's reply is spoken back;
-    /// short enough that the assistant session never appears to stall.
-    private static let replyPollCount = 4
-    private static let replyPollInterval: UInt64 = 2_000_000_000
-
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        switch FinVoiceIntentCore.prepare(message: message, container: FinSharedState.modelContainer) {
-        case .failure(let dialog):
-            return .result(dialog: dialog)
-        case .ready(let agentID, let agentName, let text):
-            // Snapshot the assistant lines already in the transcript so the poll
-            // below only reads back a GENUINELY new reply, not whatever Fin last
-            // said before this question.
-            let knownIDs = Set(
-                (await CloudAgentChannel.fetchTranscript(agentID: agentID, agentName: agentName))
-                    .filter { $0.kind == .assistantMessage }
-                    .map(\.id)
-            )
-            let (delivered, messageID) = await FinVoiceIntentCore.deliver(
-                agentID: agentID, agentName: agentName, text: text
-            )
-            guard delivered else {
-                return .result(dialog: IntentDialog(
-                    "Couldn't reach \(agentName) — check the app's cloud settings and try again."
-                ))
-            }
-            for _ in 0..<Self.replyPollCount {
-                try? await Task.sleep(nanoseconds: Self.replyPollInterval)
-                // The control-plane row answers first when there is one: its
-                // replyPreview is exactly the assistant's reply to THIS message,
-                // with no transcript diffing needed.
-                if let messageID,
-                   case .success(let row) = await ControlPlaneClient.messageState(messageID),
-                   row.state == "answered", let preview = row.replyPreview, !preview.isEmpty {
-                    return .result(dialog: IntentDialog("\(FinVoiceIntentCore.spokenSummary(preview))"))
-                }
-                let transcript = await CloudAgentChannel.fetchTranscript(
-                    agentID: agentID, agentName: agentName
-                )
-                if let reply = FinVoiceIntentCore.newReply(in: transcript, knownIDs: knownIDs) {
-                    // Interpolate (not `IntentDialog(_:)`) — IntentDialog builds from
-                    // a runtime String only via string interpolation, not a plain init.
-                    return .result(dialog: IntentDialog("\(FinVoiceIntentCore.spokenSummary(reply))"))
-                }
-            }
-            return .result(dialog: IntentDialog("Sent to \(agentName). It'll reply in the app."))
-        }
+        .result(dialog: await FinVoiceIntentCore.askAndSpeak(message: message))
     }
 }
 
