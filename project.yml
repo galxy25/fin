@@ -52,6 +52,15 @@ targets:
       # destination of this target; fin-tv deliberately has no such dependency.
       - target: fin-nse
         embed: true
+      # WidgetKit extension with the Live Activity "attention tile"
+      # (docs/CARPLAY-IMESSAGE-DESIGN.md §3.4): on iOS 26+ its `.small`
+      # supplemental family appears on the CarPlay Dashboard with no CarPlay
+      # entitlement. iOS only — ActivityKit's ActivityAttributes is unavailable
+      # on macOS and the framework does not exist on visionOS, so the embed is
+      # filtered to the iOS destination and the other two archives never see it.
+      - target: fin-widgets
+        embed: true
+        platformFilter: iOS
     info:
       path: Generated/Info.plist
       properties:
@@ -122,6 +131,11 @@ targets:
         # not declared — there is no Intents extension.
         NSUserActivityTypes:
           - INSendMessageIntent
+        # Live Activities (design §3.4): the attention tile the fin-widgets
+        # extension renders. Declared on the app, not the extension — this is
+        # the key ActivityKit checks before Activity.request and before a
+        # push-to-start token is ever minted. Harmless on macOS/visionOS.
+        NSSupportsLiveActivities: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin
@@ -182,6 +196,55 @@ targets:
         # Sandbox the Mac App Store requires of every embedded extension.
         CODE_SIGN_ENTITLEMENTS: fin/fin-nse.entitlements
         "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": fin/fin-nse-macOS.entitlements
+  fin-widgets:
+    # WidgetKit extension — docs/CARPLAY-IMESSAGE-DESIGN.md §3.4 (Phase 2, the
+    # "attention tile"). Renders the FinActivityAttributes Live Activity on the
+    # Lock Screen, in the Dynamic Island, and — through `.small` supplemental
+    # families on iOS 18+ — on the CarPlay Dashboard from iOS 26. iOS only (see
+    # the fin target's dependency note); embedded by that dependency. No app
+    # group: it reads nothing but ActivityKit state. fin-tv never gets it.
+    type: app-extension
+    supportedDestinations: [iOS]
+    # One generation above the app's 17.0: supplementalActivityFamilies /
+    # ActivityFamily.small are iOS 18 APIs and WidgetKit's builders cannot
+    # branch on availability (see FinWidgetBundle.swift). Extensions may
+    # carry a higher floor than their app; an iOS 17 device just has no tile.
+    # (Set as the build setting below: XcodeGen ignores a per-target
+    # deploymentTarget map on a supportedDestinations target.)
+    sources:
+      - path: fin-widgets
+      # The attributes/content-state contract and the tile's SwiftUI, shared
+      # verbatim with the app (which starts the activity and render-tests the
+      # views). Pure Foundation/SwiftUI/ActivityKit — they must never import
+      # anything from the app module.
+      - path: fin/LiveActivity
+        includes:
+          - FinActivityAttributes.swift
+          - FinActivityViews.swift
+    info:
+      path: Generated/Info-widgets.plist
+      properties:
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleDisplayName: "Fin"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        # Same export-compliance analysis as the app: nothing but system TLS,
+        # and this bundle makes no network calls at all.
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin.widgets
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: EC27UF79GL
+        # Version numbers must match the containing app's (App Store validation).
+        MARKETING_VERSION: "1.0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: "YES"
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        CODE_SIGN_ENTITLEMENTS: fin/fin-widgets.entitlements
   fin-tv:
     type: application
     platform: tvOS

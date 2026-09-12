@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- fin-widgets (iOS): the Live Activity extension needs NO entitlement of
+	     its own. Live Activities are declared by the containing app's
+	     NSSupportsLiveActivities (project.yml) and pushed through the app's
+	     aps-environment; the extension only renders ActivityKit state. No app
+	     group either — it reads nothing but the activity's own attributes and
+	     content state (docs/CARPLAY-IMESSAGE-DESIGN.md §3.6, "App Group only if
+	     the widget needs anything beyond ActivityKit state"). The file exists so
+	     the target signs with an explicit, reviewable, empty set. -->
+</dict>
+</plist>

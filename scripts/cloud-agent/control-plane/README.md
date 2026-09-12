@@ -389,6 +389,28 @@ alert out to every stored token.
   hosted the turn and already showed the reply. Not gated on the message's
   `source`: a reply to an app-typed question pushes the same way a voice one
   does.
+- **Live Activity tokens (Phase 2, the CarPlay Dashboard tile).** The same
+  `PUT /device-tokens` route takes an optional `"kind"`: absent or `"alert"`
+  is the APNs alert token above; `"activity-start"` is the device's ActivityKit
+  push-to-start token (iOS 17.2+, one per device); `"activity-update"` with
+  `"activityId"` is one running Live Activity's update token. All three live
+  in `fin-device-tokens` (the token is still the hash key); `_push_to_user`
+  sends alerts only to `alert` rows and `_push_live_activity` only to the two
+  activity kinds, so neither fan-out can burn the other's tokens. Activity
+  pushes go to the `dev.levischoen.fin.push-type.liveactivity` topic with
+  `apns-push-type: liveactivity` and an `aps` of `{timestamp, event:
+  start|update|end, content-state: {headline, detail, glyph, status, updatedAt},
+  attributes-type + attributes (start only), dismissal-date (end only), alert?}`
+  — the content-state keys are `FinActivityAttributes.ContentState` verbatim
+  (`updatedAt` is epoch seconds as a number). They are sent, best-effort and
+  never failing the caller, from `POST /sites/{id}/heartbeat` whenever the
+  user's folded presence (needs-input > working > idle, `FinPresence.fold`
+  mirrored in `_presence_fold`) changes — `update` to running activities,
+  `start` to devices with none, `end` (lingering 120 s) when Fin goes quiet —
+  and from an answered ack as a `"Fin answered"` update to running activities
+  only. A token APNs reports dead is deleted like an alert token; an `end`
+  also deletes the update tokens it reached, since an ended activity's token
+  is spent.
 - **Transport.** APNs' token-based HTTP/2 API. The stdlib has no HTTP/2 client
   and APNs speaks nothing else, so `deploy.sh` vendors `httpx[http2]` into the
   Lambda zip, plus `ecdsa` to sign the ES256 provider JWT — all pure python,

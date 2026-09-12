@@ -27,6 +27,14 @@ are credentials exactly like the bearer token: never logged, never echoed in a
 response body. Deployed without the APNS_* environment, `/notify` answers 503
 and every other route is unaffected.
 
+The same table holds the app's Live Activity tokens (Phase 2, the CarPlay
+Dashboard "attention tile"): `PUT /device-tokens` with `kind: activity-start`
+(a device's ActivityKit push-to-start token) or `activity-update` (+
+`activityId`, one running activity's token). `_push_live_activity` sends
+`apns-push-type: liveactivity` on the `.push-type.liveactivity` subtopic from
+site heartbeats (presence changes) and answered acks, best-effort; the alert
+fan-out never touches those rows and vice versa.
+
 The service-credential store under Secrets Manager `fin/service-creds/*` is
 WRITE-ONLY from here: no route ever returns a secret value, no handler logs one
 (the PUT body's credential fields must never reach a log line or an ApiError
@@ -1328,6 +1336,26 @@ APNS_REQUEST_TIMEOUT = 10
 # as opaque; the range keeps hex-ness without hardcoding today's size.
 DEVICE_TOKEN = re.compile(r"^[0-9a-f]{16,512}$")
 MAX_DEVICE_NAME_LENGTH = 80
+# What a fin-device-tokens row is FOR (design §3.4): the app's alert token, a
+# device's ActivityKit push-to-start token, or one running Live Activity's
+# update token. Rows without the attribute predate Phase 2 and are alerts.
+TOKEN_KINDS = ("alert", "activity-start", "activity-update")
+MAX_ACTIVITY_ID_LENGTH = 64
+# Live Activity pushes go to the app's `.push-type.liveactivity` subtopic with
+# push-type liveactivity; the `aps` carries the widget's ContentState under
+# `content-state` (FinActivityAttributes.swift is the schema; the Lambda
+# mirrors it in _activity_content_state) and, for a start, the attributes.
+APNS_LIVE_ACTIVITY_TOPIC_SUFFIX = ".push-type.liveactivity"
+ACTIVITY_ATTRIBUTES_TYPE = "FinActivityAttributes"
+ACTIVITY_EVENTS = ("start", "update", "end")
+# How long an ended tile lingers (dismissal-date) so "Fin is ready" is read
+# once and then leaves the car screen; matches the app's own quiet grace.
+ACTIVITY_END_LINGER_SECONDS = 120
+# A device sent a push-to-start is not sent another until this has passed or
+# its app registers the started activity's update token (which then takes
+# the updates). Repeated starts are repeated tiles.
+ACTIVITY_START_COOLDOWN_SECONDS = 10 * 60
+MAX_ACTIVITY_DETAIL_CHARS = 120
 MAX_NOTIFY_TITLE_LENGTH = 120
 MAX_NOTIFY_BODY_LENGTH = 800
 
@@ -1364,17 +1392,20 @@ def _apns_bearer(now_epoch=None):
     return token
 
 
-def _apns_push(client, environment, token, payload, bearer):
+def _apns_push(client, environment, token, payload, bearer, push_type="alert", topic=None):
     """One POST to one APNs environment. Returns (delivered, reason); the reason
-    is APNs' own enum string, or an HTTP status when the body carries none."""
+    is APNs' own enum string, or an HTTP status when the body carries none.
+    `push_type`/`topic` default to the alert push on the app's own topic; a
+    Live Activity push passes `liveactivity` and the `.push-type.liveactivity`
+    topic (APNs rejects the pair mismatched with TopicDisallowed)."""
     try:
         response = client.post(
             "{}/3/device/{}".format(APNS_HOSTS[environment], token),
             content=json.dumps(payload),
             headers={
                 "authorization": "bearer {}".format(bearer),
-                "apns-topic": APNS_TOPIC,
-                "apns-push-type": "alert",
+                "apns-topic": topic or APNS_TOPIC,
+                "apns-push-type": push_type,
                 "apns-priority": "10",
             },
         )
@@ -1420,11 +1451,28 @@ def put_device_token(event):
     if device_id8 and not DEVICE_ID8.match(device_id8):
         raise ApiError(400, "deviceId8 must be 8 lowercase hex characters")
 
+    # Phase 2 (design §3.4): Live Activity tokens share this table. `kind`
+    # tells the two fan-outs apart — `_push_to_user` only ever sends alerts to
+    # `alert` rows (an alert POSTed to an activity token is a TopicDisallowed
+    # or BadDeviceToken, and the dead-token sweep would then drop a live row),
+    # `_push_live_activity` only to the two activity kinds. Absent (every
+    # pre-Phase-2 build) reads as `alert`. `activityId` names the running
+    # activity an `activity-update` token belongs to.
+    kind = str(body.get("kind") or "alert").strip()
+    if kind not in TOKEN_KINDS:
+        raise ApiError(400, "kind must be one of {}".format(", ".join(TOKEN_KINDS)))
+    activity_id = body.get("activityId")
+    if activity_id is not None and not isinstance(activity_id, str):
+        raise ApiError(400, "activityId must be a string")
+    activity_id = (activity_id or "").strip()[:MAX_ACTIVITY_ID_LENGTH]
+    if activity_id and kind != "activity-update":
+        raise ApiError(400, "activityId only accompanies an activity-update token")
+
     updated_at = _iso(_now())
     names = {"#platform": "platform", "#updated": "updatedAt", "#name": "deviceName",
-             "#user": "userId", "#device": "deviceId8"}
-    values = {":platform": platform, ":updated": updated_at, ":user": event["_userId"]}
-    expression = "SET #platform = :platform, #updated = :updated, #user = :user"
+             "#user": "userId", "#device": "deviceId8", "#kind": "kind", "#activity": "activityId"}
+    values = {":platform": platform, ":updated": updated_at, ":user": event["_userId"], ":kind": kind}
+    expression = "SET #platform = :platform, #updated = :updated, #user = :user, #kind = :kind"
     if device_id8:
         expression += ", #device = :device"
         values[":device"] = device_id8
@@ -1434,6 +1482,11 @@ def put_device_token(event):
         values[":name"] = device_name
     else:
         removes.append("#name")
+    if activity_id:
+        expression += ", #activity = :activity"
+        values[":activity"] = activity_id
+    else:
+        removes.append("#activity")
     if removes:
         expression += " REMOVE " + ", ".join(removes)
     DEVICE_TOKENS_TABLE.update_item(
@@ -1444,10 +1497,11 @@ def put_device_token(event):
     )
     # The suffix identifies a device across log lines; a token alone moves no
     # pushes without the auth key, but the whole thing still stays out of logs.
-    LOG.info("registered device token …%s (%s)", token[-8:], platform)
+    LOG.info("registered %s token …%s (%s)", kind, token[-8:], platform)
     return _response(200, {
         "platform": platform,
         "deviceName": device_name or None,
+        "kind": kind,
         "updatedAt": updated_at,
     })
 
@@ -1529,11 +1583,9 @@ def _push_to_user(user_id, title, body, fin=None, aps_extra=None, exclude_device
     # Was unscoped — every registered device token, account-wide — a real
     # cross-tenant push leak once there is more than one user. Every device
     # token is stamped with its owner's userId by put_device_token now.
-    rows = _scan(
-        table=DEVICE_TOKENS_TABLE,
-        FilterExpression="userId = :user",
-        ExpressionAttributeValues={":user": user_id},
-    )
+    # Alert rows only: Live Activity tokens (Phase 2) share the table under
+    # their own `kind` and are reached by _push_live_activity instead.
+    rows = [row for row in _user_token_rows(user_id) if _token_kind(row) == "alert"]
     if not rows:
         return {
             "delivered": 0, "failed": 0, "removed": 0, "reasons": [],
@@ -1547,6 +1599,32 @@ def _push_to_user(user_id, title, body, fin=None, aps_extra=None, exclude_device
                 "note": "the only registered device is the one that answered; nothing to push",
             }
 
+    httpx, bearer = _apns_session()
+    payload = _push_payload(title, body, fin=fin, aps_extra=aps_extra)
+    with httpx.Client(http2=True, timeout=APNS_REQUEST_TIMEOUT) as client:
+        result = _apns_fan_out(client, bearer, rows, payload)
+    LOG.info("push: delivered %d, failed %d, removed %d", result["delivered"], result["failed"], result["removed"])
+    return {key: result[key] for key in ("delivered", "failed", "removed", "reasons")}
+
+
+def _user_token_rows(user_id):
+    # Was unscoped — every registered device token, account-wide — a real
+    # cross-tenant push leak once there is more than one user. Every device
+    # token is stamped with its owner's userId by put_device_token now.
+    return _scan(
+        table=DEVICE_TOKENS_TABLE,
+        FilterExpression="userId = :user",
+        ExpressionAttributeValues={":user": user_id},
+    )
+
+
+def _token_kind(row):
+    return str(row.get("kind") or "alert")
+
+
+def _apns_session():
+    """(httpx module, provider JWT) or an ApiError the route can answer with:
+    500 when the vendored dependencies are missing or the key can't sign."""
     try:
         import httpx  # vendored by deploy.sh
     except ImportError:
@@ -1558,46 +1636,256 @@ def _push_to_user(user_id, title, body, fin=None, aps_extra=None, exclude_device
     except Exception:  # noqa: BLE001 - a malformed key must not leak through the error
         LOG.exception("APNs provider JWT signing failed")
         raise ApiError(500, "APNs provider token signing failed; check the deployed APNS_* environment")
+    return httpx, bearer
 
-    payload = _push_payload(title, body, fin=fin, aps_extra=aps_extra)
 
-    delivered, removed, failures = 0, 0, []
-    with httpx.Client(http2=True, timeout=APNS_REQUEST_TIMEOUT) as client:
-        for row in rows:
-            token = str(row.get("token") or "")
-            if not token:
-                continue
-            first = "sandbox" if row.get("environment") == "sandbox" else "production"
-            second = "production" if first == "sandbox" else "sandbox"
-            environment = first
-            ok, reason = _apns_push(client, first, token, payload, bearer)
-            if not ok and reason == APNS_WRONG_ENVIRONMENT:
-                environment = second
-                ok, reason = _apns_push(client, second, token, payload, bearer)
-            if ok:
-                delivered += 1
-                if environment != row.get("environment"):
-                    DEVICE_TOKENS_TABLE.update_item(
-                        Key={"token": token},
-                        UpdateExpression="SET #env = :env",
-                        ExpressionAttributeNames={"#env": "environment"},
-                        ExpressionAttributeValues={":env": environment},
-                    )
-            elif reason in APNS_DEAD_REASONS or reason == APNS_WRONG_ENVIRONMENT:
-                # Dead in both environments, or gone for good: the row would only
-                # produce failures from here on.
-                DEVICE_TOKENS_TABLE.delete_item(Key={"token": token})
-                removed += 1
-            else:
-                failures.append(reason)
-
-    LOG.info("push: delivered %d, failed %d, removed %d", delivered, len(failures), removed)
+def _apns_fan_out(client, bearer, rows, payload, push_type="alert", topic=None):
+    """One payload to every token row, with the environment discovery and the
+    dead-token sweep both fan-outs share. Returns {"delivered", "failed",
+    "removed", "reasons", "dead"}: `dead` lists the tokens whose rows were
+    deleted, so a caller can tell which devices no longer have a live
+    activity. An alert is sent with `_apns_push`'s five positional arguments
+    exactly as before Phase 2, so a test stub with that arity keeps working."""
+    extra = () if push_type == "alert" else (push_type, topic)
+    delivered, removed, failures, dead = 0, 0, [], []
+    for row in rows:
+        token = str(row.get("token") or "")
+        if not token:
+            continue
+        first = "sandbox" if row.get("environment") == "sandbox" else "production"
+        second = "production" if first == "sandbox" else "sandbox"
+        environment = first
+        ok, reason = _apns_push(client, first, token, payload, bearer, *extra)
+        if not ok and reason == APNS_WRONG_ENVIRONMENT:
+            environment = second
+            ok, reason = _apns_push(client, second, token, payload, bearer, *extra)
+        if ok:
+            delivered += 1
+            if environment != row.get("environment"):
+                DEVICE_TOKENS_TABLE.update_item(
+                    Key={"token": token},
+                    UpdateExpression="SET #env = :env",
+                    ExpressionAttributeNames={"#env": "environment"},
+                    ExpressionAttributeValues={":env": environment},
+                )
+        elif reason in APNS_DEAD_REASONS or reason == APNS_WRONG_ENVIRONMENT:
+            # Dead in both environments, or gone for good: the row would only
+            # produce failures from here on.
+            DEVICE_TOKENS_TABLE.delete_item(Key={"token": token})
+            removed += 1
+            dead.append(token)
+        else:
+            failures.append(reason)
     return {
         "delivered": delivered,
         "failed": len(failures),
         "removed": removed,
         "reasons": sorted(set(failures)),
+        "dead": dead,
     }
+
+
+# --- Live Activity pushes (design §3.4, Phase 2) ------------------------------
+#
+# The attention tile is a Live Activity the app starts in the foreground and
+# the control plane keeps honest afterwards: a site heartbeat that changes
+# Fin's folded presence (idle → working → needs-input → idle) pushes the new
+# content state to every running activity's update token, starts one through
+# the device's push-to-start token when none is running, and ends it when Fin
+# goes quiet. An answered ack pushes "Fin answered" the same way. Every call
+# is best-effort: nothing here may fail a heartbeat or an ack.
+
+# FinPresence.fold / headline / detail / glyph (fin/Agent/SiteDirectory.swift),
+# mirrored so the car screen, the console header, and the servers list say the
+# same words. Update both together.
+PRESENCE_TEXT = {
+    "needsInput": ("Fin needs your input", "exclamationmark.bubble"),
+    "working": ("Fin is working", "gearshape.2"),
+    "idle": ("Fin is ready", "checkmark.circle"),
+    "asleep": ("Fin is asleep — no computer is reachable", "moon.zzz"),
+}
+
+
+def _presence_fold(sites, now=None):
+    """(presence, siteName) over a user's site rows — the Lambda's copy of
+    `FinPresence.fold`: the first live needs-input site wins, then the first
+    live working one, else idle if anything is live, else asleep."""
+    now = _now() if now is None else now
+    live = [s for s in sites if _site_is_live(s, now)]
+    for wanted in ("needs-input", "working"):
+        for site in live:
+            if site.get("state") == wanted:
+                return ("needsInput" if wanted == "needs-input" else "working"), str(site.get("displayName") or "")
+    return ("idle" if live else "asleep"), ""
+
+
+def _activity_content_state(presence, site_name="", now=None):
+    """The widget's ContentState for a folded presence. `asleep` is shown as
+    the idle status with its own headline — the tile has no fifth colour."""
+    now = _now() if now is None else now
+    headline, glyph = PRESENCE_TEXT[presence]
+    return {
+        "headline": headline,
+        "detail": "on {}".format(site_name) if site_name and presence in ("needsInput", "working") else None,
+        "glyph": glyph,
+        "status": "idle" if presence == "asleep" else presence,
+        "updatedAt": now.timestamp(),
+    }
+
+
+def _answered_content_state(preview, now=None):
+    now = _now() if now is None else now
+    return {
+        "headline": "Fin answered",
+        "detail": str(preview or "").strip()[:MAX_ACTIVITY_DETAIL_CHARS] or None,
+        "glyph": "checkmark.bubble",
+        "status": "answered",
+        "updatedAt": now.timestamp(),
+    }
+
+
+def _live_activity_payload(event, content_state, attributes=None, alert=None, now=None):
+    """The APNs JSON for one Live Activity push (Apple: "Updating and ending
+    your Live Activity with ActivityKit push notifications" / "Starting ... with
+    push"). `timestamp` is what ActivityKit orders updates by; a start also
+    carries the attributes type and values, an end a dismissal date."""
+    now = _now() if now is None else now
+    aps = {
+        "timestamp": int(now.timestamp()),
+        "event": event,
+        "content-state": dict(content_state),
+    }
+    if event == "start":
+        aps["attributes-type"] = ACTIVITY_ATTRIBUTES_TYPE
+        aps["attributes"] = dict(attributes or {"agentName": "Fin", "agentID": ""})
+    if event == "end":
+        aps["dismissal-date"] = int(now.timestamp()) + ACTIVITY_END_LINGER_SECONDS
+    if alert:
+        aps["alert"] = dict(alert)
+    return {"aps": aps}
+
+
+def _push_live_activity(user_id, content_state, event="update", attributes=None, alert=None, now=None,
+                        start_if_missing=True):
+    """Drive the user's attention tiles. `update`/`end` go to every
+    `activity-update` token; a device whose update tokens are all dead (or
+    that has none) gets a `start` through its `activity-start` token instead —
+    unless the event is `end`, which has nothing to start, or the caller
+    passes `start_if_missing=False` (a reply is worth showing on a tile that
+    exists, not worth conjuring one for). `start` goes to every push-to-start
+    token. Returns a summary dict and NEVER raises: the heartbeat / ack that
+    called it has already committed."""
+    summary = {"delivered": 0, "failed": 0, "removed": 0, "started": 0, "reasons": []}
+    if event not in ACTIVITY_EVENTS:
+        summary["note"] = "unknown event"
+        return summary
+    try:
+        if not _apns_configured():
+            summary["note"] = "APNs not configured"
+            return summary
+        rows = _user_token_rows(user_id)
+        update_rows = [r for r in rows if _token_kind(r) == "activity-update"]
+        start_rows = [r for r in rows if _token_kind(r) == "activity-start"]
+        if not update_rows and not start_rows:
+            summary["note"] = "no live activity tokens registered"
+            return summary
+        now = _now() if now is None else now
+        topic = APNS_TOPIC + APNS_LIVE_ACTIVITY_TOPIC_SUFFIX
+        httpx, bearer = _apns_session()
+        with httpx.Client(http2=True, timeout=APNS_REQUEST_TIMEOUT) as client:
+            needs_start = []
+            if event in ("update", "end") and update_rows:
+                payload = _live_activity_payload(event, content_state, alert=alert, now=now)
+                result = _apns_fan_out(client, bearer, update_rows, payload, "liveactivity", topic)
+                for key in ("delivered", "failed", "removed"):
+                    summary[key] += result[key]
+                summary["reasons"] = sorted(set(summary["reasons"]) | set(result["reasons"]))
+                dead = set(result["dead"])
+                reached = {r.get("deviceId8") for r in update_rows if r.get("token") not in dead}
+                needs_start = [r for r in start_rows if r.get("deviceId8") not in reached]
+                if event == "end":
+                    # The activity is over on every device that got the push;
+                    # its update token can never be used again.
+                    for row in update_rows:
+                        if row.get("token") not in dead:
+                            DEVICE_TOKENS_TABLE.delete_item(Key={"token": row["token"]})
+            elif event in ("update", "start"):
+                needs_start = start_rows
+            if event == "update" and not start_if_missing:
+                needs_start = []
+            # A start already sent to a device whose app never registered the
+            # new activity's update token (ActivityKit wakes the app for that;
+            # it can fail) must not be repeated on every transition — each
+            # repeat is one more tile on that device. The cooldown lives on
+            # the start-token row and is cleared by a later successful start.
+            needs_start = [r for r in needs_start if not _recently_started(r, now)]
+            if event != "end" and needs_start:
+                payload = _live_activity_payload("start", content_state, attributes=attributes, alert=alert, now=now)
+                result = _apns_fan_out(client, bearer, needs_start, payload, "liveactivity", topic)
+                for row in needs_start:
+                    if row.get("token") not in result["dead"]:
+                        DEVICE_TOKENS_TABLE.update_item(
+                            Key={"token": row["token"]},
+                            UpdateExpression="SET #started = :started",
+                            ExpressionAttributeNames={"#started": "startedAt"},
+                            ExpressionAttributeValues={":started": _iso(now)},
+                        )
+                summary["started"] = result["delivered"]
+                summary["failed"] += result["failed"]
+                summary["removed"] += result["removed"]
+                summary["reasons"] = sorted(set(summary["reasons"]) | set(result["reasons"]))
+        LOG.info("live activity %s: delivered %d, started %d, failed %d, removed %d",
+                 event, summary["delivered"], summary["started"], summary["failed"], summary["removed"])
+    except ApiError as exc:
+        summary["note"] = exc.message
+        LOG.warning("live activity %s skipped: %s", event, exc.message)
+    except Exception as exc:  # noqa: BLE001 - never fail the caller
+        summary["note"] = "failed"
+        LOG.warning("live activity %s failed: %s", event, _scrub(exc))
+    return summary
+
+
+def _recently_started(row, now):
+    started = _parse_iso(row.get("startedAt"))
+    return started is not None and now - started < timedelta(seconds=ACTIVITY_START_COOLDOWN_SECONDS)
+
+
+def _push_presence_change(before, after, now):
+    """Called from site_heartbeat with the site row before and after the beat.
+    Pushes the tile only when the USER's folded presence changed — one site
+    flipping working → idle while another still works is not news. The fold
+    is computed over the user's live sites with this site swapped for its
+    old and new rows, so the comparison needs one scan, not two. Never
+    raises: the scan itself is inside the guard, not just the push."""
+    if before.get("state") == after.get("state"):
+        return None
+    try:
+        return _presence_change_push(before, after, now)
+    except Exception as exc:  # noqa: BLE001 - a tile must never fail a heartbeat
+        LOG.warning("live activity presence push failed: %s", _scrub(exc))
+        return None
+
+
+def _presence_change_push(before, after, now):
+    user_id = after["userId"]
+    others = [
+        s for s in _scan(
+            table=SITES_TABLE,
+            FilterExpression="userId = :user",
+            ExpressionAttributeValues={":user": user_id},
+        )
+        if s.get("siteId") != after.get("siteId")
+    ]
+    was, _ = _presence_fold(others + [before], now)
+    presence, site_name = _presence_fold(others + [after], now)
+    if was == presence:
+        return None
+    state = _activity_content_state(presence, site_name, now)
+    if presence in ("needsInput", "working"):
+        alert = {"title": state["headline"], "body": state["detail"] or ""} if presence == "needsInput" else None
+        attributes = {"agentName": str(after.get("agent") or "Fin"), "agentID": ""}
+        return _push_live_activity(user_id, state, "update", attributes=attributes, alert=alert, now=now)
+    return _push_live_activity(user_id, state, "end", now=now)
 
 
 def _mark_message_pushed(user_id, message_id, now=None):
@@ -3290,6 +3578,11 @@ def site_heartbeat(event, site_id):
             raise ApiError(409, "site row changed underneath this heartbeat; retry")
         raise
 
+    # The attention tile (design §3.4): a state change that moves the user's
+    # folded presence pushes the Live Activity. Best-effort by construction
+    # (_push_live_activity never raises) — the beat has already committed.
+    _push_presence_change(site, updated, now)
+
     response = {
         "leaseUntil": _iso(lease_until),
         "heartbeatSeconds": SITE_HEARTBEAT_SECONDS,
@@ -3832,6 +4125,12 @@ def ack_message(event, message_id):
     pushed = False
     if ":preview" in values:
         pushed = _push_answered_reply(row, message_id, values[":preview"], body, now)
+        # The attention tile (design §3.4) shows the reply too — no dedupe
+        # against the alert push: an activity update is not a notification.
+        _push_live_activity(
+            row["userId"], _answered_content_state(values[":preview"], now), "update", now=now,
+            start_if_missing=False,
+        )
     _thread_event(row["userId"], thread_id, "message.answered", actor, {
         "messageId": message_id,
         "siteId8": site.get("siteId8"),

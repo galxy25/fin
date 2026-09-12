@@ -109,8 +109,16 @@ struct RootView: View {
                 // background cross the quiet gap into "finished" — sweep them, and
                 // nudge any queued feedback whose backoff has elapsed.
                 FeedbackService.shared.sweepTrajectories(context: modelContext)
+                #if os(iOS)
+                // The attention tile (design §3.4): sample presence while in
+                // front; the Live Activity itself outlives the foreground.
+                if #available(iOS 16.2, *) { FinLiveActivityController.shared.appDidBecomeActive() }
+                #endif
             } else if newPhase == .background {
                 sessionManager.recordLifecycleEvent("[app] backgrounded")
+                #if os(iOS)
+                if #available(iOS 16.2, *) { FinLiveActivityController.shared.appDidEnterBackground() }
+                #endif
             }
         }
         .task {
@@ -118,6 +126,11 @@ struct RootView: View {
             // would leave the watchdog stopped until the first background/foreground
             // round-trip.
             sessionManager.isAppActive = scenePhase == .active
+            #if os(iOS)
+            if scenePhase == .active, #available(iOS 16.2, *) {
+                FinLiveActivityController.shared.appDidBecomeActive()
+            }
+            #endif
             // Feedback give-up/discard lines join the agent trail (and iCloud
             // mirror) through the same audit channel other services use.
             FeedbackService.shared.audit = { [weak sessionManager] line in
