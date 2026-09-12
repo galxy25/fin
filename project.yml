@@ -242,7 +242,7 @@ targets:
     # through the same XCUITest path rather than a second, unproven mechanism.
     # Scope any run with -only-testing: — the macOS window tests are not
     # meaningful on iOS.
-    supportedDestinations: [macOS, iOS]
+    supportedDestinations: [macOS, iOS, visionOS]
     sources:
       - path: finUITests
     dependencies:

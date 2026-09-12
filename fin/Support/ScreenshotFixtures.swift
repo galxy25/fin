@@ -19,6 +19,41 @@ enum ScreenshotFixtures {
         ProcessInfo.processInfo.environment["FIN_SCREENSHOT_MODE"] == "1"
     }
 
+    /// CAUTION, and the reason `cleanup` exists: on iOS/visionOS a capture runs
+    /// against a throwaway simulator container, but on macOS it runs against the
+    /// REAL user container — and `Server`/`Agent` live in the CloudKit-synced
+    /// model configuration, so fixtures seeded on a Mac sync to every other
+    /// device on that Apple Account. Always finish a macOS capture session by
+    /// relaunching once with `FIN_SCREENSHOT_CLEANUP=1`.
+    static var isCleanupRequested: Bool {
+        ProcessInfo.processInfo.environment["FIN_SCREENSHOT_CLEANUP"] == "1"
+    }
+
+    private static let serverNames = ["Studio iMac", "Build Box", "Cloud Worker"]
+    private static let agentNames = ["Nimbus", "Relay"]
+    private static let documentNames = ["Deploy Runbook.md", "Incident Notes.md", "Scratch.md"]
+
+    /// Deletes exactly the rows `seedIfNeeded` inserts, matched by their fixture
+    /// names. Deliberately does NOT touch "Fin": a real user's own agent is named
+    /// that, and deleting it because a capture once seeded one would destroy real
+    /// data — the stray duplicate is the lesser harm and is obvious in the UI.
+    static func cleanup(_ context: ModelContext) {
+        guard isCleanupRequested else { return }
+        for server in (try? context.fetch(FetchDescriptor<Server>())) ?? []
+        where serverNames.contains(server.name) {
+            context.delete(server)
+        }
+        for agent in (try? context.fetch(FetchDescriptor<Agent>())) ?? []
+        where agentNames.contains(agent.name) {
+            context.delete(agent)
+        }
+        for document in (try? context.fetch(FetchDescriptor<MarkdownDocument>())) ?? []
+        where documentNames.contains(document.name) || document.name == "ui-test-fixture.md" {
+            context.delete(document)
+        }
+        try? context.save()
+    }
+
     /// Hosts are RFC 5737 / RFC 3849 documentation addresses and example.com
     /// subdomains on purpose: a screenshot is a public artifact, and a real
     /// reachable host or tailnet name in one is an information leak that outlives

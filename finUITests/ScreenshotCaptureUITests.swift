@@ -30,6 +30,21 @@ final class ScreenshotCaptureUITests: XCTestCase {
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+        #if os(macOS)
+        // On a Mac that app screenshot is the whole desktop — wallpaper, desktop
+        // icons, other apps' windows — so it can't ship as-is. Record every
+        // window's frame (points; multiply by the backing scale for pixels)
+        // alongside it so the capture can be cropped to the app deterministically
+        // instead of by eyeballing coordinates.
+        let frames = (0..<app.windows.count).map { index -> String in
+            let f = app.windows.element(boundBy: index).frame
+            return "\(index):\(f.origin.x),\(f.origin.y),\(f.size.width),\(f.size.height)"
+        }
+        let dump = XCTAttachment(string: frames.joined(separator: "\n"))
+        dump.name = "\(name)-frames"
+        dump.lifetime = .keepAlways
+        add(dump)
+        #endif
     }
 
     private func element(_ app: XCUIApplication, id: String) -> XCUIElement {
@@ -101,6 +116,66 @@ final class ScreenshotCaptureUITests: XCTestCase {
             }
         }
     }
+
+    #if os(macOS)
+    /// macOS captures the WINDOWS, never `app.screenshot()`: on a Mac the latter
+    /// is the whole desktop — wallpaper, desktop icons, and whatever other apps
+    /// happen to be on screen — which is both unusable as a product-page asset
+    /// and a privacy leak waiting to happen. Each window is attached on its own
+    /// so a capture can be composed deliberately afterwards (a single window, or
+    /// two side by side for the multi-window story).
+    func testCaptureMacWindows() throws {
+        let app = app()
+
+        // Same defensive entry as AgentHubWindowUITests.openAgentHubWindow: an
+        // auto-reconnected terminal session puts the tabs behind the control
+        // strip's server-rack button rather than showing them directly.
+        var terminalTab = element(app, id: "homeMode_Terminal")
+        if !terminalTab.waitForExistence(timeout: 10) {
+            let servers = element(app, id: "controlStrip_servers")
+            XCTAssertTrue(servers.waitForExistence(timeout: 10), "no way into the tabs")
+            servers.tapCenter()
+            terminalTab = element(app, id: "homeMode_Terminal")
+        }
+        XCTAssertTrue(terminalTab.waitForExistence(timeout: 15))
+        sleep(1)
+        shootWindow(app.windows.firstMatch, "mac-01-servers")
+
+        // Re-query every element after a capture: the screenshot round-trip can
+        // outlive the cached snapshot, and a stale handle reports "not found"
+        // for a control that is plainly on screen.
+        let agentsTab = element(app, id: "homeMode_Agents")
+        XCTAssertTrue(agentsTab.waitForExistence(timeout: 15), "Agents tab never appeared")
+        agentsTab.tapCenter()
+        var agentRow = firstStartingWith(app, "agentRow_")
+        XCTAssertTrue(agentRow.waitForExistence(timeout: 15))
+        shootWindow(app.windows.firstMatch, "mac-02-agents")
+
+        agentRow = firstStartingWith(app, "agentRow_")
+        XCTAssertTrue(agentRow.waitForExistence(timeout: 10))
+        agentRow.tapCenter()
+        let hub = app.windows.containing(.any, identifier: "agentSettingsForm").firstMatch
+        XCTAssertTrue(hub.waitForExistence(timeout: 15), "agent hub window never opened")
+        sleep(2)
+        shootWindow(hub, "mac-03-agent-hub")
+
+        // Sidebar hop: logs & traces is the drill-down story.
+        let logsRow = element(app, id: "hubSidebarRow_logs")
+        if logsRow.waitForExistence(timeout: 5) {
+            logsRow.tapCenter()
+            sleep(2)
+            shootWindow(hub, "mac-04-agent-logs")
+        }
+    }
+
+    private func shootWindow(_ window: XCUIElement, _ name: String) {
+        guard window.exists else { return }
+        let attachment = XCTAttachment(screenshot: window.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+    #endif
 
     /// A short, focused drive to the paywall, for screen-recording it as the
     /// Guideline 3.1.2(c) evidence App Review asked for ("reply to this message

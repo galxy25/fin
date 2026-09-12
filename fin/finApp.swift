@@ -132,6 +132,7 @@ struct FinApp: App {
         // every real launch. See ScreenshotFixtures for why empty-state captures
         // were worth fixing.
         ScreenshotFixtures.seedIfNeeded(context)
+        ScreenshotFixtures.cleanup(context)
 
         manager.resolveCredentials = { server in
             guard let keyID = server.keyID else { return nil }

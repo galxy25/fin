@@ -25,6 +25,15 @@ import XCTest
 func launchFinApp(configure: (XCUIApplication) -> Void = { _ in }) -> XCUIApplication {
     let app = XCUIApplication()
     app.launchEnvironment["FIN_UI_TESTING"] = "1"
+    #if os(macOS)
+    // macOS restores whatever windows were open when the app last quit. For a
+    // UI test that means a previous run's agent-hub window reopens, comes up
+    // frontmost, and swallows the clicks meant for the main window's tabs —
+    // observed directly: four consecutive screenshot captures all returned the
+    // same restored hub window, and a navigation test failed to find the Agents
+    // tab that was plainly on screen. Every run should start from one window.
+    app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
+    #endif
     configure(app)
     app.launch()
     return app
