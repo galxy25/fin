@@ -1263,12 +1263,33 @@ final class Daemon {
         // recordTurnInEpisodicMemory — only a genuinely submitted message does there).
         var pendingUserMessageForDigest: String? = config.task
 
-        log("submitting task: \(config.task)")
-        isTurnInFlight = true
-        var outcome = await engine.submit(config.task)
-        isTurnInFlight = false
         /// The control-plane message a turn is answering, for the `answered` ack.
         var inFlightSiteMessageID: String?
+        var outcome: AgentTurnOutcome
+        if let held = await siteClient?.nextHeldMessage() {
+            // A message claimed before a restart (or during the connect) beats the
+            // launch task: the user is waiting on it, and "say hello and wait" is not.
+            let text = held.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            log("applying held message \(held.id) before the launch task: \(text)")
+            transcript?.pendingInReplyTo = held.id
+            pendingUserMessageForDigest = text
+            inFlightSiteMessageID = held.id
+            isTurnInFlight = true
+            async let ack: Void = siteClient?.markApplied(held.id, runID: transcript?.runID.uuidString) ?? ()
+            outcome = await engine.submit(text)
+            await ack
+            isTurnInFlight = false
+        } else {
+            log("submitting task: \(config.task)")
+            isTurnInFlight = true
+            // Cancellable like a heartbeat: a message claimed during the launch turn
+            // preempts it the same way.
+            let launchTask = Task { await engine.submit(config.task) }
+            heartbeatTurnTask = launchTask
+            outcome = await launchTask.value
+            heartbeatTurnTask = nil
+            isTurnInFlight = false
+        }
 
         while !shuttingDown {
             switch outcome {
