@@ -166,9 +166,6 @@ struct AgentHubWindowView: View {
         }
     }
 }
-#endif
-
-
 /// A secondary window whose subject is gone: wait briefly for sync, then open
 /// the main window and dismiss this one. A button does the same immediately.
 struct OrphanedWindowView: View {
@@ -200,3 +197,5 @@ struct OrphanedWindowView: View {
         dismissWindow()
     }
 }
+
+#endif
