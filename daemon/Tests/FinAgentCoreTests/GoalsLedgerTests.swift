@@ -383,3 +383,10 @@ final class AskTheUserGoalGuardTests: XCTestCase {
         XCTAssertFalse(GoalsTick.isAskTheUserForGoals(title: "Ask the user which branch to deploy", nextAction: "request_input", why: "two candidates"))
     }
 }
+
+final class AskTheUserGoalGuardTitleTests: XCTestCase {
+    func testTheThirdLiveVariantIsRefusedByTitleAlone() {
+        XCTAssertTrue(GoalsTick.isAskTheUserForGoals(title: "Wait for Task", nextAction: nil, why: nil))
+        XCTAssertTrue(GoalsTick.isAskTheUserForGoals(title: "Initialize Mission", nextAction: "anything", why: nil))
+    }
+}

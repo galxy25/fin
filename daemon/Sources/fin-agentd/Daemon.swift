@@ -582,6 +582,20 @@ final class Daemon {
         return prompt
     }
 
+    /// The prompt a user's message is submitted as. The model sees this; the audit
+    /// trail and cloud transcript record the user's exact words (`displayText`).
+    /// Why: under the mission-tick rules a bare message was read as an ingest-only
+    /// tick — goal_upsert, then "I am ready, what are the goals?" (live, three
+    /// times on 2026-09-12). Said plainly, up front, every time.
+    nonisolated static func userTurnPrompt(_ text: String, source: String?) -> String {
+        let via = source == "voice" ? "by voice" : (source.map { "via \($0)" } ?? "")
+        return "The user just sent you this message\(via.isEmpty ? "" : " " + via). Do exactly what it "
+            + "asks, NOW, in this turn, with your tools (read_session to find the pane, send_session to "
+            + "talk to another agent's pane, send_input for your own shell). Then reply with what you "
+            + "did and what you saw. Do not create or update ledger goals before acting, and never "
+            + "answer by asking what the mission is.\n\nMessage from the user:\n\(text)"
+    }
+
     /// "Terminal panes right now" for the prompt, from the file `siteCapabilities`
     /// writes. Nil (byte-identical prompt) when there is no scan yet. Pure and
     /// file-based so both the system prompt and the heartbeat prompt can carry it.
@@ -1342,7 +1356,7 @@ final class Daemon {
             inFlightSiteMessageID = held.id
             isTurnInFlight = true
             async let ack: Void = siteClient?.markApplied(held.id, runID: transcript?.runID.uuidString) ?? ()
-            outcome = await engine.submit(text)
+            outcome = await engine.submit(Self.userTurnPrompt(text, source: held.source), displayText: text)
             await ack
             isTurnInFlight = false
         } else {
@@ -1514,7 +1528,7 @@ final class Daemon {
                 // the window between submit and ack is the one at-least-once window
                 // the design admits, and the shorter it is the rarer a double apply.
                 async let ack: Void = siteClient?.markApplied(message.id, runID: transcript?.runID.uuidString) ?? ()
-                outcome = await engine.submit(text)
+                outcome = await engine.submit(Self.userTurnPrompt(text, source: message.source), displayText: text)
                 await ack
                 isTurnInFlight = false
                 inFlightDirectiveID = nil
@@ -1538,7 +1552,7 @@ final class Daemon {
                 inFlightDirectiveID = directive.id
                 pendingUserMessageForDigest = text
                 isTurnInFlight = true
-                outcome = await engine.submit(text)
+                outcome = await engine.submit(Self.userTurnPrompt(text, source: nil), displayText: text)
                 isTurnInFlight = false
                 await inboxLockClient?.release()
                 continue

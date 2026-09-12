@@ -313,7 +313,11 @@ public final class AgentTurnEngine {
         transcript.replaceSystemPrompt(systemPrompt)
     }
 
-    public func submit(_ text: String) async -> AgentTurnOutcome {
+    /// `displayText`: what the audit trail and the cloud transcript record for this
+    /// turn, when it differs from what the model is sent. The daemon wraps a user's
+    /// message in an act-now preamble the model needs; the console, the pending-row
+    /// handoff and the mirror match all want the user's exact words.
+    public func submit(_ text: String, displayText: String? = nil) async -> AgentTurnOutcome {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .failed("Empty message.") }
         guard !isBusy else { return .failed("The engine is already running a turn.") }
@@ -325,7 +329,7 @@ public final class AgentTurnEngine {
         currentRetryCount = 0
 
         transcript.append(AgentMessage(role: .user, text: trimmed))
-        record("userMessage", trimmed)
+        record("userMessage", displayText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? trimmed)
         // Turn-visibility signal (item 6 of the message-delivery-reliability work): the
         // INSTANT the user message is recorded, before any tool call or LLM round trip —
         // the whole point is the app/supervisor sees "received" within seconds, not only

@@ -241,6 +241,11 @@ public enum GoalsTick {
             || haystack.contains("request the user") || haystack.contains("provide the current mission")
             || haystack.contains("what the user wants") || haystack.contains("await the user")
             || haystack.contains("wait for the user")
+        // Titles that ARE the pattern, whatever the next action says.
+        let hijackerTitle = ["initialize mission", "mission setup", "mission start", "mission init",
+                             "wait for task", "wait for instructions", "await instructions", "await task",
+                             "await user", "wait for user"].contains { title.lowercased().contains($0) }
+        if hijackerTitle { return true }
         let aboutGoals = haystack.contains("mission goal") || haystack.contains("mission goals")
             || haystack.contains("specific task") || haystack.contains("initialize mission")
             || haystack.contains("mission setup") || haystack.contains("what to do")
