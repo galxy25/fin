@@ -78,7 +78,12 @@ struct AgentHubWindowView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(minWidth: 760, minHeight: 480)
-            .accessibilityIdentifier("agentHubWindow")
+            // No identifier on this HStack itself: it has no AX surface of its own,
+            // and live-testing showed SwiftUI on macOS hoists an ancestor's
+            // `.accessibilityIdentifier` onto the nearest accessible descendant —
+            // here, the sidebar's own List — silently overwriting `hubSidebar`
+            // below it. Each accessible piece (sidebar, detail content) keeps its
+            // own identifier instead of the container claiming one too.
         } else {
             // Reachable if the agent was deleted (on this or another synced device)
             // while this window was still open, or during state restoration before

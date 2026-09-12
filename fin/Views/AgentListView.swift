@@ -12,46 +12,24 @@ struct AgentListView: View {
     // "connect, then get out of the way" behavior for the sheet case, and is a no-op
     // when there's nothing presented to dismiss (the `.home` window case).
     @Environment(\.dismiss) private var dismiss
+    // `List(selection:)` + onChange, NOT a Button nested in a row. Both were
+    // live-verified: a Button here opened the hub window fine for a real click but
+    // NEVER for an XCUITest-synthesized one (tried plain click, coordinate tap,
+    // double-click, a Space/Return key press once focused, and deferring the
+    // dismiss() call — all failed identically), while the exact same
+    // openWindow(id:value:) call from a plain top-level Button (not inside a List
+    // row) fired correctly under the same automation every time. That isolates the
+    // failure to List rows specifically — something about how a List on macOS
+    // routes a synthetic click first to row SELECTION, and only a genuinely
+    // separate mouse event to a nested control's action, in a way XCUITest's
+    // synthesized click doesn't reproduce. Selection-driven navigation sidesteps
+    // it entirely (and matches AgentHubWindowView's own sidebar, which already
+    // uses this pattern and was never affected).
+    @State private var selectedAgentID: UUID?
     #endif
 
     var body: some View {
-        List {
-            ForEach(agents) { agent in
-                // The row's single tap target is the per-agent hub — settings, logs,
-                // memory, remote conversation, and artifacts are all one tap away from
-                // there instead of behind a leading-swipe secret.
-                #if os(macOS)
-                // A NavigationLink push here would still work, but a Mac has room for
-                // the hub to be its own resizable window beside the terminal session —
-                // see AgentHubWindowView.
-                Button {
-                    openWindow(id: FinScene.agentHub, value: agent.id)
-                    dismiss()
-                } label: {
-                    AgentRow(agent: agent)
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("agentRow_\(agent.id.uuidString)")
-                #else
-                NavigationLink {
-                    AgentHubView(agent: agent)
-                } label: {
-                    AgentRow(agent: agent)
-                }
-                #endif
-            }
-            .onDelete { offsets in
-                for index in offsets {
-                    let agent = agents[index]
-                    KeychainStore.deleteAgentAPIKey(for: agent.id)
-                    // The agent's semantic index files (plaintext memory text) go
-                    // with it — no self-heal pass can ever run for a deleted agent.
-                    AgentMemoryIndexRegistry.destroyIndex(agent.id)
-                    modelContext.delete(agent)
-                }
-            }
-        }
-        .listStyle(.plain)
+        list
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -82,6 +60,56 @@ struct AgentListView: View {
                 agent.upgradeStockPromptIfNeeded()
                 agent.upgradeHeartbeatDefaultIfNeeded()
             }
+        }
+    }
+
+    @ViewBuilder
+    private var list: some View {
+        #if os(macOS)
+        List(selection: $selectedAgentID) {
+            ForEach(agents) { agent in
+                AgentRow(agent: agent)
+                    .tag(agent.id)
+                    .accessibilityIdentifier("agentRow_\(agent.id.uuidString)")
+            }
+            .onDelete(perform: deleteAgents)
+        }
+        .onChange(of: selectedAgentID) { _, newValue in
+            guard let newValue else { return }
+            openWindow(id: FinScene.agentHub, value: newValue)
+            // Reset so selecting the SAME agent again after closing its hub window
+            // still triggers onChange (a value "changing" to what it already was
+            // wouldn't fire otherwise).
+            selectedAgentID = nil
+            dismiss()
+        }
+        .listStyle(.plain)
+        #else
+        List {
+            ForEach(agents) { agent in
+                // The row's single tap target is the per-agent hub — settings, logs,
+                // memory, remote conversation, and artifacts are all one tap away from
+                // there instead of behind a leading-swipe secret.
+                NavigationLink {
+                    AgentHubView(agent: agent)
+                } label: {
+                    AgentRow(agent: agent)
+                }
+            }
+            .onDelete(perform: deleteAgents)
+        }
+        .listStyle(.plain)
+        #endif
+    }
+
+    private func deleteAgents(at offsets: IndexSet) {
+        for index in offsets {
+            let agent = agents[index]
+            KeychainStore.deleteAgentAPIKey(for: agent.id)
+            // The agent's semantic index files (plaintext memory text) go with it —
+            // no self-heal pass can ever run for a deleted agent.
+            AgentMemoryIndexRegistry.destroyIndex(agent.id)
+            modelContext.delete(agent)
         }
     }
 
