@@ -320,8 +320,7 @@ struct FinApp: App {
                 isBusy: { runtime.isBusy },
                 needsInput: { if case .awaitingApproval = runtime.state { return true } else { return false } },
                 assistantReplies: {
-                    let replies = runtime.transcript.messages.filter { $0.role == .assistant && !$0.text.isEmpty }
-                    return (replies.count, replies.last?.text ?? "")
+                    runtime.transcript.messages.filter { $0.role == .assistant && !$0.text.isEmpty }.map(\.text)
                 }
             )
         }

@@ -26,7 +26,11 @@ final class AppSiteClient: ObservableObject {
         let needsInput: () -> Bool
         /// (assistant messages so far, the newest assistant text) — no timestamps on
         /// transcript messages, so "a reply landed" is "the count went up".
-        let assistantReplies: () -> (count: Int, latest: String)
+        /// Every assistant reply in the transcript, in order. The ack uses the
+        /// FIRST reply after the submit — never "the latest", which on a hosting
+        /// device with heartbeats can be a monitor tick's output (the same
+        /// heartbeat-as-answer bug the daemon had, `settleInFlightMessage`).
+        let assistantReplies: () -> [String]
     }
 
     /// The daemon-shaped ledger, in memory: the app is foreground-only, so an
@@ -143,6 +147,7 @@ final class AppSiteClient: ObservableObject {
             let entry = held[index]
             guard let atSubmit = entry.repliesAtSubmit, !answered.contains(entry.id),
                   replies.count > atSubmit, !target.isBusy() else { continue }
+            let replyText = Self.replyForAck(replies: replies, repliesAtSubmit: atSubmit)
             answered.insert(entry.id)
             // The control plane pushes a `fin.reply` notification to the user's
             // OTHER devices on this ack: `originDeviceID8` names this device (it
@@ -156,7 +161,7 @@ final class AppSiteClient: ObservableObject {
             // `AgentNotificationService.willPresent` drops it.
             AgentNotificationService.shared.markSurfacedLocally(messageID: entry.id)
             _ = await siteRequest("POST", "/messages/\(entry.id)/ack",
-                                  body: Self.answeredAckBody(replyPreview: replies.latest, agentID: target.agentID),
+                                  body: Self.answeredAckBody(replyPreview: replyText, agentID: target.agentID),
                                   siteID: siteID, token: siteToken)
             held.remove(at: index)
         }
@@ -220,5 +225,15 @@ final class AppSiteClient: ObservableObject {
         request.setValue(siteID, forHTTPHeaderField: "X-Fin-Site")
         guard case .success(let result) = await ControlPlaneClient.perform(request) else { return nil }
         return result
+    }
+}
+
+extension AppSiteClient {
+    /// The reply that answers a message submitted when `repliesAtSubmit`
+    /// assistant replies already existed: the first one after it. Pure.
+    nonisolated static func replyForAck(replies: [String], repliesAtSubmit: Int) -> String {
+        guard replies.count > repliesAtSubmit else { return "" }
+        let first = replies[repliesAtSubmit]
+        return first.isEmpty ? (replies.last ?? "") : first
     }
 }

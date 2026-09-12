@@ -448,6 +448,22 @@ final class Daemon {
     /// `answered` ack — and for the request-input push, which names it so the
     /// control plane pushes that message once (the question, not the reply).
     private var inFlightSiteMessageID: String?
+
+    /// Settle the claimed control-plane message a turn was answering when that
+    /// turn ended WITHOUT an answer. Live bug (2026-09-12): only the `.answered`
+    /// branch cleared the id, so a failed, cancelled, or budget-exhausted turn
+    /// left it set and the NEXT heartbeat's decision JSON was acked, pushed, and
+    /// spoken as that voice message's reply. Every outcome now settles the
+    /// message: an honest preview reaches the user instead of a stale id
+    /// reaching the next turn.
+    private func settleInFlightMessage(_ preview: String) async {
+        guard let id = inFlightSiteMessageID else { return }
+        inFlightSiteMessageID = nil
+        let line = "[site] message \(id.prefix(10)) settled without an answer: \(preview)"
+        log(line)
+        record(AgentAuditEvent(kind: "notice", text: line))
+        await siteClient?.markAnswered(id, replyPreview: preview)
+    }
     /// True after TASK COMPLETE under `stayResident`: the work is done, so beats would
     /// only re-run a finished task, but the process, the SSH session and the poll loop
     /// all stay up for the next message. Cleared when one arrives.
@@ -1449,8 +1465,9 @@ final class Daemon {
         while !shuttingDown {
             switch outcome {
             case .answered(let text) where text.isEmpty:
-                // The no-launch-task start: nothing happened, nothing to record.
-                break
+                // The no-launch-task start: nothing happened, nothing to record —
+                // unless a claimed message was in flight, which must not outlive it.
+                await settleInFlightMessage("Fin finished without a reply.")
             case .answered(let text):
                 consecutiveFailures = 0
                 lastTurnAt = Date()
@@ -1503,14 +1520,17 @@ final class Daemon {
                 }
             case .failed(let message) where message == "Cancelled.":
                 // A heartbeat preempted for a claimed message: not a failure, and the
-                // wait loop below pops that message first.
+                // wait loop below pops that message first. A cancelled MESSAGE turn
+                // (shutdown mid-answer) still settles so the id cannot leak.
                 lastTurnAt = Date()
                 log("heartbeat turn preempted")
+                await settleInFlightMessage("Fin was interrupted before answering.")
             case .failed(let message):
                 consecutiveFailures += 1
                 lastTurnAt = Date()
                 lastError = message
                 log("turn failed (\(consecutiveFailures) in a row): \(message)")
+                await settleInFlightMessage("Fin couldn't finish: \(String(message.prefix(160)))")
                 if let id = inFlightDirectiveID {
                     // The id was marked applied before the submit (at-most-once by
                     // design), so this failure is otherwise invisible: surface it in
@@ -1541,6 +1561,7 @@ final class Daemon {
                 consecutiveFailures = 0
                 lastTurnAt = Date()
                 log("turn hit the tool-call ceiling; heartbeat will resume it")
+                await settleInFlightMessage("Fin hit its tool-call limit before answering; it will keep working on the next tick.")
             }
 
             // Status and the whole transcript go up after every turn, then again after
@@ -1651,6 +1672,10 @@ final class Daemon {
             log("heartbeat")
             inFlightDirectiveID = nil
             pendingUserMessageForDigest = nil
+            // Belt and braces: a heartbeat never answers a claimed message. If an
+            // id survived to here, settle it now rather than let the decision
+            // JSON become someone's reply.
+            await settleInFlightMessage("Fin lost track of this request; please send it again.")
             isTurnInFlight = true
             let prompt = Self.composedHeartbeatPrompt(
                 goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath),

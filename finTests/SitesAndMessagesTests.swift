@@ -284,3 +284,13 @@ final class SitesAndMessagesTests: XCTestCase {
         XCTAssertEqual(withSite?.inReplyTo, "m-9")
     }
 }
+
+final class AppSiteReplySelectionTests: XCTestCase {
+    func testTheAckUsesTheFirstReplyAfterTheSubmitNotTheLatest() {
+        // Two replies existed at submit; the answer is the third; a monitor tick added a fourth.
+        let replies = ["old", "old2", "the answer", "{\"decision\": \"idle\"}"]
+        XCTAssertEqual(AppSiteClient.replyForAck(replies: replies, repliesAtSubmit: 2), "the answer")
+        XCTAssertEqual(AppSiteClient.replyForAck(replies: replies, repliesAtSubmit: 4), "", "nothing after the submit yet")
+        XCTAssertEqual(AppSiteClient.replyForAck(replies: ["", "later"], repliesAtSubmit: 0), "later", "an empty first reply falls back to the latest")
+    }
+}
