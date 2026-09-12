@@ -1013,6 +1013,7 @@ final class Daemon {
         }
         setPromptMode = { [weak engine] mode in
             guard let engine else { return }
+            engine.hideGoalTools = mode == .task
             engine.refreshSystemPrompt(Self.composedSystemPrompt(
                 base: basePrompt, registryFileURL: registryURL, goalsLedgerFileURL: ledgerURL,
                 profileFileURL: profileURL, notifyAvailable: notifyAvailable, tmuxGuard: tmuxGuard,

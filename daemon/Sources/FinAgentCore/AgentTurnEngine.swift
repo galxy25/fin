@@ -306,6 +306,11 @@ public final class AgentTurnEngine {
 
     /// Runs one full exchange: user message in, tool round-trips as needed, final answer
     /// (or failure) out. Sequential by design — a second submit while busy is refused.
+    /// Task mode (a user's message is the whole job): the goal tools are not offered
+    /// at all, so the model cannot detour into ledger writes — live, five times on
+    /// 2026-09-12, that detour ate the turn. Consulted wherever the roster is built.
+    public var hideGoalTools = false
+
     /// Replace the system prompt between turns (no-op while a turn runs: the model
     /// must not see the prompt change under it mid-turn).
     public func refreshSystemPrompt(_ systemPrompt: String) {
@@ -484,7 +489,7 @@ public final class AgentTurnEngine {
                     // "unavailable here". The dispatch's honest error stays as a backstop.
                     tools: AgentToolSpec.roster(
                         readSession: onReadSession != nil, sendSession: onSendSession != nil,
-                        goalsLedger: onGoalUpsert != nil, memory: onRemember != nil,
+                        goalsLedger: onGoalUpsert != nil && !hideGoalTools, memory: onRemember != nil,
                         artifacts: onWriteArtifact != nil
                     )
                 )
@@ -621,7 +626,7 @@ public final class AgentTurnEngine {
             let message = "Error: unknown tool \"\(call.name)\". Available tools: "
                 + AgentToolSpec.roster(
                     readSession: onReadSession != nil, sendSession: onSendSession != nil,
-                    goalsLedger: onGoalUpsert != nil, memory: onRemember != nil,
+                    goalsLedger: onGoalUpsert != nil && !hideGoalTools, memory: onRemember != nil,
                     artifacts: onWriteArtifact != nil
                 ).map(\.name).joined(separator: ", ") + "."
             record("error", message, toolName: call.name, isFailure: true)
