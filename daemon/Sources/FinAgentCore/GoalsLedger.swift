@@ -230,6 +230,24 @@ public struct LedgerDocument: Codable, Equatable, Sendable {
 /// per-beat tick text. Both are derived from evals/goals-ledger/prompts/tick.md — edit
 /// THERE first, re-score the corpus, then sync here.
 public enum GoalsTick {
+    /// A goal whose only substance is "ask the user what the goals are" is not a goal —
+    /// it is the model deferring the user's own message back to the user. Two such goals
+    /// (g-init-mission, g-mission-setup) hijacked every turn on 2026-09-12: priority 1,
+    /// "drive" picked them, and a concrete voice request was answered with "I am ready.
+    /// Please provide the current mission goals". Refused at the tool, not just in prose.
+    public static func isAskTheUserForGoals(title: String, nextAction: String?, why: String?) -> Bool {
+        let haystack = [title, nextAction ?? "", why ?? ""].joined(separator: " ").lowercased()
+        let asks = haystack.contains("ask the user") || haystack.contains("ask levi")
+            || haystack.contains("request the user") || haystack.contains("provide the current mission")
+            || haystack.contains("what the user wants") || haystack.contains("await the user")
+            || haystack.contains("wait for the user")
+        let aboutGoals = haystack.contains("mission goal") || haystack.contains("mission goals")
+            || haystack.contains("specific task") || haystack.contains("initialize mission")
+            || haystack.contains("mission setup") || haystack.contains("what to do")
+            || haystack.contains("their goals") || haystack.contains("the goals")
+        return asks && aboutGoals
+    }
+
     /// The system-prompt block that teaches the model the ledger, the decision
     /// taxonomy, the priority rules, and copilot conduct, with the live goals rendered
     /// inline. Nil for an empty ledger: an agent with no goals must see zero prompt
@@ -275,7 +293,12 @@ public enum GoalsTick {
         short question; name the candidates.
 
         Priority rules: the user preempts everything — handle the oldest unprocessed \
-        message before driving, reporting, or idling. Done goals owe a closing report \
+        message before driving, reporting, or idling. A user message that asks for \
+        something concrete is NOT an ingest-only tick: record it if it is new work, then \
+        DO IT in this same turn with the tools (read_session, send_session, send_input) \
+        — the user is waiting on the result, not on a ledger entry. Never answer a \
+        request by asking what the mission goals are, and never create a goal whose only \
+        action is to ask the user what to do: the user's messages are the goals. Done goals owe a closing report \
         before anything else is driven. Blocked goals are surfaced once, then sit quiet: \
         never spin on a blocker, never re-nag it, and when the user pushes on a goal \
         blocked on THEM, remind them what it waits on rather than pretending to act. A \

@@ -371,3 +371,15 @@ final class GoalsLedgerTests: XCTestCase {
         XCTAssertFalse(tick.contains("If this tick's decision is drive"))
     }
 }
+
+final class AskTheUserGoalGuardTests: XCTestCase {
+    func testTheTwoLiveHijackersAreRefused() {
+        XCTAssertTrue(GoalsTick.isAskTheUserForGoals(title: "Initialize Mission", nextAction: "Ask the user for the current mission goals or a specific task to begin.", why: nil))
+        XCTAssertTrue(GoalsTick.isAskTheUserForGoals(title: "Mission Setup", nextAction: nil, why: "Find out what the user wants by asking Levi for their goals"))
+    }
+
+    func testARealGoalIsNotRefused() {
+        XCTAssertFalse(GoalsTick.isAskTheUserForGoals(title: "Send the Awesome Foundation grant PDF to Levi", nextAction: "send_session main:2.0 with the share-file-to-Levi skill", why: "Levi asked for the current draft as a PDF"))
+        XCTAssertFalse(GoalsTick.isAskTheUserForGoals(title: "Ask the user which branch to deploy", nextAction: "request_input", why: "two candidates"))
+    }
+}

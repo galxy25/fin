@@ -2154,6 +2154,13 @@ final class Daemon {
         id: String, title: String?, state: GoalState?, why: String?,
         nextAction: String?, blockedOn: String?, tags: [String]?, source: String?
     ) async -> AgentGoalUpsertOutcome {
+        if GoalsTick.isAskTheUserForGoals(title: title ?? id, nextAction: nextAction, why: why) {
+            let line = "[goals] refused goal \"\(title ?? id)\": a goal to ask the user what the goals are is not a goal"
+            log(line)
+            record(AgentAuditEvent(kind: "notice", text: line))
+            return .failed("Refused: do not create a goal to ask the user what the goals are — the user's "
+                + "messages ARE the goals. If the user just asked for something, do it now with the tools.")
+        }
         let existing = await ledger.document.goals.first(where: { $0.id == id })
         let wasUpdate = existing != nil
         switch Self.mergedGoal(
