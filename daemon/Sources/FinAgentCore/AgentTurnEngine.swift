@@ -306,6 +306,13 @@ public final class AgentTurnEngine {
 
     /// Runs one full exchange: user message in, tool round-trips as needed, final answer
     /// (or failure) out. Sequential by design — a second submit while busy is refused.
+    /// Replace the system prompt between turns (no-op while a turn runs: the model
+    /// must not see the prompt change under it mid-turn).
+    public func refreshSystemPrompt(_ systemPrompt: String) {
+        guard !isBusy else { return }
+        transcript.replaceSystemPrompt(systemPrompt)
+    }
+
     public func submit(_ text: String) async -> AgentTurnOutcome {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .failed("Empty message.") }

@@ -201,6 +201,18 @@ struct AgentTranscript {
         return lines.joined(separator: "\n")
     }
 
+    /// Swap the leading system message in place, keeping the conversation. Used when
+    /// a section of the prompt is time-sensitive (the pane inventory) and the engine
+    /// is between turns. A transcript with no system message gains one.
+    public mutating func replaceSystemPrompt(_ systemPrompt: String) {
+        guard !systemPrompt.isEmpty else { return }
+        if messages.first?.role == .system, !(messages.first?.isLocalOnly ?? false) {
+            messages[0] = AgentMessage(role: .system, text: systemPrompt)
+        } else {
+            messages.insert(AgentMessage(role: .system, text: systemPrompt), at: 0)
+        }
+    }
+
     mutating func reset(systemPrompt: String) {
         messages = systemPrompt.isEmpty ? [] : [AgentMessage(role: .system, text: systemPrompt)]
         droppedMessageCount = 0

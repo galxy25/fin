@@ -151,7 +151,7 @@ final class TmuxSessionReadTests: XCTestCase {
     /// is ours and total.
     func testTheListingQuotesItsFormatStringSoNoShellExpandsIt() {
         let line = TmuxSessionRead.commandLine(TmuxSessionRead.listArguments())
-        XCTAssertTrue(line.hasPrefix("tmux list-sessions -F '"), "got: \(line)")
+        XCTAssertTrue(line.hasPrefix("tmux list-panes -a -F '"), "got: \(line)")
         XCTAssertTrue(line.hasSuffix("'"), "got: \(line)")
         XCTAssertTrue(line.contains("#{session_name}"), "got: \(line)")
         // The comma-bearing conditional is inside the quotes, where bash cannot expand it.

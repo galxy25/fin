@@ -303,6 +303,11 @@ final class Daemon {
     /// at its next checkpoint, and the run loop treats that as "preempted", not a
     /// failure). User and directive turns are never cancelled.
     private var heartbeatTurnTask: Task<AgentTurnOutcome, Never>?
+    /// Recomposes the system prompt from the current local files (registry, ledger,
+    /// profile, pane inventory) and hands it to the engine between turns — set once
+    /// `run()` has the pieces. The pane picture changes every minute; the prompt
+    /// the launch composed would otherwise describe the machine as it was then.
+    private var refreshSystemPrompt: (() -> Void)?
     /// The last titled-pane scan the heartbeat sent, for the memory compactor.
     private var lastPaneObservations: [String] = []
     /// The heartbeat's capabilities, rescanned at most every `capabilitiesScanInterval`:
@@ -341,6 +346,13 @@ final class Daemon {
                 let document = await registry?.document
                 caps["tmux_sessions"] = TmuxSessionInventory.capabilitySessions(panes: panes, registry: document)
                 lastPaneObservations = TmuxSessionInventory.observationLines(panes: panes)
+                // For the system prompt: `composedSystemPrompt` is nonisolated and reads
+                // local files, so the freshest pane picture lives beside the registry.
+                let inventory: [String: Any] = ["at": ISO8601DateFormatter().string(from: Date()), "lines": lastPaneObservations]
+                if let data = try? JSONSerialization.data(withJSONObject: inventory) {
+                    try? data.write(to: URL(fileURLWithPath: paneInventoryPath), options: .atomic)
+                }
+                refreshSystemPrompt?()
             }
         } else if let previous = cachedCapabilities["tmux_sessions"] {
             caps["tmux_sessions"] = previous
@@ -510,7 +522,8 @@ final class Daemon {
         goalsLedgerFileURL: URL? = nil,
         profileFileURL: URL? = nil,
         notifyAvailable: Bool = false,
-        tmuxGuard: TmuxSendGuard = .unenforced
+        tmuxGuard: TmuxSendGuard = .unenforced,
+        paneInventoryFileURL: URL? = nil
     ) -> String {
         var prompt = base
         if let registry = RegistryDocument.loadIfPresent(at: registryFileURL),
@@ -524,6 +537,15 @@ final class Daemon {
                registry: registry,
                otherSessions: tmuxGuard.ownSocket == .standard ? .sameTmuxServer : .readSessionTool
            ) {
+            prompt += "\n\n" + section
+        }
+        // What each pane on this machine is doing RIGHT NOW — its cwd and its title,
+        // which coding agents set to their current task. Live failure this exists
+        // for: asked to "tell the African Intellect claw session…", the model
+        // listed sessions, saw only "main · 3 windows", could not find any such
+        // session, and gave up. The registry names sessions; this names panes.
+        if let paneInventoryFileURL,
+           let section = Self.paneInventorySection(fileURL: paneInventoryFileURL) {
             prompt += "\n\n" + section
         }
         // Told, not just enforced: a refusal the model understands beats a refusal it
@@ -560,18 +582,43 @@ final class Daemon {
         return prompt
     }
 
+    /// "Terminal panes right now" for the prompt, from the file `siteCapabilities`
+    /// writes. Nil (byte-identical prompt) when there is no scan yet. Pure and
+    /// file-based so both the system prompt and the heartbeat prompt can carry it.
+    nonisolated static func paneInventorySection(fileURL: URL, now: Date = Date()) -> String? {
+        guard let data = try? Data(contentsOf: fileURL),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let lines = object["lines"] as? [String], !lines.isEmpty
+        else { return nil }
+        var header = "Terminal panes right now"
+        if let at = (object["at"] as? String).flatMap({ ISO8601DateFormatter().date(from: $0) }) {
+            let minutes = max(0, Int(now.timeIntervalSince(at) / 60))
+            header += minutes == 0 ? " (just scanned)" : " (scanned \(minutes) min ago)"
+        }
+        return header + ", as pane · folder · what it is doing. The FOLDER and the TITLE are how the "
+            + "user refers to a pane (\"the pocketdj session\", \"the grant work\"); address it with "
+            + "read_session / send_session by the pane target shown, e.g. main:2.0:\n"
+            + lines.map { "- " + $0 }.joined(separator: "\n")
+    }
+
     /// The prompt a due beat submits: the goal-driving tick when the goals ledger
     /// holds any goals, the plain reflective heartbeat otherwise — byte-identical, so
     /// a host without a ledger sees zero change. Re-read at every beat (the continuity
     /// requirement: the ledger reloads into every turn), so ledger edits land on the
     /// next tick, not the next daemon launch. Nonisolated and path-parameterized so
     /// tests drive the real absent/present fork.
-    nonisolated static func composedHeartbeatPrompt(goalsLedgerFileURL: URL) -> String {
-        guard let ledger = LedgerDocument.loadIfPresent(at: goalsLedgerFileURL),
-              let tick = GoalsTick.heartbeatPrompt(ledger: ledger) else {
-            return heartbeatPrompt
+    nonisolated static func composedHeartbeatPrompt(goalsLedgerFileURL: URL, paneInventoryFileURL: URL? = nil) -> String {
+        var prompt = heartbeatPrompt
+        if let ledger = LedgerDocument.loadIfPresent(at: goalsLedgerFileURL),
+           let tick = GoalsTick.heartbeatPrompt(ledger: ledger) {
+            prompt = tick
         }
-        return tick
+        // The system prompt is composed once at launch; the pane picture changes
+        // every minute, so every beat carries the fresh one.
+        if let paneInventoryFileURL, let section = paneInventorySection(fileURL: paneInventoryFileURL) {
+            prompt += "\n\n" + section
+        }
+        return prompt
     }
 
     init(config: DaemonConfig) {
@@ -632,6 +679,11 @@ final class Daemon {
     /// simpler than a shared file with a lock.
     var siteLedgerPath: String {
         (auditLogPath as NSString).deletingLastPathComponent + "/fin-agentd-site.json"
+    }
+
+    /// The last titled-pane scan, for the prompt (written by `siteCapabilities`).
+    var paneInventoryPath: String {
+        (auditLogPath as NSString).deletingLastPathComponent + "/pane-inventory.json"
     }
 
     var goalsSyncStatePath: String {
@@ -862,11 +914,17 @@ final class Daemon {
             // The notify tool has a live channel exactly when a control-plane block or a
             // shell hook is configured; only then does the persona guidance appear.
             notifyAvailable: config.controlPlane != nil || (config.notifyCommand.map { !$0.isEmpty } ?? false),
-            tmuxGuard: tmuxGuard
+            tmuxGuard: tmuxGuard,
+            paneInventoryFileURL: URL(fileURLWithPath: paneInventoryPath)
         )
         if systemPrompt.contains("Session routing:") {
             log("session routing enabled: registry at \(routingRegistryPath)")
         }
+        let notifyAvailable = config.controlPlane != nil || (config.notifyCommand.map { !$0.isEmpty } ?? false)
+        let registryURL = URL(fileURLWithPath: routingRegistryPath)
+        let ledgerURL = URL(fileURLWithPath: goalsLedgerPath)
+        let profileURL = URL(fileURLWithPath: profileCachePath)
+        let paneURL = URL(fileURLWithPath: paneInventoryPath)
         if tmuxGuard.isEnforced {
             // The socket is the interesting half now: on a private socket the guard is a
             // second layer, on the default socket it is the only one, and the log has to
@@ -909,6 +967,14 @@ final class Daemon {
             tmuxGuard: tmuxGuard,
             audit: { [weak self] event in self?.record(event) }
         )
+        refreshSystemPrompt = { [weak self, weak engine] in
+            guard let self, let engine, !self.isTurnInFlight else { return }
+            engine.refreshSystemPrompt(Self.composedSystemPrompt(
+                base: basePrompt, registryFileURL: registryURL, goalsLedgerFileURL: ledgerURL,
+                profileFileURL: profileURL, notifyAvailable: notifyAvailable, tmuxGuard: tmuxGuard,
+                paneInventoryFileURL: paneURL
+            ))
+        }
 
         // The model's request_input tool: record + notify — the engine already wrote the
         // question into the audit trail as the tool call, this surfaces it to a human.
@@ -1482,7 +1548,10 @@ final class Daemon {
             inFlightDirectiveID = nil
             pendingUserMessageForDigest = nil
             isTurnInFlight = true
-            let prompt = Self.composedHeartbeatPrompt(goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath))
+            let prompt = Self.composedHeartbeatPrompt(
+                goalsLedgerFileURL: URL(fileURLWithPath: goalsLedgerPath),
+                paneInventoryFileURL: URL(fileURLWithPath: paneInventoryPath)
+            )
             let beatTask = Task { await engine.submit(prompt) }
             heartbeatTurnTask = beatTask
             outcome = await beatTask.value

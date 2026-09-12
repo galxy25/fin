@@ -137,11 +137,17 @@ public enum TmuxSessionRead {
     /// fixed here; the only reason it needs quoting at all is tmux's own `#{…}` syntax,
     /// which a shell would otherwise brace-expand (`#{?session_attached,attached,detached}`
     /// contains commas — bash really does expand it into three words).
-    public static let listFormat = "#{session_name}\t#{session_windows} windows\t"
-        + "#{?session_attached,attached,detached}"
+    /// One line PER PANE, not per session: `main · 3 windows` told the model nothing
+    /// about which window held the work it was asked about (live failure: "tell the
+    /// African Intellect session…" → listed sessions → gave up). The pane target, the
+    /// folder (basename only — `#{b:…}` is tmux's own basename modifier, so no path
+    /// leaves the machine) and the title, which coding agents set to their current
+    /// task, are exactly the three things a user's phrasing maps onto.
+    public static let listFormat = "#{session_name}:#{window_index}.#{pane_index}\t"
+        + "#{b:pane_current_path}\t#{pane_title}\t#{?session_attached,attached,detached}"
 
     public static func listArguments() -> [String] {
-        ["tmux", "list-sessions", "-F", listFormat]
+        ["tmux", "list-panes", "-a", "-F", listFormat]
     }
 
     /// argv → the single command string an SSH exec request carries. Elements made only
@@ -268,8 +274,10 @@ public enum TmuxSessionRead {
         guard !body.isEmpty else {
             return "No tmux sessions are running on this machine's default socket."
         }
-        return "tmux sessions on this machine (name, windows, attached state). Read one with "
-            + "read_session using its exact name. \(untrustedPreamble)\n"
+        return "tmux panes on this machine, one per line: pane target, the pane's folder, its "
+            + "title (what it is doing), attached state. The folder and title are how the user "
+            + "refers to a pane. Read one with read_session using its exact target (e.g. main:2.0); "
+            + "send to it with send_session using that same target. \(untrustedPreamble)\n"
             + fenced(annotateUnreadableNames(body))
     }
 
