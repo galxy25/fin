@@ -322,9 +322,15 @@ struct FinAppShortcuts: AppShortcutsProvider {
             // "Tell Fin to" survives because the trailing "to" reads as an
             // instruction to the app, not "text my contact Fin"; the rest are
             // phrasings the texting domain never claims.
+            // Never "Tell \(.applicationName) …": "Tell <name> <text>" is Siri's
+            // built-in Messages phrase, so in CarPlay it opened a text message and
+            // searched Contacts for "Fin" (Levi, 2026-09-12: "couldn't find a
+            // contact named Fin"). Every phrase here is shaped like nothing in
+            // Siri's system domains.
             phrases: [
                 "Talk to \(.applicationName)",
-                "Tell \(.applicationName) to",
+                "Have \(.applicationName)",
+                "Get \(.applicationName) to",
                 "Hey \(.applicationName)",
                 "\(.applicationName) agent",
                 "\(.applicationName)",
