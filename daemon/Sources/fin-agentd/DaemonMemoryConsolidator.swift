@@ -51,6 +51,12 @@ final class DaemonMemoryConsolidator {
     /// Injected so tests never touch the network — defaults to the real completion
     /// call. Same seam every other daemon client here gives its transport.
     var completion: (_ instruction: String, _ input: String) async throws -> String
+    /// Optional durable topology/environment facts learned from live terminal sessions
+    /// (`SessionActivitySummarizer`), folded into the compaction prompt as their own
+    /// section — NOT episodic conversation, so the model can tell "the user told me this"
+    /// apart from "I observed this in a terminal." nil (default) = session-activity
+    /// tracking is off; compact() behaves exactly as it did before this property existed.
+    var sessionActivityNotesProvider: (() async -> [String])?
 
     private var lastCacheRefreshAt: Date?
     private var lastConsolidationAttemptAt: Date?
@@ -131,7 +137,14 @@ final class DaemonMemoryConsolidator {
         guard case .found(let profile) = await memory.readProfile() else { return }
 
         var input = "Current profile:\n" + (profile.content.isEmpty ? "(none)" : profile.content)
-            + "\n\nRecent conversations:"
+        if let sessionActivityNotesProvider {
+            let notes = await sessionActivityNotesProvider()
+            if !notes.isEmpty {
+                input += "\n\nSession activity (from live terminal sessions Fin tracks):"
+                for note in notes { input += "\n- \(note)" }
+            }
+        }
+        input += "\n\nRecent conversations:"
         for hit in hits {
             let content = hit.content.count > Self.perHitCap
                 ? "…" + String(hit.content.suffix(Self.perHitCap))
@@ -139,8 +152,9 @@ final class DaemonMemoryConsolidator {
             input += "\n\n\(hit.title)\n\(content)"
         }
         let instruction = "Merge into a concise user profile: their ongoing tasks, goals, "
-            + "preferences, styles, tastes. Keep under 1500 characters. Output only the "
-            + "updated profile text."
+            + "preferences, styles, tastes, and durable environment/topology facts (e.g. "
+            + "machines, tmux sessions, what each is for). Keep under 1500 characters. "
+            + "Output only the updated profile text."
 
         do {
             let text = try await completion(instruction, input)

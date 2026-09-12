@@ -253,6 +253,107 @@ final class SessionRoutingTests: XCTestCase {
         XCTAssertEqual(reloaded.sessions.first?.createdByFin, true)
     }
 
+    // MARK: - observeDiscoveredSession / setActivityNote
+
+    private func makeStore() -> (store: SessionRoutingRegistry, url: URL) {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fin-routing-tests-\(UUID().uuidString)")
+            .appendingPathComponent("registry.json")
+        return (SessionRoutingRegistry(fileURL: url), url)
+    }
+
+    func testObserveDiscoveredSessionRegistersANewSessionAsCreatedByFin() async throws {
+        let (store, url) = makeStore()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        try await store.observeDiscoveredSession(
+            session: "newthing", kind: "coding-agent", cwd: "/Users/levi/newthing",
+            agent: nil, agentPaneTarget: "newthing:0.0", registeredBy: "fin-agentd (auto)"
+        )
+
+        let doc = await store.document
+        XCTAssertEqual(doc.sessions.count, 1)
+        let entry = doc.sessions[0]
+        XCTAssertEqual(entry.session, "newthing")
+        XCTAssertEqual(entry.kind, "coding-agent")
+        XCTAssertEqual(entry.cwd, "/Users/levi/newthing")
+        XCTAssertEqual(entry.agentPaneTarget, "newthing:0.0")
+        XCTAssertTrue(entry.createdByFin)
+    }
+
+    func testObserveDiscoveredSessionNeverClobbersAHandRegisteredEntry() async throws {
+        let (store, url) = makeStore()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        try await store.register(SessionRegistration(
+            session: "fin", kind: "coding-agent", cwd: "~/forges/levi/fin",
+            tasks: ["fin"], registeredBy: "levi", createdByFin: false
+        ))
+
+        // A scan sees this session running a plain shell now — must not downgrade kind,
+        // rewrite cwd, or set a pane target on a hand-registered entry.
+        try await store.observeDiscoveredSession(
+            session: "fin", kind: "shell", cwd: "/somewhere/else",
+            agent: nil, agentPaneTarget: "fin:0.0",
+            discoveredTasks: ["widget"], registeredBy: "fin-agentd (auto)"
+        )
+
+        let doc = await store.document
+        XCTAssertEqual(doc.sessions.count, 1)
+        let entry = doc.sessions[0]
+        XCTAssertEqual(entry.kind, "coding-agent", "kind must stay as the human set it")
+        XCTAssertEqual(entry.cwd, "~/forges/levi/fin", "cwd must stay as the human set it")
+        XCTAssertNil(entry.agentPaneTarget, "a hand-registered entry never gets a pane target")
+        // Vocabulary IS allowed to grow additively — same rule a successful route uses.
+        XCTAssertEqual(entry.tasks, ["fin", "widget"])
+    }
+
+    func testObserveDiscoveredSessionUpdatesAFinCreatedEntryAndUnionsTasks() async throws {
+        let (store, url) = makeStore()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        try await store.register(SessionRegistration(
+            session: "fin-auto", kind: "shell", cwd: "/old/cwd",
+            tasks: ["alpha"], createdByFin: true
+        ))
+
+        try await store.observeDiscoveredSession(
+            session: "fin-auto", kind: "coding-agent", cwd: "/new/cwd",
+            agent: "claude-code", agentPaneTarget: "fin-auto:1.0",
+            discoveredTasks: ["alpha", "beta"], registeredBy: "fin-agentd (auto)"
+        )
+
+        let doc = await store.document
+        let entry = doc.sessions[0]
+        XCTAssertEqual(entry.kind, "coding-agent")
+        XCTAssertEqual(entry.cwd, "/new/cwd")
+        XCTAssertEqual(entry.agent, "claude-code")
+        XCTAssertEqual(entry.agentPaneTarget, "fin-auto:1.0")
+        XCTAssertEqual(entry.tasks, ["alpha", "beta"], "union, never a replace")
+    }
+
+    func testSetActivityNoteWritesNoteAndTimestampForARegisteredSession() async throws {
+        let (store, url) = makeStore()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        try await store.register(SessionRegistration(session: "fin", createdByFin: true))
+        try await store.setActivityNote("Refactoring the routing registry.", forSession: "fin")
+
+        let doc = await store.document
+        XCTAssertEqual(doc.sessions[0].activityNote, "Refactoring the routing registry.")
+        XCTAssertNotNil(doc.sessions[0].activityNoteUpdatedAt)
+    }
+
+    func testSetActivityNoteIsANoOpForAnUnregisteredSession() async throws {
+        let (store, url) = makeStore()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        // Must not throw, must not create an entry.
+        try await store.setActivityNote("some note", forSession: "ghost")
+        let doc = await store.document
+        XCTAssertTrue(doc.sessions.isEmpty)
+    }
+
     // MARK: - synchronous load for prompt composition
 
     /// Both "no file yet" and "file mangled beyond the lenient decoder" must read as

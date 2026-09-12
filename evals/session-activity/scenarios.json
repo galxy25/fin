@@ -1,0 +1,233 @@
+{
+  "inventory": [
+    {
+      "id": "i01_single_shell_pane",
+      "panes": [
+        {"session": "main", "pane_target": "0.0", "cwd": "/Users/levi", "current_command": "zsh", "window_count": 1}
+      ],
+      "known_agents": ["fin", "claude", "codex"],
+      "expected": [
+        {"session": "main", "kind": "shell", "cwd": "/Users/levi", "agent_pane_target": null}
+      ]
+    },
+    {
+      "id": "i02_single_claude_pane",
+      "panes": [
+        {"session": "fin", "pane_target": "0.0", "cwd": "/Users/levi/forges/levi/fin", "current_command": "claude", "window_count": 1}
+      ],
+      "known_agents": ["fin", "claude", "codex"],
+      "expected": [
+        {"session": "fin", "kind": "coding-agent", "cwd": "/Users/levi/forges/levi/fin", "agent_pane_target": "fin:0.0"}
+      ]
+    },
+    {
+      "id": "i03_mixed_shell_and_agent_panes",
+      "panes": [
+        {"session": "fin", "pane_target": "0.0", "cwd": "/Users/levi/shell-cwd", "current_command": "zsh", "window_count": 2},
+        {"session": "fin", "pane_target": "1.0", "cwd": "/Users/levi/forges/levi/fin", "current_command": "claude", "window_count": 2}
+      ],
+      "known_agents": ["fin", "claude", "codex"],
+      "expected": [
+        {"session": "fin", "kind": "coding-agent", "cwd": "/Users/levi/forges/levi/fin", "agent_pane_target": "fin:1.0"}
+      ]
+    },
+    {
+      "id": "i04_two_sessions_sharing_a_cwd_not_merged",
+      "panes": [
+        {"session": "a", "pane_target": "0.0", "cwd": "/Users/levi/shared", "current_command": "claude", "window_count": 1},
+        {"session": "b", "pane_target": "0.0", "cwd": "/Users/levi/shared", "current_command": "claude", "window_count": 1}
+      ],
+      "known_agents": ["fin", "claude", "codex"],
+      "expected": [
+        {"session": "a", "kind": "coding-agent", "cwd": "/Users/levi/shared", "agent_pane_target": "a:0.0"},
+        {"session": "b", "kind": "coding-agent", "cwd": "/Users/levi/shared", "agent_pane_target": "b:0.0"}
+      ]
+    },
+    {
+      "id": "i05_empty_current_command_never_matches_an_agent",
+      "panes": [
+        {"session": "idle", "pane_target": "0.0", "cwd": "/Users/levi", "current_command": "", "window_count": 1}
+      ],
+      "known_agents": ["fin", "claude", "codex"],
+      "expected": [
+        {"session": "idle", "kind": "shell", "cwd": "/Users/levi", "agent_pane_target": null}
+      ]
+    },
+    {
+      "id": "i06_custom_known_agents_override",
+      "panes": [
+        {"session": "s", "pane_target": "0.0", "cwd": "/x", "current_command": "my-custom-agent", "window_count": 1}
+      ],
+      "known_agents": ["my-custom-agent"],
+      "expected": [
+        {"session": "s", "kind": "coding-agent", "cwd": "/x", "agent_pane_target": "s:0.0"}
+      ]
+    }
+  ],
+
+  "registry_merge": [
+    {
+      "id": "m01_new_session_registers_as_created_by_fin",
+      "existing_sessions": [],
+      "discover": {
+        "session": "newthing", "kind": "coding-agent", "cwd": "/Users/levi/newthing",
+        "agent": null, "agent_pane_target": "newthing:0.0", "discovered_tasks": [],
+        "registered_by": "fin-agentd (auto)"
+      },
+      "expected_entry": {
+        "session": "newthing", "kind": "coding-agent", "cwd": "/Users/levi/newthing",
+        "agent_pane_target": "newthing:0.0", "created_by_fin": true, "tasks": []
+      }
+    },
+    {
+      "id": "m02_hand_registered_entry_is_never_clobbered",
+      "existing_sessions": [
+        {"session": "fin", "kind": "coding-agent", "agent": "claude-code", "cwd": "~/forges/levi/fin",
+         "tasks": ["fin"], "registered_by": "levi", "created_by_fin": false}
+      ],
+      "discover": {
+        "session": "fin", "kind": "shell", "cwd": "/somewhere/else",
+        "agent": null, "agent_pane_target": "fin:0.0", "discovered_tasks": ["widget"],
+        "registered_by": "fin-agentd (auto)"
+      },
+      "expected_entry": {
+        "session": "fin", "kind": "coding-agent", "cwd": "~/forges/levi/fin",
+        "agent_pane_target": null, "created_by_fin": false, "tasks": ["fin", "widget"]
+      }
+    },
+    {
+      "id": "m03_fin_created_entry_is_updated_and_tasks_unioned",
+      "existing_sessions": [
+        {"session": "fin-auto", "kind": "shell", "agent": null, "cwd": "/old/cwd",
+         "tasks": ["alpha"], "registered_by": "fin-agentd (auto)", "created_by_fin": true}
+      ],
+      "discover": {
+        "session": "fin-auto", "kind": "coding-agent", "cwd": "/new/cwd",
+        "agent": "claude-code", "agent_pane_target": "fin-auto:1.0",
+        "discovered_tasks": ["alpha", "beta"], "registered_by": "fin-agentd (auto)"
+      },
+      "expected_entry": {
+        "session": "fin-auto", "kind": "coding-agent", "cwd": "/new/cwd",
+        "agent_pane_target": "fin-auto:1.0", "created_by_fin": true, "tasks": ["alpha", "beta"]
+      }
+    }
+  ],
+
+  "note-acceptance": [
+    {
+      "id": "n01_clean_one_sentence_note",
+      "candidate": "Refactoring the routing registry to support live session discovery.",
+      "expected": true,
+      "reason": "clean, no leak markers, well over the 10-char floor"
+    },
+    {
+      "id": "n02_too_short",
+      "candidate": "short",
+      "expected": false,
+      "reason": "under the 10-character floor"
+    },
+    {
+      "id": "n03_path_leak",
+      "candidate": "Editing files under /Users/levi/forges/levi/fin right now.",
+      "expected": false,
+      "reason": "leaks an absolute /Users/ path"
+    },
+    {
+      "id": "n04_ip_literal_leak",
+      "candidate": "Connecting to 192.168.1.5 to debug the server.",
+      "expected": false,
+      "reason": "leaks an IPv4 literal"
+    },
+    {
+      "id": "n05_ssh_command_leak",
+      "candidate": "Ran ssh deepspacenine@example.com to check on the box.",
+      "expected": false,
+      "reason": "leaks a literal ssh invocation with a hostname"
+    },
+    {
+      "id": "n06_idle_observation_is_the_desired_signal",
+      "candidate": "The session looks idle; no recent activity to summarize.",
+      "expected": true,
+      "reason": "\"idle\" prose is exactly what the instruction asks for when nothing is happening, not a leak"
+    },
+    {
+      "id": "n07_home_tilde_path_leak",
+      "candidate": "Working inside ~/forges/levi/fin on the daemon code.",
+      "expected": false,
+      "reason": "leaks a tilde-relative home path"
+    },
+    {
+      "id": "n08_url_leak",
+      "candidate": "Fetching data from https://example.com/api right now.",
+      "expected": false,
+      "reason": "leaks a URL"
+    }
+  ],
+
+  "redaction-leak-rate": [
+    {
+      "id": "l01_aws_key_in_pane_capture",
+      "raw_pane_capture": "$ export AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n$ terraform apply\nApply complete.",
+      "must_not_appear": ["AKIAABCDEFGHIJKLMNOP"],
+      "note": "Applying an infrastructure change with Terraform."
+    },
+    {
+      "id": "l02_password_assignment_in_pane_capture",
+      "raw_pane_capture": "$ echo \"DB_PASSWORD=SuperSecret123!\" >> .env\n$ npm run migrate\nMigration complete.",
+      "must_not_appear": ["SuperSecret123!"],
+      "note": "Running a database migration for the app."
+    },
+    {
+      "id": "l03_bearer_token_in_pane_capture",
+      "raw_pane_capture": "$ curl -H \"Authorization: Bearer sk-liveAbCdEfGhIjKlMnOpQrStUvWxYz0123456789\" https://api.example.com\n{\"ok\":true}",
+      "must_not_appear": ["sk-liveAbCdEfGhIjKlMnOpQrStUvWxYz0123456789"],
+      "note": "Calling an external API to check a response."
+    },
+    {
+      "id": "l04_pem_private_key_in_pane_capture",
+      "raw_pane_capture": "$ cat deploy_key\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBSb21lRmFrZUtleU1hdGVyaWFsRm9yVGVzdGluZ09ubHkAAAAA\n-----END OPENSSH PRIVATE KEY-----",
+      "must_not_appear": ["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBSb21lRmFrZUtleU1hdGVyaWFsRm9yVGVzdGluZ09ubHkAAAAA"],
+      "note": "Setting up a deploy key for automated SSH access."
+    }
+  ],
+
+  "multi_session_write_path": [
+    {
+      "id": "w01_three_live_sessions_one_hand_edited_not_clobbered",
+      "existing_sessions": [
+        {"session": "fin", "kind": "coding-agent", "agent": "claude-code", "cwd": "~/forges/levi/fin",
+         "tasks": ["fin", "daemon"], "registered_by": "levi", "created_by_fin": false}
+      ],
+      "known_agents": ["fin", "claude", "codex"],
+      "panes": [
+        {"session": "fin", "pane_target": "0.0", "cwd": "/Users/levi/forges/levi/fin", "current_command": "claude", "window_count": 1},
+        {"session": "scratch", "pane_target": "0.0", "cwd": "/Users/levi/scratch/widget", "current_command": "codex", "window_count": 1},
+        {"session": "notes", "pane_target": "0.0", "cwd": "/Users/levi", "current_command": "zsh", "window_count": 1}
+      ],
+      "expected_final_sessions": [
+        {"session": "fin", "kind": "coding-agent", "agent": "claude-code", "cwd": "~/forges/levi/fin",
+         "tasks": ["fin", "daemon"], "created_by_fin": false, "agent_pane_target": null},
+        {"session": "scratch", "kind": "coding-agent", "cwd": "/Users/levi/scratch/widget",
+         "tasks": [], "created_by_fin": true, "agent_pane_target": "scratch:0.0"},
+        {"session": "notes", "kind": "shell", "cwd": "/Users/levi",
+         "tasks": [], "created_by_fin": true, "agent_pane_target": null}
+      ],
+      "reason": "hand-edited 'fin' entry (cwd/tasks/agent/agent_pane_target) must survive a live scan reporting a DIFFERENT cwd and an agent pane target for the same session name; the two never-before-seen sessions ('scratch' a coding agent, 'notes' a plain shell) both register fresh with created_by_fin=true"
+    },
+    {
+      "id": "w02_rescanning_the_same_inventory_twice_is_idempotent",
+      "existing_sessions": [],
+      "known_agents": ["fin", "claude", "codex"],
+      "panes": [
+        {"session": "build", "pane_target": "0.0", "cwd": "/Users/levi/proj-a", "current_command": "claude", "window_count": 1},
+        {"session": "build", "pane_target": "1.0", "cwd": "/Users/levi/proj-a", "current_command": "zsh", "window_count": 2}
+      ],
+      "scan_twice": true,
+      "expected_final_sessions": [
+        {"session": "build", "kind": "coding-agent", "cwd": "/Users/levi/proj-a",
+         "tasks": [], "created_by_fin": true, "agent_pane_target": "build:0.0"}
+      ],
+      "reason": "scanning the identical pane list twice in a row (the real scan interval firing back-to-back) must land on the exact same entry, not append duplicate sessions or drift agent_pane_target"
+    }
+  ]
+}
