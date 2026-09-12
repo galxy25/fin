@@ -147,7 +147,7 @@ struct MarkdownListView: View {
             let didAccess = url.startAccessingSecurityScopedResource()
             defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
             do {
-                let bookmarkData = try url.bookmarkData()
+                let bookmarkData = try url.fin_markdownBookmarkData()
                 if let existing = documents.first(where: { sameFile($0, as: url) }) {
                     existing.lastOpenedAt = Date()
                 } else {
@@ -168,7 +168,7 @@ struct MarkdownListView: View {
             let didAccess = url.startAccessingSecurityScopedResource()
             defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
             do {
-                let bookmarkData = try url.bookmarkData()
+                let bookmarkData = try url.fin_markdownBookmarkData()
                 let document = MarkdownDocument(name: url.lastPathComponent, bookmarkData: bookmarkData)
                 modelContext.insert(document)
                 #if os(macOS) || os(visionOS)
@@ -214,7 +214,7 @@ struct MarkdownListView: View {
 
     private func sameFile(_ document: MarkdownDocument, as url: URL) -> Bool {
         var isStale = false
-        guard let resolved = try? URL(resolvingBookmarkData: document.bookmarkData, bookmarkDataIsStale: &isStale) else {
+        guard let resolved = URL.fin_resolveMarkdownBookmark(document.bookmarkData, isStale: &isStale) else {
             return false
         }
         return resolved.path == url.path

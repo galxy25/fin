@@ -15,7 +15,15 @@ struct HomeView: View {
         }
     }
 
+    /// True only for ControlStripView's server-rack-button sheet (a terminal
+    /// session still live underneath) — the root `.home` route is a real window,
+    /// not a sheet, and has nothing to close. A sheet's Esc-to-dismiss is a
+    /// keyboard-only affordance (native on macOS, easy to miss on iOS too); this
+    /// adds a visible close button for anyone who doesn't reach for it.
+    var isSheet: Bool = false
+
     @EnvironmentObject private var entitlementStore: EntitlementStore
+    @Environment(\.dismiss) private var dismiss
     @State private var mode: Mode = .terminal
     @State private var showsPaywall = false
     #if os(iOS)
@@ -66,6 +74,17 @@ struct HomeView: View {
                         }
                         .labelStyle(.titleAndIcon)
                         .accessibilityLabel("Fin Pro subscription")
+                    }
+                }
+                if isSheet {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button {
+                            dismiss()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .accessibilityLabel("Close")
+                        .accessibilityIdentifier("homeSheetCloseButton")
                     }
                 }
             }

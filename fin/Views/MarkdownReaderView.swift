@@ -172,12 +172,21 @@ struct MarkdownReaderView: View {
 
     private func load() {
         var isStale = false
-        guard let url = try? URL(resolvingBookmarkData: document.bookmarkData, bookmarkDataIsStale: &isStale) else {
+        guard let url = URL.fin_resolveMarkdownBookmark(document.bookmarkData, isStale: &isStale) else {
             loadError = "This file's location can no longer be resolved. It may have moved."
             return
         }
         let didAccess = url.startAccessingSecurityScopedResource()
         defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+        // A bookmark created before this stored a security-scoped one (or one
+        // whose grant was otherwise revoked) resolves fine but denies access —
+        // catching that here instead of falling through to a generic read
+        // failure is what points the user at the actual fix (re-add the file).
+        guard didAccess else {
+            loadError = "Fin lost permission to this file. Remove it and re-add it "
+                + "from the Files tab (\u{201C}Open Existing File\u{2026}\u{201D})."
+            return
+        }
         guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else {
             loadError = "Couldn't read this file."
             return
@@ -251,12 +260,17 @@ struct MarkdownReaderView: View {
 
     private func save() {
         var isStale = false
-        guard let url = try? URL(resolvingBookmarkData: document.bookmarkData, bookmarkDataIsStale: &isStale) else {
+        guard let url = URL.fin_resolveMarkdownBookmark(document.bookmarkData, isStale: &isStale) else {
             saveError = "Couldn't resolve this file's location to save."
             return
         }
         let didAccess = url.startAccessingSecurityScopedResource()
         defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+        guard didAccess else {
+            saveError = "Fin lost permission to this file. Remove it and re-add it "
+                + "from the Files tab (\u{201C}Open Existing File\u{2026}\u{201D})."
+            return
+        }
         guard let data = rawText.data(using: .utf8) else {
             saveError = "Couldn't encode the edited text."
             return

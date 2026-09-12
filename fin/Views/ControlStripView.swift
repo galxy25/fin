@@ -134,7 +134,7 @@ struct ControlStripView: View {
         .padding(.vertical, 8)
         .background(Color.black)
         .sheet(isPresented: $showingServers) {
-            HomeView()
+            HomeView(isSheet: true)
         }
         // Notification-tap deep link: the tapped agent's console opens in whichever
         // presentation this layout uses. Checked on appear too, for taps that landed
