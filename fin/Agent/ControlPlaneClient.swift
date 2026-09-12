@@ -130,6 +130,16 @@ enum ControlPlaneClient {
         let answeredAt: Date?
         let replyPreview: String?
         let duplicate: Bool?
+        /// docs/THREADS.md §2: the thread this row belongs to (a root's is its
+        /// own `messageId`; the control plane fills it for pre-thread rows).
+        let threadId: String?
+        let pushedAt: Date?
+        let claimedAt: Date?
+        let appliedRunId: String?
+
+        /// The thread the row belongs to, resolved the way the control plane
+        /// resolves it: a row with no `threadId` is its own root.
+        var resolvedThreadID: String { threadId ?? messageId }
     }
 
     struct MessageContext {
@@ -137,17 +147,31 @@ enum ControlPlaneClient {
         var deviceID8 = DeviceIdentity.short
         var activeSessionNames: [String] = []
         var siteHint: String?
+        /// Explicit thread membership (docs/THREADS.md §2): set when the user
+        /// replies inside a thread view or from a notification whose payload
+        /// carried `fin.threadId`. nil roots a new thread.
+        var threadID: String?
     }
 
     /// Mint the id HERE, not in the transport: the pending row needs it to poll.
     static func newMessageID() -> String { "m-" + UUID().uuidString.lowercased() }
 
-    static func sendMessage(agent: String, text: String, messageID: String, context: MessageContext = .init()) async -> Result<Message, Failure> {
+    /// The `POST /messages` body. Pure so the shape — `threadId` present only
+    /// when the context names one — is pinned by a test without a transport.
+    static func sendMessageBody(agent: String, text: String, messageID: String, context: MessageContext) -> [String: Any] {
         var ctx: [String: Any] = ["device_id8": context.deviceID8, "activeSessionNames": context.activeSessionNames]
         if let hint = context.siteHint { ctx["siteHint"] = hint }
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "agent": agent, "text": text, "messageId": messageID, "source": context.source, "context": ctx,
         ]
+        if let thread = context.threadID?.trimmingCharacters(in: .whitespacesAndNewlines), !thread.isEmpty {
+            body["threadId"] = thread
+        }
+        return body
+    }
+
+    static func sendMessage(agent: String, text: String, messageID: String, context: MessageContext = .init()) async -> Result<Message, Failure> {
+        let body = sendMessageBody(agent: agent, text: text, messageID: messageID, context: context)
         return await perform(request("POST", path: "/messages", body: body))
             .flatMap { decode(Message.self, status: $0.0, body: $0.1) }
     }
@@ -163,5 +187,45 @@ enum ControlPlaneClient {
         await perform(request("GET", path: "/messages", query: ["agent": agent]))
             .flatMap { decode(MessagesResponse.self, status: $0.0, body: $0.1) }
             .map(\.messages)
+    }
+
+    // MARK: - Threads (docs/THREADS.md §3; README "Threads")
+
+    /// `GET /threads/{id}`: the summary, its messages (public rows, oldest
+    /// first) and its events (oldest first).
+    struct ThreadDetail: Decodable {
+        let thread: ThreadSummary
+        let messages: [Message]
+        let events: [ThreadEvent]
+
+        enum CodingKeys: String, CodingKey { case thread, messages, events }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            thread = try c.decode(ThreadSummary.self, forKey: .thread)
+            messages = try c.decodeIfPresent([Message].self, forKey: .messages) ?? []
+            events = try c.decodeIfPresent([ThreadEvent].self, forKey: .events) ?? []
+        }
+
+        init(thread: ThreadSummary, messages: [Message], events: [ThreadEvent]) {
+            self.thread = thread; self.messages = messages; self.events = events
+        }
+    }
+
+    static func listThreads(agent: String, limit: Int = 50) async -> Result<[ThreadSummary], Failure> {
+        await perform(request("GET", path: "/threads", query: ["agent": agent, "limit": String(limit)]))
+            .flatMap { decode(ThreadListResponse.self, status: $0.0, body: $0.1) }
+            .map(\.threads)
+    }
+
+    static func thread(id: String) async -> Result<ThreadDetail, Failure> {
+        await perform(request("GET", path: "/threads/\(id)"))
+            .flatMap { decode(ThreadDetail.self, status: $0.0, body: $0.1) }
+    }
+
+    static func threadEvents(id: String, after: Int = 0) async -> Result<[ThreadEvent], Failure> {
+        await perform(request("GET", path: "/threads/\(id)/events", query: ["after": String(after)]))
+            .flatMap { decode(ThreadEventsResponse.self, status: $0.0, body: $0.1) }
+            .map(\.events)
     }
 }

@@ -35,12 +35,16 @@ enum FinVoiceIntentCore {
     /// `source` is the control plane's provenance tag: `"voice"` for anything
     /// Siri dictated (the App Intents, an Announce reply in the car), `"app"`
     /// for a reply typed into a notification's text field.
+    /// `threadID` (docs/THREADS.md §2): explicit thread membership, carried
+    /// from a notification whose payload named `fin.threadId`; nil roots a
+    /// new thread.
     static func deliver(
-        agentID: UUID, agentName: String, text: String, source: String = "voice"
+        agentID: UUID, agentName: String, text: String, source: String = "voice", threadID: String? = nil
     ) async -> (delivered: Bool, messageID: String?) {
         if CloudControlPlaneConfig.isConfigured {
             let id = ControlPlaneClient.newMessageID()
-            let context = ControlPlaneClient.MessageContext(source: source)
+            var context = ControlPlaneClient.MessageContext(source: source)
+            context.threadID = threadID
             switch await ControlPlaneClient.sendMessage(agent: agentName, text: text, messageID: id, context: context) {
             case .success: return (true, id)
             case .failure: return (false, nil)

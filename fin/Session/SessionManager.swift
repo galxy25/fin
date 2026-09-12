@@ -33,6 +33,9 @@ final class SessionManager: ObservableObject {
         /// local banners, the push's `CD_sourceDeviceID8` for cross-device
         /// pushes, nil for pushes minted by pre-v2 subscriptions.
         let originDeviceID8: String?
+        /// `fin.threadId` from the push (docs/THREADS.md §2): the remote
+        /// console opens with this thread selected. nil = the default rule.
+        var threadID: String? = nil
     }
 
     /// Set when a notification tap asks for an agent's console; the terminal screen's

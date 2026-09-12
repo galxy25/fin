@@ -21,7 +21,9 @@ final class AppSiteClient: ObservableObject {
     struct Target {
         let agentID: UUID
         let agentName: String
-        let submit: (String) -> Bool
+        /// (text, threadId) — the thread the claim reported, so the local
+        /// console can filter by it and the local banner can group under it.
+        let submit: (String, String?) -> Bool
         let isBusy: () -> Bool
         let needsInput: () -> Bool
         /// (assistant messages so far, the newest assistant text) — no timestamps on
@@ -35,7 +37,16 @@ final class AppSiteClient: ObservableObject {
 
     /// The daemon-shaped ledger, in memory: the app is foreground-only, so an
     /// unacked id that dies with the process is re-offered after its lease.
-    private(set) var held: [(id: String, text: String, repliesAtSubmit: Int?)] = []
+    private(set) var held: [(id: String, text: String, repliesAtSubmit: Int?, threadID: String?)] = []
+
+    /// `threadId` from a `POST /messages/{id}/claim` 200 body; nil when the
+    /// control plane predates threads or the body is unreadable. Pure.
+    nonisolated static func threadID(inClaimResponse data: Data) -> String? {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let thread = object["threadId"] as? String, !thread.isEmpty
+        else { return nil }
+        return thread
+    }
     private var answered = Set<String>()
 
     @Published private(set) var siteID: String?
@@ -164,6 +175,11 @@ final class AppSiteClient: ObservableObject {
                                   body: Self.answeredAckBody(replyPreview: replyText, agentID: target.agentID),
                                   siteID: siteID, token: siteToken)
             held.remove(at: index)
+            // The turn is answered: local banners go back to grouping by agent
+            // unless another claimed message is still in flight.
+            AgentNotificationService.shared.setActiveThread(
+                held.last(where: { $0.repliesAtSubmit != nil })?.threadID, for: target.agentID
+            )
         }
         let state = target.needsInput() ? "needs-input" : (target.isBusy() ? "working" : "idle")
         let body: [String: Any] = [
@@ -184,14 +200,18 @@ final class AppSiteClient: ObservableObject {
         for offer in object["messages"] as? [[String: Any]] ?? [] {
             guard let id = offer["id"] as? String, let text = offer["text"] as? String,
                   !held.contains(where: { $0.id == id }) else { continue }
-            guard let (claimStatus, _) = await siteRequest("POST", "/messages/\(id)/claim",
-                                                            body: ["leaseSeconds": Self.claimLeaseSeconds],
-                                                            siteID: siteID, token: siteToken),
+            guard let (claimStatus, claimData) = await siteRequest("POST", "/messages/\(id)/claim",
+                                                                    body: ["leaseSeconds": Self.claimLeaseSeconds],
+                                                                    siteID: siteID, token: siteToken),
                   (200...299).contains(claimStatus) else { continue }
+            // The claim answers with the row's thread (docs/THREADS.md §2); the
+            // heartbeat offer does not carry it.
+            let threadID = Self.threadID(inClaimResponse: claimData)
             // The SAME path a typed message takes; a rejection leaves the claim to lapse.
             let before = target.assistantReplies().count
-            guard target.submit(text) else { continue }
-            held.append((id: id, text: text, repliesAtSubmit: before))
+            guard target.submit(text, threadID) else { continue }
+            held.append((id: id, text: text, repliesAtSubmit: before, threadID: threadID))
+            AgentNotificationService.shared.setActiveThread(threadID, for: target.agentID)
             _ = await siteRequest("POST", "/messages/\(id)/ack", body: ["state": "applied"], siteID: siteID, token: siteToken)
             audit("[site] applied message \(id.prefix(10)) from the control plane")
         }

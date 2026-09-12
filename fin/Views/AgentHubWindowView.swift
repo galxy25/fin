@@ -23,9 +23,14 @@ struct AgentHubWindowView: View {
     @EnvironmentObject private var sessionManager: SessionManager
     @Query(sort: \Agent.createdAt) private var agents: [Agent]
     @State private var selection: HubSection? = .settings
+    /// docs/THREADS.md §4: the "Threads" sidebar section — one row per open
+    /// thread, selecting one opens the conversation filtered to it.
+    @StateObject private var threadStore = ThreadStore()
 
-    private enum HubSection: Hashable, CaseIterable {
+    private enum HubSection: Hashable {
         case settings, logs, memory, remote, artifacts, key
+        /// The conversation, filtered to one thread.
+        case thread(String)
 
         var title: String {
             switch self {
@@ -35,6 +40,7 @@ struct AgentHubWindowView: View {
             case .remote: return CloudControlPlaneConfig.isConfigured ? "Conversation" : "Remote"
             case .artifacts: return "Artifacts"
             case .key: return "Fin's Key"
+            case .thread: return "Thread"
             }
         }
 
@@ -46,6 +52,7 @@ struct AgentHubWindowView: View {
             case .remote: return CloudControlPlaneConfig.isConfigured ? "bubble.left.and.bubble.right" : "antenna.radiowaves.left.and.right"
             case .artifacts: return "externaldrive"
             case .key: return "key"
+            case .thread: return "number"
             }
         }
     }
@@ -113,12 +120,43 @@ struct AgentHubWindowView: View {
                 }
                 sidebarRow(.artifacts)
             }
+            if CloudControlPlaneConfig.isConfigured {
+                Section("Threads") {
+                    if threadStore.openThreads.isEmpty {
+                        Text(threadStore.lastFetchAt == nil ? "Loading…" : "No open threads")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(threadStore.openThreads) { thread in
+                        threadRow(thread)
+                    }
+                }
+            }
             Section {
                 sidebarRow(.key)
             }
         }
         .accessibilityIdentifier("hubSidebar")
         .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 260)
+        .task(id: agent.name) { threadStore.start(agentName: agent.name) }
+        .onDisappear { threadStore.stop() }
+    }
+
+    private func threadRow(_ thread: ThreadSummary) -> some View {
+        let chip = thread.status.chip
+        return HStack(spacing: 6) {
+            Image(systemName: chip.systemImage)
+                .foregroundStyle(chip.color)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(ThreadPicker.shortTitle(thread.displayTitle, limit: 32))
+                    .lineLimit(1)
+                Text(chip.label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .tag(HubSection.thread(thread.threadId))
+        .accessibilityIdentifier("hubSidebarThread_\(thread.threadId.prefix(8))")
     }
 
     /// One sidebar row, identified for UI-test/automation drive-through
@@ -162,6 +200,11 @@ struct AgentHubWindowView: View {
                 ArtifactsView()
             case .key:
                 AgentKeyView()
+            case .thread(let threadID):
+                // `.id` so picking another thread rebuilds the console with the new
+                // preselection rather than reusing the first one's state.
+                AgentRemoteConsoleView(agent: agent, initialThreadID: threadID)
+                    .id(threadID)
             }
         }
     }

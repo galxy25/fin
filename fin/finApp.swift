@@ -258,9 +258,9 @@ struct FinApp: App {
                 }
         }
 
-        AgentNotificationService.shared.onOpenAgent = { [weak manager] agentID, originDeviceID8 in
+        AgentNotificationService.shared.onOpenAgent = { [weak manager] agentID, originDeviceID8, threadID in
             manager?.pendingAgentOpen = SessionManager.PendingAgentOpen(
-                agentID: agentID, originDeviceID8: originDeviceID8
+                agentID: agentID, originDeviceID8: originDeviceID8, threadID: threadID
             )
         }
 
@@ -316,7 +316,7 @@ struct FinApp: App {
             return AppSiteClient.Target(
                 agentID: runtime.agent.id,
                 agentName: runtime.agent.name,
-                submit: { runtime.submit($0) != .rejected },
+                submit: { text, threadID in runtime.submit(text, threadID: threadID) != .rejected },
                 isBusy: { runtime.isBusy },
                 needsInput: { if case .awaitingApproval = runtime.state { return true } else { return false } },
                 assistantReplies: {

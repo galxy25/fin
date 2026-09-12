@@ -224,6 +224,7 @@ targets:
       # remote console uses, plus the shared control-key table.
       - path: fin/Agent/AgentMirrorRecord.swift
       - path: fin/Agent/TranscriptTurns.swift
+      - path: fin/Agent/ThreadModels.swift
       - path: fin/Terminal/TerminalControlKeys.swift
       - path: daemon/Sources/FinAgentCore/TerminalEventLog.swift
     dependencies:

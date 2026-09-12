@@ -392,6 +392,49 @@ final class AgentViewRenderTests: XCTestCase {
         )
     }
 
+    /// docs/THREADS.md §4: the thread picker, the debug sheet, and the remote console
+    /// opened on a thread — all against a store seeded by hand (no control plane),
+    /// so the header strip, the chip and the sheet's event rows lay out.
+    func testRendersThreadPickerDebugSheetAndConsoleWithAThreadSelected() throws {
+        let container = try makeContainer()
+        let agent = Agent(name: "Fin", modelIdentifier: "test-model")
+        agent.monitoringArmed = true
+        agent.monitoringDeviceID = "some-other-device"
+        container.mainContext.insert(agent)
+        try container.mainContext.save()
+
+        let store = ThreadStore(agentName: "Fin")
+        store.merge([
+            ThreadSummary(threadId: "m-1", title: "Check on African Intellect", status: .waitingOnYou, lastActivityAt: Date()),
+            ThreadSummary(threadId: "m-2", title: "Deploy", status: .answered, lastActivityAt: Date().addingTimeInterval(-3600)),
+        ])
+        store.adopt(detail: ControlPlaneClient.ThreadDetail(
+            thread: store.threads[0], messages: [],
+            events: [ThreadEvent(threadId: "m-1", seq: 1, kind: "notify.sent", actor: "operator",
+                                 detail: ["event": .string("request-input"), "title": .string("Which branch?")], at: Date())]
+        ))
+        XCTAssertEqual(store.selectedThreadID, "m-1")
+
+        render(ThreadPicker(store: store).padding())
+        render(ThreadPicker(store: store, compact: true).padding())
+        render(ThreadDebugSheet(store: store, threadID: "m-1"))
+        render(
+            AgentRemoteConsoleView(
+                agent: agent,
+                reader: AgentMirrorReader(containerURL: { FileManager.default.temporaryDirectory }),
+                initialThreadID: "m-1"
+            )
+            .modelContainer(container)
+        )
+        #if os(macOS)
+        render(
+            AgentHubWindowView(agentID: agent.id)
+                .modelContainer(container)
+                .environmentObject(SessionManager())
+        )
+        #endif
+    }
+
     /// The agent list's remotely-hosted row variant — `AgentHubView` (not the list row
     /// itself) is what branches on hosting mode now, but this still renders the list
     /// with a genuinely remote agent's data shape.

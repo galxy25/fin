@@ -39,6 +39,8 @@ struct RootView: View {
     /// this device's own transcript — a runtime the tap's conversation doesn't
     /// live in, empty in the worst case).
     @State private var remoteAgentTarget: Agent?
+    /// The thread a notification tap named, applied to the console it opens.
+    @State private var remoteAgentThreadID: String?
 
     var body: some View {
         Group {
@@ -86,7 +88,7 @@ struct RootView: View {
             // set while unlocked, but a lapse mid-presentation must not leave a
             // working remote console (compose bar included) over the paywall.
             if isUnlocked {
-                AgentRemoteConsoleView(agent: agent)
+                AgentRemoteConsoleView(agent: agent, initialThreadID: remoteAgentThreadID)
             } else {
                 PaywallView()
             }
@@ -211,6 +213,7 @@ struct RootView: View {
                       for: agent, originDeviceID8: pending.originDeviceID8
                   ) == .remoteConsole else { return }
         sessionManager.pendingAgentOpen = nil
+        remoteAgentThreadID = pending.threadID
         remoteAgentTarget = agent
     }
 

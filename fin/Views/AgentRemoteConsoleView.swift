@@ -86,6 +86,9 @@ struct AgentRemoteConsoleView: View {
         /// it lands in the transcript, which on a busy body can be minutes.
         var isRemote = false
         var source: String?
+        /// The thread the row belongs to: what it was sent with, or what the
+        /// control plane reported. nil = unknown (shown under every selection).
+        var threadID: String?
 
         enum State { case sending, sent, failed, queued, claimed, applied, answered }
     }
@@ -99,11 +102,18 @@ struct AgentRemoteConsoleView: View {
     /// Turns whose steps (reasoning, tool calls, results) are expanded. Default
     /// view is input and output only; tap a reply to open its steps.
     @State private var expandedTurns: Set<String> = []
+    /// docs/THREADS.md §4: the thread list, the selection, and the selected
+    /// thread's detail (its rows and events). Polled on this view's cadence.
+    @StateObject private var threadStore: ThreadStore
+    /// A thread to open on (a notification tap, the hub sidebar); nil = default rule.
+    private let initialThreadID: String?
 
-    init(agent: Agent, reader: AgentMirrorReader = AgentMirrorReader()) {
+    init(agent: Agent, reader: AgentMirrorReader = AgentMirrorReader(), initialThreadID: String? = nil) {
         self.agentID = agent.id
         self.agentName = agent.name
         self.reader = reader
+        self.initialThreadID = initialThreadID
+        _threadStore = StateObject(wrappedValue: ThreadStore(agentName: agent.name))
         // With a control plane, THE conversation is the cloud transcript (every body
         // writes to it), merged with this device's own mirror — whatever the agent's
         // hosting mode says. Without one, the old rule: cloud-hosted reads the cloud.
@@ -150,8 +160,10 @@ struct AgentRemoteConsoleView: View {
             if memorySync == nil {
                 memorySync = AgentMemorySyncService(context: modelContext)
             }
+            threadStore.preselect(initialThreadID)
             await refresh()
             await refreshPresenceAndPending()
+            await refreshThreads()
             memorySync?.syncIfDue(agentID: agentID, agentName: agentName)
             // Auto-refresh while visible; cancelled with the view.
             while !Task.isCancelled {
@@ -159,8 +171,20 @@ struct AgentRemoteConsoleView: View {
                 guard !Task.isCancelled else { return }
                 await refresh()
                 await refreshPresenceAndPending()
+                await refreshThreads()
                 memorySync?.syncIfDue(agentID: agentID, agentName: agentName)
             }
+        }
+    }
+
+    /// The thread list on the console cadence, plus the selected thread's
+    /// detail — its rows fill the `messageId → threadId` map a legacy
+    /// `in_reply_to` line is resolved through, its events interleave below.
+    private func refreshThreads() async {
+        guard usesControlPlane, threadStore.isAvailable else { return }
+        await threadStore.refresh()
+        if let selected = threadStore.selectedThreadID {
+            await threadStore.loadDetail(selected)
         }
     }
 
@@ -190,6 +214,19 @@ struct AgentRemoteConsoleView: View {
                 }
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("finPresenceHeader")
+                HStack(spacing: 8) {
+                    ThreadPicker(store: threadStore, compact: true)
+                    if let thread = threadStore.selectedThread {
+                        ThreadChipView(chip: thread.status.chip)
+                        if let goal = thread.openGoal {
+                            Label("follow-up \(goal.suffix(6))", systemImage: "flag")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
             } else {
             HStack(spacing: 6) {
                 Image(systemName: isCloudHosted ? "cloud" : "antenna.radiowaves.left.and.right")
@@ -277,11 +314,22 @@ struct AgentRemoteConsoleView: View {
                     }
                     if records.isEmpty {
                         emptyState
+                    } else if turns.isEmpty, threadStore.selectedThreadID != nil, threadEventItems.isEmpty {
+                        Label("Nothing in this thread has reached the transcript yet.", systemImage: "number")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    ForEach(turns) { turn in
-                        turnView(turn)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .id(turn.id)
+                    ForEach(consoleRows) { row in
+                        switch row {
+                        case .turn(let turn):
+                            turnView(turn)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(turn.id)
+                        case .event(let item):
+                            threadEventRow(item)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(item.id)
+                        }
                     }
                     ForEach(visibleRelayRows) { message in
                         relayRow(message)
@@ -384,10 +432,88 @@ struct AgentRemoteConsoleView: View {
 
     typealias Turn = TranscriptTurns.Turn
 
-    /// See `TranscriptTurns.turns(from:)`.
-    static func turns(from records: [AgentMirrorRecord]) -> [Turn] { TranscriptTurns.turns(from: records) }
+    /// See `TranscriptTurns.turns(from:)`. With a thread selected the turns are
+    /// filtered to that thread's `thread_id` / `in_reply_to` set (docs/THREADS.md
+    /// §4) — `threadOfMessage` resolves a legacy prompt through its row.
+    static func turns(
+        from records: [AgentMirrorRecord], threadID: String? = nil, threadOfMessage: [String: String] = [:]
+    ) -> [Turn] {
+        ThreadMembership.turns(TranscriptTurns.turns(from: records), in: threadID, threadOfMessage: threadOfMessage)
+    }
 
-    private var turns: [Turn] { Self.turns(from: records) }
+    /// `messageId → threadId` from every control-plane row this view has seen:
+    /// the open-message poll plus the selected thread's detail.
+    private var threadOfMessage: [String: String] {
+        var map = threadStore.threadOfMessage
+        for (id, row) in remoteMessages { map[id] = row.resolvedThreadID }
+        return map
+    }
+
+    private var turns: [Turn] {
+        Self.turns(from: records, threadID: threadStore.selectedThreadID, threadOfMessage: threadOfMessage)
+    }
+
+    /// The selected thread's notify / relay / follow-up events that no transcript
+    /// line already shows — interleaved between turns by time.
+    private var threadEventItems: [ThreadItem] {
+        guard let selected = threadStore.selectedThreadID, let detail = threadStore.detail(for: selected) else { return [] }
+        let threadRecords = turns.flatMap { [$0.prompt].compactMap { $0 } + $0.steps + [$0.reply].compactMap { $0 } }
+        return ThreadTimeline.build(thread: detail.thread, messages: [], records: threadRecords, events: detail.events)
+            .filter { $0.source == .event }
+    }
+
+    enum ConsoleRow: Identifiable {
+        case turn(Turn)
+        case event(ThreadItem)
+        var id: String {
+            switch self { case .turn(let turn): return "t:" + turn.id; case .event(let item): return item.id }
+        }
+        var timestamp: Date {
+            switch self {
+            case .turn(let turn): return turn.prompt?.timestamp ?? turn.steps.first?.timestamp ?? turn.reply?.timestamp ?? .distantPast
+            case .event(let item): return item.timestamp
+            }
+        }
+    }
+
+    /// Turns and thread events in one time order. Pure so the interleave is testable.
+    static func interleave(turns: [Turn], events: [ThreadItem]) -> [ConsoleRow] {
+        let rows = turns.map(ConsoleRow.turn) + events.map(ConsoleRow.event)
+        // Stable: a turn and an event in the same second keep source order (turn first).
+        return rows.enumerated().sorted { a, b in
+            if a.element.timestamp != b.element.timestamp { return a.element.timestamp < b.element.timestamp }
+            return a.offset < b.offset
+        }.map(\.element)
+    }
+
+    private var consoleRows: [ConsoleRow] { Self.interleave(turns: turns, events: threadEventItems) }
+
+    private func threadEventRow(_ item: ThreadItem) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: item.kind == .notify ? "bell" : item.party.systemImage)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(item.party.label)
+                    ForEach(item.status, id: \.self) { chip in
+                        Text(chip)
+                            .padding(.horizontal, 5)
+                            .background(.quaternary.opacity(0.5), in: Capsule())
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                Text(item.text)
+                    .font(.caption)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.blue.opacity(item.kind == .notify ? 0.08 : 0.04), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityIdentifier("threadEventRow")
+    }
 
     @ViewBuilder
     private func turnView(_ turn: Turn) -> some View {
@@ -530,6 +656,22 @@ struct AgentRemoteConsoleView: View {
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+        case .toolCall where PaneRelay.target(of: record) != nil:
+            // The pane is its own party in a thread (docs/THREADS.md §1): what
+            // Fin sent into it, labelled with the pane, not a generic tool blob.
+            let target = PaneRelay.target(of: record) ?? ""
+            let isRead = PaneRelay.readTools.contains(record.toolName ?? "")
+            VStack(alignment: .leading, spacing: 2) {
+                Label(isRead ? "read pane \(target)" : "→ pane \(target)", systemImage: "terminal")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(record.text)
+                    .font(.system(.caption, design: .monospaced))
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.teal.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+            .accessibilityIdentifier("paneRelayRow")
         case .toolCall:
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: record.toolName == "send_input" ? "arrow.right.square" : "eye")
@@ -671,12 +813,19 @@ struct AgentRemoteConsoleView: View {
     /// Cloud pending rows, with the same mirror handoff as relay rows: once the
     /// harness's transcript shows the applied prompt, the local row retires.
     private var visibleCloudPending: [CloudPendingMessage] {
-        cloudPending.filter { message in
+        Self.pendingRows(cloudPending, inThread: threadStore.selectedThreadID).filter { message in
             message.state != .sent
                 || !Self.relayRowIsMirrored(
                     text: message.text, createdAt: message.createdAt, records: records
                 )
         }
+    }
+
+    /// With a thread selected, a pending row shows only when it belongs to that
+    /// thread — or when its thread is not known yet (just composed, no row back).
+    static func pendingRows(_ rows: [CloudPendingMessage], inThread threadID: String?) -> [CloudPendingMessage] {
+        guard let threadID else { return rows }
+        return rows.filter { $0.threadID == nil || $0.threadID == threadID }
     }
 
     private func cloudPendingRow(_ message: CloudPendingMessage) -> some View {
@@ -757,6 +906,7 @@ struct AgentRemoteConsoleView: View {
             cloudPending[index].siteName = row.targetSiteName
             cloudPending[index].routedBy = row.routedBy
             cloudPending[index].clarifyCandidates = row.clarifyCandidates ?? []
+            cloudPending[index].threadID = row.resolvedThreadID
         }
         let known = Set(cloudPending.compactMap { $0.messageID })
         for row in remote where !known.contains(row.messageId) && Self.isOpen(row) {
@@ -771,6 +921,7 @@ struct AgentRemoteConsoleView: View {
             pending.clarifyCandidates = row.clarifyCandidates ?? []
             pending.isRemote = true
             pending.source = row.source
+            pending.threadID = row.resolvedThreadID
             cloudPending.append(pending)
         }
         cloudPending.sort { $0.createdAt < $1.createdAt }
@@ -889,11 +1040,16 @@ struct AgentRemoteConsoleView: View {
             // server-side no-op, and the row can poll its own progress.
             let messageID = ControlPlaneClient.newMessageID()
             pending.messageID = messageID
+            // docs/THREADS.md §2: a reply composed inside a thread view joins
+            // that thread explicitly; "All activity" roots a new one.
+            let threadID = threadStore.selectedThreadID
+            pending.threadID = threadID
             cloudPending.append(pending)
             Task {
-                let context = ControlPlaneClient.MessageContext(
+                var context = ControlPlaneClient.MessageContext(
                     source: "app", activeSessionNames: Self.activeSessionNames()
                 )
+                context.threadID = threadID
                 let result = await ControlPlaneClient.sendMessage(
                     agent: agentName, text: text, messageID: messageID, context: context
                 )
@@ -904,6 +1060,8 @@ struct AgentRemoteConsoleView: View {
                     cloudPending[index].siteName = row.targetSiteName
                     cloudPending[index].routedBy = row.routedBy
                     cloudPending[index].clarifyCandidates = row.clarifyCandidates ?? []
+                    cloudPending[index].threadID = row.resolvedThreadID
+                    remoteMessages[row.messageId] = row
                 case .failure:
                     cloudPending[index].state = .failed
                 }
