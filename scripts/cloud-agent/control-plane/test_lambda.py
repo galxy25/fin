@@ -725,5 +725,301 @@ class PresignSupervisionStatusBackCompatTests(unittest.TestCase):
         self.assertEqual(self.signed, [])
 
 
+
+class _FakeSitesTable:
+    """Enough DynamoDB for the sites routes: get/put/update with the one
+    conditional shape they use (`rev = :rev`) and a scan that honours the two
+    string FilterExpressions in this file. A fake rather than moto because the
+    point of these tests is the routes' own logic, and the conditional write is
+    the only DynamoDB behaviour they actually depend on."""
+
+    def __init__(self, items=()):
+        self.items = {i["siteId"]: dict(i) for i in items}
+
+    def get_item(self, Key):
+        item = self.items.get(Key["siteId"])
+        return {"Item": dict(item)} if item else {}
+
+    def _check_rev(self, item, values):
+        return int((item or {}).get("rev") or 0) == int(values[":rev"])
+
+    def put_item(self, Item, ConditionExpression=None, ExpressionAttributeValues=None):
+        if ConditionExpression:
+            assert ConditionExpression == "rev = :rev", ConditionExpression
+            if not self._check_rev(self.items.get(Item["siteId"]), ExpressionAttributeValues):
+                raise lam.ClientError(
+                    {"Error": {"Code": "ConditionalCheckFailedException", "Message": "no"}},
+                    "PutItem",
+                )
+        self.items[Item["siteId"]] = dict(Item)
+
+    def update_item(self, Key, UpdateExpression, ExpressionAttributeValues=None,
+                    ExpressionAttributeNames=None, ConditionExpression=None):
+        item = self.items.setdefault(Key["siteId"], {"siteId": Key["siteId"]})
+        values = ExpressionAttributeValues or {}
+        if ConditionExpression:
+            assert ConditionExpression == "rev = :rev", ConditionExpression
+            if not self._check_rev(item, values):
+                raise lam.ClientError(
+                    {"Error": {"Code": "ConditionalCheckFailedException", "Message": "no"}},
+                    "UpdateItem",
+                )
+        if "commands = :c" in UpdateExpression:
+            item["commands"] = values[":c"]
+        if ":retired" in values:
+            item["state"] = values[":retired"]
+            item["retiredAt"] = values[":now"]
+        if ":next" in values:
+            item["rev"] = values[":next"]
+        if "REMOVE" in UpdateExpression:
+            for field in UpdateExpression.split("REMOVE", 1)[1].split(","):
+                item.pop(field.strip(), None)
+
+    def scan(self, FilterExpression=None, ExpressionAttributeValues=None, **kwargs):
+        values = ExpressionAttributeValues or {}
+        rows = list(self.items.values())
+        if FilterExpression and "userId = :user" in FilterExpression:
+            rows = [r for r in rows if r.get("userId") == values[":user"]]
+        if FilterExpression and "enrollKey = :key" in FilterExpression:
+            rows = [r for r in rows if r.get("enrollKey") == values[":key"]]
+        if FilterExpression and "agent = :agent" in FilterExpression:
+            rows = [r for r in rows if r.get("agent") == values[":agent"]]
+        return {"Items": [dict(r) for r in rows]}
+
+
+class _SitesTestCase(unittest.TestCase):
+    def setUp(self):
+        self._orig = lam.SITES_TABLE
+        lam.SITES_TABLE = _FakeSitesTable()
+        self.addCleanup(lambda: setattr(lam, "SITES_TABLE", self._orig))
+
+    def enroll(self, user="user-1", **body):
+        payload = {"agent": "Fin", "kind": "resident", "enrollKey": "levis-imac/deepspacenine"}
+        payload.update(body)
+        response = lam.enroll_site({"_userId": user, "body": json.dumps(payload)})
+        return json.loads(response["body"])
+
+
+class SiteEnrollmentTests(_SitesTestCase):
+    def test_enrolling_twice_with_the_same_key_returns_the_same_site(self):
+        # The installer is re-run whenever a Mac is reconfigured; that must not
+        # accumulate a row per run, or "Fin's computers" fills with ghosts of
+        # the same physical machine.
+        first = self.enroll()
+        second = self.enroll()
+        self.assertEqual(first["siteId"], second["siteId"])
+        self.assertTrue(second["reEnrolled"])
+        self.assertEqual(len(lam.SITES_TABLE.items), 1)
+
+    def test_re_enrolling_rotates_the_token(self):
+        # Re-enrolling IS the revocation story: a leaked site token is killed by
+        # running the installer again, so the old one must stop working.
+        first = self.enroll()
+        second = self.enroll()
+        self.assertNotEqual(first["siteToken"], second["siteToken"])
+        stored = lam.SITES_TABLE.items[first["siteId"]]["tokenSha256"]
+        self.assertEqual(stored, lam._site_token_hash(second["siteToken"]))
+
+    def test_the_token_is_never_stored_in_the_clear(self):
+        result = self.enroll()
+        row = lam.SITES_TABLE.items[result["siteId"]]
+        self.assertNotIn(result["siteToken"], json.dumps(row, default=str))
+
+    def test_the_same_enroll_key_under_two_users_is_two_sites(self):
+        # enrollKey is the operator's name for a place, not a global identifier;
+        # two users may each call their own machine "imac".
+        mine = self.enroll(user="user-1")
+        theirs = self.enroll(user="user-2")
+        self.assertNotEqual(mine["siteId"], theirs["siteId"])
+
+    def test_an_adopted_siteid_is_kept_verbatim(self):
+        # The resident iMac's device_id8 is already stamped on its status
+        # objects and transcript lines; re-minting an id would orphan them.
+        adopted = "a4a1d987-0000-4000-8000-000000000000"
+        result = self.enroll(siteId=adopted)
+        self.assertEqual(result["siteId"], adopted)
+        self.assertEqual(result["siteId8"], "a4a1d987")
+
+    def test_kind_sets_the_default_priority(self):
+        self.assertEqual(
+            lam.SITES_TABLE.items[self.enroll()["siteId"]]["priority"],
+            lam.SITE_DEFAULT_PRIORITY["resident"],
+        )
+
+    def test_an_unknown_kind_is_rejected(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            self.enroll(kind="toaster")
+        self.assertEqual(caught.exception.status, 400)
+
+
+class SiteLeaseTests(_SitesTestCase):
+    def setUp(self):
+        super().setUp()
+        self._orig_presign = lam._presign
+        lam._presign = lambda method, key: "https://example.invalid/{}".format(key)
+        self.addCleanup(lambda: setattr(lam, "_presign", self._orig_presign))
+        self.site = self.enroll()
+
+    def _beat(self, user="user-1", **body):
+        event = {"_userId": user, "body": json.dumps(body)}
+        return json.loads(lam.site_heartbeat(event, self.site["siteId"])["body"])
+
+    def test_a_heartbeat_extends_the_lease_from_the_lambdas_own_clock(self):
+        # Sites send durations, never timestamps: a site with a skewed clock
+        # must not be able to grant itself a longer lease than anyone else.
+        before = lam._now()
+        result = self._beat(state="working")
+        lease = lam._parse_iso(result["leaseUntil"])
+        self.assertGreaterEqual((lease - before).total_seconds(), lam.SITE_LEASE_SECONDS - 2)
+        self.assertLessEqual((lease - before).total_seconds(), lam.SITE_LEASE_SECONDS + 2)
+
+    def test_a_working_site_is_live(self):
+        # The reason the heartbeat runs off the turn loop at all: a long turn on
+        # a local model would otherwise read as a dead body.
+        self._beat(state="working")
+        row = lam.SITES_TABLE.items[self.site["siteId"]]
+        self.assertEqual(row["state"], "working")
+        self.assertTrue(lam._site_is_live(row))
+
+    def test_a_site_past_its_lease_is_not_live(self):
+        row = dict(lam.SITES_TABLE.items[self.site["siteId"]])
+        row["leaseUntil"] = _iso(lam._now() - timedelta(seconds=1))
+        self.assertFalse(lam._site_is_live(row))
+
+    def test_a_retired_site_is_never_live_however_fresh_its_lease(self):
+        row = dict(lam.SITES_TABLE.items[self.site["siteId"]])
+        row["state"] = "retired"
+        row["leaseUntil"] = _iso(lam._now() + timedelta(hours=1))
+        self.assertFalse(lam._site_is_live(row))
+
+    def test_urls_are_refreshed_when_the_sites_copies_are_nearly_expired(self):
+        soon = _iso(lam._now() + timedelta(minutes=5))
+        self.assertIn("urls", self._beat(urlsExpireAt=soon))
+
+    def test_urls_are_not_re_signed_while_the_sites_copies_are_fresh(self):
+        later = _iso(lam._now() + timedelta(minutes=55))
+        self.assertNotIn("urls", self._beat(urlsExpireAt=later))
+
+    def test_the_status_url_is_the_sites_own_per_device_key(self):
+        urls = self._beat()["urls"]
+        self.assertIn("/fin/devices/{}/status.json".format(self.site["siteId8"]), urls["supervisionStatusPut"])
+
+    def test_a_heartbeat_drains_queued_commands_exactly_once(self):
+        lam.queue_site_command(
+            {"_userId": "user-1", "body": json.dumps({"kind": "restart"})}, self.site["siteId"]
+        )
+        self.assertEqual([c["kind"] for c in self._beat()["commands"]], ["restart"])
+        self.assertEqual(self._beat()["commands"], [])
+
+    def test_oversized_capabilities_are_rejected_rather_than_stored(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            self._beat(capabilities={"junk": "x" * (lam.MAX_CAPABILITIES_BYTES + 1)})
+        self.assertEqual(caught.exception.status, 413)
+
+    def test_another_users_site_404s_rather_than_403s(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            self._beat(user="attacker-b")
+        self.assertEqual(caught.exception.status, 404)
+
+    def test_retiring_a_site_destroys_its_token_hash(self):
+        # Retirement IS revocation; a kept token hash would leave a retired
+        # body able to authenticate.
+        lam.delete_site({"_userId": "user-1"}, self.site["siteId"])
+        row = lam.SITES_TABLE.items[self.site["siteId"]]
+        self.assertEqual(row["state"], "retired")
+        self.assertNotIn("tokenSha256", row)
+
+
+class SiteTokenScopeTests(_SitesTestCase):
+    """A site token attaches the owner's `_userId` exactly like a session token
+    does, and every route reads only that — so this allow-list is the ENTIRE
+    boundary between "one body" and "full account access". Pinned directly."""
+
+    def _parts(self, path):
+        return [p for p in path.split("/") if p]
+
+    def _assert_denied(self, method, path, site_id="site-a"):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam._require_site_scope({"_siteId": site_id}, method, self._parts(path))
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_a_site_may_heartbeat_itself(self):
+        lam._require_site_scope({"_siteId": "site-a"}, "POST", self._parts("/sites/site-a/heartbeat"))
+
+    def test_a_site_may_retire_itself(self):
+        lam._require_site_scope({"_siteId": "site-a"}, "DELETE", self._parts("/sites/site-a"))
+
+    def test_a_site_may_not_heartbeat_another_site(self):
+        self._assert_denied("POST", "/sites/site-b/heartbeat")
+
+    def test_a_site_may_not_retire_another_site(self):
+        self._assert_denied("DELETE", "/sites/site-b")
+
+    def test_a_site_may_not_enumerate_its_siblings(self):
+        self._assert_denied("GET", "/sites")
+
+    def test_a_site_may_not_enroll_new_sites(self):
+        self._assert_denied("POST", "/sites/enroll")
+
+    def test_a_site_may_not_queue_commands_even_for_itself(self):
+        # Commands are what an operator tells a body to do; a body that can
+        # queue its own is a body that can tell itself to update from S3.
+        self._assert_denied("POST", "/sites/site-a/commands")
+
+    def test_a_site_may_not_touch_ec2(self):
+        self._assert_denied("POST", "/workers")
+        self._assert_denied("GET", "/workers")
+        self._assert_denied("DELETE", "/workers/i-123")
+
+    def test_a_site_may_not_read_secrets_or_memory(self):
+        self._assert_denied("GET", "/secrets")
+        self._assert_denied("GET", "/memory")
+        self._assert_denied("GET", "/memory/profile")
+
+    def test_a_site_may_re_sign_its_own_urls_and_notify_its_owner(self):
+        lam._require_site_scope({"_siteId": "site-a"}, "POST", self._parts("/presign"))
+        lam._require_site_scope({"_siteId": "site-a"}, "POST", self._parts("/notify"))
+
+    def test_an_unlisted_future_route_is_denied_by_default(self):
+        # The allow-list is deny-by-default on purpose: a route added later
+        # should be unreachable by a site until someone decides otherwise.
+        self._assert_denied("POST", "/some/route/added/later")
+
+    def test_an_operator_token_is_unaffected_by_the_guard(self):
+        lam._require_site_scope({"_userId": "user-1"}, "POST", self._parts("/workers"))
+
+
+
+class SiteRouteRegistrationTests(unittest.TestCase):
+    """Every handler in lambda.py's router also needs a route in deploy.sh's
+    ROUTES heredoc, or API Gateway 404s a path the Lambda handles perfectly —
+    exactly how `GET /devices/status` shipped broken. The sites routes are new
+    surface, so pin them rather than trusting a careful reading."""
+
+    @classmethod
+    def setUpClass(cls):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "deploy.sh")) as f:
+            cls.deploy_sh = f.read()
+
+    def test_every_sites_route_is_registered(self):
+        for route in (
+            "POST /sites/enroll",
+            "GET /sites",
+            "POST /sites/{siteId}/heartbeat",
+            "POST /sites/{siteId}/commands",
+            "DELETE /sites/{siteId}",
+        ):
+            self.assertIn(route + "\n", self.deploy_sh, route)
+
+    def test_the_sites_table_is_created_and_granted(self):
+        self.assertIn("SITES_TABLE=fin-sites", self.deploy_sh)
+        self.assertIn('"Sid": "SitesTable"', self.deploy_sh)
+        # Scan is load-bearing: enrollment idempotency and the site list are
+        # both scans, and a policy with only Get/Put would 403 at runtime.
+        sid = self.deploy_sh.split('"Sid": "SitesTable"', 1)[1].split("}", 1)[0]
+        self.assertIn("dynamodb:Scan", sid)
+
+
 if __name__ == "__main__":
     unittest.main()

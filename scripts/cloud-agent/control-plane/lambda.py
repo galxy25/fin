@@ -140,6 +140,15 @@ DEVICE_TOKENS_TABLE_NAME = os.environ.get("FIN_CP_DEVICE_TOKENS_TABLE", "fin-dev
 # shape DEVICE_TOKENS_TABLE already uses. See _authorize/_verify_apple_identity_token.
 USERS_TABLE_NAME = os.environ.get("FIN_CP_USERS_TABLE", "fin-users")
 SESSIONS_TABLE_NAME = os.environ.get("FIN_CP_SESSIONS_TABLE", "fin-sessions")
+# Sites (docs/SITES.md): one row per BODY that can act as an agent — an EC2
+# worker, the resident daemon on a Mac, a BYO box, or an app install. Its own
+# table for the same reason fin-device-tokens is: fin-cloud-workers' rows ARE
+# EC2 instances (list_workers scans it whole, /usage prices it, the sweep
+# terminates from it), and a resident Mac row in there would be swept to
+# "instance-gone" and billed as unpriced. A site is owned by exactly one user:
+# `userId` is on every row, and a site token is a second way to BECOME that
+# user, never a way to skip being one.
+SITES_TABLE_NAME = os.environ.get("FIN_CP_SITES_TABLE", "fin-sites")
 SECURITY_GROUP_NAME = "fin-agent-egress"
 INSTANCE_PROFILE_NAME = "fin-agent-ssm"
 AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
@@ -220,6 +229,7 @@ TABLE = _DYNAMODB.Table(TABLE_NAME)
 DEVICE_TOKENS_TABLE = _DYNAMODB.Table(DEVICE_TOKENS_TABLE_NAME)
 USERS_TABLE = _DYNAMODB.Table(USERS_TABLE_NAME)
 SESSIONS_TABLE = _DYNAMODB.Table(SESSIONS_TABLE_NAME)
+SITES_TABLE = _DYNAMODB.Table(SITES_TABLE_NAME)
 
 # Byte-for-byte the bootstrap from launch.sh; the two presigned URLs are the only
 # substitutions. Any change to launch.sh's user-data belongs here too —
@@ -565,6 +575,26 @@ def _authorize(event):
     token = token.strip()
     if scheme.lower() != "bearer" or not token:
         raise ApiError(401, "unauthorized")
+
+    # A site token (docs/SITES.md §3.1) presents `X-Fin-Site: <siteId>` alongside
+    # the bearer. It is checked FIRST and exclusively: a caller who names a site
+    # is asking to act as that body, and silently falling through to operator or
+    # session auth when the site check fails would turn a revoked site token into
+    # whatever else the same string happens to unlock.
+    site_id = _header(event, "x-fin-site").strip().lower()
+    if site_id:
+        site = _read_site(site_id)
+        presented_hash = _site_token_hash(token)
+        stored_hash = (site or {}).get("tokenSha256") or ""
+        # compare_digest against a dummy of equal shape even when the site is
+        # missing or retired, so a wrong id and a wrong token cost the same.
+        if not hmac.compare_digest(presented_hash, stored_hash or "0" * 64):
+            raise ApiError(401, "unauthorized")
+        if not site or site.get("state") == "retired" or not site.get("userId"):
+            raise ApiError(401, "unauthorized")
+        event["_userId"] = site["userId"]
+        event["_siteId"] = site["siteId"]
+        return
 
     legacy_token = os.environ.get("FIN_CP_TOKEN") or ""
     legacy_user_id = os.environ.get("FIN_CP_LEGACY_USER_ID") or ""
@@ -2543,7 +2573,392 @@ def list_device_status(event):
     return _response(200, {"generatedAt": _iso(_now()), "devices": devices})
 
 
+# --- sites -------------------------------------------------------------------
+#
+# Phase 1a of docs/SITES.md: the registry only — who exists, who is alive, what
+# each one can reach. Message dispatch, primary election and the claim protocol
+# are Phase 1b and deliberately absent here; a registry that only knows
+# liveness is independently useful (it is what "Fin's computers" reads) and
+# independently testable, and shipping it alone changes no existing behaviour.
+
+SITE_KINDS = ("ec2", "resident", "byo", "app")
+
+# Default dispatch priority by kind. Higher wins the primary role in 1b: the
+# always-on Mac in the study beats a cloud worker, which beats the phone in
+# your pocket. Operator-overridable per site at enroll.
+SITE_DEFAULT_PRIORITY = {"resident": 100, "byo": 50, "ec2": 10, "app": 1}
+
+SITE_HEARTBEAT_SECONDS = 20
+# Three missed heartbeats. Sites send DURATIONS and the Lambda stamps the
+# expiry from its own clock, so a site with a skewed clock cannot forge a lease.
+SITE_LEASE_SECONDS = 60
+
+SITE_STATES = ("idle", "working", "needs-input", "task-complete", "draining")
+SITE_COMMAND_KINDS = ("restart", "update", "stop", "drain")
+
+# `enrollKey` is the operator's stable name for a physical place
+# ("levis-imac/deepspacenine"), and is what makes enrollment idempotent:
+# re-running the installer returns the same site with a fresh token instead of
+# accumulating a new row per run.
+ENROLL_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+SITE_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# Capabilities are reported verbatim by the site and echoed to the app, so they
+# are capped rather than trusted: a runaway tmux inventory should fail its own
+# heartbeat, not bloat every row of the caller's site list.
+MAX_CAPABILITIES_BYTES = 16 * 1024
+MAX_SITE_COMMANDS = 16
+
+
+def _site_token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _site_is_live(site, now=None):
+    now = _now() if now is None else now
+    if site.get("state") == "retired":
+        return False
+    lease_until = _parse_iso(site.get("leaseUntil"))
+    return lease_until is not None and now < lease_until
+
+
+def _public_site(site, now=None):
+    """The shape the app sees. Never includes tokenSha256 — a hash is still a
+    verifier, and nothing outside _authorize has any use for it."""
+    now = _now() if now is None else now
+    return {
+        "siteId": site.get("siteId"),
+        "siteId8": site.get("siteId8"),
+        "agent": site.get("agent"),
+        "kind": site.get("kind"),
+        "displayName": site.get("displayName"),
+        "priority": int(site.get("priority") or 0),
+        "state": site.get("state"),
+        "live": _site_is_live(site, now),
+        "enrolledAt": site.get("enrolledAt"),
+        "lastHeartbeatAt": site.get("lastHeartbeatAt"),
+        "leaseUntil": site.get("leaseUntil"),
+        "capabilities": site.get("capabilities") or {},
+        "runId": site.get("runId"),
+        "workerId": site.get("workerId"),
+    }
+
+
+def _read_site(site_id):
+    if not SITE_ID_RE.match(site_id or ""):
+        return None
+    return SITES_TABLE.get_item(Key={"siteId": site_id}).get("Item")
+
+
+def _owned_site(event, site_id):
+    """A site the CALLER owns, or 404. Same reasoning as delete_worker's
+    ownership check: never confirm the existence of another user's row."""
+    site = _read_site(site_id)
+    if not site or not site.get("userId") or site.get("userId") != event.get("_userId"):
+        raise ApiError(404, "no such site")
+    return site
+
+
+def _site_for_enroll_key(user_id, enroll_key):
+    """Idempotency lookup. A scan rather than a GSI on purpose: this table
+    holds one row per physical computer a user owns — tens, not thousands —
+    and it is read exactly once per install, not per heartbeat. Revisit if a
+    user ever has enough bodies for this to matter."""
+    items = _scan(
+        table=SITES_TABLE,
+        FilterExpression="userId = :user AND enrollKey = :key",
+        ExpressionAttributeValues={":user": user_id, ":key": enroll_key},
+    )
+    return items[0] if items else None
+
+
+def enroll_site(event):
+    """POST /sites/enroll (operator token) — idempotent by (userId, enrollKey).
+
+    Returns the site token in the clear exactly once per call; only its sha256
+    is stored, so a lost token is re-issued by re-enrolling, never recovered."""
+    body = _body(event)
+    user_id = event["_userId"]
+
+    agent = str(body.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+
+    kind = str(body.get("kind") or "").strip()
+    if kind not in SITE_KINDS:
+        raise ApiError(400, "kind must be one of {}".format(", ".join(SITE_KINDS)))
+
+    enroll_key = str(body.get("enrollKey") or "").strip()
+    if not ENROLL_KEY_RE.match(enroll_key):
+        raise ApiError(400, "enrollKey must match [A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
+
+    display_name = str(body.get("displayName") or "").strip() or kind
+    if len(display_name) > 64:
+        raise ApiError(400, "displayName must be 64 characters or fewer")
+
+    priority = body.get("priority")
+    if priority is None:
+        priority = SITE_DEFAULT_PRIORITY[kind]
+    try:
+        priority = int(priority)
+    except (TypeError, ValueError):
+        raise ApiError(400, "priority must be an integer")
+    if not 0 <= priority <= 1000:
+        raise ApiError(400, "priority must be between 0 and 1000")
+
+    now = _now()
+    token = secrets.token_hex(32)
+    existing = _site_for_enroll_key(user_id, enroll_key)
+
+    if existing:
+        site_id = existing["siteId"]
+    else:
+        # `siteId` lets the operator adopt a body that already has an identity
+        # in the world — the resident iMac's device_id8 is already stamped on
+        # its status objects and transcript lines, and re-minting it would
+        # orphan them.
+        requested = str(body.get("siteId") or "").strip().lower()
+        if requested and not SITE_ID_RE.match(requested):
+            raise ApiError(400, "siteId must be a lowercase uuid")
+        site_id = requested or str(uuid.uuid4())
+        if requested and _read_site(site_id):
+            raise ApiError(409, "that siteId is already enrolled")
+
+    site_id8 = site_id[:8]
+    item = {
+        "siteId": site_id,
+        "siteId8": site_id8,
+        "userId": user_id,
+        "agent": agent,
+        "kind": kind,
+        "displayName": display_name,
+        "priority": priority,
+        "enrollKey": enroll_key,
+        "tokenSha256": _site_token_hash(token),
+        "enrolledAt": (existing or {}).get("enrolledAt") or _iso(now),
+        "state": (existing or {}).get("state") or "idle",
+        "capabilities": (existing or {}).get("capabilities") or {},
+        "commands": (existing or {}).get("commands") or [],
+        "rev": int((existing or {}).get("rev") or 0),
+    }
+    for carried in ("lastHeartbeatAt", "leaseUntil", "runId", "transcriptKey", "workerId"):
+        if (existing or {}).get(carried):
+            item[carried] = existing[carried]
+    SITES_TABLE.put_item(Item=item)
+
+    return _response(200, {
+        "siteId": site_id,
+        "siteId8": site_id8,
+        "siteToken": token,
+        "heartbeatSeconds": SITE_HEARTBEAT_SECONDS,
+        "reEnrolled": bool(existing),
+    })
+
+
+def list_sites(event):
+    """GET /sites[?agent=] — the caller's own sites. Operator token only: a
+    site token is scoped to its own row, and one body has no business
+    enumerating its siblings."""
+    user_id = event["_userId"]
+    agent = str(((event.get("queryStringParameters") or {}).get("agent") or "")).strip()
+    expression = "userId = :user"
+    values = {":user": user_id}
+    if agent:
+        expression += " AND agent = :agent"
+        values[":agent"] = agent
+    now = _now()
+    sites = [
+        _public_site(s, now)
+        for s in _scan(table=SITES_TABLE, FilterExpression=expression, ExpressionAttributeValues=values)
+    ]
+    sites.sort(key=lambda s: (-int(s.get("priority") or 0), s.get("displayName") or ""))
+    return _response(200, {"generatedAt": _iso(now), "sites": sites})
+
+
+def _site_refresh_urls(user_id, agent, site_id8):
+    """The presigned set a daemon needs to keep working, re-signed on the
+    heartbeat. Deliberately a small explicit list rather than a call into
+    `presign`: that route's job is to answer a client's arbitrary `kinds`
+    request, this one's is to hand a site exactly what its run loop reads and
+    writes, and collapsing them would couple two different contracts."""
+    slug = _key_slug(agent)
+    inbox_key = INBOX_KEY.format(user=user_id, agent=slug)
+    return {
+        "supervisionDirectiveGet": _presign(
+            "get_object", SUPERVISION_DIRECTIVE_KEY.format(user=user_id)
+        ),
+        "supervisionStatusPut": _presign(
+            "put_object", DEVICE_STATUS_KEY.format(user=user_id, device=site_id8)
+        ),
+        "inboxGet": _presign("get_object", inbox_key),
+        "inboxPut": _presign("put_object", inbox_key),
+        "transcriptPut": _presign("put_object", TRANSCRIPT_KEY.format(user=user_id, agent=slug)),
+    }
+
+
+def site_heartbeat(event, site_id):
+    """POST /sites/{siteId}/heartbeat — renew the lease, record what this body
+    can reach, drain its queued commands, and re-sign its URLs before they
+    lapse.
+
+    Runs from a task INDEPENDENT of the daemon's turn loop, which is the whole
+    reason it exists: today's status uplink only runs in the wait between
+    turns, and a multi-tool turn on a local 12B model takes minutes — so a site
+    that is working hardest is exactly the one that looks dead to every lease.
+    `state: "working"` is therefore online, not busy-and-unreachable."""
+    site = _owned_site(event, site_id)
+    body = _body(event)
+
+    state = str(body.get("state") or "idle").strip()
+    if state not in SITE_STATES:
+        raise ApiError(400, "state must be one of {}".format(", ".join(SITE_STATES)))
+
+    capabilities = body.get("capabilities")
+    if capabilities is None:
+        capabilities = site.get("capabilities") or {}
+    if not isinstance(capabilities, dict):
+        raise ApiError(400, "capabilities must be an object")
+    if len(json.dumps(capabilities, default=_json_default)) > MAX_CAPABILITIES_BYTES:
+        raise ApiError(413, "capabilities exceed {} bytes".format(MAX_CAPABILITIES_BYTES))
+
+    now = _now()
+    lease_until = now + timedelta(seconds=SITE_LEASE_SECONDS)
+    commands = list(site.get("commands") or [])
+
+    updated = dict(site)
+    updated.update({
+        "state": state,
+        "capabilities": capabilities,
+        "lastHeartbeatAt": _iso(now),
+        "leaseUntil": _iso(lease_until),
+        "commands": [],
+        "rev": int(site.get("rev") or 0) + 1,
+    })
+    for field in ("runId", "transcriptKey"):
+        value = body.get(field)
+        if isinstance(value, str) and value:
+            updated[field] = value
+
+    try:
+        # Conditional on `rev`: the drain above is a read-modify-write, and an
+        # operator queuing a command between the read and the write would
+        # otherwise have it silently dropped. A 409 here means exactly that
+        # happened; the site retries on its next beat 20 s later, so the
+        # command is delayed, never lost.
+        SITES_TABLE.put_item(
+            Item=updated,
+            ConditionExpression="rev = :rev",
+            ExpressionAttributeValues={":rev": int(site.get("rev") or 0)},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(409, "site row changed underneath this heartbeat; retry")
+        raise
+
+    response = {
+        "leaseUntil": _iso(lease_until),
+        "heartbeatSeconds": SITE_HEARTBEAT_SECONDS,
+        "commands": commands,
+    }
+
+    # Re-sign before the daemon's copies lapse, not after: URLs signed with the
+    # Lambda's temporary credentials die with those credentials regardless of
+    # their stated expiry, so "refresh when the site says it is within 20
+    # minutes of expiry" is the floor, and a site that reports nothing gets a
+    # fresh set.
+    expires_at = _parse_iso(body.get("urlsExpireAt"))
+    if expires_at is None or expires_at - now < timedelta(minutes=20):
+        response["urls"] = _site_refresh_urls(site["userId"], site["agent"], site["siteId8"])
+        response["urlsExpireAt"] = _iso(now + timedelta(seconds=PRESIGN_TTL_SECONDS))
+
+    return _response(200, response)
+
+
+def queue_site_command(event, site_id):
+    """POST /sites/{siteId}/commands (operator token) — {kind, args?}. Delivered
+    on the site's next heartbeat; there is no inbound path to a site by design,
+    so a box behind a tailnet is as reachable as an EC2 instance."""
+    site = _owned_site(event, site_id)
+    body = _body(event)
+    kind = str(body.get("kind") or "").strip()
+    if kind not in SITE_COMMAND_KINDS:
+        raise ApiError(400, "kind must be one of {}".format(", ".join(SITE_COMMAND_KINDS)))
+    args = body.get("args") or {}
+    if not isinstance(args, dict):
+        raise ApiError(400, "args must be an object")
+
+    pending = list(site.get("commands") or [])
+    if len(pending) >= MAX_SITE_COMMANDS:
+        # A site that is not draining its queue is not listening; piling more on
+        # helps nobody and is how a row grows without bound.
+        raise ApiError(409, "this site has {} undelivered commands".format(len(pending)))
+    command = {"id": "c-" + str(uuid.uuid4()), "kind": kind, "args": args, "queuedAt": _iso(_now())}
+    pending.append(command)
+
+    try:
+        SITES_TABLE.update_item(
+            Key={"siteId": site_id},
+            UpdateExpression="SET commands = :c, rev = :next",
+            ConditionExpression="rev = :rev",
+            ExpressionAttributeValues={
+                ":c": pending,
+                ":rev": int(site.get("rev") or 0),
+                ":next": int(site.get("rev") or 0) + 1,
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(409, "site row changed underneath this write; retry")
+        raise
+    return _response(200, {"command": command})
+
+
+def delete_site(event, site_id):
+    """DELETE /sites/{siteId} — retire it. The row is kept (it is the only
+    record of what that body was, and the sweep still reads it) but its token
+    hash is destroyed, so a leaked token dies with the same call."""
+    site = _owned_site(event, site_id)
+    SITES_TABLE.update_item(
+        Key={"siteId": site_id},
+        UpdateExpression=(
+            "SET #state = :retired, retiredAt = :now, rev = :next REMOVE tokenSha256, leaseUntil"
+        ),
+        ExpressionAttributeNames={"#state": "state"},
+        ExpressionAttributeValues={
+            ":retired": "retired",
+            ":now": _iso(_now()),
+            ":next": int(site.get("rev") or 0) + 1,
+        },
+    )
+    return _response(200, {"siteId": site_id, "state": "retired"})
+
+
 # --- entry point -------------------------------------------------------------
+
+
+def _require_site_scope(event, method, parts):
+    """A site token authenticates ONE body, and may only act as that body.
+
+    Without this, a site token would be a full operator token for its owner's
+    account: `_authorize` attaches the same `_userId`, and every route reads
+    only that. The allow-list is therefore the whole boundary, and it is
+    written as "deny unless explicitly listed" — a route added later is
+    inaccessible to sites until someone decides it should be."""
+    site_id = event.get("_siteId")
+    if not site_id:
+        return
+    # Its own row: heartbeat and retire-self. Not /sites (enumerating its
+    # siblings), not /sites/enroll (minting new bodies), not another site's id.
+    if len(parts) >= 2 and parts[0] == "sites" and parts[1] == site_id:
+        if (method == "POST" and len(parts) == 3 and parts[2] == "heartbeat") or (
+            method == "DELETE" and len(parts) == 2
+        ):
+            return
+    # Re-signing its own URLs, and telling its owner something happened. Both
+    # are already scoped to `_userId` and neither can name another site.
+    if method == "POST" and parts in (["presign"], ["notify"]):
+        return
+    raise ApiError(403, "a site token cannot use this route")
 
 
 def _route(event):
@@ -2552,6 +2967,18 @@ def _route(event):
     path = str(event.get("rawPath") or http.get("path") or "/").rstrip("/") or "/"
     parts = [p for p in path.split("/") if p]
 
+    _require_site_scope(event, method, parts)
+
+    if method == "POST" and parts == ["sites", "enroll"]:
+        return enroll_site(event)
+    if method == "GET" and parts == ["sites"]:
+        return list_sites(event)
+    if method == "POST" and len(parts) == 3 and parts[0] == "sites" and parts[2] == "heartbeat":
+        return site_heartbeat(event, parts[1])
+    if method == "POST" and len(parts) == 3 and parts[0] == "sites" and parts[2] == "commands":
+        return queue_site_command(event, parts[1])
+    if method == "DELETE" and len(parts) == 2 and parts[0] == "sites":
+        return delete_site(event, parts[1])
     if method == "POST" and parts == ["workers"]:
         return create_worker(event)
     if method == "GET" and parts == ["workers"]:

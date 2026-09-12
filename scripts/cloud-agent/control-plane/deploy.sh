@@ -23,6 +23,7 @@ TABLE=fin-cloud-workers
 TOKENS_TABLE=fin-device-tokens
 USERS_TABLE=fin-users
 SESSIONS_TABLE=fin-sessions
+SITES_TABLE=fin-sites
 API_NAME=fin-control-plane
 RULE=fin-worker-sweep
 WAKE_RULE=fin-worker-wake
@@ -107,6 +108,21 @@ if ! aws dynamodb describe-table --table-name "$SESSIONS_TABLE" >/dev/null 2>&1;
   aws dynamodb update-time-to-live --table-name "$SESSIONS_TABLE" \
     --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
   echo "==> Created DynamoDB table $SESSIONS_TABLE (on-demand, TTL on ttl)"
+fi
+
+# Sites (docs/SITES.md): one row per body that can act as an agent. Its own
+# table, never rows in $TABLE — that one's contents ARE EC2 instances, and a
+# resident Mac row there would be swept to termination and priced as unknown.
+# No TTL: a retired site's row is the only record of what that body was, and
+# the sweep still reads it.
+if ! aws dynamodb describe-table --table-name "$SITES_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$SITES_TABLE" \
+    --attribute-definitions AttributeName=siteId,AttributeType=S \
+    --key-schema AttributeName=siteId,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$SITES_TABLE"
+  echo "==> Created DynamoDB table $SITES_TABLE (on-demand)"
 fi
 
 # --- model-factory data lake -------------------------------------------------
@@ -235,6 +251,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$SESSIONS_TABLE"
+    },
+    {
+      "Sid": "SitesTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$SITES_TABLE"
     },
     {
       "Sid": "AgentObjects",
@@ -501,6 +523,11 @@ while read -r ROUTE_KEY; do
   fi
 done <<'ROUTES'
 POST /auth/apple
+POST /sites/enroll
+GET /sites
+POST /sites/{siteId}/heartbeat
+POST /sites/{siteId}/commands
+DELETE /sites/{siteId}
 POST /workers
 GET /workers
 DELETE /workers/{workerId}

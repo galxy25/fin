@@ -88,6 +88,53 @@ sizes below. Note the default is `t4g.nano`, one size below `launch.sh`'s manual
 explicitly if a worker dies on memory. The agent name `shared` (any case) is
 refused: it is reserved as the everyone-readable secret scope (below).
 
+## Sites
+
+A **site** is one body that can act as an agent — an EC2 worker, the resident
+daemon on a Mac, a BYO box, an app install. See `docs/SITES.md` for the design;
+this is Phase 1a, the registry only. Dispatch, primary election and the claim
+protocol are Phase 1b and do not exist yet, so nothing here routes a message.
+
+```sh
+# enroll (operator token). Idempotent by enrollKey: re-running the installer
+# returns the SAME site with a fresh token, it does not add a row.
+curl -sS -X POST "$API/sites/enroll" -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"agent":"Fin","kind":"resident","displayName":"Levi'"'"'s iMac",
+       "enrollKey":"levis-imac/deepspacenine"}'
+
+# the caller's own sites, highest priority first
+curl -sS "$API/sites" -H "$AUTH"
+
+# queue a lifecycle command; it is delivered on the site's next heartbeat
+curl -sS -X POST "$API/sites/<siteId>/commands" -H "$AUTH" \
+  -H 'content-type: application/json' -d '{"kind":"restart"}'
+
+# retire it — this also destroys the stored token hash, so it IS the revocation
+curl -sS -X DELETE "$API/sites/<siteId>" -H "$AUTH"
+```
+
+The heartbeat is the site's own call, authenticated with the **site token**
+returned by enroll plus an `X-Fin-Site` header naming itself:
+
+```sh
+curl -sS -X POST "$API/sites/<siteId>/heartbeat" \
+  -H "authorization: Bearer <siteToken>" -H "X-Fin-Site: <siteId>" \
+  -H 'content-type: application/json' \
+  -d '{"state":"working","capabilities":{"daemon_version":"1.5.0"}}'
+```
+
+It renews the 60-second lease from the Lambda's own clock (sites send
+durations, never timestamps), records what the body can reach, drains any
+queued commands exactly once, and re-signs the site's presigned URLs when the
+site reports they are within 20 minutes of expiry.
+
+A site token is scoped to **that one body**: its own heartbeat, its own
+retirement, `/presign` and `/notify`. It cannot list its siblings, enroll new
+sites, queue commands, or touch `/workers`, `/secrets` or `/memory` — the
+allow-list in `_require_site_scope` is deny-by-default and is the entire
+boundary, since a site token attaches its owner's `userId` exactly like a
+session token does. Revoke one by re-enrolling (rotates) or retiring (destroys).
+
 ## Auto-provisioning
 
 The app lets any agent be set to Cloud Harness and delivers mail to its
