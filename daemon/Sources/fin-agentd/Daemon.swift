@@ -159,6 +159,22 @@ struct DaemonConfig: Decodable {
         var maxLines: Int?
     }
 
+    /// Live-tmux session inventory + per-coding-agent-session activity notes. Present =
+    /// on; absent = the daemon behaves exactly as it does today. Off by default in every
+    /// shipped config — this reads a human's live terminal input/output into an LLM call,
+    /// a materially more sensitive default than anything else here, so Levi must add this
+    /// block himself (or the installer must ask) before it ever runs on a real machine.
+    struct SessionActivityConfig: Decodable {
+        /// How often to re-scan `tmux list-panes -a` and upsert the registry. Default 5 min.
+        var inventoryIntervalSeconds: Int?
+        /// How often to re-capture and re-summarize each coding-agent session. Default 15 min.
+        var activityIntervalSeconds: Int?
+        /// Lines of pane scrollback to capture per summarization pass. Default 200.
+        var captureLines: Int?
+        /// Override for `TmuxSessionInventory.defaultCoderAgentProcessNames`.
+        var knownAgentProcesses: [String]?
+    }
+
     var server: ServerConfig
     var agent: AgentConfig
     /// The initial instruction submitted the moment the session is up.
@@ -185,6 +201,9 @@ struct DaemonConfig: Decodable {
     var transcript: TranscriptConfig?
     /// Optional control-plane block for push notifications; see `ControlPlaneConfig`.
     var controlPlane: ControlPlaneConfig?
+    /// Optional session-activity block; see `SessionActivityConfig`. Opt-in, off by
+    /// default — see that struct's doc comment.
+    var sessionActivity: SessionActivityConfig?
 
     static let defaultDeviceToken8 = "cloud001"
     static let defaultTranscriptFlushSeconds = 15
@@ -271,6 +290,18 @@ final class Daemon {
     /// this daemon's own prompt-injection cache fresh; nil when the config has no
     /// `controlPlane` block — same gate as the other memory-adjacent clients.
     private var memoryConsolidator: DaemonMemoryConsolidator?
+    /// The session-routing registry, opened for `SessionInventoryScanner`/
+    /// `SessionActivitySummarizer` to write into; nil unless `config.sessionActivity`
+    /// is present. (The routing PROMPT reads its own copy of the same file via
+    /// `composedSystemPrompt`'s `RegistryDocument.loadIfPresent` — this actor is a
+    /// separate, writable handle onto that same on-disk registry.)
+    private var sessionRoutingRegistry: SessionRoutingRegistry?
+    /// Periodic `tmux list-panes -a` scan → registry upsert; nil unless
+    /// `config.sessionActivity` is present.
+    private var sessionInventoryScanner: SessionInventoryScanner?
+    /// Periodic per-coding-agent-session capture → summarize → registry write; nil
+    /// unless `config.sessionActivity` is present.
+    private var sessionActivitySummarizer: SessionActivitySummarizer?
     /// Cross-site inbox cooperation: claimed before this daemon answers a directive,
     /// released after — so a second site polling the same agent's inbox backs off
     /// instead of racing to answer the same message. Nil when the config has no
@@ -961,6 +992,55 @@ final class Daemon {
                 }
             )
             log("profile compaction enabled: control plane /memory/profile, cache at \(profileCachePath)")
+
+            // Live session inventory + per-coding-agent activity notes — opt-in (see
+            // `DaemonConfig.SessionActivityConfig`'s doc comment): a config with no
+            // `sessionActivity` block leaves this whole feature untouched. `session`
+            // (the connected SSH session, in scope in `run()` since `launch()`) is
+            // always set by this point — well before this control-plane block runs.
+            if let activityConfig = config.sessionActivity {
+                let registry = SessionRoutingRegistry(fileURL: URL(fileURLWithPath: routingRegistryPath))
+                _ = try? await registry.load()
+                sessionRoutingRegistry = registry
+
+                let knownAgents = activityConfig.knownAgentProcesses.map(Set.init)
+                    ?? TmuxSessionInventory.defaultCoderAgentProcessNames
+                let inventoryInterval = activityConfig.inventoryIntervalSeconds
+                    ?? Int(SessionInventoryScanner.defaultIntervalSeconds)
+                let activityInterval = activityConfig.activityIntervalSeconds
+                    ?? Int(SessionActivitySummarizer.defaultIntervalSeconds)
+                sessionInventoryScanner = SessionInventoryScanner(
+                    registry: registry, session: session,
+                    intervalSeconds: TimeInterval(inventoryInterval),
+                    knownAgentProcesses: knownAgents,
+                    audit: { [weak self] line in
+                        self?.log(line)
+                        self?.record(AgentAuditEvent(kind: "notice", text: line))
+                    }
+                )
+                sessionActivitySummarizer = SessionActivitySummarizer(
+                    registry: registry, session: session,
+                    intervalSeconds: TimeInterval(activityInterval),
+                    captureLines: activityConfig.captureLines ?? SessionActivitySummarizer.defaultCaptureLines,
+                    endpointURL: config.agent.endpointURL, modelIdentifier: config.agent.modelIdentifier,
+                    apiKey: config.agent.apiKey, temperature: config.agent.temperature ?? 0.2,
+                    maxOutputTokens: config.agent.maxOutputTokens ?? 640,
+                    audit: { [weak self] line in
+                        self?.log(line)
+                        self?.record(AgentAuditEvent(kind: "notice", text: line))
+                    }
+                )
+                memoryConsolidator?.sessionActivityNotesProvider = { [weak registry] in
+                    guard let registry else { return [] }
+                    let doc = await registry.document
+                    return doc.sessions.compactMap { entry in
+                        guard let note = entry.activityNote, !note.isEmpty else { return nil }
+                        return "\(entry.session): \(note)"
+                    }
+                }
+                log("session-activity tracking enabled: inventory every \(inventoryInterval)s, "
+                    + "activity notes every \(activityInterval)s")
+            }
         }
 
         var consecutiveFailures = 0
@@ -1083,6 +1163,8 @@ final class Daemon {
                 }
                 await transcript?.flushIfDue()
                 memoryConsolidator?.tickIfDue()
+                sessionInventoryScanner?.tickIfDue()
+                sessionActivitySummarizer?.tickIfDue()
                 if heartbeatEnabled, !beatsAreSuspended, Date() >= beatAt { break }
                 try? await Task.sleep(for: .milliseconds(250))
             }

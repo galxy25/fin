@@ -30,11 +30,26 @@ public struct SessionRegistration: Codable, Equatable, Sendable {
     /// True for sessions Fin itself spawned (auto-registered), so the registry can
     /// distinguish them from ones the user handed over explicitly.
     public var createdByFin: Bool
+    /// A short, model-written note on what this coding-agent session is currently
+    /// working on and how — written by `SessionActivitySummarizer`, nil until that
+    /// (opt-in) feature runs at least once for this session. Never touched for a
+    /// session the user registered by hand.
+    public var activityNote: String?
+    /// ISO8601 string, matching `GoalsLedger`'s convention for a hand-editable JSON
+    /// file — never a raw `Codable Date` (that would encode as a `Double`, unreadable
+    /// by a human editing this file directly).
+    public var activityNoteUpdatedAt: String?
+    /// `"session:window.pane"`, set only by auto-discovery (`TmuxSessionInventory`
+    /// via `observeDiscoveredSession`), used to re-capture that pane on later ticks.
+    public var agentPaneTarget: String?
 
     enum CodingKeys: String, CodingKey {
         case session, kind, agent, cwd, tasks
         case registeredBy = "registered_by"
         case createdByFin = "created_by_fin"
+        case activityNote = "activity_note"
+        case activityNoteUpdatedAt = "activity_note_updated_at"
+        case agentPaneTarget = "agent_pane_target"
     }
 
     public init(
@@ -44,7 +59,10 @@ public struct SessionRegistration: Codable, Equatable, Sendable {
         cwd: String? = nil,
         tasks: [String] = [],
         registeredBy: String? = nil,
-        createdByFin: Bool = false
+        createdByFin: Bool = false,
+        activityNote: String? = nil,
+        activityNoteUpdatedAt: String? = nil,
+        agentPaneTarget: String? = nil
     ) {
         self.session = session
         self.kind = kind
@@ -53,6 +71,9 @@ public struct SessionRegistration: Codable, Equatable, Sendable {
         self.tasks = tasks
         self.registeredBy = registeredBy
         self.createdByFin = createdByFin
+        self.activityNote = activityNote
+        self.activityNoteUpdatedAt = activityNoteUpdatedAt
+        self.agentPaneTarget = agentPaneTarget
     }
 
     /// Lenient by hand: the registry is a user-editable working-memory artifact, and
@@ -67,6 +88,9 @@ public struct SessionRegistration: Codable, Equatable, Sendable {
         tasks = try container.decodeIfPresent([String].self, forKey: .tasks) ?? []
         registeredBy = try container.decodeIfPresent(String.self, forKey: .registeredBy)
         createdByFin = try container.decodeIfPresent(Bool.self, forKey: .createdByFin) ?? false
+        activityNote = try container.decodeIfPresent(String.self, forKey: .activityNote)
+        activityNoteUpdatedAt = try container.decodeIfPresent(String.self, forKey: .activityNoteUpdatedAt)
+        agentPaneTarget = try container.decodeIfPresent(String.self, forKey: .agentPaneTarget)
     }
 }
 
@@ -574,6 +598,58 @@ public actor SessionRoutingRegistry {
             }
         }
         if appended { try save() }
+    }
+
+    /// The missing WRITE path this actor's own comments (and RoutingRegistryLocation.swift
+    /// :13-16) describe only as "future." Never mutates an entry the user hand-registered
+    /// (`createdByFin == false`) beyond additively learning vocabulary through
+    /// `appendTasks` — exactly what a successful route already does — so a hand-edited
+    /// registry can never be clobbered by a background scan. Only an entry Fin itself
+    /// created (or one this method itself is creating) has its kind/cwd/agent/pane-target
+    /// rewritten, and even then `tasks` is UNIONED, never replaced.
+    public func observeDiscoveredSession(
+        session: String,
+        kind: String,
+        cwd: String?,
+        agent: String?,
+        agentPaneTarget: String? = nil,
+        discoveredTasks: [String] = [],
+        registeredBy: String
+    ) throws {
+        if let index = document.sessions.firstIndex(where: { $0.session == session }) {
+            guard document.sessions[index].createdByFin else {
+                if !discoveredTasks.isEmpty { try appendTasks(discoveredTasks, toSession: session) }
+                return
+            }
+            var entry = document.sessions[index]
+            entry.kind = kind
+            entry.cwd = cwd ?? entry.cwd
+            entry.agent = agent ?? entry.agent
+            entry.agentPaneTarget = agentPaneTarget ?? entry.agentPaneTarget
+            for t in discoveredTasks where !entry.tasks.contains(t) { entry.tasks.append(t) }
+            document.sessions[index] = entry
+            try save()
+        } else {
+            try register(SessionRegistration(
+                session: session, kind: kind, agent: agent, cwd: cwd,
+                tasks: discoveredTasks, registeredBy: registeredBy, createdByFin: true
+            ))
+            if agentPaneTarget != nil, let idx = document.sessions.firstIndex(where: { $0.session == session }) {
+                document.sessions[idx].agentPaneTarget = agentPaneTarget
+                try save()
+            }
+        }
+    }
+
+    /// Write/refresh one session's activity note. A no-op (not an error) when the session
+    /// isn't registered yet — `observeDiscoveredSession` always runs earlier in the same
+    /// tick, so this should never actually miss in production; the guard exists so a test
+    /// or a race can't crash the actor.
+    public func setActivityNote(_ note: String, forSession name: String, at date: Date = Date()) throws {
+        guard let index = document.sessions.firstIndex(where: { $0.session == name }) else { return }
+        document.sessions[index].activityNote = note
+        document.sessions[index].activityNoteUpdatedAt = ISO8601DateFormatter().string(from: date)
+        try save()
     }
 
     /// Atomic write so a crash mid-save can never leave a half-written registry —
