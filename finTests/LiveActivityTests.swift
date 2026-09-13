@@ -24,8 +24,8 @@ final class LiveActivityTests: XCTestCase {
 
     func testContentStateIsPresenceVocabularyVerbatim() {
         let working = FinLiveActivityPlan.contentState(for: .working(siteName: "Levi's iMac"), now: t0)
-        XCTAssertEqual(working.headline, "Fin is working")
-        XCTAssertEqual(working.detail, "on Levi's iMac")
+        XCTAssertEqual(working.headline, "Fin on it: Levi's iMac")
+        XCTAssertNil(working.detail, "the device is in the headline now")
         XCTAssertEqual(working.glyph, "gearshape.2")
         XCTAssertEqual(working.status, .working)
         XCTAssertEqual(working.updatedAt, t0.timeIntervalSince1970)
@@ -52,10 +52,16 @@ final class LiveActivityTests: XCTestCase {
     func testWireShapeMatchesTheLambdaContract() throws {
         // The Lambda mirrors these keys (`_activity_content_state`); a rename
         // on either side silently blanks the tile, so the JSON is pinned here.
-        let state = FinLiveActivityPlan.contentState(for: .working(siteName: "iMac"), now: t0)
+        // needs-input is the state that still carries a detail line ("Fin on
+        // it: <device>" moved the device into the working headline).
+        let state = FinLiveActivityPlan.contentState(for: .needsInput(siteName: "iMac"), now: t0)
         let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? [String: Any]
         XCTAssertEqual(Set(try XCTUnwrap(json).keys), ["headline", "detail", "glyph", "status", "updatedAt"])
-        XCTAssertEqual(json?["status"] as? String, "working")
+        XCTAssertEqual(json?["status"] as? String, "needsInput")
+        let working = try JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            FinLiveActivityPlan.contentState(for: .working(siteName: "iMac"), now: t0))) as? [String: Any]
+        XCTAssertEqual(working?["headline"] as? String, "Fin on it: iMac")
+        XCTAssertNil(working?["detail"])
         XCTAssertEqual(json?["updatedAt"] as? Double, t0.timeIntervalSince1970)
         // And what the Lambda sends decodes: `detail: null`, epoch seconds.
         let pushed = """

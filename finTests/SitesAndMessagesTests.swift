@@ -75,10 +75,11 @@ final class SitesAndMessagesTests: XCTestCase {
         XCTAssertEqual(FinPresence.fold([site("gone", state: "retired", live: true)]), .asleep)
     }
 
-    func testPresenceHeadlinesNeverNameAComputerExceptInTheDetail() {
+    func testWorkingHeadlineNamesTheDeviceAndNeedsInputKeepsItInTheDetail() {
         let presence = FinPresence.working(siteName: "Levi's iMac")
-        XCTAssertEqual(presence.headline, "Fin is working")
-        XCTAssertEqual(presence.detail, "on Levi's iMac")
+        XCTAssertEqual(presence.headline, "Fin on it: Levi's iMac")
+        XCTAssertNil(presence.detail)
+        XCTAssertEqual(FinPresence.needsInput(siteName: "Cloud").detail, "on Cloud")
         XCTAssertNil(FinPresence.asleep.detail)
     }
 

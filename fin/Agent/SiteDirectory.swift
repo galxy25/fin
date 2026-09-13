@@ -112,7 +112,10 @@ enum FinPresence: Equatable {
     var headline: String {
         switch self {
         case .needsInput: return "Fin needs your input"
-        case .working: return "Fin is working"
+        // Levi (2026-09-12, from the car): the device belongs in the headline so
+        // the small CarPlay Dashboard tile names it. Mirrored in the Lambda's
+        // `_activity_content_state`; change both together.
+        case .working(let name): return "Fin on it: \(name)"
         case .idle: return "Fin is ready"
         case .asleep: return "Fin is asleep — no computer is reachable"
         }
@@ -120,8 +123,8 @@ enum FinPresence: Equatable {
 
     var detail: String? {
         switch self {
-        case .needsInput(let name), .working(let name): return "on \(name)"
-        case .idle, .asleep: return nil
+        case .needsInput(let name): return "on \(name)"
+        case .working, .idle, .asleep: return nil
         }
     }
 

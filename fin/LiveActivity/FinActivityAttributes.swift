@@ -34,7 +34,7 @@ struct FinActivityAttributes: Codable, Hashable {
             case answered
         }
 
-        /// "Fin is working" / "Fin needs your input" — `FinPresence.headline`
+        /// "Fin on it: <device>" / "Fin needs your input" — `FinPresence.headline`
         /// verbatim, or "Fin answered" for a reply push.
         var headline: String
         /// "on Levi's iMac", or the reply preview; nil when there is nothing to add.
