@@ -115,12 +115,32 @@ public func rawCompletion(
     return completion.text
 }
 
+/// The one knob a host process sets on the (internal) endpoint client.
+public enum AgentEndpointDefaults {
+    public static func setRequestTimeout(seconds: Int) {
+        AgentEndpointClient.defaultRequestTimeout = TimeInterval(min(max(seconds, 30), 1800))
+    }
+
+    public static var requestTimeoutSeconds: Int { Int(AgentEndpointClient.defaultRequestTimeout) }
+}
+
 struct AgentEndpointClient {
     let baseURL: String
     let model: String
     let apiKey: String?
     let temperature: Double
     let maxOutputTokens: Int
+    /// How long one completion may take. Defaults to `defaultRequestTimeout`,
+    /// which the daemon raises from its config: a 12B local model chewing an
+    /// 8k context on a 32 GB Mac that is also archiving four TestFlight builds
+    /// took longer than 120 s on 2026-09-12, and the user's question came back
+    /// as "Fin couldn't finish: the request timed out".
+    var requestTimeout: TimeInterval = AgentEndpointClient.defaultRequestTimeout
+
+    /// Process-wide default, set once at startup (the daemon reads
+    /// `agent.requestTimeoutSeconds` through `AgentEndpointDefaults`); the app
+    /// keeps the historical 120 s.
+    nonisolated(unsafe) static var defaultRequestTimeout: TimeInterval = 120
 
     private var completionsURL: URL? {
         var trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -164,7 +184,7 @@ struct AgentEndpointClient {
         if let apiKey, !apiKey.isEmpty {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
-        request.timeoutInterval = 120
+        request.timeoutInterval = requestTimeout
 
         var payload: [String: Any] = [
             "model": model,

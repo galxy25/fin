@@ -108,6 +108,9 @@ struct DaemonConfig: Decodable {
         var systemPrompt: String?
         var terminalContextLines: Int?
         var heartbeatSeconds: Int?
+        /// Seconds one model completion may take before the turn fails. Default
+        /// 300: a local model under build load needs more than the app's 120.
+        var requestTimeoutSeconds: Int?
     }
 
     /// The S3 remote-supervision channel — the same bucket contract the app's
@@ -880,6 +883,7 @@ final class Daemon {
         self.auditLogPath = auditPath
         self.auditLog = writer
         self.heartbeatSeconds = max(5, config.agent.heartbeatSeconds ?? 60)
+        AgentEndpointDefaults.setRequestTimeout(seconds: config.agent.requestTimeoutSeconds ?? 300)
         // Already validated by `DaemonConfig.load`; a nil here is an absent field.
         let parsedAgentID = try? config.parsedAgentID()
         self.agentID = parsedAgentID

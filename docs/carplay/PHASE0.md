@@ -67,6 +67,9 @@ car screen in Phase 0 (or Phase 1) — do not describe it as "displaying the res
 
 On the iPhone: **Settings › Notifications › Announce Notifications** → turn on
 **Announce Notifications**, then turn on **CarPlay** (and **Headphones** if you
+also want AirPods), **then scroll to the app list and turn on Fin** — every app
+is off there by default, and Levi's first in-car test (2026-09-12) showed both
+pushes on the phone and nothing spoken for exactly this reason. (Continue:) …if you
 also want AirPods). Under CarPlay, keep "Announce New Messages" on and
 "Time Sensitive and Direct Messages" as the filter. Until Phase 1 ships Fin's
 pushes are plain alerts, so nothing will be announced yet; the setting is the
