@@ -168,6 +168,18 @@ public struct Goal: Codable, Equatable, Sendable {
         updates.contains { $0.kind == .close }
     }
 
+    /// Why a second `close` on this goal is refused, or nil when a close is due. On
+    /// 2026-09-13 the model logged `close` on one done goal eleven times over four
+    /// hours and pushed the same "Audit Complete" after each — the ledger already
+    /// hides a closed-out goal from the tick, but nothing stopped the model re-closing
+    /// it from memory. The tool now refuses, and the refusal says why.
+    public var closeRefusalReason: String? {
+        guard let closed = updates.last(where: { $0.kind == .close }) else { return nil }
+        return "goal \"\(id)\" was already closed out and reported to the user at \(closed.at). "
+            + "Do not report, close, or notify about it again — it is finished. Move on to the "
+            + "open goals, or idle if there are none."
+    }
+
     /// Whether the latest blocker has never been followed by a `report` update — the
     /// baseline's `_needs_blocker_surface`: an unsurfaced blocker is reported once; a
     /// surfaced one sits quiet, never driven, never re-nagged.

@@ -512,6 +512,21 @@ final class AgentEngineDispatchTests: XCTestCase {
         XCTAssertFalse(result.contains("not reached"), "a queued push is not the same as no channel")
     }
 
+    /// A push the runner refused as a repeat of a recent one must tell the model the
+    /// owner already has that news — never "sent", never "no channel".
+    func testNotifyReportsSuppressedDuplicate() async {
+        let engine = makeEngine()
+        engine.onNotify = { _, _ in .suppressedDuplicate(minutesAgo: 12, title: "Audit Complete") }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.notify.name,
+            #"{"title": "Audit Complete", "body": "The audit is complete."}"#
+        ))
+        XCTAssertTrue(result.hasPrefix("Not sent"), "got: \(result)")
+        XCTAssertTrue(result.contains("Audit Complete") && result.contains("12 minutes ago"), "got: \(result)")
+        XCTAssertTrue(result.contains("do not report it again"), "got: \(result)")
+    }
+
     /// A channel that IS configured and WAS attempted, but is confirmed not to have
     /// delivered, must read as a real failure — distinct from both "sent" and from "no
     /// channel configured" (a runner reports `.unavailable` only when nothing exists at

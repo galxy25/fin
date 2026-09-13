@@ -971,6 +971,32 @@ final class Daemon {
             .path
     }
 
+    /// The model's recent `notify` pushes (`NotifyDedupe`), same sibling-file directory.
+    /// On disk, not in memory, because the crash loop that spams is the one that
+    /// restarts the process — an in-memory list would forget every push at each restart.
+    private var recentNotifyPath: String {
+        URL(fileURLWithPath: auditLogPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("fin-agentd-notify-recent.json")
+            .path
+    }
+
+    /// Closes out a paged stall on the first turn that succeeds: one "is back" push per
+    /// incident, so the owner who was paged about the outage also hears it ended, and the
+    /// next stall starts a fresh backoff instead of inheriting this one's page count.
+    private func noteStallRecovered() {
+        let now = Date()
+        guard let recovered = StallNotifyGate.stateRecovered(
+            from: StallNotifyMarker.state(at: stallNotifyStatePath), now: now
+        ) else { return }
+        StallNotifyMarker.write(recovered, at: stallNotifyStatePath)
+        let pages = recovered.pageCount
+        let line = "[stall] recovered — turns succeed again after \(pages) page\(pages == 1 ? "" : "s")"
+        log(line)
+        record(AgentAuditEvent(kind: "notice", text: line))
+        notify(event: "agent-recovered", message: "fin-agentd is answering again; the earlier stall is over.")
+    }
+
     /// A local cache of the shared cumulative profile (`/memory/profile`), same sibling-
     /// file directory as the goals ledger and routing registry. `composedSystemPrompt`
     /// is `nonisolated static` and reads local files synchronously, so it can't fetch
@@ -1664,6 +1690,7 @@ final class Daemon {
                 lastTurnAt = Date()
                 lastAssistantPreview = String(text.prefix(200))
                 log("agent: \(text)")
+                noteStallRecovered()
                 // Kept past the ack so a task-complete push below can name the
                 // message it answers — the control plane pushes each message's
                 // reply once, whichever of the ack or this push gets there first.
@@ -1745,16 +1772,22 @@ final class Daemon {
                     // paging a human every ~17 minutes for as long as the underlying
                     // failure persists — exactly what happened live on 2026-09-09/10.
                     let now = Date()
-                    if StallNotifyGate.shouldNotify(
-                        lastNotifiedAt: StallNotifyMarker.lastNotifiedAt(at: stallNotifyStatePath),
-                        now: now
-                    ) {
+                    let stallState = StallNotifyMarker.state(at: stallNotifyStatePath)
+                    if StallNotifyGate.shouldNotify(state: stallState, failure: message, now: now) {
+                        let repeatNote = (stallState?.active == true && stallState?.failureKey == StallNotifyGate.failureKey(message))
+                            ? " (still the same failure; next page in \(Int(StallNotifyGate.repeatCooldown(pageCount: (stallState?.pageCount ?? 0) + 1) / 60)) min at the earliest)"
+                            : ""
                         notify(
                             event: "agent-stalled",
-                            message: "fin-agentd giving up after 5 consecutive failed turns: \(message)",
+                            message: "fin-agentd giving up after 5 consecutive failed turns: \(message)\(repeatNote)",
                             messageID: failedMessageID, threadID: failedThreadID
                         )
-                        StallNotifyMarker.recordNotified(at: stallNotifyStatePath, now: now)
+                        StallNotifyMarker.write(
+                            StallNotifyGate.statePaged(after: stallState, failure: message, now: now),
+                            at: stallNotifyStatePath
+                        )
+                    } else {
+                        log("[stall] not paging again yet — same failure as the last page")
                     }
                     await fail("5 consecutive turn failures; last: \(message)")
                 }
@@ -2569,9 +2602,12 @@ final class Daemon {
     private func goalLog(
         ledger: GoalsLedgerStore, goalID: String, kind: UpdateKind, text: String
     ) async -> AgentGoalLogOutcome {
-        let exists = await ledger.document.goals.contains(where: { $0.id == goalID })
-        guard exists else {
+        guard let goal = await ledger.document.goals.first(where: { $0.id == goalID }) else {
             return .failed("no goal with id \"\(goalID)\" exists.")
+        }
+        if kind == .close, let reason = goal.closeRefusalReason {
+            log("[goal_log] refused repeat close on \(goalID)")
+            return .failed(reason)
         }
         do {
             try await ledger.appendUpdate(Update(kind: kind, text: text), toGoal: goalID)
@@ -2602,6 +2638,20 @@ final class Daemon {
     private func notifyFromTool(title: String, body: String) async -> AgentNotifyOutcome {
         guard hasNotifyChannel else { return .unavailable }
 
+        // The floor under the prompt's "never spam": a push that repeats one the model
+        // already sent in the last two hours is refused before either channel fires,
+        // and the tool result tells the model the owner already has that news.
+        let now = Date()
+        if let earlier = NotifyDedupe.duplicate(
+            title: title, body: body, in: RecentNotifyStore.load(at: recentNotifyPath), now: now
+        ) {
+            let minutesAgo = max(0, Int(now.timeIntervalSince(earlier.at) / 60))
+            let line = "[notify] suppressed duplicate of \"\(earlier.title)\" sent \(minutesAgo) min ago"
+            log(line)
+            record(AgentAuditEvent(kind: "notice", text: line))
+            return .suppressedDuplicate(minutesAgo: minutesAgo, title: earlier.title)
+        }
+
         // The shell hook is title-less by contract (FIN_EVENT/FIN_MESSAGE only), so the
         // model's title rides in as the event label and the body is the message. Launching
         // it either succeeds or fails synchronously — there's nothing to await beyond that.
@@ -2617,6 +2667,14 @@ final class Daemon {
         lastNotifyTask = sendTask
 
         let confirmed = await firstToFinish(sendTask, timeoutSeconds: Self.notifyToolTimeoutSeconds)
+        if confirmed != false {
+            // Sent or in flight: remember it so the next near-identical push is refused.
+            let recent = RecentNotifyStore.load(at: recentNotifyPath)
+            RecentNotifyStore.save(
+                NotifyDedupe.remembering(RecentNotify(title: title, body: body, at: now), in: recent, now: now),
+                at: recentNotifyPath
+            )
+        }
 
         return notifyOutcome(commandLaunched: commandLaunched, hasClient: true, confirmed: confirmed)
     }

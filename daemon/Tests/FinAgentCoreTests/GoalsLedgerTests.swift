@@ -116,6 +116,10 @@ final class GoalsLedgerTests: XCTestCase {
         var closed = ledger.goals[2]
         closed.updates.append(Update(kind: .close, text: "Closed and reported."))
         XCTAssertTrue(closed.hasCloseUpdate)
+        // A second close is refused (2026-09-13: eleven closes on one goal, a push each).
+        XCTAssertNil(ledger.goals[2].closeRefusalReason)
+        let refusal = closed.closeRefusalReason ?? ""
+        XCTAssertTrue(refusal.contains("already closed out") && refusal.contains("Do not report"), "got: \(refusal)")
 
         // blocker followed by report → surfaced, sits quiet.
         XCTAssertFalse(ledger.goals[1].needsBlockerSurface)

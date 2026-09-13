@@ -22,6 +22,9 @@ public enum AgentNotifyOutcome: Equatable, Sendable {
     case failed
     /// No push channel is configured at all.
     case unavailable
+    /// Not sent: it repeats a push the model already sent `minutesAgo` minutes ago
+    /// (`NotifyDedupe`). The owner has that news; the tool says so instead of pushing.
+    case suppressedDuplicate(minutesAgo: Int, title: String)
 }
 
 /// Model + sampling configuration for a headless engine. The daemon reads this straight
@@ -754,6 +757,11 @@ public final class AgentTurnEngine {
         case .unavailable:
             return "No push channel is configured, so the owner was not reached — say anything "
                 + "important in your reply text instead, and keep going."
+        case .suppressedDuplicate(let minutesAgo, let title):
+            let ago = minutesAgo <= 1 ? "a minute ago" : "\(minutesAgo) minutes ago"
+            return "Not sent: this repeats the notify \"\(title)\" you already sent \(ago). The owner "
+                + "has that news — do not report it again. Notify only when there is genuinely new "
+                + "information (and give it a new title); otherwise keep working or idle."
         }
     }
 

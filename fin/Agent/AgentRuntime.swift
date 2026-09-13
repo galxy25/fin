@@ -2034,6 +2034,10 @@ final class AgentRuntime: ObservableObject {
         case .unavailable:
             return "No push channel is configured, so the owner was not reached — say anything "
                 + "important in your reply text instead, and keep going."
+        case .suppressedDuplicate(let minutesAgo, let title):
+            // The in-app runner does not dedupe (yet); the case exists for the daemon.
+            return "Not sent: this repeats the notify \"\(title)\" you already sent \(minutesAgo) "
+                + "minutes ago. The owner has that news — do not report it again."
         }
     }
 

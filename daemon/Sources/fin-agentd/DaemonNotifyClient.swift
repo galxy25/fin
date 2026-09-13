@@ -76,6 +76,7 @@ final class DaemonNotifyClient {
         case "request-input": return "\(agentName) needs input"
         case "task-complete": return "\(agentName): task complete"
         case "agent-stalled": return "\(agentName) is stuck"
+        case "agent-recovered": return "\(agentName) is back"
         default: return agentName
         }
     }
