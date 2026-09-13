@@ -2838,7 +2838,7 @@ class PresenceFoldTests(unittest.TestCase):
         now = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
         state = lam._activity_content_state("working", "Levi's iMac", now)
         self.assertEqual(state, {
-            "headline": "Fin is working", "detail": "on Levi's iMac", "glyph": "gearshape.2",
+            "headline": "Fin on it: Levi's iMac", "detail": None, "glyph": "gearshape.2",
             "status": "working", "updatedAt": now.timestamp(),
         })
         asleep = lam._activity_content_state("asleep", "", now)
@@ -2895,7 +2895,7 @@ class LiveActivityPushTests(_MessagesTestCase):
         (payload, headers), = self.sent_to("tok-phone-update")
         self.assertEqual(headers, ("liveactivity", self.TOPIC))
         self.assertEqual(payload["aps"]["event"], "update")
-        self.assertEqual(payload["aps"]["content-state"]["headline"], "Fin is working")
+        self.assertEqual(payload["aps"]["content-state"]["headline"], "Fin on it: iMac")
         (payload, headers), = self.sent_to("tok-pad-start")
         self.assertEqual(headers, ("liveactivity", self.TOPIC))
         self.assertEqual(payload["aps"]["event"], "start")

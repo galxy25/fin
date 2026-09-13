@@ -1724,9 +1724,14 @@ def _activity_content_state(presence, site_name="", now=None):
     the idle status with its own headline — the tile has no fifth colour."""
     now = _now() if now is None else now
     headline, glyph = PRESENCE_TEXT[presence]
+    # Levi (2026-09-12, from the car): "Fin is working" → "Fin on it: <device>".
+    # The device moves into the headline, so the small Dashboard tile names it
+    # without needing the detail line.
+    if presence == "working" and site_name:
+        headline = "Fin on it: {}".format(site_name)
     return {
         "headline": headline,
-        "detail": "on {}".format(site_name) if site_name and presence in ("needsInput", "working") else None,
+        "detail": "on {}".format(site_name) if site_name and presence == "needsInput" else None,
         "glyph": glyph,
         "status": "idle" if presence == "asleep" else presence,
         "updatedAt": now.timestamp(),
