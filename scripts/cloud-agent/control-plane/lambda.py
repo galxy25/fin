@@ -3663,8 +3663,11 @@ def site_heartbeat(event, site_id):
         if isinstance(value, str) and value:
             updated[field] = value
     # The thread behind a heartbeat question (`_root_question_thread`) lives
-    # only as long as the site is waiting on it.
-    if state != "needs-input":
+    # only as long as the site is waiting on it: cleared on the beat that
+    # LEAVES needs-input. Not on any non-needs-input beat — the question is
+    # pushed mid-turn, and the beat that lands before the turn ends still says
+    # "working" (live on 2026-09-14: the id was gone before the state flipped).
+    if site.get("state") == "needs-input" and state != "needs-input":
         updated.pop("pendingThreadId", None)
 
     try:

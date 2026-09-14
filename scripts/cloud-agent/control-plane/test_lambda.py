@@ -2506,9 +2506,14 @@ class NotifyThreadTests(_ThreadsTestCase):
         self.assertEqual((summary["status"], summary["title"]), ("waiting_on_you", "Fix the two loose ends, or leave them?"))
         # No sweep ever wakes a worker for the question row.
         self.assertEqual(lam._queued_message_candidates(lam._now()), [])
-        # The user's reply joins the thread and the site's next beat lets go of it.
+        # The user's reply joins the thread.
         reply = self.send("leave them", threadId=thread_id)
         self.assertEqual(reply["threadId"], thread_id)
+        # The question is pushed mid-turn: a "working" beat before the turn ends
+        # must keep the id; the beat that leaves needs-input lets go of it.
+        self.beat(self.imac, state="working")
+        self.assertEqual(lam.SITES_TABLE.items[self.imac["siteId"]]["pendingThreadId"], thread_id)
+        self.beat(self.imac, state="needs-input")
         self.beat(self.imac, state="working")
         self.assertNotIn("pendingThreadId", lam.SITES_TABLE.items[self.imac["siteId"]])
 
