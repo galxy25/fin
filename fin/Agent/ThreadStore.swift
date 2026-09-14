@@ -301,12 +301,17 @@ enum ThreadTimeline {
         }
 
         // Message rows not yet in the transcript: queued / claimed / in flight.
+        // A row Fin authored (`source: "agent"` — a heartbeat question that
+        // rooted its own thread) is Fin asking, not Levi prompting.
         for message in messages where !appliedMessageIDs.contains(message.messageId) {
             guard let text = message.text, !text.isEmpty else { continue }
+            let asked = message.source == "agent"
             items.append(ThreadItem(
-                id: "m:" + message.messageId, party: .levi(deviceID8: message.authorSiteId8), kind: .prompt,
+                id: "m:" + message.messageId,
+                party: asked ? .fin(siteID8: message.authorSiteId8) : .levi(deviceID8: message.authorSiteId8),
+                kind: asked ? .notify : .prompt,
                 text: text, timestamp: message.createdAt ?? .distantPast,
-                status: messageChips(message), source: .message, sequence: 0
+                status: asked ? [] : messageChips(message), source: .message, sequence: 0
             ))
         }
 
@@ -318,7 +323,7 @@ enum ThreadTimeline {
                 let chips = deliveryChips(event)
                 if event.actor != "operator",
                    let index = items.firstIndex(where: { item in
-                       item.kind == .notify && item.source == .record
+                       item.kind == .notify && (item.source == .record || item.source == .message)
                            && item.party == .fin(siteID8: event.actor)
                            && abs(item.timestamp.timeIntervalSince(at)) <= foldWindow
                            && item.status.isEmpty

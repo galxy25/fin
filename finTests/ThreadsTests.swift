@@ -143,6 +143,27 @@ final class ThreadsTests: XCTestCase {
 
     // MARK: - Status chips and default selection
 
+    /// A heartbeat question roots a thread whose first row Fin authored
+    /// (`source: "agent"`, lambda.py `_root_question_thread`): it renders as
+    /// Fin asking, and the push event that followed folds into it as chips
+    /// instead of repeating the question.
+    func testAnAgentAuthoredQuestionRowIsFinAskingNotLeviPrompting() throws {
+        var json = messageJSON("m-q", thread: nil, text: "Fix the two loose ends, or leave them?", state: "answered", created: 0, author: "iMac0001")
+        json["source"] = "agent"
+        let question = try decodeMessage(json)
+        let events = [
+            ThreadEvent(threadId: "m-q", seq: 1, kind: "question.asked", actor: "iMac0001", detail: ["messageId": .string("m-q")], at: at(0)),
+            ThreadEvent(threadId: "m-q", seq: 2, kind: "notify.sent", actor: "iMac0001",
+                        detail: ["event": .string("request-input"), "title": .string("Fin needs input"), "delivered": .number(5), "failed": .number(0)], at: at(1)),
+        ]
+        let items = ThreadTimeline.build(thread: nil, messages: [question], records: [], events: events)
+        XCTAssertEqual(items.map(\.id), ["m:m-q"], "the notify event folds into the question row")
+        XCTAssertEqual(items.first?.party, .fin(siteID8: "iMac0001"))
+        XCTAssertEqual(items.first?.kind, .notify)
+        XCTAssertEqual(items.first?.text, "Fix the two loose ends, or leave them?")
+        XCTAssertEqual(items.first?.status, ThreadTimeline.deliveryChips(events[1]))
+    }
+
     func testStatusChipMapping() {
         XCTAssertEqual(ThreadStatus.waitingOnYou.chip, ThreadChip(label: "waiting on you", systemImage: "hand.raised", tint: .orange))
         XCTAssertEqual(ThreadStatus.stalled.chip, ThreadChip(label: "stalled", systemImage: "exclamationmark.triangle", tint: .red))

@@ -44,6 +44,10 @@ struct FinActivityAttributes: Codable, Hashable {
         var status: Status
         /// Unix epoch seconds.
         var updatedAt: Double
+        /// The thread a needs-input tile is waiting on (the question the site
+        /// asked rooted it, `_root_question_thread` in lambda.py) — what a tap
+        /// opens. Absent from older pushes and from every other status.
+        var threadID: String? = nil
     }
 }
 

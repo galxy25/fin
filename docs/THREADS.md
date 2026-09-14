@@ -46,6 +46,15 @@ after the last message, nothing since).
   the user line carries `in_reply_to`). `send_session` / `read_session` lines
   gain a structured `target` field (the pane) so the pane's side is a first
   class participant, not a string parsed out of prose.
+- **A question asked outside any message** (a `request-input` push from a
+  site during a heartbeat tick — nothing in flight to hang it off) roots its
+  own thread (`_root_question_thread`, 2026-09-13): one `fin-messages` row
+  authored by the agent (`source: "agent"`, `state: "answered"` so no sweep
+  wakes a body for it), a `question.asked` event, and `pendingThreadId` on
+  the site row until its next non-needs-input heartbeat. The push carries
+  that `fin.threadId`, the reply joins it, and the Live Activity's
+  needs-input content state carries it as `threadID` so a tap on the tile
+  (`fin://open?agent=…&thread=…`, `FinActivityLink`) opens the thread.
 - `/notify` gains optional `threadId` and `messageId` (the daemon passes the
   message it is answering; `notify-levi.sh --thread <id>`). The APNs payload
   carries `fin.threadId`, and `thread-id` = threadId so iOS groups the Lock

@@ -13,6 +13,7 @@ struct FinLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: FinActivityAttributes.self) { context in
             FinActivityPresentation(agentName: context.attributes.agentName, state: context.state)
+                .widgetURL(Self.link(context))
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
@@ -22,6 +23,7 @@ struct FinLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.center) {
                     FinActivityExpandedCenter(state: context.state)
+                        .widgetURL(Self.link(context))
                 }
                 DynamicIslandExpandedRegion(.trailing) {
                     FinActivityCompactTrailing(state: context.state)
@@ -40,6 +42,12 @@ struct FinLiveActivity: Widget {
         // floor. iOS 26 is what starts placing this family on the CarPlay
         // Dashboard (CarPlay Developer Guide pp. 3, 9, 10; WWDC25 session 216).
         .supplementalActivityFamilies([.small])
+    }
+
+    /// Every presentation opens the agent's conversation — and the pending
+    /// question's thread when the content state names one.
+    private static func link(_ context: ActivityViewContext<FinActivityAttributes>) -> URL? {
+        FinActivityLink.url(agentName: context.attributes.agentName, threadID: context.state.threadID)
     }
 }
 

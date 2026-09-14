@@ -76,6 +76,29 @@ final class LiveActivityTests: XCTestCase {
         XCTAssertEqual(attributes.agentName, "Fin")
     }
 
+    /// A needs-input tile names the thread its question rooted; every other
+    /// push (and every older one) leaves the key out, and the widget's link
+    /// carries it to the app.
+    func testAPendingQuestionThreadRidesTheContentStateAndTheLink() throws {
+        let pushed = """
+        {"headline":"Fin needs your input","detail":"on iMac","glyph":"exclamationmark.bubble","status":"needsInput","updatedAt":1800000000,"threadID":"m-11111111-2222-4333-8444-555555555555"}
+        """
+        let decoded = try JSONDecoder().decode(FinActivityAttributes.ContentState.self, from: Data(pushed.utf8))
+        XCTAssertEqual(decoded.threadID, "m-11111111-2222-4333-8444-555555555555")
+        let plain = FinLiveActivityPlan.contentState(for: .working(siteName: "iMac"), now: t0)
+        XCTAssertNil(plain.threadID)
+        let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(plain)) as? [String: Any]
+        XCTAssertNil(json?["threadID"], "nil must be omitted, not encoded as null — the Lambda's keys are pinned")
+
+        let url = try XCTUnwrap(FinActivityLink.url(agentName: "Fin", threadID: decoded.threadID))
+        XCTAssertEqual(url.absoluteString, "fin://open?agent=Fin&thread=m-11111111-2222-4333-8444-555555555555")
+        XCTAssertEqual(FinActivityLink.target(of: url), .init(agentName: "Fin", threadID: "m-11111111-2222-4333-8444-555555555555"))
+        let bare = try XCTUnwrap(FinActivityLink.url(agentName: "Fin", threadID: nil))
+        XCTAssertEqual(FinActivityLink.target(of: bare), .init(agentName: "Fin", threadID: nil))
+        XCTAssertNil(FinActivityLink.target(of: URL(string: "https://example.com/open?agent=Fin")!))
+        XCTAssertNil(FinActivityLink.target(of: URL(string: "fin://open?thread=m-1")!), "no agent, no target")
+    }
+
     // MARK: - Decision loop
 
     func testTrackerStartsUpdatesAndEndsAfterTheQuietGrace() {

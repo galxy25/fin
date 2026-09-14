@@ -71,6 +71,11 @@ targets:
         # as non-monotonic.
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        # `fin://open?agent=…&thread=…` — what a tap on the Live Activity opens
+        # (FinActivityLink / finApp.openActivityLink).
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.levischoen.fin.open
+            CFBundleURLSchemes: [fin]
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

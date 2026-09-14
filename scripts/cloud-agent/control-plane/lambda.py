@@ -1710,18 +1710,27 @@ def _presence_fold(sites, now=None):
     """(presence, siteName) over a user's site rows — the Lambda's copy of
     `FinPresence.fold`: the first live needs-input site wins, then the first
     live working one, else idle if anything is live, else asleep."""
+    presence, site = _presence_fold_site(sites, now)
+    return presence, str((site or {}).get("displayName") or "")
+
+
+def _presence_fold_site(sites, now=None):
+    """`_presence_fold`, but with the winning site row (None for idle/asleep)
+    so the tile can carry that site's pending question thread."""
     now = _now() if now is None else now
     live = [s for s in sites if _site_is_live(s, now)]
     for wanted in ("needs-input", "working"):
         for site in live:
             if site.get("state") == wanted:
-                return ("needsInput" if wanted == "needs-input" else "working"), str(site.get("displayName") or "")
-    return ("idle" if live else "asleep"), ""
+                return ("needsInput" if wanted == "needs-input" else "working"), site
+    return ("idle" if live else "asleep"), None
 
 
-def _activity_content_state(presence, site_name="", now=None):
+def _activity_content_state(presence, site_name="", now=None, thread_id=None):
     """The widget's ContentState for a folded presence. `asleep` is shown as
-    the idle status with its own headline — the tile has no fifth colour."""
+    the idle status with its own headline — the tile has no fifth colour.
+    `thread_id` (a needs-input site's pending question) is what a tap opens;
+    older widgets ignore the key."""
     now = _now() if now is None else now
     headline, glyph = PRESENCE_TEXT[presence]
     # Levi (2026-09-12, from the car): "Fin is working" → "Fin on it: <device>".
@@ -1729,13 +1738,16 @@ def _activity_content_state(presence, site_name="", now=None):
     # without needing the detail line.
     if presence == "working" and site_name:
         headline = "Fin on it: {}".format(site_name)
-    return {
+    state = {
         "headline": headline,
         "detail": "on {}".format(site_name) if site_name and presence == "needsInput" else None,
         "glyph": glyph,
         "status": "idle" if presence == "asleep" else presence,
         "updatedAt": now.timestamp(),
     }
+    if thread_id:
+        state["threadID"] = thread_id
+    return state
 
 
 def _answered_content_state(preview, now=None):
@@ -1882,10 +1894,12 @@ def _presence_change_push(before, after, now):
         if s.get("siteId") != after.get("siteId")
     ]
     was, _ = _presence_fold(others + [before], now)
-    presence, site_name = _presence_fold(others + [after], now)
+    presence, winner = _presence_fold_site(others + [after], now)
     if was == presence:
         return None
-    state = _activity_content_state(presence, site_name, now)
+    site_name = str((winner or {}).get("displayName") or "")
+    thread_id = (winner or {}).get("pendingThreadId") if presence == "needsInput" else None
+    state = _activity_content_state(presence, site_name, now, thread_id=thread_id)
     if presence in ("needsInput", "working"):
         alert = {"title": state["headline"], "body": state["detail"] or ""} if presence == "needsInput" else None
         attributes = {"agentName": str(after.get("agent") or "Fin"), "agentID": ""}
@@ -2002,6 +2016,13 @@ def notify(event):
     thread_id = _thread_root_for(user_id, str(body.get("threadId") or "").strip()) or ""
     if not thread_id and message_id:
         thread_id = _thread_root_for(user_id, message_id) or ""
+    # A question Fin asks OUTSIDE any message turn — a heartbeat tick that hit a
+    # blocker (Levi, 2026-09-13: "I don't see the thread with the question in
+    # the remote transcript") — has no message to hang off, so it roots its own
+    # thread here: Fin's question is the first turn, the reply the user types or
+    # speaks joins it, and the tile that says "needs your input" can open it.
+    if not thread_id and push_event == "request-input" and event.get("_siteId"):
+        thread_id = _root_question_thread(event, user_id, agent, text, _now()) or ""
 
     fin = {}
     if agent_id:
@@ -2067,12 +2088,63 @@ def notify(event):
         return _response(200, {"delivered": 0, "failed": 0, "removed": 0, "note": result["note"]})
     # 502 when tokens exist but nothing got through, so an unattended caller's
     # audit trail records the outage instead of a hollow success.
-    return _response(200 if result["delivered"] else 502, {
+    answer = {
         "delivered": result["delivered"],
         "failed": result["failed"],
         "removed": result["removed"],
         "reasons": result["reasons"],
-    })
+    }
+    if thread_id:
+        answer["threadId"] = thread_id
+    return _response(200 if result["delivered"] else 502, answer)
+
+
+def _root_question_thread(event, user_id, agent, question, now):
+    """Roots a thread for a question a site asked from a heartbeat (no message
+    in flight): one `fin-messages` row authored BY the agent — `source:
+    "agent"`, `state: "answered"` so no sweep wakes a worker for it and no body
+    claims it — whose id is the thread, plus a `question.asked` event and a
+    `pendingThreadId` stamp on the site row so its needs-input presence can
+    name the thread. Best-effort: any failure means "no thread", never a
+    refused push. Returns the thread id or None."""
+    site = _read_site(event.get("_siteId")) or {}
+    agent = agent or str(site.get("agent") or "").strip()
+    if not agent or site.get("userId") != user_id:
+        return None
+    message_id = "m-" + str(uuid.uuid4())
+    row = {
+        "messageId": message_id,
+        "userId": user_id,
+        "agent": agent,
+        "text": question,
+        "source": "agent",
+        "createdAt": _iso(now),
+        "state": "answered",
+        "answeredAt": _iso(now),
+        "context": {},
+        "routedBy": "question",
+        "clarifyCandidates": [],
+        "threadId": message_id,
+        "threadReason": "question",
+    }
+    site_id8 = site.get("siteId8")
+    if site_id8:
+        row["authorSiteId8"] = site_id8
+    try:
+        MESSAGES_TABLE.put_item(Item=row, ConditionExpression="attribute_not_exists(messageId)")
+        SITES_TABLE.update_item(
+            Key={"siteId": site["siteId"]},
+            UpdateExpression="SET pendingThreadId = :thread",
+            ExpressionAttributeValues={":thread": message_id},
+        )
+    except Exception as exc:  # noqa: BLE001 - the push itself must still go out
+        LOG.warning("question thread not rooted for %s: %s", agent, _scrub(exc))
+        return None
+    _thread_event(user_id, message_id, "question.asked", site_id8 or site.get("siteId"), {
+        "messageId": message_id,
+        "body": question[:MAX_THREAD_PREVIEW_CHARS],
+    }, now=now)
+    return message_id
 
 
 def _notify_actor(event):
@@ -3566,6 +3638,10 @@ def site_heartbeat(event, site_id):
         value = body.get(field)
         if isinstance(value, str) and value:
             updated[field] = value
+    # The thread behind a heartbeat question (`_root_question_thread`) lives
+    # only as long as the site is waiting on it.
+    if state != "needs-input":
+        updated.pop("pendingThreadId", None)
 
     try:
         # Conditional on `rev`: the drain above is a read-modify-write, and an
@@ -4642,6 +4718,7 @@ MAX_THREAD_EVENTS_READ = 1000
 THREAD_EVENT_KINDS = (
     "message.queued", "message.claimed", "message.applied", "message.answered",
     "thread.assigned", "notify.sent", "goal.followup", "relay.sent", "relay.read",
+    "question.asked",
 )
 THREAD_STATUSES = ("waiting_on_you", "working", "stalled", "answered")
 

@@ -394,12 +394,30 @@ struct FinApp: App {
         _sessionManager = StateObject(wrappedValue: manager)
     }
 
+    /// A tap on the Live Activity (`FinActivityLink`): route it exactly like a
+    /// notification tap on the same agent and thread. The link names the agent
+    /// by display name — the control plane's heartbeat path never knows the
+    /// UUID — so it is resolved against the synced agents here. No origin
+    /// device is known, so the residence rule decides local vs. remote console.
+    @MainActor
+    private func openActivityLink(_ url: URL) {
+        guard let target = FinActivityLink.target(of: url) else { return }
+        let name = target.agentName
+        var descriptor = FetchDescriptor<Agent>(predicate: #Predicate<Agent> { $0.name == name })
+        descriptor.fetchLimit = 1
+        guard let agent = try? modelContainer.mainContext.fetch(descriptor).first else { return }
+        sessionManager.pendingAgentOpen = SessionManager.PendingAgentOpen(
+            agentID: agent.id, originDeviceID8: nil, threadID: target.threadID
+        )
+    }
+
     var body: some Scene {
         WindowGroup(id: FinScene.main) {
             RootView()
                 .environmentObject(sessionManager)
                 .environmentObject(entitlementStore)
                 .preferredColorScheme(.dark)
+                .onOpenURL { url in openActivityLink(url) }
         }
         .modelContainer(modelContainer)
         #if os(macOS) || os(visionOS)

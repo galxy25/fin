@@ -2483,6 +2483,41 @@ class NotifyThreadTests(_ThreadsTestCase):
         self.assertEqual(payload["aps"]["thread-id"], root["messageId"])
         self.assertEqual(payload["fin"]["threadId"], root["messageId"])
 
+    def test_a_sites_heartbeat_question_roots_its_own_thread(self):
+        # Levi, 2026-09-13: a request_input from a heartbeat tick (no message in
+        # flight) was a push and nothing else — no thread to open, nothing in the
+        # remote transcript. Now it is a thread whose first turn is the question.
+        status, result = self.notify(event="request-input", agent="Fin", site=self.imac,
+                                     body="Fix the two loose ends, or leave them?")
+        self.assertEqual((status, result["delivered"]), (200, 1))
+        thread_id = result["threadId"]
+        row = lam.MESSAGES_TABLE.items[thread_id]
+        self.assertEqual((row["source"], row["state"], row["threadId"], row["authorSiteId8"]),
+                         ("agent", "answered", thread_id, self.imac["siteId8"]))
+        self.assertEqual([e["kind"] for e in self.events.for_thread(thread_id)], ["question.asked", "notify.sent"])
+        # The push groups by and deep-links to the new thread.
+        payload = self.apns.payloads[0]
+        self.assertEqual((payload["aps"]["thread-id"], payload["fin"]["threadId"]), (thread_id, thread_id))
+        # The site remembers which thread it is waiting on.
+        self.assertEqual(lam.SITES_TABLE.items[self.imac["siteId"]]["pendingThreadId"], thread_id)
+        # It lists as a thread waiting on the user, titled by the question.
+        status, listing = self.list_threads()
+        summary = next(t for t in listing["threads"] if t["threadId"] == thread_id)
+        self.assertEqual((summary["status"], summary["title"]), ("waiting_on_you", "Fix the two loose ends, or leave them?"))
+        # No sweep ever wakes a worker for the question row.
+        self.assertEqual(lam._queued_message_candidates(lam._now()), [])
+        # The user's reply joins the thread and the site's next beat lets go of it.
+        reply = self.send("leave them", threadId=thread_id)
+        self.assertEqual(reply["threadId"], thread_id)
+        self.beat(self.imac, state="working")
+        self.assertNotIn("pendingThreadId", lam.SITES_TABLE.items[self.imac["siteId"]])
+
+    def test_an_operator_question_without_a_thread_stays_threadless(self):
+        status, result = self.notify(event="request-input", agent="Fin")
+        self.assertEqual(status, 200)
+        self.assertNotIn("threadId", result)
+        self.assertEqual([r for r in lam.MESSAGES_TABLE.items.values() if r.get("source") == "agent"], [])
+
     def test_notify_with_only_message_id_resolves_the_thread(self):
         root = self.send("root")
         reply = self.send("reply", threadId=root["messageId"])
@@ -2980,6 +3015,17 @@ class LiveActivityPushTests(_MessagesTestCase):
         self.beat(self.imac, state="idle")
         self.assertEqual(self.activity_events()[4:], [("tok-phone-update", "end", "idle")])
         self.assertIn("dismissal-date", self.apns.payloads[4]["aps"])
+
+    def test_a_needs_input_tile_carries_the_pending_question_thread(self):
+        lam.SITES_TABLE.items[self.cloud["siteId"]]["pendingThreadId"] = "m-11111111-2222-4333-8444-555555555555"
+        self.beat(self.cloud, state="needs-input")
+        (payload, _), = self.sent_to("tok-phone-update")
+        self.assertEqual(payload["aps"]["content-state"]["threadID"], "m-11111111-2222-4333-8444-555555555555")
+        self.assertEqual(payload["aps"]["content-state"]["status"], "needsInput")
+        # Back to idle: the pending thread is dropped from the row and the tile.
+        self.beat(self.cloud, state="idle")
+        self.assertNotIn("pendingThreadId", lam.SITES_TABLE.items[self.cloud["siteId"]])
+        self.assertNotIn("threadID", self.apns.payloads[-1]["aps"]["content-state"])
 
     def test_a_push_failure_never_fails_the_heartbeat(self):
         self.addCleanup(setattr, lam, "_push_live_activity", lam._push_live_activity)
