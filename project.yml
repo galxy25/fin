@@ -226,6 +226,7 @@ targets:
         includes:
           - FinActivityAttributes.swift
           - FinActivityViews.swift
+          - FinActivityLink.swift
     info:
       path: Generated/Info-widgets.plist
       properties:

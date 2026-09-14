@@ -2512,6 +2512,17 @@ class NotifyThreadTests(_ThreadsTestCase):
         self.beat(self.imac, state="working")
         self.assertNotIn("pendingThreadId", lam.SITES_TABLE.items[self.imac["siteId"]])
 
+    def test_the_daemons_operator_token_push_is_attributed_by_its_device_id8(self):
+        # The daemon's notify client carries the operator token and its own
+        # device id8 as originDeviceID8 — which is the resident site's siteId8.
+        self.beat(self.imac, state="working")
+        status, result = self.notify(event="request-input", agent="Fin",
+                                     originDeviceID8=self.imac["siteId8"], body="Which branch?")
+        self.assertEqual(status, 200)
+        thread_id = result["threadId"]
+        self.assertEqual(lam.MESSAGES_TABLE.items[thread_id]["authorSiteId8"], self.imac["siteId8"])
+        self.assertEqual(lam.SITES_TABLE.items[self.imac["siteId"]]["pendingThreadId"], thread_id)
+
     def test_an_operator_question_without_a_thread_stays_threadless(self):
         status, result = self.notify(event="request-input", agent="Fin")
         self.assertEqual(status, 200)

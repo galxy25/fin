@@ -2021,8 +2021,10 @@ def notify(event):
     # the remote transcript") — has no message to hang off, so it roots its own
     # thread here: Fin's question is the first turn, the reply the user types or
     # speaks joins it, and the tile that says "needs your input" can open it.
-    if not thread_id and push_event == "request-input" and event.get("_siteId"):
-        thread_id = _root_question_thread(event, user_id, agent, text, _now()) or ""
+    if not thread_id and push_event == "request-input":
+        asking = _asking_site(event, user_id, agent, origin_device_id8)
+        if asking:
+            thread_id = _root_question_thread(asking, user_id, agent, text, _now()) or ""
 
     fin = {}
     if agent_id:
@@ -2099,7 +2101,30 @@ def notify(event):
     return _response(200 if result["delivered"] else 502, answer)
 
 
-def _root_question_thread(event, user_id, agent, question, now):
+def _asking_site(event, user_id, agent, origin_device_id8=""):
+    """The site behind a request-input push, or None for a push nobody can be
+    attributed to (an operator's notify-levi.sh). The daemon pushes with the
+    OPERATOR token, not its site token, so `_siteId` is usually absent; its
+    `originDeviceID8` is its device id8, which is the resident site's
+    `siteId8`."""
+    if event.get("_siteId"):
+        site = _read_site(event["_siteId"])
+        if site and site.get("userId") == user_id:
+            return site
+        return None
+    if not agent:
+        return None
+    now = _now()
+    live = _live_sites(user_id, agent, now)
+    for site in live:
+        if origin_device_id8 and str(site.get("siteId8") or "").lower() == origin_device_id8.lower():
+            return site
+    # No primary-site fallback on purpose: an operator's push must never be
+    # written into the ledger as a site's question.
+    return None
+
+
+def _root_question_thread(site, user_id, agent, question, now):
     """Roots a thread for a question a site asked from a heartbeat (no message
     in flight): one `fin-messages` row authored BY the agent — `source:
     "agent"`, `state: "answered"` so no sweep wakes a worker for it and no body
@@ -2107,7 +2132,6 @@ def _root_question_thread(event, user_id, agent, question, now):
     `pendingThreadId` stamp on the site row so its needs-input presence can
     name the thread. Best-effort: any failure means "no thread", never a
     refused push. Returns the thread id or None."""
-    site = _read_site(event.get("_siteId")) or {}
     agent = agent or str(site.get("agent") or "").strip()
     if not agent or site.get("userId") != user_id:
         return None
