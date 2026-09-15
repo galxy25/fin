@@ -7,6 +7,11 @@
 #   install.sh --site8 HEX8    site identity to use (first install, or must match the persisted one)
 #   install.sh --reprovision   rewrite config.json from defaults instead of re-signing in place
 #   install.sh --no-verify     skip provision-config.sh's GET check of the two read URLs
+#   install.sh --env-file P    read FIN_* settings from a 0600 file (default: ./site.env)
+#   install.sh --llm URL       brain endpoint (default http://127.0.0.1:1234/v1); the
+#                              bearer for a remote one comes from FIN_LLM_API_KEY, never argv
+#   install.sh --priority N    dispatch priority 0-1000 (resident default 100); persisted,
+#                              because an omitted priority is RESET to the default on re-enroll
 #
 # What it does, in order — every step is idempotent, so re-run it freely:
 #   1. checks the binary's own `--version` against the floor below, then copies it to
@@ -43,6 +48,37 @@ CONFIG="$FIN_AGENTD_HOME/config.json"
 KEY="$FIN_AGENTD_HOME/site_ed25519"
 AUTHORIZED_KEYS="$HOME/.ssh/authorized_keys"
 DOMAIN="gui/$(id -u)"
+
+# --- site.env: the one file that carries a site's non-default settings -------------------
+# A work laptop is installed from a TARBALL, not a checkout, and needs three things this
+# script would otherwise default wrong: a brain that is not on this machine, the bearer
+# that brain requires, and a dispatch priority below the iMac's. Passing a bearer on the
+# argv would put it in `ps` output for every user on the box, so settings arrive in a
+# 0600 file instead — sourced HERE, before the defaults below read the environment, so a
+# real flag on the command line still wins over it.
+#
+# Recognized keys (all optional): FIN_LLM_URL, FIN_LLM_API_KEY, FIN_MODEL, FIN_PRIORITY,
+# FIN_CONTROL_PLANE_ENDPOINT, FIN_DISPLAY_NAME, FIN_TMUX_SOCKET.
+ENV_FILE=""
+for i in $(seq 1 $#); do
+	if [ "${!i}" = "--env-file" ]; then j=$((i + 1)); ENV_FILE="${!j:-}"; fi
+done
+[ -n "$ENV_FILE" ] || { [ -f "$SCRIPT_DIR/site.env" ] && ENV_FILE="$SCRIPT_DIR/site.env"; }
+if [ -n "$ENV_FILE" ]; then
+	[ -f "$ENV_FILE" ] || { echo "error: --env-file not found: $ENV_FILE" >&2; exit 64; }
+	# Owner-only, and checked rather than assumed: `tar -xf` as a non-root user applies the
+	# umask unless -p is given, so a file packed 0600 routinely lands 0644 on the far side —
+	# and 0644 means every other account on a managed laptop can read the brain's bearer.
+	perms="$(stat -f %Lp "$ENV_FILE")"
+	case "$perms" in
+		*00) : ;;
+		*) echo "error: $ENV_FILE is mode $perms — it holds a bearer token, so it must be owner-only:
+    chmod 600 $ENV_FILE" >&2; exit 1 ;;
+	esac
+	set -a; . "$ENV_FILE"; set +a
+	echo "env file:   $ENV_FILE"
+fi
+
 LLM_URL="${FIN_LLM_URL:-http://127.0.0.1:1234/v1}"
 
 BIN_SRC="${FIN_AGENTD_BIN_SRC:-$REPO_ROOT/daemon/.build/release/fin-agentd}"
@@ -66,7 +102,20 @@ REQUIRED_DAEMON_VERSION="${FIN_REQUIRED_DAEMON_VERSION:-1.5.0}"
 RUNTIME_SCRIPTS=(refresh.sh provision-config.sh enroll-config.py rotate-logs.sh launch-agentd.sh)
 START=0; SITE8_ARG=""; REPROVISION=0; PROVISION_ARGS=()
 ENROLL_TOKEN=""; ENDPOINT="${FIN_CONTROL_PLANE_ENDPOINT:-https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com}"
-MODEL="${FIN_MODEL:-google/gemma-4-12b-qat}"; DISPLAY_NAME=""
+MODEL="${FIN_MODEL:-google/gemma-4-12b-qat}"; DISPLAY_NAME="${FIN_DISPLAY_NAME:-}"
+# Dispatch priority (docs/SITES-ANY-MAC.md §5.1). `_elect_primary` preempts only on
+# STRICTLY greater priority, so equal-priority residents never take the role from one
+# another — whichever heartbeats first keeps it until its lease lapses. Distinct numbers
+# are therefore what make "the iMac always answers an unaddressed message" a fact rather
+# than an accident of boot order: iMac 100 (the kind default), MacBook Neo 90, work
+# laptop 80.
+#
+# It is persisted because `enroll_site` RESETS an omitted priority to the kind default —
+# a second run of this installer on the laptop would silently promote it to 100 and tie
+# the iMac. The file is the memory; the flag overrides and rewrites it.
+PRIORITY_FILE="$FIN_AGENTD_HOME/site-priority"
+PRIORITY="${FIN_PRIORITY:-}"
+if [ -z "$PRIORITY" ] && [ -s "$PRIORITY_FILE" ]; then PRIORITY="$(cat "$PRIORITY_FILE")"; fi
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--start) START=1 ;;
@@ -78,6 +127,10 @@ while [ $# -gt 0 ]; do
 		--endpoint) [ $# -ge 2 ] || { echo "error: --endpoint needs a URL" >&2; exit 64; }; ENDPOINT="$2"; shift ;;
 		--model) [ $# -ge 2 ] || { echo "error: --model needs an id" >&2; exit 64; }; MODEL="$2"; shift ;;
 		--name) [ $# -ge 2 ] || { echo "error: --name needs a value" >&2; exit 64; }; DISPLAY_NAME="$2"; shift ;;
+		--priority) [ $# -ge 2 ] || { echo "error: --priority needs a number" >&2; exit 64; }; PRIORITY="$2"; shift ;;
+		--llm) [ $# -ge 2 ] || { echo "error: --llm needs a URL" >&2; exit 64; }; LLM_URL="$2"; shift ;;
+		# Consumed in the pre-scan above; accepted here so it is not an "unknown argument".
+		--env-file) [ $# -ge 2 ] || { echo "error: --env-file needs a path" >&2; exit 64; }; shift ;;
 		--binary) [ $# -ge 2 ] || { echo "error: --binary needs a path" >&2; exit 64; }; BIN_SRC="$2"; shift ;;
 		--site8) [ $# -ge 2 ] || { echo "error: --site8 needs a value" >&2; exit 64; }; SITE8_ARG="$2"; shift ;;
 		--reprovision) REPROVISION=1 ;;
@@ -225,14 +278,23 @@ if [ -n "$ENROLL_TOKEN" ]; then
 	SITE_ID="${SITE8}-0000-4000-8000-000000000000"
 	ENROLL_KEY="$(hostname -s | tr '[:upper:]' '[:lower:]')/$USER"
 	NAME="${DISPLAY_NAME:-$(scutil --get ComputerName 2>/dev/null || hostname -s)}"
-	RESPONSE="$(FIN_TOKEN="$ENROLL_TOKEN" FIN_SITE_ID="$SITE_ID" FIN_KEY="$ENROLL_KEY" FIN_NAME="$NAME" /usr/bin/python3 -c '
+	RESPONSE="$(FIN_TOKEN="$ENROLL_TOKEN" FIN_SITE_ID="$SITE_ID" FIN_KEY="$ENROLL_KEY" FIN_NAME="$NAME" \
+		FIN_PRIORITY="$PRIORITY" /usr/bin/python3 -c '
 import json, os
-print(json.dumps({"enrollToken": os.environ["FIN_TOKEN"], "enrollKey": os.environ["FIN_KEY"],
-                  "siteId": os.environ["FIN_SITE_ID"], "displayName": os.environ["FIN_NAME"]}))' \
+body = {"enrollToken": os.environ["FIN_TOKEN"], "enrollKey": os.environ["FIN_KEY"],
+        "siteId": os.environ["FIN_SITE_ID"], "displayName": os.environ["FIN_NAME"]}
+priority = os.environ.get("FIN_PRIORITY") or ""
+if priority.strip():
+    body["priority"] = int(priority)
+print(json.dumps(body))' \
 		| curl -sS -X POST "$ENDPOINT/sites/enroll" -H 'content-type: application/json' --data-binary @-)" \
 		|| die "enroll request failed"
+	if [ -n "$PRIORITY" ]; then
+		printf '%s\n' "$PRIORITY" > "$PRIORITY_FILE"; chmod 600 "$PRIORITY_FILE"
+	fi
 	FIN_RESPONSE="$RESPONSE" FIN_CONFIG="$CONFIG" FIN_ENDPOINT="$ENDPOINT" FIN_MODEL="$MODEL" \
 	FIN_SITE8="$SITE8" FIN_KEY_PATH="$KEY" FIN_AUDIT="$FIN_AGENTD_HOME/audit.jsonl" FIN_SOCKET="${FIN_TMUX_SOCKET:-fin}" \
+	FIN_LLM_URL="$LLM_URL" FIN_LLM_API_KEY="${FIN_LLM_API_KEY:-}" \
 	/usr/bin/python3 "$SCRIPT_DIR/enroll-config.py" || die "enroll: could not write config"
 	CONFIG_MODE="enrolled"
 else

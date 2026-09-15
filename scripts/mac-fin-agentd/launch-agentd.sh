@@ -29,6 +29,9 @@
 #      incident). Checked at every launch, not once at install. INTERACTIVE is the word
 #      that matters — see the long note at the check itself for why the previous version
 #      of it could not fail.
+#      (The brain may be on ANOTHER machine, reached over Funnel and bearer-gated — see
+#      check 2. Check 3 below is still loopback SSH on THIS machine, which every resident
+#      site needs whatever it thinks with.)
 #   4. presigned-URL expiry — warn only. Expired URLs 403; the daemon treats a 403 as a
 #      poll failure and keeps running (daemon/README.md, "403 is never absent"), so this
 #      is loud in the log rather than fatal.
@@ -69,20 +72,42 @@ except Exception as error:                     # noqa: BLE001 — the reason mat
     sys.exit("unreadable/invalid JSON: %s" % error.__class__.__name__)
 agent = c.get("agent") or {}
 server = c.get("server") or {}
-print("%s\t%s\t%s\t%s" % (
+print("%s\t%s\t%s\t%s\t%s" % (
     agent.get("endpointURL", ""), agent.get("modelIdentifier", ""),
-    server.get("username", ""), server.get("privateKeyPath", "")))
+    server.get("username", ""), server.get("privateKeyPath", ""),
+    "yes" if (agent.get("apiKey") or "").strip() else "no"))
 PY
 )" || refuse "config.json did not parse ($FIELDS): $CONFIG"
-IFS=$'\t' read -r ENDPOINT MODEL SSH_USER KEY_PATH <<<"$FIELDS"
+IFS=$'\t' read -r ENDPOINT MODEL SSH_USER KEY_PATH HAS_API_KEY <<<"$FIELDS"
 [ -n "$ENDPOINT" ] || refuse "config has no agent.endpointURL"
 [ -n "$SSH_USER" ] && [ -n "$KEY_PATH" ] || refuse "config has no server.username / server.privateKeyPath"
 
 if [ "${FIN_SKIP_BRAIN_CHECK:-0}" != "1" ]; then
 	# -f: without it curl exits 0 on a 404/500, so an LM Studio that is listening with no
 	# model loaded would pass. The model id must actually appear in the /models payload.
-	models="$(curl -fsS -m 10 "$ENDPOINT/models" 2>/dev/null)" \
-		|| refuse "no brain at $ENDPOINT/models (start LM Studio)"
+	#
+	# A REMOTE brain is bearer-gated, and to `-f` alone its 401 is indistinguishable from
+	# "no brain at all" — so when the config carries an apiKey it is sent, through a 0600
+	# `-K` file rather than a `-H` argument: curl's argv is world-readable in `ps`, and on
+	# a managed laptop that is not a theoretical audience. The key is read out of the
+	# config by python (the config is 0600 and also holds the site token), never echoed.
+	CURL_AUTH=()
+	KEYCONF=""
+	if [ "$HAS_API_KEY" = "yes" ]; then
+		KEYCONF="$(mktemp -t fin-brain-auth)" || refuse "could not create a temp file for the brain auth header"
+		chmod 600 "$KEYCONF"
+		trap 'rm -f "$KEYCONF"' EXIT
+		FIN_CONFIG="$CONFIG" "$PYTHON" - > "$KEYCONF" <<'PY' || refuse "could not read agent.apiKey from the config"
+import json, os
+key = ((json.load(open(os.environ["FIN_CONFIG"])).get("agent") or {}).get("apiKey") or "").strip()
+print('header = "Authorization: Bearer %s"' % key)
+PY
+		CURL_AUTH=(-K "$KEYCONF")
+	fi
+	# 20 s, not 10: a Funnel round trip to another Mac is not a loopback one.
+	models="$(curl -fsS -m 20 "${CURL_AUTH[@]}" "$ENDPOINT/models" 2>/dev/null)" \
+		|| refuse "no brain at $ENDPOINT/models — LM Studio down, the shim refusing this key, or the network in the way"
+	if [ -n "$KEYCONF" ]; then rm -f "$KEYCONF"; trap - EXIT; fi
 	if [ -n "$MODEL" ] && ! printf '%s' "$models" | grep -qF -- "$MODEL"; then
 		refuse "$ENDPOINT is serving, but not the configured model ($MODEL) — load it in LM Studio"
 	fi

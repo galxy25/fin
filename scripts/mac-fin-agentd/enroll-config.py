@@ -24,11 +24,25 @@ cfg.setdefault("server", {}).update({
     "connectCommand": "exec tmux -L %s new-session -A -s fin \; set status off" % socket,
 })
 agent = cfg.setdefault("agent", {})
-agent.update({"endpointURL": "http://127.0.0.1:1234/v1", "modelIdentifier": os.environ["FIN_MODEL"]})
+# The brain is not necessarily on this Mac. A site whose own machine cannot run the model
+# (a managed work laptop) points at another body's LM Studio through the Funnel shim
+# (scripts/cloud-agent/lmstudio-auth-shim.py), which is bearer-gated — so the key travels
+# in the environment from a 0600 site.env, never on an argv every user of the box can read
+# in `ps`. An empty FIN_LLM_API_KEY leaves any existing key alone rather than blanking it:
+# a re-enroll must not silently turn an authenticated endpoint into an unauthenticated one.
+agent.update({"endpointURL": os.environ.get("FIN_LLM_URL") or "http://127.0.0.1:1234/v1",
+              "modelIdentifier": os.environ["FIN_MODEL"]})
+api_key = (os.environ.get("FIN_LLM_API_KEY") or "").strip()
+if api_key:
+    agent["apiKey"] = api_key
 agent.setdefault("contextWindowTokens", 8192)
 agent.setdefault("maxOutputTokens", 640)
 agent.setdefault("temperature", 0.2)
 agent.setdefault("heartbeatSeconds", 60)
+# A brain reached over Funnel adds a WAN round trip to every turn; the daemon's default
+# 300 s is generous enough, but a loaded remote LM Studio streaming 640 tokens has been
+# seen to need most of it, so it is made explicit here rather than left to the default.
+agent.setdefault("requestTimeoutSeconds", 300)
 # The ROLE goes in the system prompt; the launch task is one line. A long role text
 # as the first user turn anchored every later reply as "I understand my role…"
 # (2026-09-12, six live trials).
