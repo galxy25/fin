@@ -2960,6 +2960,41 @@ def _require_memory_field(body, field, max_bytes=None):
     return value
 
 
+def delete_memory_entry(event, entry_id):
+    """DELETE /memory/{id} — remove one episodic entry from the agent's document.
+
+    WHY THIS EXISTS. Memory was append-and-upsert only, which is right for a store the
+    agent writes as it works — and wrong the moment something writes the WRONG thing. On
+    2026-09-15 the store held 37 entries of which 27 were noise: 23 copies of Fin's own
+    system prompt saved as a "conversation", three smoke tests, and a 49-character "Memory
+    Test". Every profile compaction was being asked to distil a person from that. There was
+    no way to remove any of it without hand-editing the document in S3.
+
+    Deleting is safe against resurrection: the app pushes only entries newer than its own
+    watermark AND originating from its own device, so an old row is never re-sent.
+    """
+    params = event.get("queryStringParameters") or {}
+    agent = str(params.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    entry_id = str(entry_id or "").strip()
+    if not entry_id:
+        raise ApiError(400, "id must be a non-empty string")
+
+    document = _read_memory_document(event["_userId"], agent)
+    entries = document["entries"]
+    remaining = [e for e in entries if str(e.get("id") or "") != entry_id]
+    if len(remaining) == len(entries):
+        raise ApiError(404, "no entry with that id")
+    document = {"version": 1, "updatedAt": _iso(_now()), "entries": remaining}
+    S3.put_object(
+        Bucket=BUCKET, Key=MEMORY_KEY.format(user=event["_userId"], agent=_key_slug(agent)),
+        Body=json.dumps(document, sort_keys=True).encode("utf-8"), ContentType="application/json",
+    )
+    LOG.info("deleted memory entry %s for %s", entry_id, agent)
+    return _response(200, {"agent": agent, "id": entry_id, "entries": len(remaining)})
+
+
 def put_memory_entry(event):
     """POST /memory — one entry, upserted by id into the agent's document.
     {"agent", "id", "agentId"?, "conversationId"?, "kind", "title", "content",
@@ -5685,6 +5720,8 @@ def _route(event):
         return put_memory_entry(event)
     if method == "GET" and parts == ["memory"]:
         return get_memory(event)
+    if method == "DELETE" and len(parts) == 2 and parts[0] == "memory":
+        return delete_memory_entry(event, parts[1])
     if method == "PUT" and parts == ["memory", "profile", "lock"]:
         return claim_memory_profile_lock(event)
     if method == "DELETE" and parts == ["memory", "profile", "lock"]:

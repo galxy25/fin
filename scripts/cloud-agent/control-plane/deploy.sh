@@ -674,6 +674,7 @@ PUT /transcript-chunk
 GET /transcript-chunks
 POST /memory
 GET /memory
+DELETE /memory/{id}
 PUT /memory/profile
 GET /memory/profile
 GET /devices/status
