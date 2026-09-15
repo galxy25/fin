@@ -54,12 +54,60 @@ struct FinAgentDaemon {
 
 struct DaemonConfig: Decodable {
     struct ServerConfig: Decodable {
-        var host: String
+        /// How the daemon reaches the terminal it drives (docs/SITES-ANY-MAC.md §2).
+        ///
+        /// `ssh` — the original, and still the default: connect to `host` and attach a PTY
+        /// there. For a resident site that host is `127.0.0.1`, which needs an `sshd`
+        /// listening on the site's OWN machine — i.e. macOS Remote Login on.
+        ///
+        /// `local` — open a PTY directly and exec the connect command in it. No sshd, no
+        /// key, no `authorized_keys` line. The one transport a managed Mac with Remote
+        /// Login locked off can use, and the one that has no login shell in the path to
+        /// auto-attach anything.
+        enum Transport: String, Decodable {
+            case ssh
+            case local
+        }
+        /// Absent = `ssh`, so every config written before this existed keeps its meaning.
+        var transport: Transport?
+
+        /// SSH-only, and therefore optional: a `local` config has no host to name, no user
+        /// to authenticate as, and no key to read. They stay non-optional in EFFECT for the
+        /// ssh transport — `validate()` refuses a config that omits them.
+        var host: String?
         var port: Int?
-        var username: String
-        var privateKeyPath: String
+        var username: String?
+        var privateKeyPath: String?
         var passphrase: String?
         var connectCommand: String?
+
+        var resolvedTransport: Transport { transport ?? .ssh }
+
+        /// What the status document and the site heartbeat report as this body's reach. A
+        /// local transport drives this machine and names it as such rather than inventing a
+        /// hostname it never connects to.
+        var describedHost: String { host ?? "localhost" }
+        var describedUsername: String { username ?? NSUserName() }
+
+        /// The one thing a `Decodable` cannot express: which fields are required depends on
+        /// another field's value. Returns the operator-facing reason, or nil when the block
+        /// is coherent.
+        func validationFailure() -> String? {
+            switch resolvedTransport {
+            case .ssh:
+                if (host ?? "").isEmpty { return "server.host is required for the ssh transport" }
+                if (username ?? "").isEmpty { return "server.username is required for the ssh transport" }
+                if (privateKeyPath ?? "").isEmpty {
+                    return "server.privateKeyPath is required for the ssh transport"
+                }
+            case .local:
+                if (connectCommand ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return "server.connectCommand is required for the local transport — it IS the "
+                        + "process the daemon runs, not a line typed into a shell that already exists"
+                }
+            }
+            return nil
+        }
         /// Extra SSH env requests for the PTY channel. Merged OVER the always-on
         /// `LC_FIN_AGENT` marker — see `sessionEnvironment`.
         var environment: [String: String]?
@@ -259,7 +307,7 @@ struct DaemonConfigError: Error, CustomStringConvertible {
 @MainActor
 final class Daemon {
     private let config: DaemonConfig
-    private var session: HeadlessTerminalSession?
+    private var session: (any AgentTerminalTransport)?
     private var shuttingDown = false
     private let auditLog: AuditLogWriter
     private let auditLogPath: String
@@ -282,6 +330,12 @@ final class Daemon {
     var supervisionFetch: ((URLRequest) async throws -> (Data, URLResponse))?
     var makeSession: @MainActor (HeadlessSessionConfiguration) -> HeadlessTerminalSession = {
         HeadlessTerminalSession(configuration: $0)
+    }
+    /// The local-PTY counterpart of `makeSession`. Separate rather than one factory over a
+    /// union: the two transports take genuinely different configuration, and the launch
+    /// tests drive the SSH seam by name.
+    var makeLocalSession: @MainActor (LocalSessionConfiguration) -> LocalTerminalSession = {
+        LocalTerminalSession(configuration: $0)
     }
     var terminate: (Int32) -> Void = { exit($0) }
 
@@ -343,7 +397,7 @@ final class Daemon {
     /// same fixed-argv exec channel `read_session` uses. A machine without tmux
     /// reports no sessions; the heartbeat never fails for it.
     private func siteCapabilities(
-        session: HeadlessTerminalSession?, registry: SessionRoutingRegistry?, hostname: String
+        session: (any AgentTerminalTransport)?, registry: SessionRoutingRegistry?, hostname: String
     ) async -> [String: Any] {
         if let at = cachedCapabilitiesAt, Date().timeIntervalSince(at) < Self.capabilitiesScanInterval {
             return cachedCapabilities
@@ -352,7 +406,7 @@ final class Daemon {
             "daemon_version": DaemonDirectiveClient.daemonVersion,
             "always_on": config.stayResident ?? false,
             "brain": ["kind": "openai-compatible", "model": config.agent.modelIdentifier],
-            "hosts": [["host": config.server.host, "username": config.server.username]],
+            "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
         ]
         if let session, !isTurnInFlight || cachedCapabilitiesAt == nil {
             // Not mid-turn (the turn's own tool calls share the exec-channel budget)
@@ -895,7 +949,7 @@ final class Daemon {
                 maxLines: config.transcript?.maxLines ?? DaemonConfig.defaultTranscriptMaxLines,
                 agentID: parsedAgentID,
                 agentName: config.supervision?.agentName ?? "Agent",
-                server: config.server.host,
+                server: config.server.describedHost,
                 modelIdentifier: config.agent.modelIdentifier,
                 temperature: config.agent.temperature ?? 0.2,
                 // Local trail only, deliberately: a transcript the app can't fetch is
@@ -1013,14 +1067,23 @@ final class Daemon {
     /// and pure so tests can prove what reaches the PTY channel — in particular that the
     /// `LC_FIN_AGENT` marker rides along whether or not the operator configured an
     /// `environment` (`DaemonSessionEnvironmentTests`).
+    nonisolated static func localSessionConfiguration(
+        server: DaemonConfig.ServerConfig
+    ) -> LocalSessionConfiguration {
+        LocalSessionConfiguration(
+            connectCommand: server.connectCommand ?? "",
+            environment: server.sessionEnvironment
+        )
+    }
+
     nonisolated static func sessionConfiguration(
         server: DaemonConfig.ServerConfig,
         privateKeyPEM: String
     ) -> HeadlessSessionConfiguration {
         HeadlessSessionConfiguration(
-            host: server.host,
+            host: server.host ?? "127.0.0.1",
             port: server.port ?? 22,
-            username: server.username,
+            username: server.username ?? NSUserName(),
             privateKeyPEM: privateKeyPEM,
             passphrase: server.passphrase,
             connectCommand: server.connectCommand ?? "",
@@ -1041,8 +1104,11 @@ final class Daemon {
     /// during the prime's fetch — `shutdown` already closed the audit log and scheduled
     /// the exit, so opening SSH, and failing into the audit log, would only race it —
     /// and when the key can't be read, after `abort` has scheduled that exit.
-    func launch() async -> HeadlessTerminalSession? {
-        log("fin-agentd starting: \(config.server.username)@\(config.server.host) → \(config.agent.modelIdentifier)")
+    func launch() async -> (any AgentTerminalTransport)? {
+        let where_: String = config.server.resolvedTransport == .local
+            ? "local pty"
+            : config.server.describedUsername + "@" + config.server.describedHost
+        log("fin-agentd starting: \(where_) → \(config.agent.modelIdentifier)")
 
         if let block = config.supervision {
             // Phase 3 (docs/SITES.md §11): a site gets its messages by claim, so the
@@ -1101,18 +1167,30 @@ final class Daemon {
             )
         }
 
-        let keyPEM: String
-        do {
-            let keyPath = (config.server.privateKeyPath as NSString).expandingTildeInPath
-            keyPEM = try String(contentsOfFile: keyPath, encoding: .utf8)
-        } catch {
-            await abort("cannot read private key at \(config.server.privateKeyPath): \(error)")
+        if let reason = config.server.validationFailure() {
+            await abort(reason)
             return nil
         }
 
-        let session = makeSession(
-            Self.sessionConfiguration(server: config.server, privateKeyPEM: keyPEM)
-        )
+        let session: any AgentTerminalTransport
+        switch config.server.resolvedTransport {
+        case .local:
+            // No key to read, and nothing to authenticate to: the terminal is a child
+            // process of this daemon.
+            session = makeLocalSession(Self.localSessionConfiguration(server: config.server))
+        case .ssh:
+            let keyPath = ((config.server.privateKeyPath ?? "") as NSString).expandingTildeInPath
+            let keyPEM: String
+            do {
+                keyPEM = try String(contentsOfFile: keyPath, encoding: .utf8)
+            } catch {
+                await abort("cannot read private key at \(keyPath): \(error)")
+                return nil
+            }
+            session = makeSession(
+                Self.sessionConfiguration(server: config.server, privateKeyPEM: keyPEM)
+            )
+        }
         self.session = session
         return session
     }
@@ -1123,7 +1201,8 @@ final class Daemon {
         do {
             try await session.waitForConnection(timeout: 30)
         } catch {
-            await fail("SSH connect failed: \(error.localizedDescription)")
+            await fail("\(config.server.resolvedTransport == .local ? "terminal" : "SSH") connect "
+                + "failed: \(error.localizedDescription)")
         }
         log("connected; probing until the shell answers")
         // Probe-based readiness: echo probes until the shell inside the tmux attach
@@ -1166,7 +1245,7 @@ final class Daemon {
         // alone. What this probe buys is an operator who learns at launch, in the log and
         // the audit trail, that the connectCommand did not take effect.
         if tmuxGuard.isEnforced, tmuxGuard.ownSocket != .standard {
-            let reported = await session.probeEnvironment("TMUX")
+            let reported = await session.probeEnvironment("TMUX", timeout: 8)
             let confined = TmuxSendGuard.shellReportIsOwnServer(
                 reported, socket: tmuxGuard.ownSocket
             )
@@ -1551,7 +1630,7 @@ final class Daemon {
             if let site = config.site {
                 let client = DaemonSiteClient(
                     siteID: site.id,
-                    displayName: site.displayName ?? config.server.host,
+                    displayName: site.displayName ?? config.server.describedHost,
                     token: site.token,
                     heartbeatSeconds: site.heartbeatSeconds,
                     endpointURL: block.endpointURL,
@@ -2195,7 +2274,7 @@ final class Daemon {
     /// exactly as given — the model was precise, so this is too.
     private func readSession(name: String?, lines: Int) async -> AgentReadSessionOutcome {
         guard let session else {
-            return .failed("the daemon has no SSH session open.")
+            return .failed("the daemon has no terminal session open.")
         }
         guard let name else {
             return await runFixedSessionCommand(TmuxSessionRead.listArguments(), session: session)
@@ -2233,7 +2312,7 @@ final class Daemon {
     /// resolved correctly once, by luck, whenever its full path stayed under the
     /// threshold; a longer path (or a deeper `forges/` checkout) failed every time.
     private func runFixedSessionCommand(
-        _ argv: [String], session: HeadlessTerminalSession, redact: Bool = true
+        _ argv: [String], session: any AgentTerminalTransport, redact: Bool = true
     ) async -> AgentReadSessionOutcome {
         let commandLine = TmuxSessionRead.commandLine(argv)
         do {
@@ -2285,7 +2364,7 @@ final class Daemon {
     /// settle on anything — never a worse outcome than before this existed, only
     /// sometimes not a better one.
     private func resolveBareNameAndRead(
-        _ requested: String, lines: Int, session: HeadlessTerminalSession
+        _ requested: String, lines: Int, session: any AgentTerminalTransport
     ) async -> AgentReadSessionOutcome {
         // NEVER the plain, undisclosed read `readSession` used before this resolver
         // existed: every exit through here says so, in the header, outside the fence —
@@ -2365,7 +2444,7 @@ final class Daemon {
     /// (via its reply) the owner.
     private func readResolvedWindow(
         _ window: TmuxSessionResolution.WindowInfo,
-        requested: String, lines: Int, session: HeadlessTerminalSession
+        requested: String, lines: Int, session: any AgentTerminalTransport
     ) async -> AgentReadSessionOutcome {
         let target = TmuxSessionResolution.target(for: window)
         guard let validatedTarget = TmuxSessionRead.validate(name: target) else {

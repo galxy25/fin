@@ -63,8 +63,17 @@ refuse() {
 # --- 1 + 2. config and brain -----------------------------------------------------------
 # One python read: the config is 0600 and holds the control-plane token, so it is parsed,
 # never grepped, and only these four non-secret fields are echoed.
+# SHELL ASSIGNMENTS, NOT DELIMITED FIELDS. This used to print tab-separated values and
+# split them with `IFS=$'\t' read`, which is wrong in a way that hid until a config left a
+# field EMPTY: tab is IFS *whitespace*, so bash collapses runs of it into one delimiter and
+# every field after an empty one shifts left. Under the local transport `username` and
+# `privateKeyPath` are both absent by design, so `HAS_API_KEY` received the transport name,
+# `TRANSPORT` received nothing, and the checks below silently examined the wrong values —
+# the ssh branch "passed" on two fields that were not a user and not a key. Python quotes
+# each value with shlex instead, so an empty value stays empty and a value with a space
+# stays one value.
 FIELDS="$(FIN_CONFIG="$CONFIG" "$PYTHON" - <<'PY' 2>&1
-import json, os, sys
+import json, os, shlex, sys
 try:
     with open(os.environ["FIN_CONFIG"]) as fh:
         c = json.load(fh)
@@ -72,15 +81,34 @@ except Exception as error:                     # noqa: BLE001 — the reason mat
     sys.exit("unreadable/invalid JSON: %s" % error.__class__.__name__)
 agent = c.get("agent") or {}
 server = c.get("server") or {}
-print("%s\t%s\t%s\t%s\t%s" % (
-    agent.get("endpointURL", ""), agent.get("modelIdentifier", ""),
-    server.get("username", ""), server.get("privateKeyPath", ""),
-    "yes" if (agent.get("apiKey") or "").strip() else "no"))
+for name, value in (
+    ("ENDPOINT", agent.get("endpointURL", "")),
+    ("MODEL", agent.get("modelIdentifier", "")),
+    ("SSH_USER", server.get("username", "")),
+    ("KEY_PATH", server.get("privateKeyPath", "")),
+    # The key itself is never printed — only whether there is one.
+    ("HAS_API_KEY", "yes" if (agent.get("apiKey") or "").strip() else "no"),
+    ("TRANSPORT", server.get("transport") or "ssh"),
+):
+    print("%s=%s" % (name, shlex.quote(str(value))))
 PY
 )" || refuse "config.json did not parse ($FIELDS): $CONFIG"
-IFS=$'\t' read -r ENDPOINT MODEL SSH_USER KEY_PATH HAS_API_KEY <<<"$FIELDS"
+case "$FIELDS" in
+    *"ENDPOINT="*"TRANSPORT="*) : ;;
+    *) refuse "could not read the config's fields: $FIELDS" ;;
+esac
+eval "$FIELDS"
 [ -n "$ENDPOINT" ] || refuse "config has no agent.endpointURL"
-[ -n "$SSH_USER" ] && [ -n "$KEY_PATH" ] || refuse "config has no server.username / server.privateKeyPath"
+if [ "$TRANSPORT" = "local" ]; then
+	# tmux IS the session under the local transport — the connect command is the child
+	# process, so a tmux that is not on PATH is not an error the daemon can report from
+	# inside a shell, it is a child that exits instantly, forever, at the backoff ceiling.
+	# launchd's PATH is the plist's, not a login shell's, which is exactly the environment
+	# where a Homebrew tmux goes missing.
+	command -v tmux >/dev/null || refuse "tmux is not on PATH ($PATH) — the local transport runs it directly"
+else
+	[ -n "$SSH_USER" ] && [ -n "$KEY_PATH" ] || refuse "config has no server.username / server.privateKeyPath"
+fi
 
 if [ "${FIN_SKIP_BRAIN_CHECK:-0}" != "1" ]; then
 	# -f: without it curl exits 0 on a 404/500, so an LM Studio that is listening with no
@@ -91,7 +119,6 @@ if [ "${FIN_SKIP_BRAIN_CHECK:-0}" != "1" ]; then
 	# `-K` file rather than a `-H` argument: curl's argv is world-readable in `ps`, and on
 	# a managed laptop that is not a theoretical audience. The key is read out of the
 	# config by python (the config is 0600 and also holds the site token), never echoed.
-	CURL_AUTH=()
 	KEYCONF=""
 	if [ "$HAS_API_KEY" = "yes" ]; then
 		KEYCONF="$(mktemp -t fin-brain-auth)" || refuse "could not create a temp file for the brain auth header"
@@ -102,10 +129,18 @@ import json, os
 key = ((json.load(open(os.environ["FIN_CONFIG"])).get("agent") or {}).get("apiKey") or "").strip()
 print('header = "Authorization: Bearer %s"' % key)
 PY
-		CURL_AUTH=(-K "$KEYCONF")
 	fi
+	# Two spellings rather than one with an array of curl flags: the shebang here is
+	# /bin/bash, which on macOS is 3.2, where expanding an EMPTY array under `set -u`
+	# ("${CURL_AUTH[@]}") is an unbound-variable error rather than nothing. That failure
+	# looked exactly like "the brain is down".
 	# 20 s, not 10: a Funnel round trip to another Mac is not a loopback one.
-	models="$(curl -fsS -m 20 "${CURL_AUTH[@]}" "$ENDPOINT/models" 2>/dev/null)" \
+	if [ -n "$KEYCONF" ]; then
+		models="$(curl -fsS -m 20 -K "$KEYCONF" "$ENDPOINT/models" 2>/dev/null)"; brain_rc=$?
+	else
+		models="$(curl -fsS -m 20 "$ENDPOINT/models" 2>/dev/null)"; brain_rc=$?
+	fi
+	[ "$brain_rc" -eq 0 ] \
 		|| refuse "no brain at $ENDPOINT/models — LM Studio down, the shim refusing this key, or the network in the way"
 	if [ -n "$KEYCONF" ]; then rm -f "$KEYCONF"; trap - EXIT; fi
 	if [ -n "$MODEL" ] && ! printf '%s' "$models" | grep -qF -- "$MODEL"; then
@@ -135,7 +170,15 @@ fi
 # What it still cannot prove: that the auto-attach works at all — a config that never
 # attaches passes too. Checking that direction means attaching the owner's session on
 # purpose, which this launcher will not do. See scripts/mac-fin-agentd/README.md.
-if [ "${FIN_SKIP_TMUX_GUARD_CHECK:-0}" != "1" ]; then
+# UNDER THE LOCAL TRANSPORT THIS CHECK HAS NOTHING TO CHECK. It exists because sshd hands
+# the daemon an INTERACTIVE LOGIN SHELL, which can auto-attach the owner's tmux before the
+# daemon types anything (2026-09-05). A local PTY execs the connect command itself,
+# non-interactively: no login shell, no rc files, no auto-attach to exclude. The daemon
+# still asserts at every launch that `$TMUX` names its own socket afterwards, which is the
+# stronger statement and covers both transports.
+if [ "$TRANSPORT" = "local" ]; then
+	:
+elif [ "${FIN_SKIP_TMUX_GUARD_CHECK:-0}" != "1" ]; then
 	[ -r "$KEY_PATH" ] || refuse "site key unreadable: $KEY_PATH"
 	# NEVER run this without LC_FIN_AGENT=1: without the marker an interactive login shell
 	# is SUPPOSED to attach, which is the thing being tested for.

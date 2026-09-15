@@ -25,7 +25,7 @@ final class SessionInventoryScanner {
 
     init(
         registry: SessionRoutingRegistry,
-        session: HeadlessTerminalSession,
+        session: any AgentTerminalTransport,
         intervalSeconds: TimeInterval = SessionInventoryScanner.defaultIntervalSeconds,
         knownAgentProcesses: Set<String> = TmuxSessionInventory.defaultCoderAgentProcessNames,
         registeredByName: String = "fin-agentd (auto)",

@@ -12,6 +12,10 @@
 #                              bearer for a remote one comes from FIN_LLM_API_KEY, never argv
 #   install.sh --priority N    dispatch priority 0-1000 (resident default 100); persisted,
 #                              because an omitted priority is RESET to the default on re-enroll
+#   install.sh --transport local
+#                              drive tmux through a PTY this daemon opens itself instead of
+#                              over loopback SSH. For a Mac where Remote Login cannot be
+#                              turned on: no sshd, no site key, no authorized_keys line.
 #
 # What it does, in order — every step is idempotent, so re-run it freely:
 #   1. checks the binary's own `--version` against the floor below, then copies it to
@@ -41,7 +45,12 @@ LABEL="dev.levischoen.fin.agentd"
 REFRESH_LABEL="dev.levischoen.fin.agentd.refresh"
 FIN_AGENTD_HOME="${FIN_AGENTD_HOME:-$HOME/Library/Application Support/fin-agentd}"
 LOG_DIR="${FIN_AGENTD_LOG_DIR:-$HOME/Library/Logs/fin-agentd}"
-AGENTS_DIR="$HOME/Library/LaunchAgents"
+# Overridable for ONE reason: rehearsing an install on a Mac that already runs a site.
+# Both defaults are shared per-user state — the same plist path and, below, the same
+# enrollKey — so a test run here would overwrite the live site's LaunchAgent and, because
+# `enroll_site` is idempotent BY ENROLL KEY, rotate the running daemon's token out from
+# under it. Neither override has a flag; they are for the rehearsal, not for operators.
+AGENTS_DIR="${FIN_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 BIN_DIR="$FIN_AGENTD_HOME/bin"
 BIN_DEST="$BIN_DIR/fin-agentd"
 CONFIG="$FIN_AGENTD_HOME/config.json"
@@ -57,7 +66,7 @@ DOMAIN="gui/$(id -u)"
 # 0600 file instead — sourced HERE, before the defaults below read the environment, so a
 # real flag on the command line still wins over it.
 #
-# Recognized keys (all optional): FIN_LLM_URL, FIN_LLM_API_KEY, FIN_MODEL, FIN_PRIORITY,
+# Recognized keys (all optional): FIN_TRANSPORT, FIN_LLM_URL, FIN_LLM_API_KEY, FIN_MODEL, FIN_PRIORITY,
 # FIN_CONTROL_PLANE_ENDPOINT, FIN_DISPLAY_NAME, FIN_TMUX_SOCKET.
 ENV_FILE=""
 for i in $(seq 1 $#); do
@@ -81,7 +90,17 @@ fi
 
 LLM_URL="${FIN_LLM_URL:-http://127.0.0.1:1234/v1}"
 
-BIN_SRC="${FIN_AGENTD_BIN_SRC:-$REPO_ROOT/daemon/.build/release/fin-agentd}"
+# In a BUNDLE (make-bundle.sh) the binary sits next to this script; in a checkout it is
+# where swift build leaves it. Preferring the sibling makes the tarball self-contained —
+# without it a bundled install dies pointing at a `daemon/.build` path that exists only on
+# the machine the bundle was built on.
+if [ -n "${FIN_AGENTD_BIN_SRC:-}" ]; then
+	BIN_SRC="$FIN_AGENTD_BIN_SRC"
+elif [ -x "$SCRIPT_DIR/fin-agentd" ]; then
+	BIN_SRC="$SCRIPT_DIR/fin-agentd"
+else
+	BIN_SRC="$REPO_ROOT/daemon/.build/release/fin-agentd"
+fi
 # The floor, not a preference, and it tracks the daemon<->config CONTRACT.
 #
 # 1.5.0 is the private-socket contract: provision-config.sh writes (and on every refresh
@@ -113,6 +132,11 @@ MODEL="${FIN_MODEL:-google/gemma-4-12b-qat}"; DISPLAY_NAME="${FIN_DISPLAY_NAME:-
 # It is persisted because `enroll_site` RESETS an omitted priority to the kind default —
 # a second run of this installer on the laptop would silently promote it to 100 and tie
 # the iMac. The file is the memory; the flag overrides and rewrites it.
+# How the daemon reaches the tmux it drives (docs/SITES-ANY-MAC.md §2). `ssh` keeps the
+# original shape — loopback sshd, a key pinned to 127.0.0.1, the login-shell guard. `local`
+# opens the PTY in-process, which is the only option on a Mac whose Remote Login is locked
+# off, and which has no login shell in the path to auto-attach anyone's session.
+TRANSPORT="${FIN_TRANSPORT:-ssh}"
 PRIORITY_FILE="$FIN_AGENTD_HOME/site-priority"
 PRIORITY="${FIN_PRIORITY:-}"
 if [ -z "$PRIORITY" ] && [ -s "$PRIORITY_FILE" ]; then PRIORITY="$(cat "$PRIORITY_FILE")"; fi
@@ -128,6 +152,10 @@ while [ $# -gt 0 ]; do
 		--model) [ $# -ge 2 ] || { echo "error: --model needs an id" >&2; exit 64; }; MODEL="$2"; shift ;;
 		--name) [ $# -ge 2 ] || { echo "error: --name needs a value" >&2; exit 64; }; DISPLAY_NAME="$2"; shift ;;
 		--priority) [ $# -ge 2 ] || { echo "error: --priority needs a number" >&2; exit 64; }; PRIORITY="$2"; shift ;;
+		--transport)
+			[ $# -ge 2 ] || { echo "error: --transport needs ssh or local" >&2; exit 64; }
+			case "$2" in ssh|local) TRANSPORT="$2" ;; *) echo "error: --transport must be ssh or local" >&2; exit 64 ;; esac
+			shift ;;
 		--llm) [ $# -ge 2 ] || { echo "error: --llm needs a URL" >&2; exit 64; }; LLM_URL="$2"; shift ;;
 		# Consumed in the pre-scan above; accepted here so it is not an "unknown argument".
 		--env-file) [ $# -ge 2 ] || { echo "error: --env-file needs a path" >&2; exit 64; }; shift ;;
@@ -216,6 +244,16 @@ else
 fi
 echo "site8: $SITE8 (persisted in $FIN_AGENTD_HOME/site8)"
 
+if [ "$TRANSPORT" = "local" ]; then
+	step "Transport"
+	echo "transport:  local PTY — no site key, no authorized_keys line, no sshd needed"
+	# tmux IS the session under this transport: the connect command is the child process,
+	# so a missing tmux is not a shell error the daemon can report, it is a child that
+	# exits instantly forever. Checked here, and again at every launch.
+	command -v tmux >/dev/null || die "tmux is not on PATH — brew install tmux, then re-run this."
+	echo "tmux:       $(command -v tmux) ($(tmux -V))"
+else
+
 step "Site key"
 if [ -f "$KEY" ]; then
 	echo "exists: $KEY"
@@ -263,6 +301,7 @@ else
 	echo "appended: fin-site-$SITE8 line to $AUTHORIZED_KEYS ($(grep -c . "$AUTHORIZED_KEYS") lines now)"
 fi
 chmod 600 "$AUTHORIZED_KEYS"
+fi   # end of the ssh-only key + authorized_keys steps
 
 # --- 5. config + presigned URLs + routing registry -------------------------------------
 # A re-install used to run a FULL provision every time, rebuilding every field from this
@@ -276,7 +315,7 @@ if [ -n "$ENROLL_TOKEN" ]; then
 	# (control-plane enroll_with_token). The site id adopts this Mac's site8 so the
 	# per-device status objects it already writes keep their identity.
 	SITE_ID="${SITE8}-0000-4000-8000-000000000000"
-	ENROLL_KEY="$(hostname -s | tr '[:upper:]' '[:lower:]')/$USER"
+	ENROLL_KEY="${FIN_ENROLL_KEY:-$(hostname -s | tr '[:upper:]' '[:lower:]')/$USER}"
 	NAME="${DISPLAY_NAME:-$(scutil --get ComputerName 2>/dev/null || hostname -s)}"
 	RESPONSE="$(FIN_TOKEN="$ENROLL_TOKEN" FIN_SITE_ID="$SITE_ID" FIN_KEY="$ENROLL_KEY" FIN_NAME="$NAME" \
 		FIN_PRIORITY="$PRIORITY" /usr/bin/python3 -c '
@@ -294,7 +333,7 @@ print(json.dumps(body))' \
 	fi
 	FIN_RESPONSE="$RESPONSE" FIN_CONFIG="$CONFIG" FIN_ENDPOINT="$ENDPOINT" FIN_MODEL="$MODEL" \
 	FIN_SITE8="$SITE8" FIN_KEY_PATH="$KEY" FIN_AUDIT="$FIN_AGENTD_HOME/audit.jsonl" FIN_SOCKET="${FIN_TMUX_SOCKET:-fin}" \
-	FIN_LLM_URL="$LLM_URL" FIN_LLM_API_KEY="${FIN_LLM_API_KEY:-}" \
+	FIN_LLM_URL="$LLM_URL" FIN_LLM_API_KEY="${FIN_LLM_API_KEY:-}" FIN_TRANSPORT="$TRANSPORT" \
 	/usr/bin/python3 "$SCRIPT_DIR/enroll-config.py" || die "enroll: could not write config"
 	CONFIG_MODE="enrolled"
 else
@@ -381,6 +420,19 @@ Installed and rendered; not loaded."
 		echo "brain: $LLM_URL serving ${WANT_MODEL:-<unchecked>}"
 	fi
 
+	# UNDER THE LOCAL TRANSPORT THERE IS NOTHING TO CHECK HERE, because the hazard is gone
+	# rather than handled: sshd hands out an INTERACTIVE LOGIN SHELL, and the whole
+	# LC_FIN_AGENT apparatus exists because such a shell can auto-attach the owner's tmux
+	# before the daemon types anything (2026-09-05). A local PTY execs the connect command
+	# itself, non-interactively — no login shell, no rc files, nothing to exclude. What
+	# replaces this check is the daemon's own launch-time assertion that after the connect
+	# command `$TMUX` names Fin's own socket, which is a stronger statement and is made on
+	# every start of either transport.
+	if [ "$TRANSPORT" = "local" ]; then
+		step "Login-shell guard check"
+		echo "skipped:    local transport — no login shell is involved, so there is no auto-attach to exclude"
+	else
+
 	step "Login-shell guard check"
 	# The LC_FIN_AGENT marker only helps if the login shell honours it, and that lives in
 	# ~/.config/fish/config.fish — a file this package neither owns nor installs, and one
@@ -451,6 +503,7 @@ Restore the LC_FIN_AGENT exclusion in ~/.config/fish/config.fish.
 Installed and rendered; not loaded." ;;
 		esac
 	fi
+	fi   # end of the ssh-only login-shell guard check
 
 	step "Bootstrapping into $DOMAIN"
 	"$BIN_DIR/rotate-logs.sh" || echo "warning: log rotation failed (continuing)" >&2
@@ -497,6 +550,10 @@ else
 		done
 	fi
 
+	# The local transport never generated a key; saying otherwise sends the operator looking
+	# for a file that is not there.
+	KEY_SUMMARY="$KEY"
+	[ "$TRANSPORT" = "local" ] && KEY_SUMMARY="(none — the local transport needs no key)"
 	step "Installed, NOT loaded"
 	cat <<EOF
 site8:    $SITE8
@@ -504,7 +561,7 @@ version:  fin-agentd $DAEMON_VERSION
 binary:   $BIN_DEST
 launcher: $BIN_DIR/launch-agentd.sh (preflights brain + tmux guard at every launch)
 config:   $CONFIG (0600, $CONFIG_MODE)
-key:      $KEY
+key:      ${KEY_SUMMARY}
 plists:   $AGENTS_DIR/$LABEL.plist
           $AGENTS_DIR/$REFRESH_LABEL.plist   (runs $BIN_DIR/refresh.sh)
 logs:     $LOG_DIR/

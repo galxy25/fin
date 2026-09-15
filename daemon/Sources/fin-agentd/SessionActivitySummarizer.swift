@@ -40,7 +40,7 @@ final class SessionActivitySummarizer {
 
     init(
         registry: SessionRoutingRegistry,
-        session: HeadlessTerminalSession,
+        session: any AgentTerminalTransport,
         intervalSeconds: TimeInterval = SessionActivitySummarizer.defaultIntervalSeconds,
         captureLines: Int = SessionActivitySummarizer.defaultCaptureLines,
         endpointURL: String, modelIdentifier: String, apiKey: String?,

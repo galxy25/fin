@@ -7,6 +7,7 @@
 #
 #   make-bundle.sh --out DIR [--binary PATH] [--name "Work laptop"] [--priority 80]
 #                  [--llm URL] [--from-local-shim] [--model ID] [--endpoint URL]
+#                  [--transport local]
 #
 #   --from-local-shim   read the LM Studio shim bearer out of THIS Mac's
 #                       dev.levischoen.fin.llm-shim LaunchAgent and put it in site.env.
@@ -25,7 +26,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SHIM_PLIST="$HOME/Library/LaunchAgents/dev.levischoen.fin.llm-shim.plist"
 
 BIN_SRC="$REPO_ROOT/daemon/.build/release/fin-agentd"
-OUT_DIR=""; NAME=""; PRIORITY=""; LLM_URL=""; MODEL=""; FROM_SHIM=0
+OUT_DIR=""; NAME=""; PRIORITY=""; LLM_URL=""; MODEL=""; FROM_SHIM=0; TRANSPORT=""
 ENDPOINT="${FIN_CONTROL_PLANE_ENDPOINT:-https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com}"
 
 while [ $# -gt 0 ]; do
@@ -37,6 +38,9 @@ while [ $# -gt 0 ]; do
 		--llm) LLM_URL="$2"; shift ;;
 		--model) MODEL="$2"; shift ;;
 		--endpoint) ENDPOINT="$2"; shift ;;
+		--transport)
+			case "$2" in ssh|local) TRANSPORT="$2" ;; *) echo "error: --transport must be ssh or local" >&2; exit 64 ;; esac
+			shift ;;
 		--from-local-shim) FROM_SHIM=1 ;;
 		-h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*) echo "error: unknown argument: $1" >&2; exit 64 ;;
@@ -66,7 +70,7 @@ chmod 755 "$PKG/fin-agentd"
 # --- site.env ---------------------------------------------------------------------------
 # Only written when there is something non-default to say. install.sh sources it before it
 # reads any environment default, and refuses to read it unless it is owner-only.
-if [ -n "$NAME$PRIORITY$LLM_URL$MODEL" ] || [ "$FROM_SHIM" -eq 1 ]; then
+if [ -n "$NAME$PRIORITY$LLM_URL$MODEL$TRANSPORT" ] || [ "$FROM_SHIM" -eq 1 ]; then
 	ENV_FILE="$PKG/site.env"
 	: > "$ENV_FILE"; chmod 600 "$ENV_FILE"
 	# Every value is shell-QUOTED. install.sh sources this file, and a display name is the
@@ -82,6 +86,7 @@ if [ -n "$NAME$PRIORITY$LLM_URL$MODEL" ] || [ "$FROM_SHIM" -eq 1 ]; then
 		kv FIN_PRIORITY "$PRIORITY"
 		kv FIN_LLM_URL "$LLM_URL"
 		kv FIN_MODEL "$MODEL"
+		kv FIN_TRANSPORT "$TRANSPORT"
 	} >> "$ENV_FILE"
 	if [ "$FROM_SHIM" -eq 1 ]; then
 		[ -f "$SHIM_PLIST" ] || { echo "error: no shim LaunchAgent at $SHIM_PLIST" >&2; exit 1; }

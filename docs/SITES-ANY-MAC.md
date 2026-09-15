@@ -24,6 +24,16 @@ Two smaller things follow from running three of them: the brain (§3) and primar
 
 ## 2. `server.transport: "local"` — a PTY instead of a socket
 
+> **Status: built and verified, 2026-09-15.** `LocalTerminalSession` (FinAgentCore), the
+> `transport` discriminator, the installer's `--transport local`, and the launch
+> preflight's local branch all landed. Verified on the iMac: 12 unit tests against real
+> child processes (including that `forkpty` gives the child a controlling terminal, which
+> is the whole reason it is `forkpty` and not `posix_spawn`), then the real daemon on the
+> local transport attaching a real tmux server — `tmux confinement confirmed: the shell is
+> inside -L finlocaltest` — and a full rehearsal install that enrolled a throwaway site,
+> heartbeat to the live control plane with a Funnel brain, and was then retired. What
+> follows is the design as built.
+
 ### 2.1 Config
 
 Additive, defaulted, so every existing config keeps its meaning:
@@ -41,7 +51,7 @@ Additive, defaulted, so every existing config keeps its meaning:
 
 A new `FinAgentCore` type conforming to `AgentSessionDriving`, sibling to `HeadlessTerminalSession`, mirroring its structure (generation counter, serialized write chain, short-life backoff) with the SSH layer replaced:
 
-- **Spawn.** `openpty(3)`, then `posix_spawn` of the connect command **as an argv, not through a login shell** — `/opt/homebrew/bin/tmux -L fin new-session -A -s fin \; set status off` — with `setsid` + `TIOCSCTTY` so the child owns the terminal, the slave fd as stdin/stdout/stderr, and a fixed 120×40 winsize (`TIOCSWINSZ`). The `LC_FIN_AGENT` marker still goes into the child environment; it costs nothing and the shell tmux spawns inside the pane still reads it.
+- **Spawn.** `forkpty(3)` + `execve`, not `openpty` + `posix_spawn` *(changed during implementation)*: the child must be a session leader with the slave side as its **controlling terminal**, and `posix_spawn` cannot do the `setsid` + `TIOCSCTTY` dance that requires — without it tmux exits `open terminal failed: not a terminal`. `forkpty` is exactly that dance. argv and envp are materialized in the PARENT before the fork, because between `fork` and `execve` a child of a multithreaded process may call only async-signal-safe functions. The connect command is handed to `/bin/sh -c` rather than split into an argv *(also changed)* — `\;` is a shell escape tmux depends on receiving as a literal `;`, and a hand-rolled argv splitter would be one more parser to get wrong. `sh -c` runs **non-interactively**, so no login profile and no auto-attach block is evaluated; the shell the agent types at is the one tmux spawns in the pane, unchanged. The `LC_FIN_AGENT` marker goes into the child environment; nothing here needs it, but the pane shell still reads it.
 - **Read.** `DispatchSource.makeReadSource` on the master fd → the same `TerminalEventLog` the engine reads. Byte-accumulating, not per-chunk decoding (the UTF-8 boundary lesson from `collect`).
 - **Write.** `write(2)` on the master fd, chained exactly as `send(bytes:)` chains today, resolving to whether the bytes actually left — the engine checks that outcome.
 - **`probeEnvironment` / `waitForShellReady`.** Unchanged in behaviour: they type `echo FIN_READY_<n>` into the PTY and read the answer back. Port the bodies verbatim.
@@ -50,13 +60,17 @@ A new `FinAgentCore` type conforming to `AgentSessionDriving`, sibling to `Headl
 
 ### 2.3 The seam
 
-`runFixedCommand` is called from three places (`Daemon.swift:363`, `Daemon.swift:2240`, `SessionInventoryScanner.swift:41`, `SessionActivitySummarizer.swift:65`) on a concrete `HeadlessTerminalSession?`. Add it to a small protocol — `AgentFixedCommandRunning`, or `AgentSessionDriving` itself with a default that throws `notSupported` — and widen `Daemon.session` and the `makeSession` test seam (`Daemon.swift:283`) to the protocol. That is the only invasive edit outside the new file; the turn engine already never learns which session it is driving.
+As built: a protocol **`AgentTerminalTransport: AgentSessionDriving`** carrying the five things the daemon asks of a terminal — `connect`, `disconnect`, `waitForConnection`, `waitForShellReady`, `runFixedCommand` — with `HeadlessTerminalSession` retrofitted onto it in a one-line extension. `Daemon.session` becomes `(any AgentTerminalTransport)?`, and the two scanners plus the `read_session` helpers widen with it.
+
+`makeSession` is left **exactly as it was** (an SSH factory taking `HeadlessSessionConfiguration`) and a sibling `makeLocalSession` added beside it, so the nine launch-order tests that drive that seam by name did not have to change. `launch()` branches on the transport: local skips the private key entirely, ssh reads it as before.
+
+One thing a `Decodable` cannot express had to move into code: *which fields are required depends on another field's value*. `ServerConfig.validationFailure()` is that check — ssh demands host/username/privateKeyPath, local demands a connectCommand (it IS the process, not a line typed into a shell that already exists) — and `launch()` aborts on it with the operator-facing reason.
 
 ### 2.4 What this does to the security model
 
 **Kept, unchanged:** the private tmux socket (`-L fin`) as a *topological* boundary — Fin's server is a different process with a different socket file from the one hosting Levi's `main`; `TmuxCommandGuard` R1–R7; `read_session`'s fixed argv against the default socket; `MemoryRedactor` on everything leaving the machine.
 
-**Deleted, and good riddance:** the site key, the `authorized_keys` line, the `from="127.0.0.1,::1"` pin, the sshd requirement, `AcceptEnv`, and — this is the big one — **the login-shell auto-attach hazard**. The 2026-09-05 incident (`~/.config/fish/config.fish` losing its `LC_FIN_AGENT` guard, every keystroke landing in Levi's live `main`) is structurally impossible when the daemon `posix_spawn`s tmux by argv: there is no login shell in the path to auto-attach anything. `launch-agentd.sh`'s check 3 — the interactive-SSH probe, the one that took two rounds to stop being vacuous — is replaced under `transport: local` by the assertion the daemon already makes at launch: after the connect command, `$TMUX` must name Fin's own socket (`Daemon.swift:1169`).
+**Deleted, and good riddance:** the site key, the `authorized_keys` line, the `from="127.0.0.1,::1"` pin, the sshd requirement, `AcceptEnv`, and — this is the big one — **the login-shell auto-attach hazard**. The 2026-09-05 incident (`~/.config/fish/config.fish` losing its `LC_FIN_AGENT` guard, every keystroke landing in Levi's live `main`) is structurally impossible when the daemon execs its connect command itself, non-interactively: there is no login shell in the path to auto-attach anything. `launch-agentd.sh`'s check 3 — the interactive-SSH probe, the one that took two rounds to stop being vacuous — is replaced under `transport: local` by the assertion the daemon already makes at launch: after the connect command, `$TMUX` must name Fin's own socket (`Daemon.swift:1169`).
 
 **Made harder, stated honestly:** SITES.md §9 names a **dedicated UNIX user** as the airtight hardening — a different uid cannot open a `0700` `/tmp/tmux-<uid>` at all. Over SSH that is one `sudo` step and an `authorized_keys` line for the other user. With a local PTY the agent runs as whoever the *daemon* runs as, so the airtight version would mean running `fin-agentd` itself as that user (a second LaunchAgent in a second user's `gui/` domain, or a LaunchDaemon). That is a real regression in the *reachability* of the hardening, not in today's posture, and the residual list is otherwise identical (`TMUX_TMPDIR`, a symlink dropped over Fin's own socket path, non-tmux damage). On a work laptop it deserves a second look, because the blast radius there is an employer's machine.
 
@@ -128,7 +142,7 @@ Chosen: the work laptop behaves exactly like the iMac. Redacted transcripts land
 
 ## 7. Phasing
 
-- **A — local transport.** `LocalTerminalSession`, the protocol seam, `transport` in config, installer `--transport local`, `launch-agentd.sh` branch, unit tests. Prove it **on the iMac first** by flipping that machine's config to `transport: "local"` — it is the box with a working sshd, so the two transports can be A/B'd against the same tmux server, the same guard, the same `read_session` calls, with the SSH config one `launchctl kickstart` away.
+- **A — local transport. DONE (2026-09-15).** `LocalTerminalSession`, the `AgentTerminalTransport` seam, `transport` in config, installer `--transport local`, `launch-agentd.sh` branch, 12 unit tests, and a live rehearsal on the iMac. Three bugs the rehearsal caught that reading would not have: a bundled installer that looked for `daemon/.build/release`; an unquoted display name that broke `site.env` sourcing on its space; and — the one that mattered — `launch-agentd.sh` splitting its config fields on tabs, where tab is IFS *whitespace*, so the two fields a local config leaves EMPTY collapsed and shifted every later field left. That last one had been latent in the ssh path all along; it only became reachable when a config first left a field empty.
 - **B — the laptop.** Notarized binary, curl installer, enroll at priority 80, Funnel brain, one voice round-trip from the phone, one `read_session` against a real work pane, one `/notify`.
 - **C — three-way.** iMac 100 / Neo 90 / laptop 80, distinct display names, `brain.reachable` in the heartbeat and in "Fin's computers".
 - **D — presence routing, dark.** `hostId`, `presence`, the `_pin_for` rule, flag off. Flip after a week of observed `routedBy`.

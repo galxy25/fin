@@ -443,7 +443,7 @@ public final class HeadlessTerminalSession: AgentSessionDriving {
     /// Keeps the last `limit` BYTES (not Characters — the budget is a byte budget), cut
     /// forward to the next newline so the result starts on a whole line and on a whole
     /// UTF-8 scalar.
-    static func keepingLastBytes(_ input: [UInt8], _ limit: Int) -> [UInt8] {
+    nonisolated static func keepingLastBytes(_ input: [UInt8], _ limit: Int) -> [UInt8] {
         var bytes = input
         guard bytes.count > limit else { return bytes }
         bytes = Array(bytes.suffix(limit))

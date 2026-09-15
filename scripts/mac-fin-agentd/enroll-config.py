@@ -18,11 +18,23 @@ try:
 except Exception:
     cfg = {}
 socket = os.environ.get("FIN_SOCKET") or "fin"
-cfg.setdefault("server", {}).update({
-    "host": "127.0.0.1", "port": 22, "username": os.environ["USER"],
-    "privateKeyPath": os.environ["FIN_KEY_PATH"],
-    "connectCommand": "exec tmux -L %s new-session -A -s fin \; set status off" % socket,
-})
+connect = "exec tmux -L %s new-session -A -s fin \; set status off" % socket
+server = cfg.setdefault("server", {})
+if (os.environ.get("FIN_TRANSPORT") or "ssh") == "local":
+    # The daemon opens the PTY itself, so there is no host to name, no user to
+    # authenticate as and no key to read — and the fields are REMOVED rather than left
+    # stale, so a config converted from ssh cannot be misread later as still having a
+    # working loopback key. The connect command is identical: what changes is who runs it.
+    server.update({"transport": "local", "connectCommand": connect})
+    for stale in ("host", "port", "username", "privateKeyPath", "passphrase"):
+        server.pop(stale, None)
+else:
+    server.update({
+        "transport": "ssh",
+        "host": "127.0.0.1", "port": 22, "username": os.environ["USER"],
+        "privateKeyPath": os.environ["FIN_KEY_PATH"],
+        "connectCommand": connect,
+    })
 agent = cfg.setdefault("agent", {})
 # The brain is not necessarily on this Mac. A site whose own machine cannot run the model
 # (a managed work laptop) points at another body's LM Studio through the Funnel shim
