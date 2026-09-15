@@ -43,6 +43,22 @@ struct AgentLogView: View {
     @State private var expandedRuns: Set<UUID> = []
     @State private var didSetInitialExpansion = false
     @State private var exportURL: URL?
+
+    // MARK: - Derived once, not per body pass
+    //
+    // `allEntries` mapped every local row AND every cloud trace record into LogItems and
+    // sorted the result; `runs` called `allEntries` again, grouped, sorted each group, and
+    // filtered by thread membership. `body` touches both, more than once per pass — and
+    // SwiftUI evaluates body constantly, including as the LazyVStack materialises cards
+    // while you scroll. So a long log paid for its whole history several times a frame.
+    // Same shape as the Conversation transcript, same fix (2026-09-15).
+    @State private var allEntriesCache: [LogItem] = []
+    @State private var runsCache: [AgentRun] = []
+    /// How many of the newest runs are rendered; the rest are one tap away.
+    @State private var visibleRunLimit = AgentLogView.runPage
+
+    /// One page of runs. A run is already a fold-up card, so a page of them is a lot of log.
+    static let runPage = 25
     @State private var showingClearConfirmation = false
 
     init(agent: Agent) {
@@ -54,10 +70,38 @@ struct AgentLogView: View {
         )
     }
 
-    /// Local runtime rows plus the cloud transcript's, newest first.
-    private var allEntries: [LogItem] {
-        (entries.map(LogItem.init) + cloudTraces.records.map(LogItem.init(record:)))
+    /// Local runtime rows plus the cloud transcript's, newest first. Cached —
+    /// `rebuildLog()` is the only writer.
+    private var allEntries: [LogItem] { allEntriesCache }
+
+    /// Pure, so the rebuild can be reasoned about (and tested) without a view.
+    static func mergedEntries(
+        local: [AgentLogEntry], cloud: [AgentMirrorRecord]
+    ) -> [LogItem] {
+        (local.map(LogItem.init) + cloud.map(LogItem.init(record:)))
             .sorted { $0.timestamp > $1.timestamp }
+    }
+
+    /// What the merge depends on: how much of each source there is, the newest line of
+    /// each, and the two filters that change which runs survive.
+    private var logSignature: String {
+        [
+            String(entries.count), entries.first?.id.uuidString ?? "-",
+            String(cloudTraces.records.count), cloudTraces.records.last?.id ?? "-",
+            kindFilter?.rawValue ?? "-", threadStore.selectedThreadID ?? "-",
+        ].joined(separator: "|")
+    }
+
+    /// The one place the log is merged and grouped.
+    private func rebuildLog() {
+        let merged = Self.mergedEntries(local: entries, cloud: cloudTraces.records)
+        allEntriesCache = merged
+        runsCache = Self.runs(
+            from: merged,
+            kindFilter: kindFilter,
+            threadID: threadStore.selectedThreadID,
+            threadOfMessage: threadStore.threadOfMessage
+        )
     }
 
     var body: some View {
@@ -67,17 +111,37 @@ struct AgentLogView: View {
                     SummaryPanel(runs: runs, entries: allEntries)
                     filterBar
                 }
-                ForEach(runs) { run in
+                ForEach(visibleRuns) { run in
                     RunCard(
                         run: run,
                         isExpanded: expandedRuns.contains(run.id),
                         toggle: { toggle(run.id) }
                     )
                 }
+                if hiddenRunCount > 0 {
+                    Button {
+                        visibleRunLimit += Self.runPage
+                    } label: {
+                        Label("Show \(min(hiddenRunCount, Self.runPage)) earlier "
+                              + (hiddenRunCount == 1 ? "run" : "runs"), systemImage: "chevron.down")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .accessibilityIdentifier("showEarlierRuns")
+                }
             }
             .padding(.horizontal)
             .padding(.vertical, 14)
         }
+        .onAppear { rebuildLog() }
+        .onChange(of: logSignature) { _, _ in rebuildLog() }
+        .onChange(of: kindFilter) { _, _ in
+            // A new filter is a new list: start at its newest page rather than inheriting
+            // however far back the previous one was paged.
+            visibleRunLimit = Self.runPage
+        }
+        .onChange(of: threadStore.selectedThreadID) { _, _ in visibleRunLimit = Self.runPage }
         .background(Color.groupedBackground)
         .navigationTitle("Logs")
         #if os(iOS) || os(visionOS)
@@ -129,8 +193,22 @@ struct AgentLogView: View {
 
     /// Entries grouped into trajectories, newest run first, steps within a run in the
     /// order they actually happened.
-    private var runs: [AgentRun] {
-        let source = kindFilter.map { filter in allEntries.filter { $0.kind == filter } } ?? allEntries
+    private var runs: [AgentRun] { runsCache }
+
+    /// The newest page of runs — what is actually rendered.
+    private var visibleRuns: [AgentRun] {
+        runsCache.count <= visibleRunLimit ? runsCache : Array(runsCache.prefix(visibleRunLimit))
+    }
+
+    private var hiddenRunCount: Int { max(0, runsCache.count - visibleRunLimit) }
+
+    /// Pure: group merged rows into runs, filtered by kind and (when one is selected) by
+    /// thread membership. Lifted out of the view so it runs on a rebuild, not on a redraw.
+    fileprivate static func runs(
+        from merged: [LogItem], kindFilter: AgentLogKind?, threadID: String?,
+        threadOfMessage: [String: String]
+    ) -> [AgentRun] {
+        let source = kindFilter.map { filter in merged.filter { $0.kind == filter } } ?? merged
         var order: [UUID] = []
         var grouped: [UUID: [LogItem]] = [:]
         for entry in source {
@@ -140,9 +218,8 @@ struct AgentLogView: View {
         let all = order.map { id in
             AgentRun(id: id, entries: (grouped[id] ?? []).sorted { $0.sequence < $1.sequence })
         }
-        guard let threadID = threadStore.selectedThreadID else { return all }
-        let threadOfMessage = threadStore.threadOfMessage
-        return all.filter { Self.runCarries(threadID: threadID, entries: $0.entries, threadOfMessage: threadOfMessage) }
+        guard let threadID else { return all }
+        return all.filter { runCarries(threadID: threadID, entries: $0.entries, threadOfMessage: threadOfMessage) }
     }
 
     /// A run belongs to a thread when any of its lines names it (`thread_id`),
