@@ -47,14 +47,11 @@ final class AgentBehaviorTests: XCTestCase {
         }
     }
 
-    override func setUpWithError() throws {
-        try super.setUpWithError()
-        try requireLiveOptIn()
-    }
-
     private var session: TerminalSession?
 
     override func setUpWithError() throws {
+        // The opt-in comes FIRST: without it nothing here runs, whatever else is available.
+        try requireLiveOptIn()
         guard AppleOnDeviceBackend.isAvailable else {
             throw XCTSkip("Apple on-device model isn't available on this machine.")
         }

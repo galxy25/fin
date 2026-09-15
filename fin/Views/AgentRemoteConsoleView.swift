@@ -34,6 +34,32 @@ struct AgentRemoteConsoleView: View {
     /// The remembered-conversations sheet (moved here from the Memory screen).
     @State private var showingRemembered = false
 
+    // MARK: - The merged transcript, computed once instead of per body pass
+    //
+    // WHY THESE ARE STATE AND NOT COMPUTED PROPERTIES. They used to be computed, and
+    // SwiftUI evaluates `body` constantly — every state change, and again as a LazyVStack
+    // materializes rows while you scroll. Each pass rebuilt the whole transcript: group
+    // every record into turns, filter them to the thread, then build the thread timeline
+    // (which grouped every record into turns a SECOND time, line for line), then sort the
+    // lot. On a thread with real history that is the scroll hanging — the content appears,
+    // because the first pass completes, and then every subsequent frame pays for the
+    // entire merge again (reported 2026-09-15: "showed me some content and when I tried to
+    // scroll it hung").
+    //
+    // Now the merge runs when its INPUTS change — `mergeSignature` — and scrolling costs
+    // nothing but drawing.
+    @State private var turnsCache: [Turn] = []
+    @State private var consoleRowsCache: [ConsoleRow] = []
+    /// How many of the newest rows are rendered. The rest are one tap away rather than
+    /// eagerly built: a LazyVStack is lazy about VIEWS, but `ForEach` still needs the whole
+    /// array's identity up front, and `ScrollViewProxy.scrollTo` forces layout of
+    /// everything ahead of its target.
+    @State private var visibleRowLimit = AgentRemoteConsoleView.rowPage
+
+    /// One page of conversation. Big enough that paging is rare on an ordinary thread,
+    /// small enough that opening a long one is instant.
+    static let rowPage = 40
+
     /// Cloud-hosted only, "load earlier" support. `latestWindowRecords` is whatever the
     /// periodic refresh's default fetch returns (the latest hour, merged with the
     /// previous one when it exists — see `CloudAgentChannel.fetchTranscriptChunks`);
@@ -334,12 +360,25 @@ struct AgentRemoteConsoleView: View {
                     }
                     if records.isEmpty {
                         emptyState
-                    } else if turns.isEmpty, threadStore.selectedThreadID != nil, threadEventItems.isEmpty {
+                    } else if turnsCache.isEmpty, threadStore.selectedThreadID != nil, consoleRowsCache.isEmpty {
                         Label("Nothing in this thread has reached the transcript yet.", systemImage: "number")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    ForEach(consoleRows) { row in
+                    if hiddenConsoleRowCount > 0 {
+                        Button {
+                            visibleRowLimit += Self.rowPage
+                        } label: {
+                            Label("Show \(min(hiddenConsoleRowCount, Self.rowPage)) earlier "
+                                  + (hiddenConsoleRowCount == 1 ? "item" : "items"),
+                                  systemImage: "chevron.up")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .accessibilityIdentifier("showEarlierRows")
+                    }
+                    ForEach(visibleConsoleRows) { row in
                         switch row {
                         case .turn(let turn):
                             turnView(turn)
@@ -364,7 +403,16 @@ struct AgentRemoteConsoleView: View {
                 }
                 .padding()
             }
-            .onChange(of: records.count) { _, _ in scrollToLatest(proxy) }
+            .onChange(of: mergeSignature) { _, _ in
+                rebuildTranscript()
+                scrollToLatest(proxy)
+            }
+            .onChange(of: threadStore.selectedThreadID) { _, _ in
+                // A different thread is a different conversation: start at its newest page
+                // rather than inheriting however far back the last one was paged.
+                visibleRowLimit = Self.rowPage
+            }
+            .onAppear { rebuildTranscript() }
             // A just-composed relay row appended below the fold must scroll into
             // view too — records.count alone never changes on compose.
             .onChange(of: visibleRelayRows.count) { _, _ in scrollToLatest(proxy) }
@@ -469,17 +517,45 @@ struct AgentRemoteConsoleView: View {
         return map
     }
 
-    private var turns: [Turn] {
-        Self.turns(from: records, threadID: threadStore.selectedThreadID, threadOfMessage: threadOfMessage)
-    }
+    /// The cached merge. `rebuildTranscript()` is the only writer.
+    private var turns: [Turn] { turnsCache }
 
-    /// The selected thread's notify / relay / follow-up events that no transcript
-    /// line already shows — interleaved between turns by time.
-    private var threadEventItems: [ThreadItem] {
-        guard let selected = threadStore.selectedThreadID, let detail = threadStore.detail(for: selected) else { return [] }
+    /// The selected thread's notify / relay / follow-up events that no transcript line
+    /// already shows. Derived inside `rebuildTranscript()` from the turns it just computed,
+    /// rather than recomputing them — that double pass was half the cost of the old merge.
+    private static func threadEventItems(
+        turns: [Turn], selectedThreadID: String?, detail: ControlPlaneClient.ThreadDetail?
+    ) -> [ThreadItem] {
+        guard selectedThreadID != nil, let detail else { return [] }
         let threadRecords = turns.flatMap { [$0.prompt].compactMap { $0 } + $0.steps + [$0.reply].compactMap { $0 } }
         return ThreadTimeline.build(thread: detail.thread, messages: [], records: threadRecords, events: detail.events)
             .filter { $0.source == .event }
+    }
+
+    /// What the merge depends on. Cheap to compute, and changes exactly when the merged
+    /// result would: the transcript's size and newest line, the selected thread, how much
+    /// of its detail has arrived, and the open control-plane rows.
+    private var mergeSignature: String {
+        let selected = threadStore.selectedThreadID ?? "-"
+        let detail = threadStore.selectedThreadID.flatMap { threadStore.detail(for: $0) }
+        return [
+            String(records.count), records.last?.id ?? "-",
+            selected, String(detail?.events.count ?? 0), String(detail?.messages.count ?? 0),
+            String(remoteMessages.count),
+        ].joined(separator: "|")
+    }
+
+    /// The one place the transcript is merged.
+    private func rebuildTranscript() {
+        let selected = threadStore.selectedThreadID
+        let merged = Self.turns(from: records, threadID: selected, threadOfMessage: threadOfMessage)
+        let events = Self.threadEventItems(
+            turns: merged,
+            selectedThreadID: selected,
+            detail: selected.flatMap { threadStore.detail(for: $0) }
+        )
+        turnsCache = merged
+        consoleRowsCache = Self.interleave(turns: merged, events: events)
     }
 
     enum ConsoleRow: Identifiable {
@@ -506,7 +582,18 @@ struct AgentRemoteConsoleView: View {
         }.map(\.element)
     }
 
-    private var consoleRows: [ConsoleRow] { Self.interleave(turns: turns, events: threadEventItems) }
+    private var consoleRows: [ConsoleRow] { consoleRowsCache }
+
+    /// The newest page of rows — what is actually rendered.
+    private var visibleConsoleRows: [ConsoleRow] {
+        consoleRowsCache.count <= visibleRowLimit
+            ? consoleRowsCache
+            : Array(consoleRowsCache.suffix(visibleRowLimit))
+    }
+
+    private var hiddenConsoleRowCount: Int {
+        max(0, consoleRowsCache.count - visibleRowLimit)
+    }
 
     private func threadEventRow(_ item: ThreadItem) -> some View {
         HStack(alignment: .top, spacing: 6) {
