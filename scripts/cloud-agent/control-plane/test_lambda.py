@@ -881,6 +881,10 @@ class _FakeEventsTable:
             result["LastEvaluatedKey"] = {"threadId": thread, "seq": page[-1]["seq"]}
         return result
 
+    def delete_item(self, Key):
+        self.rows = [r for r in self.rows
+                     if not (r["threadId"] == Key["threadId"] and int(r["seq"]) == int(Key["seq"]))]
+
     def for_thread(self, thread_id):
         return sorted((r for r in self.rows if r["threadId"] == thread_id), key=lambda r: r["seq"])
 
@@ -1841,6 +1845,11 @@ class _FakeS3:
 
     def delete_object(self, Bucket, Key):
         self.objects.pop(Key, None)
+        return {}
+
+    def delete_objects(self, Bucket, Delete):
+        for entry in Delete.get("Objects", []):
+            self.objects.pop(entry["Key"], None)
         return {}
 
     def list_objects_v2(self, **kwargs):
@@ -3090,3 +3099,196 @@ class LiveActivityTokenRegistrationTests(DeviceTokenRegistrationTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AccountDeletionTests(_SitesTestCase):
+    """`DELETE /account` — App Store Guideline 5.1.1(v). The promise the button
+    makes is absolute ("everything of yours is gone"), so these pin that every
+    store is actually swept, that a second account in the same tables is
+    untouched, and that only the Sign in with Apple session may do it."""
+
+    def setUp(self):
+        super().setUp()
+        for attr, key in (
+            ("TABLE", "workerId"), ("USERS_TABLE", "appleSub"), ("SESSIONS_TABLE", "token"),
+            ("DEVICE_TOKENS_TABLE", "token"), ("ENROLL_TOKENS_TABLE", "tokenSha256"),
+        ):
+            orig = getattr(lam, attr)
+            setattr(lam, attr, _FakeDynamoTable(key))
+            self.addCleanup(setattr, lam, attr, orig)
+        self.addCleanup(setattr, lam, "S3", lam.S3)
+        lam.S3 = _FakeS3()
+        self.addCleanup(setattr, lam, "SECRETS", lam.SECRETS)
+        lam.SECRETS = self._FakeSecrets()
+        self.terminated = []
+        self.addCleanup(setattr, lam, "_terminate", lam._terminate)
+        lam._terminate = self._terminate
+
+    class _FakeSecrets:
+        def __init__(self):
+            self.names = []
+
+        def list_secrets(self, Filters=None, MaxResults=None, NextToken=None, **kwargs):
+            prefix = (Filters or [{}])[0].get("Values", [""])[0]
+            return {"SecretList": [{"Name": n} for n in self.names if n.startswith(prefix)]}
+
+        def delete_secret(self, SecretId, **kwargs):
+            assert kwargs.get("ForceDeleteWithoutRecovery") is True, kwargs
+            self.names = [n for n in self.names if n != SecretId]
+            return {}
+
+    def _terminate(self, worker, reason):
+        self.terminated.append((worker["workerId"], reason))
+        worker = dict(worker, status="terminated", terminatedReason=reason)
+        lam.TABLE.put_item(Item=worker)
+        return worker
+
+    def _populate(self, user, site_suffix):
+        """One account's worth of rows across every store."""
+        site = self.enroll(user=user, enrollKey="mac/" + site_suffix)
+        message = json.loads(lam.send_message({
+            "_userId": user, "body": json.dumps({"agent": "Fin", "text": "hello " + user})})["body"])
+        lam.TABLE.put_item(Item={"workerId": "w-" + site_suffix, "userId": user,
+                                 "status": "live", "instanceId": "i-" + site_suffix})
+        lam.USERS_TABLE.put_item(Item={"appleSub": "apple-" + site_suffix, "userId": user})
+        lam.SESSIONS_TABLE.put_item(Item={"token": "sess-" + site_suffix, "userId": user})
+        lam.DEVICE_TOKENS_TABLE.put_item(Item={"token": "apns-" + site_suffix, "userId": user})
+        lam.ENROLL_TOKENS_TABLE.put_item(Item={"tokenSha256": "enr-" + site_suffix, "userId": user})
+        lam.AGENTS_TABLE.put_item(Item={"agentKey": lam._agent_key(user, "Fin"), "userId": user})
+        lam.S3.objects["users/{}/fin/transcripts/fin.jsonl".format(user)] = b"line"
+        lam.S3.objects["users/{}/fin/vault/keys/k1.json".format(user)] = b"sealed"
+        lam.SECRETS.names.append("users/{}/fin/service-creds/shared/github".format(user))
+        return site, message
+
+    def test_deleting_an_account_sweeps_every_store_and_terminates_instances(self):
+        _site, message = self._populate("user-1", "one")
+        # A thread event exists for the message (message.queued).
+        self.assertTrue(self.events.for_thread(message["threadId"]))
+
+        response = lam.delete_account({"_userId": "user-1", "_authKind": "session"})
+        self.assertEqual(response["statusCode"], 200)
+        deleted = json.loads(response["body"])["deleted"]
+
+        self.assertEqual(self.terminated, [("w-one", "account-deleted")])
+        self.assertEqual(deleted["instancesTerminated"], 1)
+        for store in ("workers", "sites", "messages", "agents", "enrollTokens",
+                      "deviceTokens", "identities", "sessions", "credentials"):
+            self.assertEqual(deleted[store], 1, store)
+        self.assertEqual(deleted["objects"], 2)
+        self.assertGreaterEqual(deleted["threadEvents"], 1)
+
+        self.assertEqual(lam.TABLE.items, {})
+        self.assertEqual(lam.SITES_TABLE.items, {})
+        self.assertEqual(lam.MESSAGES_TABLE.items, {})
+        self.assertEqual(lam.AGENTS_TABLE.items, {})
+        self.assertEqual(lam.ENROLL_TOKENS_TABLE.items, {})
+        self.assertEqual(lam.DEVICE_TOKENS_TABLE.items, {})
+        self.assertEqual(lam.USERS_TABLE.items, {})
+        self.assertEqual(lam.SESSIONS_TABLE.items, {}, "every device is signed out")
+        self.assertEqual(lam.S3.objects, {})
+        self.assertEqual(lam.SECRETS.names, [])
+        self.assertEqual(self.events.for_thread(message["threadId"]), [])
+
+    def test_a_second_account_in_the_same_tables_is_untouched(self):
+        self._populate("user-1", "one")
+        _site, other_message = self._populate("user-2", "two")
+
+        lam.delete_account({"_userId": "user-1", "_authKind": "session"})
+
+        self.assertEqual(self.terminated, [("w-one", "account-deleted")])
+        self.assertEqual(list(lam.SITES_TABLE.items.values())[0]["userId"], "user-2")
+        self.assertEqual(list(lam.MESSAGES_TABLE.items.values())[0]["userId"], "user-2")
+        self.assertEqual(list(lam.USERS_TABLE.items.values())[0]["userId"], "user-2")
+        self.assertEqual(list(lam.SESSIONS_TABLE.items), ["sess-two"])
+        self.assertEqual(list(lam.DEVICE_TOKENS_TABLE.items), ["apns-two"])
+        self.assertEqual(list(lam.ENROLL_TOKENS_TABLE.items), ["enr-two"])
+        self.assertEqual(sorted(lam.S3.objects), [
+            "users/user-2/fin/transcripts/fin.jsonl", "users/user-2/fin/vault/keys/k1.json"])
+        self.assertEqual(lam.SECRETS.names, ["users/user-2/fin/service-creds/shared/github"])
+        self.assertTrue(self.events.for_thread(other_message["threadId"]))
+
+    def test_only_a_sign_in_with_apple_session_may_delete(self):
+        # A site token is a body's credential (a stolen EC2 instance must not be
+        # able to wipe its owner) and the operator token sits in every daemon's
+        # config file. Neither is the account's owner proving who they are.
+        self._populate("user-1", "one")
+        for kind in ("site", "operator", None):
+            with self.assertRaises(lam.ApiError) as caught:
+                lam.delete_account({"_userId": "user-1", "_authKind": kind})
+            self.assertEqual(caught.exception.status, 403)
+        self.assertEqual(len(lam.SITES_TABLE.items), 1, "nothing was deleted")
+
+    def test_an_empty_account_deletes_cleanly(self):
+        lam.USERS_TABLE.put_item(Item={"appleSub": "apple-x", "userId": "user-1"})
+        lam.SESSIONS_TABLE.put_item(Item={"token": "sess-x", "userId": "user-1"})
+        response = lam.delete_account({"_userId": "user-1", "_authKind": "session"})
+        self.assertEqual(response["statusCode"], 200)
+        deleted = json.loads(response["body"])["deleted"]
+        self.assertEqual((deleted["identities"], deleted["sessions"], deleted["objects"]), (1, 1, 0))
+
+    def test_a_store_that_refuses_reports_500_and_names_the_stage(self):
+        # A user told "deleted" deserves that to be true; a partial sweep must
+        # not answer 200. The rest of the account still goes.
+        self._populate("user-1", "one")
+        def refuse(Key):
+            raise RuntimeError("dynamo said no")
+        lam.SITES_TABLE.delete_item = refuse
+
+        response = lam.delete_account({"_userId": "user-1", "_authKind": "session"})
+        self.assertEqual(response["statusCode"], 500)
+        body = json.loads(response["body"])
+        self.assertEqual(body["incomplete"], ["sites"])
+        self.assertIn("contact support", body["error"])
+        self.assertEqual(lam.MESSAGES_TABLE.items, {}, "the other stores still went")
+        self.assertEqual(lam.SESSIONS_TABLE.items, {})
+
+
+class AccountDeletionAuthKindTests(unittest.TestCase):
+    """`_authKind` is what `delete_account` gates on, so the three ways to
+    authenticate must label themselves correctly."""
+
+    def setUp(self):
+        self.addCleanup(setattr, lam, "SESSIONS_TABLE", lam.SESSIONS_TABLE)
+        lam.SESSIONS_TABLE = _FakeDynamoTable("token")
+        self.addCleanup(setattr, lam, "SITES_TABLE", lam.SITES_TABLE)
+        lam.SITES_TABLE = _FakeDynamoTable("siteId")
+
+    def test_a_session_bearer_is_labelled_session(self):
+        expires = lam._iso(lam._now() + lam.timedelta(hours=1))
+        lam.SESSIONS_TABLE.put_item(Item={"token": "tok", "userId": "user-1", "expiresAt": expires})
+        event = {"headers": {"authorization": "Bearer tok"}}
+        lam._authorize(event)
+        self.assertEqual((event["_userId"], event["_authKind"]), ("user-1", "session"))
+
+    def test_a_site_bearer_is_labelled_site(self):
+        site_id = "a4a1d987-0000-4000-8000-000000000000"
+        lam.SITES_TABLE.put_item(Item={
+            "siteId": site_id, "userId": "user-1", "state": "idle",
+            "tokenSha256": lam._site_token_hash("sitetok"),
+        })
+        event = {"headers": {"authorization": "Bearer sitetok", "x-fin-site": site_id}}
+        lam._authorize(event)
+        self.assertEqual(event["_authKind"], "site")
+
+    def test_the_operator_token_is_labelled_operator(self):
+        self.addCleanup(os.environ.pop, "FIN_CP_TOKEN", None)
+        self.addCleanup(os.environ.pop, "FIN_CP_LEGACY_USER_ID", None)
+        os.environ["FIN_CP_TOKEN"] = "op-secret"
+        os.environ["FIN_CP_LEGACY_USER_ID"] = "legacy-user"
+        event = {"headers": {"authorization": "Bearer op-secret"}}
+        lam._authorize(event)
+        self.assertEqual((event["_userId"], event["_authKind"]), ("legacy-user", "operator"))
+
+
+class AccountRouteRegistrationTests(unittest.TestCase):
+    def test_delete_account_is_registered_in_deploy_sh(self):
+        # A route the Lambda handles but API Gateway doesn't know 404s live.
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "deploy.sh")) as handle:
+            deploy_sh = handle.read()
+        self.assertIn("DELETE /account\n", deploy_sh)
+
+    def test_a_site_token_is_denied_the_account_route(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam._require_site_scope({"_siteId": "site-1", "_userId": "user-1"}, "DELETE", ["account"])
+        self.assertEqual(caught.exception.status, 403)
+

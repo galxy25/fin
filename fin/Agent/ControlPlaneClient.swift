@@ -108,6 +108,64 @@ enum ControlPlaneClient {
             }
     }
 
+    // MARK: - Account
+
+    /// What `DELETE /account` reports it removed, so the app can tell the user
+    /// what actually happened instead of a bare "done".
+    struct AccountDeletion: Decodable, Equatable {
+        struct Counts: Decodable, Equatable {
+            let instancesTerminated: Int?
+            let sites: Int?
+            let messages: Int?
+            let objects: Int?
+            let sessions: Int?
+        }
+        let deleted: Counts
+    }
+
+    /// Erases the Fin account and everything it owns (App Store Guideline
+    /// 5.1.1(v)). The server destroys every session as its last act, so the
+    /// token this call authenticated with is dead on return — the caller MUST
+    /// clear it locally (`CloudControlPlaneConfig.setToken("")`), which is
+    /// also the right thing to do when the account is already gone.
+    ///
+    /// A 401 counts as success: it means no session remained to delete, so the
+    /// account is not there to be deleted either. Anything else is reported,
+    /// including the server's own 500 when a stage could not be swept — the
+    /// user is told to contact support rather than shown a false "deleted".
+    static func deleteAccount() async -> Result<AccountDeletion?, Failure> {
+        await perform(request("DELETE", path: "/account")).flatMap { status, body in
+            if (200...299).contains(status) {
+                return .success(try? JSONDecoder().decode(AccountDeletion.self, from: body))
+            }
+            if status == 401 { return .success(nil) }
+            return .failure(.http(status, errorMessage(status: status, body: body)))
+        }
+    }
+
+    /// The sentence shown after a successful deletion. Pure so the wording is
+    /// pinned by a test rather than only visible on a device.
+    static func deletionSummary(_ deletion: AccountDeletion?) -> String {
+        guard let counts = deletion?.deleted else {
+            return "Your Fin account is gone. This device is signed out."
+        }
+        var parts: [String] = []
+        if let value = counts.instancesTerminated, value > 0 {
+            parts.append(value == 1 ? "1 cloud computer shut down" : "\(value) cloud computers shut down")
+        }
+        if let value = counts.sites, value > 0 {
+            parts.append(value == 1 ? "1 computer unlinked" : "\(value) computers unlinked")
+        }
+        if let value = counts.objects, value > 0 {
+            parts.append(value == 1 ? "1 stored file erased" : "\(value) stored files erased")
+        }
+        guard !parts.isEmpty else {
+            return "Your Fin account is gone. This device is signed out."
+        }
+        return "Your Fin account is gone: " + parts.joined(separator: ", ")
+            + ". Every device is signed out."
+    }
+
     // MARK: - Messages
 
     /// The control plane's row, as `_public_message` renders it.

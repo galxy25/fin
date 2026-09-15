@@ -303,44 +303,50 @@ cat > "$BUILD/policy.json" <<JSON
     {
       "Sid": "UserRecords",
       "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Scan"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$USERS_TABLE"
     },
     {
       "Sid": "SessionRecords",
       "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Scan"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$SESSIONS_TABLE"
     },
     {
       "Sid": "SitesTable",
       "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan"],
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan", "dynamodb:DeleteItem"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$SITES_TABLE"
     },
     {
       "Sid": "MessagesTable",
       "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan"],
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan", "dynamodb:DeleteItem"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$MESSAGES_TABLE"
     },
     {
       "Sid": "AgentsTable",
       "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan", "dynamodb:DeleteItem"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$AGENTS_TABLE"
     },
     {
       "Sid": "EnrollTokensTable",
       "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"],
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Scan"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$ENROLL_TOKENS_TABLE"
     },
     {
       "Sid": "ThreadEventsTable",
       "Effect": "Allow",
-      "Action": ["dynamodb:PutItem", "dynamodb:Query"],
+      "Action": ["dynamodb:PutItem", "dynamodb:Query", "dynamodb:DeleteItem"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$THREAD_EVENTS_TABLE"
+    },
+    {
+      "Sid": "AccountDeletion",
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::$BUCKET/users/*"
     },
     {
       "Sid": "AgentObjects",
@@ -680,6 +686,7 @@ DELETE /artifacts/{path+}
 GET /vault/keys
 PUT /vault/keys/{keyId}
 DELETE /vault/keys/{keyId}
+DELETE /account
 ROUTES
 
 if ! aws apigatewayv2 get-stage --api-id "$API_ID" --stage-name '$default' >/dev/null 2>&1; then

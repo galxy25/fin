@@ -174,4 +174,20 @@ struct KeyVaultClient {
     func delete(keyID: UUID) async throws {
         _ = try await send(try request("DELETE", path: "/vault/keys/\(keyID.uuidString)"))
     }
+
+    /// `DELETE /account` — erases the Fin account and everything it owns (App
+    /// Store Guideline 5.1.1(v)). Lives on this client because it is the whole
+    /// control-plane surface the Apple TV has; the iPhone/iPad/Mac app goes
+    /// through `ControlPlaneClient.deleteAccount()` instead.
+    ///
+    /// A 401 is success, not failure: the server destroys every session as its
+    /// last act, so a retry after a dropped response finds no session left —
+    /// and no session means no account to delete.
+    func deleteAccount() async throws {
+        do {
+            _ = try await send(try request("DELETE", path: "/account"))
+        } catch ClientError.http(let status, _) where status == 401 {
+            return
+        }
+    }
 }

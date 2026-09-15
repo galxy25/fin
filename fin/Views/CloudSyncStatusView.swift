@@ -118,6 +118,12 @@ struct CloudSyncStatusView: View {
     @State private var isProbing = false
     @State private var vaultResult: String?
     @State private var isPushingVault = false
+    /// Account deletion (App Store Guideline 5.1.1(v)): the confirmation gate,
+    /// the in-flight flag, and whatever the server said afterwards.
+    @State private var isConfirmingDelete = false
+    @State private var isDeletingAccount = false
+    @State private var deleteResult: String?
+    @State private var hasAccount = CloudControlPlaneConfig.isConfigured
     @Environment(\.modelContext) private var modelContext
 
     var body: some View {
@@ -172,13 +178,47 @@ struct CloudSyncStatusView: View {
                     Button(isPushingVault ? "Sending keys\u{2026}" : "Send Keys to My Fin Account") {
                         Task { await pushVault() }
                     }
-                    .disabled(isPushingVault || !CloudControlPlaneConfig.isConfigured)
+                    .disabled(isPushingVault || !hasAccount)
+
+                    // Guideline 5.1.1(v): Sign in with Apple creates an account,
+                    // so the app has to offer to delete it. Shown only when there
+                    // IS one — a device that never signed in has nothing to erase.
+                    if hasAccount {
+                        if let deleteResult {
+                            Text(deleteResult)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Button(role: .destructive) {
+                            isConfirmingDelete = true
+                        } label: {
+                            Text(isDeletingAccount ? "Deleting account\u{2026}" : "Delete Fin Account")
+                        }
+                        .disabled(isDeletingAccount)
+                        .accessibilityIdentifier("account-delete")
+                    } else if let deleteResult {
+                        Text(deleteResult)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 } header: {
                     Text("Fin Account")
                 } footer: {
-                    Text(CloudControlPlaneConfig.isConfigured
-                        ? "Seals every SSH key on this device with your account's vault key and sends it to your Fin account, so the Apple TV can install it after Sign in with Apple."
+                    Text(hasAccount
+                        ? "Seals every SSH key on this device with your account's vault key and sends it to your Fin account, so the Apple TV can install it after Sign in with Apple.\n\nDeleting your Fin account shuts down any cloud computers, unlinks every computer, and erases your agent's messages, transcripts, memory, goals, stored keys, and saved credentials from Fin's servers. It cannot be undone. Your servers, SSH keys, and settings in iCloud are untouched, and so is this app on your devices."
                         : "Sign in with Apple in an agent's settings first — the Apple TV gets its keys through your Fin account.")
+                }
+                .confirmationDialog(
+                    "Delete your Fin account?",
+                    isPresented: $isConfirmingDelete,
+                    titleVisibility: .visible
+                ) {
+                    Button("Delete Account", role: .destructive) {
+                        Task { await deleteAccount() }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("This erases your account and everything in it from Fin's servers, shuts down any cloud computers, and signs out every device. It cannot be undone.")
                 }
             }
             .navigationTitle("iCloud Sync")
@@ -192,6 +232,37 @@ struct CloudSyncStatusView: View {
                 await refresh()
                 await probeCloud()
             }
+        }
+    }
+
+    /// Deletes the Fin account, then clears the local token whatever happened:
+    /// on success the server has already destroyed every session (so the token
+    /// is dead), and on a 401 there was no account left to hold. A real failure
+    /// keeps the token — there is still an account to try again on.
+    private func deleteAccount() async {
+        isDeletingAccount = true
+        defer { isDeletingAccount = false }
+        deleteResult = nil
+        switch await ControlPlaneClient.deleteAccount() {
+        case .success(let deletion):
+            CloudControlPlaneConfig.setToken("")
+            hasAccount = false
+            deleteResult = ControlPlaneClient.deletionSummary(deletion)
+        case .failure(let failure):
+            deleteResult = Self.deleteFailureMessage(failure)
+        }
+    }
+
+    /// Pure: what the user reads when deletion did not happen. Separated so the
+    /// wording — especially the "nothing was deleted" reassurance — is testable.
+    static func deleteFailureMessage(_ failure: ControlPlaneClient.Failure) -> String {
+        switch failure {
+        case .notConfigured:
+            return "No Fin account is configured on this device."
+        case .network:
+            return "Couldn't reach Fin's servers, so nothing was deleted. Check your connection and try again."
+        case .http(let status, let message):
+            return "Couldn't delete the account (\(status)). \(message)"
         }
     }
 

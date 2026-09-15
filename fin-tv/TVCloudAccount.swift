@@ -103,6 +103,28 @@ final class TVCloudAccount: ObservableObject {
         phase = endpoint.isEmpty ? .waitingForEndpoint : .needsSignIn
     }
 
+    /// Deletes the Fin account and everything in it (App Store Guideline
+    /// 5.1.1(v)). The TV can do this because Sign in with Apple happens here
+    /// too, and a TV may be the only device someone still has Fin on.
+    ///
+    /// On success the server has already destroyed every session, so this signs
+    /// the TV out locally as well; on failure the token is kept, because there
+    /// is still an account to try again on.
+    func deleteAccount() async {
+        guard isSignedIn else { return }
+        phase = .syncing
+        let client = KeyVaultClient(endpoint: endpoint, token: sessionToken)
+        do {
+            try await client.deleteAccount()
+            keysInstalled = 0
+            keysUnopenable = 0
+            missingFingerprints = []
+            signOut()
+        } catch {
+            phase = .failed("Couldn't delete the account: \(error.localizedDescription)")
+        }
+    }
+
     /// Lists the vault and installs every entry this account's vault key opens.
     /// An entry that fails to open is skipped, not fatal: it may have been sealed
     /// by a device whose CloudKit vault-key record lost the mint race (see
@@ -168,6 +190,10 @@ final class TVCloudAccount: ObservableObject {
 struct TVAccountSection: View {
     @EnvironmentObject private var account: TVCloudAccount
     @StateObject private var signIn = TVAppleSignIn()
+    /// Guideline 5.1.1(v)'s confirmation gate. `@State` on the section rather
+    /// than the account object: it is a question this screen asked, not
+    /// account state that should survive a re-sync.
+    @State private var isConfirmingDelete = false
     @Query private var servers: [Server]
     @Query private var agents: [Agent]
     @Query private var keys: [KeyMetadata]
@@ -218,13 +244,40 @@ struct TVAccountSection: View {
                         .foregroundStyle(.secondary)
                 }
                 Button("Sync now") { Task { await account.syncVault() } }
+                deleteAccountButton
             case .failed(let message):
                 Label(message, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
                 Button("Try again") { Task { await account.refresh() } }
+                deleteAccountButton
             }
         } header: {
             Text("Fin Account")
+        }
+    }
+
+    /// Offered wherever the TV is actually signed in — including the failed
+    /// state, so a TV that cannot sync is not a TV that cannot leave.
+    @ViewBuilder
+    private var deleteAccountButton: some View {
+        if account.isSignedIn {
+            Button(role: .destructive) {
+                isConfirmingDelete = true
+            } label: {
+                Label("Delete Fin Account", systemImage: "trash")
+            }
+            .confirmationDialog(
+                "Delete your Fin account?",
+                isPresented: $isConfirmingDelete,
+                titleVisibility: .visible
+            ) {
+                Button("Delete Account", role: .destructive) {
+                    Task { await account.deleteAccount() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This erases your Fin account and everything in it from Fin's servers, shuts down any cloud computers, and signs out every device. Your servers and settings in iCloud are untouched. It cannot be undone.")
+            }
         }
     }
 }

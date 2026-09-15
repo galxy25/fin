@@ -590,12 +590,219 @@ def auth_apple(event):
     return _response(200, {"token": session_token})
 
 
+def _account_owned_rows(table, user_id):
+    """Every row of `table` belonging to one user. A plain scan + filter: none
+    of these tables has a userId index, and account deletion is rare enough
+    that one pass per table is the right trade against a GSI on all nine."""
+    return _scan(
+        table=table,
+        FilterExpression="userId = :user",
+        ExpressionAttributeValues={":user": user_id},
+    )
+
+
+def _delete_rows(table, key_name, rows, failures, stage):
+    """Best-effort delete of a list of rows, counting what actually went. A
+    single row that refuses must not abandon the rest of the account."""
+    deleted = 0
+    for row in rows:
+        key = row.get(key_name)
+        if key is None:
+            continue
+        try:
+            table.delete_item(Key={key_name: key})
+            deleted += 1
+        except Exception as exc:  # noqa: BLE001 - recorded, never fatal
+            LOG.warning("account delete: %s row %s: %s", stage, key, _scrub(exc))
+            failures.append(stage)
+    return deleted
+
+
+def _delete_s3_prefix(prefix, failures, stage):
+    """Everything under one S3 prefix, 1000 keys at a time."""
+    deleted, token = 0, None
+    while True:
+        kwargs = {"Bucket": BUCKET, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        try:
+            page = S3.list_objects_v2(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("account delete: listing %s: %s", prefix, _scrub(exc))
+            failures.append(stage)
+            return deleted
+        contents = page.get("Contents", [])
+        if contents:
+            try:
+                S3.delete_objects(
+                    Bucket=BUCKET,
+                    Delete={"Objects": [{"Key": o["Key"]} for o in contents], "Quiet": True},
+                )
+                deleted += len(contents)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("account delete: deleting under %s: %s", prefix, _scrub(exc))
+                failures.append(stage)
+        token = page.get("NextContinuationToken")
+        if not token:
+            break
+    return deleted
+
+
+def _delete_account_secrets(user_id, failures):
+    """Service credentials live in Secrets Manager, not S3 or Dynamo. Deleted
+    WITHOUT a recovery window: "delete my account" has to mean the credential
+    is gone, not recoverable for 30 days."""
+    prefix = SECRET_PREFIX.format(user=user_id) + "/"
+    deleted, token = 0, None
+    while True:
+        kwargs = {"Filters": [{"Key": "name", "Values": [prefix]}], "MaxResults": 100}
+        if token:
+            kwargs["NextToken"] = token
+        try:
+            page = SECRETS.list_secrets(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("account delete: listing secrets: %s", _scrub(exc))
+            failures.append("secrets")
+            return deleted
+        for entry in page.get("SecretList", []):
+            name = entry.get("Name") or ""
+            # list_secrets' name filter is a prefix match, but confirm it here:
+            # deleting another user's credential would be unforgivable.
+            if not name.startswith(prefix):
+                continue
+            try:
+                SECRETS.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+                deleted += 1
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                    continue
+                LOG.warning("account delete: secret: %s", _scrub(exc))
+                failures.append("secrets")
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("account delete: secret: %s", _scrub(exc))
+                failures.append("secrets")
+        token = page.get("NextToken")
+        if not token:
+            break
+    return deleted
+
+
+def delete_account(event):
+    """DELETE /account — erase this account and everything it owns.
+
+    App Store Guideline 5.1.1(v): an app that creates an account must let the
+    user delete it from inside the app. Sign in with Apple creates one here, so
+    this is the other half of `POST /auth/apple`.
+
+    What goes, in this order (the caller's own session is destroyed LAST, so
+    every stage still authenticates while it runs):
+
+      1. EC2 workers — terminated, then their rows dropped. Terminating first
+         means the account cannot leave a running instance billing the owner.
+      2. Sites, messages and their thread events, agents, enroll tokens,
+         device tokens (push stops immediately).
+      3. Every S3 object under `users/{userId}/` — configs, transcripts,
+         memory, goals ledgers, artifacts, the key vault, device status.
+      4. Service credentials in Secrets Manager, force-deleted.
+      5. The fin-users row (the Apple `sub` → userId mapping), so a later sign
+         in with the same Apple ID is a brand-new account with a new userId.
+      6. Every session, including the one that made this call.
+
+    Best-effort per stage: one stubborn row must not strand the rest of the
+    account, so failures are collected and reported rather than raised
+    mid-way. A clean run answers 200; anything left behind answers 500 naming
+    the stages, because a user told "deleted" deserves that to be true.
+
+    Apple's own token revocation is deliberately not attempted: sign-in
+    requests no scopes and stores no authorization code or refresh token
+    (`_get_or_create_user`), so there is nothing here to revoke with. The
+    user's Apple ID keeps no relationship to this service beyond the row this
+    deletes."""
+    if event.get("_authKind") != "session":
+        raise ApiError(403, "account deletion requires a Sign in with Apple session token")
+    user_id = event["_userId"]
+    failures, deleted = [], {}
+
+    workers = _account_owned_rows(TABLE, user_id)
+    terminated = 0
+    for worker in workers:
+        if worker.get("status") == "live":
+            try:
+                _terminate(worker, "account-deleted")
+                terminated += 1
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("account delete: terminating %s: %s", worker.get("instanceId"), _scrub(exc))
+                failures.append("workers")
+    deleted["instancesTerminated"] = terminated
+    deleted["workers"] = _delete_rows(TABLE, "workerId", workers, failures, "workers")
+
+    deleted["sites"] = _delete_rows(
+        SITES_TABLE, "siteId", _account_owned_rows(SITES_TABLE, user_id), failures, "sites")
+
+    messages = _account_owned_rows(MESSAGES_TABLE, user_id)
+    events = 0
+    for thread_id in {_thread_of(m) for m in messages if _thread_of(m)}:
+        for row in _thread_events_for(thread_id, after=0, limit=MAX_SCAN_ITEMS):
+            try:
+                THREAD_EVENTS_TABLE.delete_item(Key={"threadId": thread_id, "seq": int(row["seq"])})
+                events += 1
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("account delete: thread event %s: %s", thread_id, _scrub(exc))
+                failures.append("threadEvents")
+    deleted["threadEvents"] = events
+    deleted["messages"] = _delete_rows(MESSAGES_TABLE, "messageId", messages, failures, "messages")
+
+    deleted["agents"] = _delete_rows(
+        AGENTS_TABLE, "agentKey", _account_owned_rows(AGENTS_TABLE, user_id), failures, "agents")
+    deleted["enrollTokens"] = _delete_rows(
+        ENROLL_TOKENS_TABLE, "tokenSha256", _account_owned_rows(ENROLL_TOKENS_TABLE, user_id),
+        failures, "enrollTokens")
+    deleted["deviceTokens"] = _delete_rows(
+        DEVICE_TOKENS_TABLE, "token", _account_owned_rows(DEVICE_TOKENS_TABLE, user_id),
+        failures, "deviceTokens")
+
+    deleted["objects"] = _delete_s3_prefix("users/{}/".format(user_id), failures, "storage")
+    deleted["credentials"] = _delete_account_secrets(user_id, failures)
+
+    users = _scan(
+        table=USERS_TABLE,
+        FilterExpression="userId = :user",
+        ExpressionAttributeValues={":user": user_id},
+    )
+    deleted["identities"] = _delete_rows(USERS_TABLE, "appleSub", users, failures, "identity")
+
+    # Last: every session, the caller's included. After this line the bearer
+    # that authorized this request is dead, which is the point — every signed-in
+    # device is signed out at once.
+    deleted["sessions"] = _delete_rows(
+        SESSIONS_TABLE, "token", _account_owned_rows(SESSIONS_TABLE, user_id), failures, "sessions")
+
+    stages = sorted(set(failures))
+    LOG.info("account deleted: %s", json.dumps(deleted, sort_keys=True))
+    if stages:
+        LOG.error("account deletion incomplete, stages: %s", ",".join(stages))
+        return _response(500, {
+            "deleted": deleted,
+            "incomplete": stages,
+            "error": "some data could not be deleted ({}); nothing here is recoverable, "
+                     "please contact support so the rest can be removed by hand".format(", ".join(stages)),
+        })
+    return _response(200, {"deleted": deleted})
+
+
 def _authorize(event):
     presented = _header(event, "authorization").strip()
     scheme, _, token = presented.partition(" ")
     token = token.strip()
     if scheme.lower() != "bearer" or not token:
         raise ApiError(401, "unauthorized")
+
+    # Which credential answered. `DELETE /account` insists on "session": the
+    # Sign in with Apple identity that created the account is the only thing
+    # allowed to erase it — never a site token (a stolen EC2 body must not be
+    # able to wipe its owner) and never the shared operator token that sits in
+    # every daemon's config file.
+    event["_authKind"] = None
 
     # A site token (docs/SITES.md §3.1) presents `X-Fin-Site: <siteId>` alongside
     # the bearer. It is checked FIRST and exclusively: a caller who names a site
@@ -615,18 +822,21 @@ def _authorize(event):
             raise ApiError(401, "unauthorized")
         event["_userId"] = site["userId"]
         event["_siteId"] = site["siteId"]
+        event["_authKind"] = "site"
         return
 
     legacy_token = os.environ.get("FIN_CP_TOKEN") or ""
     legacy_user_id = os.environ.get("FIN_CP_LEGACY_USER_ID") or ""
     if legacy_token and legacy_user_id and hmac.compare_digest(token.encode(), legacy_token.encode()):
         event["_userId"] = legacy_user_id
+        event["_authKind"] = "operator"
         return
 
     session = _read_session(token)
     if session is None:
         raise ApiError(401, "unauthorized")
     event["_userId"] = session["userId"]
+    event["_authKind"] = "session"
     SESSIONS_TABLE.update_item(
         Key={"token": token},
         UpdateExpression="SET lastSeenAt = :now",
@@ -5391,6 +5601,8 @@ def _route(event):
         return put_vault_key(event, parts[2])
     if method == "DELETE" and len(parts) == 3 and parts[:2] == ["vault", "keys"]:
         return delete_vault_key(event, parts[2])
+    if method == "DELETE" and parts == ["account"]:
+        return delete_account(event)
     if method == "GET" and parts == ["artifacts"]:
         return list_artifacts(event)
     if method == "GET" and len(parts) >= 2 and parts[0] == "artifacts":
