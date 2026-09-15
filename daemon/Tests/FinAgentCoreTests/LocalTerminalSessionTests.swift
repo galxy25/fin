@@ -207,6 +207,63 @@ final class LocalTerminalSessionTests: XCTestCase {
         XCTAssertEqual(result.output.trimmingCharacters(in: .whitespacesAndNewlines), "TMUX=[]")
     }
 
+    // MARK: - The locale, which is not a cosmetic concern
+
+    /// tmux replaces every character it considers unprintable in the current locale with
+    /// `_` — and in the C locale that includes TAB and all non-ASCII. A LaunchAgent has no
+    /// locale unless its plist sets one, so the daemon's own children had none, and
+    /// `list-panes -F` output arrived as one underscore-joined field instead of five
+    /// tab-separated ones. Nothing errored; the inventory just silently parsed to nothing
+    /// (the work laptop, 2026-09-15).
+    func testAChildWithNoInheritedLocaleStillGetsAUTF8CharacterType() {
+        let fixed = LocalTerminalSession.withUTF8CharacterType([:])
+        XCTAssertEqual(fixed["LC_CTYPE"], "UTF-8")
+    }
+
+    /// A locale the operator actually chose is never overridden — including one that names
+    /// UTF-8 through any of the three variables POSIX consults, in precedence order.
+    func testAnExistingUTF8LocaleIsLeftAlone() {
+        for variable in ["LC_ALL", "LC_CTYPE", "LANG"] {
+            let given = [variable: "en_GB.UTF-8"]
+            XCTAssertEqual(LocalTerminalSession.withUTF8CharacterType(given), given, "\(variable) was overridden")
+        }
+        // Spelling variants of the same thing.
+        for spelling in ["C.utf8", "en_US.UTF8", "ja_JP.utf-8"] {
+            let given = ["LANG": spelling]
+            XCTAssertEqual(LocalTerminalSession.withUTF8CharacterType(given), given, "\(spelling) was overridden")
+        }
+    }
+
+    /// A non-UTF-8 locale keeps its collation, messages and number formats — only the
+    /// character type is corrected, because that is the only category tmux's sanitizing
+    /// depends on.
+    func testANonUTF8LocaleKeepsEverythingButTheCharacterType() {
+        let fixed = LocalTerminalSession.withUTF8CharacterType(["LANG": "de_DE.ISO8859-1"])
+        XCTAssertEqual(fixed["LANG"], "de_DE.ISO8859-1")
+        XCTAssertEqual(fixed["LC_CTYPE"], "UTF-8")
+    }
+
+    /// The end-to-end version of the bug, against a real tmux if one is running: the exact
+    /// inventory command, through the real transport, must come back as tab-separated
+    /// fields the real parser accepts.
+    func testTheInventoryCommandParsesThroughThisTransport() async throws {
+        let session = makeSession()
+        let commandLine = TmuxSessionRead.commandLine(TmuxSessionInventory.paneTitlesArguments())
+        let result: FixedCommandOutput
+        do {
+            result = try await session.runFixedCommand(commandLine, maxResponseBytes: 64 * 1024)
+        } catch {
+            throw XCTSkip("no tmux server on the default socket here: \(error.localizedDescription)")
+        }
+        try XCTSkipIf(result.output.isEmpty, "a tmux server with no panes")
+        let panes = TmuxSessionInventory.parseTitledPanes(result.output)
+        XCTAssertFalse(
+            panes.isEmpty,
+            "tmux printed \(result.output.utf8.count) bytes and the inventory parsed none of it — "
+                + "the classic shape of a lost locale: \(result.output.prefix(120).debugDescription)"
+        )
+    }
+
     // MARK: - Helpers
 
     /// Polls the event log until the text shows up, so a slow machine fails on the clock

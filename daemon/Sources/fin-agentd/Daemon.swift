@@ -445,10 +445,39 @@ final class Daemon {
         if let session, mayScan {
             lastPaneScanAt = Date()
             let commandLine = TmuxSessionRead.commandLine(TmuxSessionInventory.paneTitlesArguments())
-            if let result = try? await session.runFixedCommand(
-                commandLine, maxResponseBytes: TmuxSessionRead.maxResponseBytes
-            ) {
+            // THE OUTCOME IS LOGGED, ALWAYS. This was a bare `try?`, so a scan that failed
+            // and a scan that found nothing were the same event to anyone outside the
+            // process: the app showed a computer with no terminals and the log said nothing
+            // at all. Diagnosing that from another machine took an hour and three wrong
+            // theories (2026-09-15). One line per scan is a small price for the question
+            // "is it failing, or is it finding nothing?" being answerable at all.
+            let scanResult: FixedCommandOutput?
+            do {
+                scanResult = try await session.runFixedCommand(
+                    commandLine, maxResponseBytes: TmuxSessionRead.maxResponseBytes
+                )
+            } catch {
+                scanResult = nil
+                log("[panes] scan FAILED: \(error.localizedDescription) — command was \(commandLine)")
+            }
+            if let result = scanResult {
                 let panes = TmuxSessionInventory.parseTitledPanes(result.output, hostname: hostname)
+                if panes.isEmpty {
+                    // Include the BYTES when there was output but nothing parsed. "Found
+                    // no panes" with a non-empty stdout is not an empty machine, it is a
+                    // parse failure, and the two are indistinguishable without the data —
+                    // which is exactly where this stalled for an hour. debugDescription so
+                    // tabs and newlines are visible as escapes rather than as whitespace.
+                    let sample = result.output.isEmpty
+                        ? ""
+                        : " raw=\(result.output.prefix(300).debugDescription)"
+                    log("[panes] scan found no panes (stdout \(result.output.utf8.count)B, "
+                        + "stderr \(result.diagnostics.utf8.count)B"
+                        + (result.diagnostics.isEmpty ? "" : ": \(result.diagnostics.prefix(160))") + ")"
+                        + sample)
+                } else {
+                    log("[panes] scan found \(panes.count): \(panes.map(\.target).joined(separator: ", "))")
+                }
                 let document = await registry?.document
                 caps["tmux_sessions"] = TmuxSessionInventory.capabilitySessions(panes: panes, registry: document)
                 lastPaneObservations = TmuxSessionInventory.observationLines(panes: panes)
@@ -461,6 +490,10 @@ final class Daemon {
                 refreshSystemPrompt?()
             }
         } else if let previous = cachedCapabilities["tmux_sessions"] {
+            // Carrying a stale inventory forward is the thing that made a frozen list look
+            // like a working one, so say so rather than doing it quietly.
+            log("[panes] scan SKIPPED (session \(session == nil ? "absent" : "present"), "
+                + "turnInFlight \(isTurnInFlight)) — reusing the previous inventory")
             caps["tmux_sessions"] = previous
         }
         cachedCapabilities = caps

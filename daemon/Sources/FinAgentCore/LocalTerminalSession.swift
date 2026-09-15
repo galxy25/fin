@@ -205,6 +205,10 @@ public final class LocalTerminalSession: AgentTerminalTransport {
         var environment = ProcessInfo.processInfo.environment
         environment["TERM"] = "xterm-256color"
         for (key, value) in configuration.environment { environment[key] = value }
+        // The agent's own tmux, too, not just the read path: without a UTF-8 ctype tmux
+        // renders every non-ASCII character in the agent's pane as `_`, so the model reads
+        // a mangled copy of the terminal it is supposed to be driving.
+        environment = Self.withUTF8CharacterType(environment)
         let envp = environment.map { "\($0.key)=\($0.value)" }
 
         var window = winsize(
@@ -511,6 +515,7 @@ public final class LocalTerminalSession: AgentTerminalTransport {
         process.arguments = ["-c", commandLine]
         var environment = ProcessInfo.processInfo.environment
         for (key, value) in configuration.environment { environment[key] = value }
+        environment = Self.withUTF8CharacterType(environment)
         // Deliberately NOT inside tmux: this command reads the DEFAULT socket's sessions,
         // and an inherited $TMUX would make a socket-less `tmux` in the command line
         // resolve to Fin's own server instead — the very confusion `read_session` exists to
@@ -578,6 +583,41 @@ public final class LocalTerminalSession: AgentTerminalTransport {
     private static func firstLine(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.split(separator: "\n").first.map(String.init) ?? trimmed
+    }
+
+    /// Ensures the child has a UTF-8 character type, without overriding a locale the
+    /// operator actually chose.
+    ///
+    /// THE BUG THIS FIXES, because it is not guessable from the symptom. tmux sanitizes
+    /// characters it considers unprintable in the current locale — and in the C/POSIX
+    /// locale that includes TAB and every non-ASCII byte, each replaced with `_`. So
+    /// `list-panes -F` output that should be five tab-separated fields arrives as one field
+    /// of underscores, and a pane title of `✳ Claude Code` arrives as `_ Claude Code`.
+    /// Nothing fails; the data is simply, silently, the wrong shape, and the inventory
+    /// parser drops every line. Measured on macOS with tmux 3.6a:
+    ///
+    ///     LANG=en_US.UTF-8   main^I0.0^I✳ Claude Code      (5 fields, parses)
+    ///     (no locale at all) main_0.0__ Claude Code        (1 field, dropped)
+    ///
+    /// WHY ONLY THIS TRANSPORT HIT IT. An SSH exec channel runs under sshd, whose login
+    /// shell exports `LANG`; a local PTY inherits the daemon's own environment, and a
+    /// LaunchAgent's environment has no locale at all unless its plist sets one. So the
+    /// resident site on the work laptop reported zero tmux sessions for an hour while
+    /// `read_session` — whose own parser splits on a different field — worked perfectly
+    /// (2026-09-15).
+    ///
+    /// Minimal intervention: if the inherited environment already names a UTF-8 ctype
+    /// through any of the three variables that decide it, nothing is touched. Otherwise
+    /// only `LC_CTYPE` is set — the one category that governs this — so a deliberately
+    /// non-English `LANG` keeps its collation, messages and formats.
+    static func withUTF8CharacterType(_ environment: [String: String]) -> [String: String] {
+        // POSIX precedence: LC_ALL beats LC_CTYPE beats LANG.
+        let deciding = environment["LC_ALL"] ?? environment["LC_CTYPE"] ?? environment["LANG"] ?? ""
+        let normalized = deciding.uppercased().replacingOccurrences(of: "-", with: "")
+        if normalized.contains("UTF8") { return environment }
+        var updated = environment
+        updated["LC_CTYPE"] = "UTF-8"
+        return updated
     }
 
     /// Materializes Swift strings as a NULL-terminated C array for `execve`, and frees it
