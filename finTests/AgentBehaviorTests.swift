@@ -17,6 +17,41 @@ import XCTest
 @MainActor
 final class AgentBehaviorTests: XCTestCase {
 
+    // MARK: - Opt-in
+
+    /// The environment variable that turns these on. Set it and nothing else changes;
+    /// leave it unset — which is every ordinary `swift test`, every CI run, and every
+    /// build script in this repo — and every test in this class skips.
+    static let optInVariable = "FIN_LIVE_TESTS"
+
+    /// LIVE TESTS ARE OPT-IN, AND THE DEFAULT IS OFF EVEN WHEN THEY WOULD PASS.
+    ///
+    /// The prerequisite helpers below skip when a dependency is MISSING, which reads like
+    /// a gate and is the opposite of one: on the machine these were written for, sshd and
+    /// LM Studio are both up, so "skip if unavailable" meant "run on every test run". A
+    /// routine `swift test` was quietly driving a 12B model through a real tmux session —
+    /// two minutes of the suite's runtime, a dependency on a model being loaded, and a
+    /// failure mode that has nothing to do with the code under test (observed 2026-09-15:
+    /// the suite went red because a build step had unloaded the model moments earlier).
+    ///
+    /// LM Studio belongs to one-off end-to-end checks, not to the regular suite. So the
+    /// question is no longer "is the dependency there?" but "did someone ASK for this?" —
+    /// and the availability checks stay, for the run where someone did.
+    ///
+    ///     FIN_LIVE_TESTS=1 bash scripts/test-macos.sh -only-testing:finTests/AgentBehaviorTests
+    func requireLiveOptIn() throws {
+        guard ProcessInfo.processInfo.environment[Self.optInVariable] == "1" else {
+            throw XCTSkip("Live tests are opt-in: set \(Self.optInVariable)=1 to run them. "
+                + "They drive a real LM Studio model through a real tmux session and have no "
+                + "place in an ordinary test run.")
+        }
+    }
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try requireLiveOptIn()
+    }
+
     private var session: TerminalSession?
 
     override func setUpWithError() throws {
