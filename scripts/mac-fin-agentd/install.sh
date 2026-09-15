@@ -171,6 +171,84 @@ done
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
+PYTHON="${FIN_PYTHON:-/usr/bin/python3}"
+progress() { printf '%s\n' "$*"; }
+
+# --- waiting for a brain, and loading the model ON DEMAND --------------------------------
+# Two things this replaced, both wrong in ways that only showed on a real machine:
+#
+#   1. IT REFUSED INSTEAD OF WAITING. A single failed GET meant "no brain", which is right
+#      only if the brain is a process on this same box. Reached over a Funnel it is also
+#      what a sleeping Mac, a roaming laptop, a DERP hiccup or an LM Studio that is still
+#      starting looks like — none of which is a reason to give up for a whole backoff.
+#   2. `/models` WAS NOT EVIDENCE. LM Studio lists every DOWNLOADED model there whether or
+#      not any of them is in memory, so the old "is the id in the payload?" test passed
+#      with nothing loaded at all — and then every real turn failed. (Verified: with
+#      `lms unload --all`, /v1/models still answers 200 and still lists the model.)
+#
+# So: poll until the endpoint answers, then prove it can SERVE with a one-token completion.
+# That probe is also the FIX for an unloaded model rather than a complaint about it — LM
+# Studio JIT-loads on a chat request (measured: ~3 s for a 7 GB gemma), so asking for one
+# token is what brings the model back. A model with a TTL is expected to unload; that must
+# cost the next turn three seconds, never a refusal to start.
+#
+# The one failure that does NOT wait is a model the server does not have at all: no amount
+# of patience downloads it, so that returns 2 and the caller fails fast.
+BRAIN_WAIT_SECONDS="${FIN_BRAIN_WAIT_SECONDS:-300}"
+brain_probe_reason=""
+
+# $1 endpoint (…/v1), $2 model id, $3 curl -K auth file or "", $4 python
+brain_completion() {
+	local endpoint="$1" model="$2" keyconf="$3" python="$4" payload
+	payload="$(FIN_MODEL_ID="$model" "$python" -c 'import json, os; print(json.dumps({
+    "model": os.environ["FIN_MODEL_ID"],
+    "messages": [{"role": "user", "content": "ping"}],
+    "max_tokens": 1, "temperature": 0}))')" || return 1
+	# -m 180: a COLD model has to be read off disk inside this request. The outer deadline
+	# is what actually bounds the wait; this only stops one attempt hanging forever.
+	if [ -n "$keyconf" ]; then
+		curl -fsS -m 180 -K "$keyconf" -H 'content-type: application/json' \
+			-d "$payload" "$endpoint/chat/completions" >/dev/null 2>&1
+	else
+		curl -fsS -m 180 -H 'content-type: application/json' \
+			-d "$payload" "$endpoint/chat/completions" >/dev/null 2>&1
+	fi
+}
+
+# 0 = serving, 1 = still not serving when the budget ran out, 2 = it will never serve this
+# model. Sets brain_probe_reason on 1 and 2. $5 is a progress logger (a shell function name).
+brain_wait() {
+	local endpoint="$1" model="$2" keyconf="$3" python="$4" progress="$5"
+	local started elapsed body rc announced=0
+	started="$(date +%s)"
+	while :; do
+		if [ -n "$keyconf" ]; then
+			body="$(curl -fsS -m 15 -K "$keyconf" "$endpoint/models" 2>/dev/null)"; rc=$?
+		else
+			body="$(curl -fsS -m 15 "$endpoint/models" 2>/dev/null)"; rc=$?
+		fi
+		if [ "$rc" -eq 0 ]; then
+			if [ -n "$model" ] && ! printf '%s' "$body" | grep -qF -- "$model"; then
+				brain_probe_reason="$endpoint answers, but has no model called $model — check the id, or download it on the machine serving it"
+				return 2
+			fi
+			if brain_completion "$endpoint" "$model" "$keyconf" "$python"; then
+				return 0
+			fi
+		fi
+		elapsed=$(( $(date +%s) - started ))
+		if [ "$elapsed" -ge "$BRAIN_WAIT_SECONDS" ]; then
+			brain_probe_reason="$endpoint could not serve ${model:-a model} within ${elapsed}s"
+			return 1
+		fi
+		if [ "$announced" -eq 0 ]; then
+			"$progress" "waiting for the brain at $endpoint (up to ${BRAIN_WAIT_SECONDS}s; an unloaded model is loaded on demand by this probe)"
+			announced=1
+		fi
+		sleep 5
+	done
+}
+
 
 for f in "${RUNTIME_SCRIPTS[@]}" "$LABEL.plist" "$REFRESH_LABEL.plist"; do
 	[ -f "$SCRIPT_DIR/$f" ] || die "$SCRIPT_DIR/$f not found"
@@ -406,18 +484,44 @@ if [ "$START" -eq 1 ]; then
 	# id must be in the payload too. (This is a convenience: launch-agentd.sh re-runs the
 	# same check at EVERY launch, which is the one that actually protects the owner.)
 	if [ "${FIN_SKIP_BRAIN_CHECK:-0}" != "1" ]; then
-		MODELS="$(curl -fsS -m 10 "$LLM_URL/models" 2>/dev/null)" || die \
-			"nothing usable answers at $LLM_URL/models — start LM Studio (or set FIN_LLM_URL) before --start.
-Installed and rendered; not loaded. FIN_SKIP_BRAIN_CHECK=1 overrides this check."
-		WANT_MODEL="${FIN_MODEL:-$(FIN_CONFIG="$CONFIG" /usr/bin/python3 -c '
-import json, os
+		# The config is the source of truth here, not this script's defaults: an enrolled
+		# config carries the endpoint AND the bearer a remote brain needs, and a bearer
+		# must not come from an argv anyway.
+		BRAIN_FIELDS="$(FIN_CONFIG="$CONFIG" "$PYTHON" -c '
+import json, os, shlex
 with open(os.environ["FIN_CONFIG"]) as fh:
-    print(((json.load(fh) or {}).get("agent") or {}).get("modelIdentifier") or "")' 2>/dev/null)}"
-		if [ -n "$WANT_MODEL" ] && ! printf '%s' "$MODELS" | grep -qF -- "$WANT_MODEL"; then
-			die "$LLM_URL is serving, but not $WANT_MODEL — load that model in LM Studio.
-Installed and rendered; not loaded."
+    agent = ((json.load(fh) or {}).get("agent") or {})
+print("WANT_URL=%s" % shlex.quote(agent.get("endpointURL") or ""))
+print("WANT_MODEL=%s" % shlex.quote(agent.get("modelIdentifier") or ""))
+print("WANT_KEY=%s" % shlex.quote("yes" if (agent.get("apiKey") or "").strip() else "no"))' 2>/dev/null)"
+		eval "${BRAIN_FIELDS:-WANT_URL=; WANT_MODEL=; WANT_KEY=no}"
+		[ -n "$WANT_URL" ] || WANT_URL="$LLM_URL"
+		[ -n "$WANT_MODEL" ] || WANT_MODEL="${FIN_MODEL:-}"
+
+		BRAIN_KEYCONF=""
+		if [ "$WANT_KEY" = "yes" ]; then
+			BRAIN_KEYCONF="$(mktemp -t fin-brain-auth)" || die "could not create a temp file for the brain auth header"
+			chmod 600 "$BRAIN_KEYCONF"
+			FIN_CONFIG="$CONFIG" "$PYTHON" -c '
+import json, os
+key = ((json.load(open(os.environ["FIN_CONFIG"])).get("agent") or {}).get("apiKey") or "").strip()
+print("header = \"Authorization: Bearer %s\"" % key)' > "$BRAIN_KEYCONF" || die "could not read agent.apiKey"
 		fi
-		echo "brain: $LLM_URL serving ${WANT_MODEL:-<unchecked>}"
+		set +e
+		brain_wait "$WANT_URL" "$WANT_MODEL" "$BRAIN_KEYCONF" "$PYTHON" progress
+		BRAIN_RC=$?
+		set -e
+		[ -n "$BRAIN_KEYCONF" ] && rm -f "$BRAIN_KEYCONF"
+		case "$BRAIN_RC" in
+			0) : ;;
+			2) die "$brain_probe_reason
+Installed and rendered; not loaded." ;;
+			*) die "$brain_probe_reason
+The machine serving it may be asleep, off the network, or not running LM Studio; if this
+laptop cannot reach it at all, the endpoint is the thing to change (FIN_LLM_URL in site.env).
+Installed and rendered; not loaded. FIN_SKIP_BRAIN_CHECK=1 overrides this check." ;;
+		esac
+		echo "brain: $WANT_URL served ${WANT_MODEL:-<unchecked>} (one-token probe)"
 	fi
 
 	# UNDER THE LOCAL TRANSPORT THERE IS NOTHING TO CHECK HERE, because the hazard is gone

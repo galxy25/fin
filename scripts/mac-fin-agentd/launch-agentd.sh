@@ -19,8 +19,11 @@
 #
 # Checks, in order:
 #   1. config.json exists and parses
-#   2. the brain answers AND serves the configured model id  (a 404 from a running
-#      LM Studio with no model loaded is not a brain)
+#   2. the brain can actually SERVE the configured model — polled for up to 5 minutes
+#      (FIN_BRAIN_WAIT_SECONDS), and proved with a one-token completion rather than a
+#      /models listing, which LM Studio answers from its DOWNLOADED models whether or not
+#      any is in memory. That probe doubles as the on-demand load: an unloaded model costs
+#      the probe a few seconds instead of costing the site a refusal to start.
 #   3. the login shell honours the LC_FIN_AGENT marker — i.e. an INTERACTIVE SSH session
 #      with the marker set lands in a PLAIN shell, not in the owner's `main` tmux session.
 #      This lives in ~/.config/fish/config.fish, a file this package does not own and Fin
@@ -46,6 +49,82 @@ PYTHON="${FIN_PYTHON:-/usr/bin/python3}"
 
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 note() { printf '[%s] launch: %s\n' "$(stamp)" "$*" >&2; }
+
+# --- waiting for a brain, and loading the model ON DEMAND --------------------------------
+# Two things this replaced, both wrong in ways that only showed on a real machine:
+#
+#   1. IT REFUSED INSTEAD OF WAITING. A single failed GET meant "no brain", which is right
+#      only if the brain is a process on this same box. Reached over a Funnel it is also
+#      what a sleeping Mac, a roaming laptop, a DERP hiccup or an LM Studio that is still
+#      starting looks like — none of which is a reason to give up for a whole backoff.
+#   2. `/models` WAS NOT EVIDENCE. LM Studio lists every DOWNLOADED model there whether or
+#      not any of them is in memory, so the old "is the id in the payload?" test passed
+#      with nothing loaded at all — and then every real turn failed. (Verified: with
+#      `lms unload --all`, /v1/models still answers 200 and still lists the model.)
+#
+# So: poll until the endpoint answers, then prove it can SERVE with a one-token completion.
+# That probe is also the FIX for an unloaded model rather than a complaint about it — LM
+# Studio JIT-loads on a chat request (measured: ~3 s for a 7 GB gemma), so asking for one
+# token is what brings the model back. A model with a TTL is expected to unload; that must
+# cost the next turn three seconds, never a refusal to start.
+#
+# The one failure that does NOT wait is a model the server does not have at all: no amount
+# of patience downloads it, so that returns 2 and the caller fails fast.
+BRAIN_WAIT_SECONDS="${FIN_BRAIN_WAIT_SECONDS:-300}"
+brain_probe_reason=""
+
+# $1 endpoint (…/v1), $2 model id, $3 curl -K auth file or "", $4 python
+brain_completion() {
+	local endpoint="$1" model="$2" keyconf="$3" python="$4" payload
+	payload="$(FIN_MODEL_ID="$model" "$python" -c 'import json, os; print(json.dumps({
+    "model": os.environ["FIN_MODEL_ID"],
+    "messages": [{"role": "user", "content": "ping"}],
+    "max_tokens": 1, "temperature": 0}))')" || return 1
+	# -m 180: a COLD model has to be read off disk inside this request. The outer deadline
+	# is what actually bounds the wait; this only stops one attempt hanging forever.
+	if [ -n "$keyconf" ]; then
+		curl -fsS -m 180 -K "$keyconf" -H 'content-type: application/json' \
+			-d "$payload" "$endpoint/chat/completions" >/dev/null 2>&1
+	else
+		curl -fsS -m 180 -H 'content-type: application/json' \
+			-d "$payload" "$endpoint/chat/completions" >/dev/null 2>&1
+	fi
+}
+
+# 0 = serving, 1 = still not serving when the budget ran out, 2 = it will never serve this
+# model. Sets brain_probe_reason on 1 and 2. $5 is a progress logger (a shell function name).
+brain_wait() {
+	local endpoint="$1" model="$2" keyconf="$3" python="$4" progress="$5"
+	local started elapsed body rc announced=0
+	started="$(date +%s)"
+	while :; do
+		if [ -n "$keyconf" ]; then
+			body="$(curl -fsS -m 15 -K "$keyconf" "$endpoint/models" 2>/dev/null)"; rc=$?
+		else
+			body="$(curl -fsS -m 15 "$endpoint/models" 2>/dev/null)"; rc=$?
+		fi
+		if [ "$rc" -eq 0 ]; then
+			if [ -n "$model" ] && ! printf '%s' "$body" | grep -qF -- "$model"; then
+				brain_probe_reason="$endpoint answers, but has no model called $model — check the id, or download it on the machine serving it"
+				return 2
+			fi
+			if brain_completion "$endpoint" "$model" "$keyconf" "$python"; then
+				return 0
+			fi
+		fi
+		elapsed=$(( $(date +%s) - started ))
+		if [ "$elapsed" -ge "$BRAIN_WAIT_SECONDS" ]; then
+			brain_probe_reason="$endpoint could not serve ${model:-a model} within ${elapsed}s"
+			return 1
+		fi
+		if [ "$announced" -eq 0 ]; then
+			"$progress" "waiting for the brain at $endpoint (up to ${BRAIN_WAIT_SECONDS}s; an unloaded model is loaded on demand by this probe)"
+			announced=1
+		fi
+		sleep 5
+	done
+}
+
 
 # Refuse WITHOUT failing: launchd counts a non-zero exit as a crash and respawns at
 # ThrottleInterval (15 s). Sleeping first turns that into a calm retry cadence.
@@ -130,22 +209,16 @@ key = ((json.load(open(os.environ["FIN_CONFIG"])).get("agent") or {}).get("apiKe
 print('header = "Authorization: Bearer %s"' % key)
 PY
 	fi
-	# Two spellings rather than one with an array of curl flags: the shebang here is
-	# /bin/bash, which on macOS is 3.2, where expanding an EMPTY array under `set -u`
-	# ("${CURL_AUTH[@]}") is an unbound-variable error rather than nothing. That failure
-	# looked exactly like "the brain is down".
-	# 20 s, not 10: a Funnel round trip to another Mac is not a loopback one.
-	if [ -n "$KEYCONF" ]; then
-		models="$(curl -fsS -m 20 -K "$KEYCONF" "$ENDPOINT/models" 2>/dev/null)"; brain_rc=$?
-	else
-		models="$(curl -fsS -m 20 "$ENDPOINT/models" 2>/dev/null)"; brain_rc=$?
-	fi
-	[ "$brain_rc" -eq 0 ] \
-		|| refuse "no brain at $ENDPOINT/models — LM Studio down, the shim refusing this key, or the network in the way"
+	set +e
+	brain_wait "$ENDPOINT" "$MODEL" "$KEYCONF" "$PYTHON" note
+	brain_rc=$?
+	set -e
 	if [ -n "$KEYCONF" ]; then rm -f "$KEYCONF"; trap - EXIT; fi
-	if [ -n "$MODEL" ] && ! printf '%s' "$models" | grep -qF -- "$MODEL"; then
-		refuse "$ENDPOINT is serving, but not the configured model ($MODEL) — load it in LM Studio"
-	fi
+	case "$brain_rc" in
+		0) : ;;
+		2) refuse "$brain_probe_reason" ;;
+		*) refuse "$brain_probe_reason — the machine serving it may be asleep, off the network, or not running LM Studio" ;;
+	esac
 fi
 
 # --- 3. the login-shell guard ------------------------------------------------------------
