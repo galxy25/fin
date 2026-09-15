@@ -3292,3 +3292,55 @@ class AccountRouteRegistrationTests(unittest.TestCase):
             lam._require_site_scope({"_siteId": "site-1", "_userId": "user-1"}, "DELETE", ["account"])
         self.assertEqual(caught.exception.status, 403)
 
+
+
+class ThreadStalenessTests(unittest.TestCase):
+    """A thread whose only unfinished message died two days ago is not "working".
+
+    Nothing reclaims an APPLIED row — that is what makes application at-most-once — so a
+    turn that died after applying and before acking leaves its row unfinished forever, and
+    the derived status said "Fin is working" indefinitely. One was found two days into
+    that state on 2026-09-15, sitting in the open-threads list as if it were live work.
+    """
+
+    def _msg(self, state, applied_minutes_ago=None, created_minutes_ago=0):
+        now = lam._now()
+        row = {"state": state,
+               "createdAt": lam._iso(now - timedelta(minutes=created_minutes_ago))}
+        if applied_minutes_ago is not None:
+            row["appliedAt"] = lam._iso(now - timedelta(minutes=applied_minutes_ago))
+        return row
+
+    def test_a_recently_applied_message_is_still_working(self):
+        status = lam._thread_status([self._msg("applied", applied_minutes_ago=2)], [])
+        self.assertEqual(status, "working")
+
+    def test_an_applied_message_left_for_days_reads_stalled(self):
+        # Created and applied two days ago — a row cannot be applied before it exists, so
+        # both stamps move together. (The first version of this test set createdAt to now
+        # and appliedAt to two days ago, which is impossible, and the "most recent sign of
+        # life" rule correctly called it live.)
+        status = lam._thread_status(
+            [self._msg("applied", applied_minutes_ago=60 * 48, created_minutes_ago=60 * 48)], []
+        )
+        self.assertEqual(status, "stalled")
+
+    def test_one_fresh_message_keeps_the_thread_working(self):
+        """Newest wins: an old abandoned row next to live work is still live work."""
+        messages = [
+            self._msg("applied", applied_minutes_ago=60 * 48),
+            self._msg("claimed", created_minutes_ago=1),
+        ]
+        self.assertEqual(lam._thread_status(messages, []), "working")
+
+    def test_a_finished_thread_is_still_answered(self):
+        self.assertEqual(lam._thread_status([{"state": "answered"}], []), "answered")
+
+    def test_a_request_for_input_still_outranks_everything(self):
+        events = [{"kind": "notify.sent", "detail": {"event": "request-input"}}]
+        messages = [self._msg("applied", applied_minutes_ago=60 * 48)]
+        self.assertEqual(lam._thread_status(messages, events), "waiting_on_you")
+
+    def test_a_row_with_no_timestamps_is_treated_as_live(self):
+        """Unjudgeable is not the same as stale — never retire a row we cannot date."""
+        self.assertEqual(lam._thread_status([{"state": "queued"}], []), "working")

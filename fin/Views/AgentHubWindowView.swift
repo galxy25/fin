@@ -23,6 +23,8 @@ struct AgentHubWindowView: View {
     @EnvironmentObject private var sessionManager: SessionManager
     @Query(sort: \Agent.createdAt) private var agents: [Agent]
     @State private var selection: HubSection? = .settings
+    /// Answered threads stay reachable but collapsed — see the sidebar section.
+    @State private var showingAnsweredThreads = false
     /// docs/THREADS.md §4: the "Threads" sidebar section — one row per open
     /// thread, selecting one opens the conversation filtered to it.
     @StateObject private var threadStore = ThreadStore()
@@ -131,6 +133,23 @@ struct AgentHubWindowView: View {
                         threadRow(thread)
                     }
                 }
+                // Answered threads are still conversations. They used to leave the sidebar
+                // the instant Fin replied, which made an answered thread unreachable from
+                // this window — the question gone along with the answer. Collapsed by
+                // default so the open work stays at the top, where it was.
+                if !threadStore.answeredThreads.isEmpty {
+                    Section {
+                        DisclosureGroup(isExpanded: $showingAnsweredThreads) {
+                            ForEach(threadStore.answeredThreads.prefix(20)) { thread in
+                                threadRow(thread)
+                            }
+                        } label: {
+                            Text("Answered (\(threadStore.answeredThreads.count))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
             }
             Section {
                 sidebarRow(.key)
@@ -178,11 +197,19 @@ struct AgentHubWindowView: View {
     @ViewBuilder
     private func detail(for agent: Agent) -> some View {
         NavigationStack {
-            // `.remote` can only be reached while `isRemotelyHosted` is true (it's
-            // the only way the sidebar row appears) — but hosting can flip in the
-            // background (an in-flight migration, another device changing it)
-            // while this window sits on that selection, so the fallback isn't dead
-            // code.
+            // THE SIDEBAR'S CONDITION AND THIS ONE MUST BE THE SAME EXPRESSION.
+            // They drifted: the row is offered when the agent is remotely hosted OR a
+            // control plane is configured, while this switch asked only about hosting and
+            // fell back to `AgentEditView` — so with a control plane and no CloudKit-style
+            // hosting, tapping "Conversation" rendered the SETTINGS screen. Reported as
+            // "conversation is a dupe of the settings screen", and it was exactly that.
+            // The comment that used to sit here asserted `.remote` was unreachable unless
+            // hosted, which stopped being true the day the control-plane clause was added
+            // to the sidebar; an assertion in a comment does not hold itself up.
+            //
+            // The fallback still exists, because hosting really can flip in the background
+            // (an in-flight migration, another device changing it) while this window sits
+            // on the selection — but it now says so instead of impersonating another screen.
             switch selection ?? .settings {
             case .settings:
                 AgentEditView(agent: agent)
@@ -191,10 +218,15 @@ struct AgentHubWindowView: View {
             case .memory:
                 AgentMemoryView(agent: agent)
             case .remote:
-                if sessionManager.isRemotelyHosted(agent) {
+                if sessionManager.isRemotelyHosted(agent) || CloudControlPlaneConfig.isConfigured {
                     AgentRemoteConsoleView(agent: agent)
                 } else {
-                    AgentEditView(agent: agent)
+                    ContentUnavailableView(
+                        "No conversation here",
+                        systemImage: "bubble.left.and.bubble.right",
+                        description: Text("This agent isn\u{2019}t hosted on another device and no control "
+                            + "plane is configured, so there is no shared conversation to show.")
+                    )
                 }
             case .artifacts:
                 ArtifactsView()

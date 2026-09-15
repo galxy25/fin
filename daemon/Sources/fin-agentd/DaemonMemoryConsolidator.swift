@@ -71,6 +71,18 @@ final class DaemonMemoryConsolidator {
 
     private var lastCacheRefreshAt: Date?
     private var lastConsolidationAttemptAt: Date?
+    /// When THIS daemon last actually rewrote the profile. Distinct from the document's
+    /// own `updatedAt` on purpose: that timestamp moves whenever anyone writes the
+    /// document for any reason, and it was being moved constantly by app devices echoing
+    /// the profile back after pulling it. Deciding "is a rewrite due?" from a field every
+    /// other participant can touch meant a rewrite was never due. This clock only moves
+    /// when a rewrite actually happens here.
+    private var lastConsolidationAt: Date?
+    /// How far back to look for material when this daemon has never consolidated (or has
+    /// not for a long time). A rolling window rather than "everything since the profile
+    /// was last written": the point of a pass is to re-summarize RECENT life, and a window
+    /// anchored to a write timestamp collapses to nothing the moment anything writes.
+    static let candidateLookback: TimeInterval = 7 * 24 * 60 * 60
     private var isRunning = false
 
     init(
@@ -129,10 +141,21 @@ final class DaemonMemoryConsolidator {
         }
         guard attemptConsolidation else { return }
         lastConsolidationAttemptAt = Date()
-        let due = Date().timeIntervalSince(profile.updatedAt ?? .distantPast) >= Self.consolidationFloor
+        // Due against OUR OWN last rewrite, not the document's `updatedAt` — see
+        // `lastConsolidationAt`. A daemon that has never consolidated is due immediately,
+        // which is what makes a stalled profile recover on the next restart instead of
+        // waiting for a write that will never come.
+        let due = Date().timeIntervalSince(lastConsolidationAt ?? .distantPast) >= Self.consolidationFloor
         guard due else { return }
 
-        let candidates = await memory.episodicEntriesSince(profile.updatedAt, limit: Self.maxCandidates)
+        // A rolling window, floored at the last rewrite. `profile.updatedAt` is deliberately
+        // NOT used: it is written by every participant, and anchoring the window to it made
+        // the candidate set empty whenever anyone had touched the document recently.
+        let windowStart = max(
+            lastConsolidationAt ?? .distantPast,
+            Date().addingTimeInterval(-Self.candidateLookback)
+        )
+        let candidates = await memory.episodicEntriesSince(windowStart, limit: Self.maxCandidates)
         guard case .found(let hits) = candidates, !hits.isEmpty else { return }
 
         guard case .claimed = await memory.claimProfileLock(holder: holder) else { return }
@@ -183,6 +206,10 @@ final class DaemonMemoryConsolidator {
                 audit("[memory] profile compaction failed: the control plane rejected the write")
                 return
             }
+            // Only a rewrite that actually landed moves this daemon's clock — a model that
+            // returned unusable text, or a control plane that rejected the write, must
+            // leave the next pass due rather than buying another 24 hours of silence.
+            lastConsolidationAt = Date()
             audit("[memory] profile compaction: merged \(hits.count) conversation(s) (\(bounded.count) chars)")
         } catch {
             audit("[memory] profile compaction failed: \(error.localizedDescription)")

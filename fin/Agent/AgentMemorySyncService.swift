@@ -316,6 +316,24 @@ final class AgentMemorySyncService {
         record.content = MemoryRedactor.redact(remote.content)
         record.updatedAt = remoteUpdatedAt
         try? context.save()
+
+        // DO NOT ECHO WHAT WE JUST PULLED. The push half fires when the local record is
+        // newer than this device's last push, and a pull sets the local record's
+        // `updatedAt` to the REMOTE timestamp — which is newer than anything this device
+        // pushed. So every sync pulled the profile and immediately PUT it straight back.
+        //
+        // The content never changed, so it looked harmless. It was not: a PUT stamps the
+        // document `updatedAt = now` server-side, and the daemon's consolidator reads that
+        // one timestamp for BOTH of its decisions — "has it been 24h since the profile was
+        // last written?" (its due check) and "which episodic entries are newer than the
+        // profile?" (its candidate window). With every app device echoing every few
+        // minutes, the profile was permanently "just written": consolidation was never due
+        // and the candidate window was always empty. The profile stopped changing weeks
+        // ago while its timestamp stayed fresh, which is exactly how it looked to the user
+        // — "very out of date information" on a document updated an hour ago (2026-09-15).
+        //
+        // Advancing the watermark here makes the pull a pull.
+        defaults.set(remoteUpdatedAt, forKey: Self.lastPushedProfileKey)
     }
 
     private func pushCumulativeProfileIfNewer() async {

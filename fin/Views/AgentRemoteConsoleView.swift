@@ -11,6 +11,9 @@ import SwiftData
 /// console's visual vocabulary (user/assistant/tool) in reduced form; lifecycle
 /// notices are filtered out entirely (see `refresh`).
 struct AgentRemoteConsoleView: View {
+    /// The record itself, not just its id: the Remembered sheet queries this agent's
+    /// episodic memories and needs the model object (and its `memoryViewDays`).
+    private let agent: Agent
     private let agentID: UUID
     private let agentName: String
     private let reader: AgentMirrorReader
@@ -28,6 +31,8 @@ struct AgentRemoteConsoleView: View {
     @State private var hasLoaded = false
     @State private var isRefreshing = false
     @State private var draft = ""
+    /// The remembered-conversations sheet (moved here from the Memory screen).
+    @State private var showingRemembered = false
 
     /// Cloud-hosted only, "load earlier" support. `latestWindowRecords` is whatever the
     /// periodic refresh's default fetch returns (the latest hour, merged with the
@@ -109,6 +114,7 @@ struct AgentRemoteConsoleView: View {
     private let initialThreadID: String?
 
     init(agent: Agent, reader: AgentMirrorReader = AgentMirrorReader(), initialThreadID: String? = nil) {
+        self.agent = agent
         self.agentID = agent.id
         self.agentName = agent.name
         self.reader = reader
@@ -150,7 +156,21 @@ struct AgentRemoteConsoleView: View {
                     }
                     .disabled(isRefreshing)
                 }
+                // The conversations Fin REMEMBERS, one tap from the one in front of you.
+                // They used to sit under the cumulative profile in Memory, which put the
+                // distilled thing and the episodic things on one screen and neither next
+                // to the live conversation they belong beside.
+                ToolbarItem(placement: .secondaryAction) {
+                    Button {
+                        showingRemembered = true
+                    } label: {
+                        Label("Remembered", systemImage: "clock.arrow.circlepath")
+                    }
+                }
             }
+        }
+        .sheet(isPresented: $showingRemembered) {
+            RememberedConversationsView(agent: agent)
         }
         .task {
             // Cross-device banners are the whole point of this screen, so this is

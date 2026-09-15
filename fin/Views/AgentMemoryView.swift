@@ -2,13 +2,16 @@ import SwiftUI
 import SwiftData
 
 /// Read-only window into what the agent remembers: the cumulative user profile it
-/// injects into every conversation, and this agent's recent episodic memories.
+/// injects into every conversation, and what its computers are seeing right now.
 ///
-/// Deliberately not an editor — memories are written by the runtime (auto-digest,
-/// the remember tool, consolidation) and hand-editing them would put the store and
-/// the audit trail out of agreement. The lookback is the agent's own setting
-/// (memoryViewDays) so a long-running agent can be reviewed at whatever horizon
-/// its owner cares about.
+/// The remembered CONVERSATIONS used to be a third section here; they live in
+/// `RememberedConversationsView` now, reached from the Conversation screen, because that
+/// is the screen about conversations. What stays is the distilled picture — who Fin thinks
+/// you are, and what its bodies can see — which is what "memory" answers.
+///
+/// Deliberately not an editor: memories are written by the runtime (auto-digest, the
+/// remember tool, consolidation) and hand-editing them would put the store and the audit
+/// trail out of agreement.
 struct AgentMemoryView: View {
     let agent: Agent
 
@@ -31,17 +34,6 @@ struct AgentMemoryView: View {
         memories
             .filter { $0.kind == .cumulative }
             .min(by: { $0.createdAt < $1.createdAt })
-    }
-
-    private var recentEpisodic: [AgentMemory] {
-        let cutoff = Calendar.current.date(
-            byAdding: .day,
-            value: -max(agent.memoryViewDays, 1),
-            to: Date()
-        ) ?? .distantPast
-        return memories.filter {
-            $0.kind == .episodic && $0.agentID == agent.id && $0.updatedAt >= cutoff
-        }
     }
 
     var body: some View {
@@ -93,21 +85,6 @@ struct AgentMemoryView: View {
             }
             .accessibilityIdentifier("memoryRightNowSection")
 
-            Section {
-                if recentEpisodic.isEmpty {
-                    Text("No conversations remembered in the last \(agent.memoryViewDays) days.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(recentEpisodic) { memory in
-                        episodicRow(memory)
-                    }
-                }
-            } header: {
-                Text("Conversations — last \(agent.memoryViewDays) days")
-            } footer: {
-                Text("The lookback window is set per agent in its settings.")
-            }
         }
         .navigationTitle("Memory")
         #if os(iOS) || os(visionOS)
@@ -189,30 +166,4 @@ struct AgentMemoryView: View {
         return parts.isEmpty ? "idle shell" : parts.joined(separator: " — ")
     }
 
-    private func episodicRow(_ memory: AgentMemory) -> some View {
-        DisclosureGroup {
-            Text(memory.content)
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } label: {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(memory.title.isEmpty ? "Untitled conversation" : memory.title)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(2)
-                HStack(spacing: 6) {
-                    Text(memory.updatedAt.formatted(.relative(presentation: .named)))
-                    if memory.stoppedAt == nil {
-                        Text("· open")
-                    }
-                    if !memory.tags.isEmpty {
-                        Text("· \(memory.tags)")
-                            .lineLimit(1)
-                    }
-                }
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            }
-        }
-    }
 }

@@ -44,6 +44,16 @@ final class ThreadStore: ObservableObject {
     /// Threads whose status is not answered — the hub sidebar's "open" rows.
     var openThreads: [ThreadSummary] { threads.filter { $0.status != .answered } }
 
+    /// Threads Fin has finished with, newest first. Answered is not the same as gone:
+    /// until this existed the sidebar showed only open threads, so the moment Fin replied
+    /// the conversation left the list, and there was no way back to it from the hub — the
+    /// answer and the question both simply vanished from view (reported 2026-09-15). The
+    /// server keeps every thread; the UI just stopped offering them.
+    var answeredThreads: [ThreadSummary] {
+        threads.filter { $0.status == .answered }
+            .sorted { ($0.lastActivityAt ?? .distantPast) > ($1.lastActivityAt ?? .distantPast) }
+    }
+
     /// `messageId → threadId` across every row this store has seen, for
     /// resolving a legacy `in_reply_to` line into its thread.
     var threadOfMessage: [String: String] {
@@ -313,6 +323,35 @@ enum ThreadTimeline {
                 text: text, timestamp: message.createdAt ?? .distantPast,
                 status: asked ? [] : messageChips(message), source: .message, sequence: 0
             ))
+
+            // THE ANSWER, WHEN THE TRANSCRIPT HASN'T ARRIVED TO CARRY IT.
+            //
+            // Fin's replies normally come from transcript records, which is why nothing
+            // here ever read `replyPreview`. But the two travel by different routes — the
+            // reply is acked to the control plane the moment the turn ends, while the
+            // transcript is an hourly S3 chunk this device has to fetch — so there is a
+            // window, and on a site whose chunk never lands there is no window, there is
+            // just permanent absence. What the user saw was a thread stamped "answered"
+            // with nothing under it and no way to find out what was said (2026-09-15); the
+            // answer was on the server the whole time, in this field.
+            //
+            // Only for rows with no record: once the transcript arrives it is the better
+            // copy — full text rather than the ack's 500-character preview — and it lands
+            // in `appliedMessageIDs`, so this branch stops firing for that message.
+            if let reply = message.replyPreview?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !reply.isEmpty, !asked {
+                items.append(ThreadItem(
+                    id: "mr:" + message.messageId,
+                    party: .fin(siteID8: message.claimedBy.map { String($0.prefix(8)) }),
+                    kind: .reply,
+                    text: reply,
+                    // `answeredAt` if the control plane recorded one; otherwise just after
+                    // the prompt, so the reply never sorts above the question it answers.
+                    timestamp: message.answeredAt
+                        ?? (message.createdAt ?? .distantPast).addingTimeInterval(1),
+                    status: [], source: .message, sequence: 1
+                ))
+            }
         }
 
         // Events: the notify / relay / goal transitions, folded when a record shows them.

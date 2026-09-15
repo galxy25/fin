@@ -5085,13 +5085,45 @@ def _thread_timeline(thread_id, member_ids):
     return events
 
 
-def _thread_status(messages, events):
+# How long a message may sit unfinished before its thread stops claiming to be
+# "working". Nothing reclaims an APPLIED row — that is deliberate, and it is what makes
+# application at-most-once — so a turn that died after applying and before acking leaves
+# its row unfinished forever, and the thread derived from it said "Fin is working" for as
+# long as the account existed. One was found two days into that state (2026-09-15), listed
+# among the open threads as if it were live work.
+STALE_WORKING_SECONDS = int(os.environ.get("FIN_CP_STALE_WORKING_SECONDS", str(2 * 60 * 60)))
+
+
+def _thread_unfinished_since(messages, now):
+    """Seconds since the most recent sign of life on any unfinished message, or None
+    when there are no unfinished messages. Newest wins: one fresh row means the thread
+    really is working, whatever older rows are doing."""
+    freshest = None
+    for message in messages:
+        if message.get("state") not in ("queued", "claimed", "applied"):
+            continue
+        stamps = [
+            _parse_iso(message.get(field))
+            for field in ("appliedAt", "claimedAt", "createdAt")
+        ]
+        stamps = [value for value in stamps if value is not None]
+        if not stamps:
+            # A row with no usable timestamp cannot be judged stale; treat it as live.
+            return 0
+        newest = max(stamps)
+        age = (now - newest).total_seconds()
+        freshest = age if freshest is None else min(freshest, age)
+    return freshest
+
+
+def _thread_status(messages, events, now=None):
     """Derived, never stored (docs/THREADS.md §1). In precedence order:
     `waiting_on_you` — the last event is a push asking for input;
     `stalled` — the last event is an agent-stalled push (it outranks an open
-    message: a stall IS the state of that open message);
-    `working` — any message still queued/claimed/applied, or the last event is
-    a follow-up goal Fin still owes an answer on;
+    message: a stall IS the state of that open message), OR every unfinished
+    message has been unfinished longer than STALE_WORKING_SECONDS;
+    `working` — any message still queued/claimed/applied recently enough to be
+    plausible, or the last event is a follow-up goal Fin still owes an answer on;
     `answered` — otherwise."""
     last = events[-1] if events else {}
     kind = last.get("kind")
@@ -5100,8 +5132,13 @@ def _thread_status(messages, events):
         return "waiting_on_you"
     if kind == "notify.sent" and detail.get("event") == "agent-stalled":
         return "stalled"
-    if any(m.get("state") in ("queued", "claimed", "applied") for m in messages):
-        return "working"
+    unfinished_for = _thread_unfinished_since(messages, now or _now())
+    if unfinished_for is not None:
+        # "Working" is a claim about right now. Past the cutoff it is no longer a claim
+        # anyone can support, and `stalled` is the honest word — the same one an
+        # agent-stalled push produces, because it is the same situation: work that
+        # stopped without an answer.
+        return "working" if unfinished_for < STALE_WORKING_SECONDS else "stalled"
     if kind == "goal.followup":
         return "working"
     return "answered"
