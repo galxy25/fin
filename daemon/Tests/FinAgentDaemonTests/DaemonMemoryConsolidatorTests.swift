@@ -200,7 +200,20 @@ final class DaemonMemoryConsolidatorTests: XCTestCase {
         await consolidator.run(refreshCache: false, attemptConsolidation: true)
 
         XCTAssertEqual(methodsByPath["/memory/profile/lock"], ["PUT", "DELETE"], "claim then release, in order")
-        XCTAssertEqual(writtenProfileContent, "Levi is working on Fin; prefers direct, concise answers and end-to-end verification.")
+        // The model is handed an already-started answer (`ProfileCompaction.assistantPrefill`)
+        // and continues it, so what gets STORED is the prefill joined to the reply. Asserting
+        // the assembled form is asserting the contract: a profile that lost its first heading
+        // would fail the structure check on the very next pass.
+        XCTAssertEqual(
+            writtenProfileContent,
+            ProfileCompaction.assembled(
+                from: "Levi is working on Fin; prefers direct, concise answers and end-to-end verification."
+            )
+        )
+        XCTAssertTrue(
+            writtenProfileContent?.hasPrefix("**Current work**") ?? false,
+            "the stored profile must begin with the heading the model was continuing"
+        )
         XCTAssertTrue(completionInput?.contains("Deploy target") ?? false, "the candidate's title/content must reach the prompt")
         XCTAssertTrue(completionInput?.contains("existing profile text") ?? false, "the current profile must be re-read under the lock and included")
         XCTAssertTrue(auditLines().contains { $0.contains("merged 1 conversation") })
@@ -295,6 +308,12 @@ final class DaemonMemoryConsolidatorTests: XCTestCase {
         await consolidator.run(refreshCache: false, attemptConsolidation: true)
 
         XCTAssertEqual(lockMethods, ["PUT", "DELETE"], "an unusable reply must still release the lock")
-        XCTAssertTrue(auditLines().contains { $0.contains("skipped: model returned unusable text") })
+        // The audit line now says WHAT was wrong. "Model returned unusable text" was equally
+        // true of an empty string, a refusal, and a good profile missing one heading — and
+        // that ambiguity is what made a stale profile take hours to diagnose.
+        XCTAssertTrue(
+            auditLines().contains { $0.contains("compaction skipped:") && $0.contains("chars") && $0.contains("headings") },
+            "the rejection must report length and heading count: \(auditLines())"
+        )
     }
 }

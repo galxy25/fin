@@ -99,19 +99,26 @@ public func rawCompletion(
     model: String,
     apiKey: String?,
     temperature: Double,
-    maxOutputTokens: Int
+    maxOutputTokens: Int,
+    /// An already-started assistant turn for the model to CONTINUE. The single most
+    /// effective control over a reasoning model that will not stop deliberating: it is no
+    /// longer deciding whether to begin. See `ProfileCompaction.assistantPrefill` for the
+    /// measurements. The reply continues this text rather than repeating it, so the caller
+    /// joins them back together.
+    assistantPrefill: String? = nil
 ) async throws -> String {
     let client = AgentEndpointClient(
         baseURL: endpointURL, model: model, apiKey: apiKey,
         temperature: temperature, maxOutputTokens: maxOutputTokens
     )
-    let completion = try await client.complete(
-        messages: [
-            AgentMessage(role: .system, text: instruction),
-            AgentMessage(role: .user, text: input),
-        ],
-        tools: []
-    )
+    var messages = [
+        AgentMessage(role: .system, text: instruction),
+        AgentMessage(role: .user, text: input),
+    ]
+    if let assistantPrefill, !assistantPrefill.isEmpty {
+        messages.append(AgentMessage(role: .assistant, text: assistantPrefill))
+    }
+    let completion = try await client.complete(messages: messages, tools: [])
     return completion.text
 }
 

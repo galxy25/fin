@@ -109,7 +109,8 @@ final class DaemonMemoryConsolidator {
             try await rawCompletion(
                 instruction: instruction, input: input,
                 endpointURL: endpointURL, model: modelIdentifier, apiKey: apiKey,
-                temperature: temperature, maxOutputTokens: maxOutputTokens
+                temperature: temperature, maxOutputTokens: maxOutputTokens,
+                assistantPrefill: ProfileCompaction.assistantPrefill
             )
         }
     }
@@ -196,9 +197,20 @@ final class DaemonMemoryConsolidator {
 
         do {
             let text = try await completion(instruction, input)
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            // The model was handed a started answer; put the start back on.
+            let trimmed = ProfileCompaction.assembled(from: text)
             guard Self.acceptableProfile(trimmed, replacing: profile.content) else {
-                audit("[memory] profile compaction skipped: model returned unusable text")
+                // SAY WHAT WAS WRONG. "Unusable text" was true of an empty string, a refusal
+                // and a perfect profile with one heading alike, and it cost hours: the real
+                // answer turned out to be that the model never emitted any content at all,
+                // which this line could not distinguish from garbage.
+                let headings = ProfileCompaction.sectionHeadings.filter { trimmed.contains($0) }
+                audit("[memory] profile compaction skipped: \(trimmed.count) chars, "
+                    + "\(headings.count)/4 headings"
+                    + (trimmed.isEmpty
+                        ? " — the model returned NOTHING, which for a reasoning model means it "
+                          + "spent the whole output budget thinking"
+                        : ": \(trimmed.prefix(160))"))
                 return
             }
             let bounded = String(MemoryRedactor.redact(trimmed).prefix(Self.maxStoredProfileCharacters))

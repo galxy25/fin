@@ -47,6 +47,37 @@ public enum ProfileCompaction {
         }
     }
 
+    /// The first characters of the ANSWER, handed to the model as an already-started
+    /// assistant turn.
+    ///
+    /// THIS IS THE DIFFERENCE BETWEEN A PROFILE AND NOTHING AT ALL. Gemma 4 is a reasoning
+    /// model, and asked to "rewrite the user profile" it deliberates without bound: measured
+    /// on 2026-09-15 it spent 2045 of 2048 output tokens thinking and emitted three tokens
+    /// of content, then 6144 tokens over 523 seconds and emitted none. It was not failing
+    /// the task — it was caught mid-self-review ("Wait, let me double check the Current work
+    /// date logic") every time. Raising the budget does not help; the endpoint ignores
+    /// `reasoning_effort` and `enable_thinking`, and LM Studio has no load-time switch.
+    ///
+    /// Prefilling the assistant turn ends the question. The model is no longer deciding
+    /// whether to begin; it is continuing a line that has already begun. Same model, same
+    /// 8192 context, same prompt: `reasoning_tokens: 0`, `finish_reason: stop`, 1632
+    /// characters of correct profile, first try.
+    ///
+    /// The model's reply CONTINUES this text rather than repeating it, so a caller must put
+    /// it back — see `assembled(from:)`.
+    public static let assistantPrefill = "**Current work**\n-"
+
+    /// The finished profile: what the model returned, joined back onto the prefill it was
+    /// continuing. Trims only trailing whitespace from the prefill's own line so a reply
+    /// that starts with a space reads as one list item, not two.
+    public static func assembled(from reply: String) -> String {
+        let continuation = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !continuation.isEmpty else { return "" }
+        // A model that ignored the prefill and restated the heading must not get it twice.
+        if continuation.hasPrefix("**Current work**") { return continuation }
+        return assistantPrefill + " " + continuation
+    }
+
     public static func instruction(today: Date = Date()) -> String {
         "Today is \(dayString(today)). Rewrite the user profile as four labeled sections, "
             + "in this order, each item a short line ending with the date it was last "
