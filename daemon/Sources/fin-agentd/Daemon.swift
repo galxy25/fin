@@ -1,5 +1,6 @@
 import Foundation
 import FinAgentCore
+import Crypto
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
@@ -389,6 +390,24 @@ final class Daemon {
     /// every scan is an exec channel on the SSH connection, and `runFixedCommand`
     /// recycles the whole connection after enough abandoned ones (OpenSSH
     /// MaxSessions) — so the 20 s heartbeat must not open one per beat.
+    /// The first 12 hex of the RUNNING binary's sha256, reported beside `daemon_version`.
+    ///
+    /// WHY A VERSION STRING IS NOT ENOUGH. `daemonVersion` changes when someone edits a
+    /// constant, which is to say it identifies a CONTRACT, not a build. Ship a fix without
+    /// bumping it — the ordinary case for a bug fix — and every observer, the app and the
+    /// operator included, sees the same "1.6.6" before and after: there is no way to answer
+    /// "did the update actually land?" from outside the machine. That question cost an hour
+    /// on 2026-09-15, chasing a fix that may or may not have been running. `publish-binary.sh`
+    /// already prints the sha256 it uploaded, so the two are directly comparable.
+    ///
+    /// Computed once, lazily, and never fatal: a binary that cannot read itself reports
+    /// nothing rather than failing a heartbeat over a diagnostic.
+    static let runningBuildIdentity: String = {
+        let path = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        guard let data = try? Data(contentsOf: path) else { return "unknown" }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined().prefix(12).description
+    }()
+
     private var cachedCapabilities: [String: Any] = [:]
     private var cachedCapabilitiesAt: Date?
     /// When the pane scan last actually RAN — which is not when capabilities were last
@@ -409,6 +428,7 @@ final class Daemon {
         }
         var caps: [String: Any] = [
             "daemon_version": DaemonDirectiveClient.daemonVersion,
+            "daemon_build": Self.runningBuildIdentity,
             "always_on": config.stayResident ?? false,
             "brain": ["kind": "openai-compatible", "model": config.agent.modelIdentifier],
             "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
