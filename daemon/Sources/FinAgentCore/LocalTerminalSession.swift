@@ -64,6 +64,21 @@ extension HeadlessTerminalSession: AgentTerminalTransport {
     public var fixedCommandsCompeteWithTurn: Bool { true }
 }
 
+// EVERYTHING BELOW IS macOS-ONLY, AND THIS FILE IS SHARED WITH THE APP.
+//
+// FinAgentCore is compiled into the iOS, visionOS and tvOS targets as well as the daemon,
+// and this transport is built from APIs those platforms do not have: `Process` does not
+// exist off macOS at all, and `forkpty` + spawning a child shell is not something an app
+// sandbox permits even where the symbol resolves. The protocol above stays unguarded —
+// `HeadlessTerminalSession` conforms to it everywhere, and the daemon's generic code has
+// no platform opinion.
+//
+// Found by shipping: the daemon and the macOS app built clean, and the first TestFlight
+// run after this landed failed three of four platforms on "cannot find 'Process' in
+// scope" (2026-09-15). A shared module's new file needs a thought about every target that
+// compiles it, not just the one being worked on.
+#if os(macOS)
+
 public struct LocalSessionConfiguration: Sendable {
     /// The connect command, verbatim — the SAME string the SSH transport types into its
     /// shell (`exec tmux -L fin new-session -A -s fin \; set status off`). It is handed to
@@ -687,3 +702,5 @@ private final class FixedOutputCollector: @unchecked Sendable {
         )
     }
 }
+
+#endif  // os(macOS)
