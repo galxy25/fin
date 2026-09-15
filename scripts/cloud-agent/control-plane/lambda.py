@@ -2717,6 +2717,7 @@ def sweep(_event=None):
         "terminated": terminated,
         "reconciled": reconciled,
         "staleSites": stale_sites,
+        "retiredMessages": _retire_abandoned_messages(now),
         "adopted": [{"workerId": w["workerId"], "agent": w["agent"], "instanceId": w["instanceId"]} for w in adopted],
     }
 
@@ -5092,6 +5093,68 @@ def _thread_timeline(thread_id, member_ids):
 # long as the account existed. One was found two days into that state (2026-09-15), listed
 # among the open threads as if it were live work.
 STALE_WORKING_SECONDS = int(os.environ.get("FIN_CP_STALE_WORKING_SECONDS", str(2 * 60 * 60)))
+
+
+# How long an APPLIED message waits for its ack before the control plane accepts that none
+# is coming. Same duration as the display cutoff and deliberately a separate name: saying
+# "stalled" is a label, and writing `expired` is a decision that no answer will ever
+# arrive. They can diverge without touching the other.
+ABANDON_APPLIED_SECONDS = int(
+    os.environ.get("FIN_CP_ABANDON_APPLIED_SECONDS", str(STALE_WORKING_SECONDS))
+)
+
+
+def _retire_abandoned_messages(now):
+    """Move `applied`-but-never-acked rows to `expired`, and say why.
+
+    Nothing reclaims an APPLIED row — that is exactly what makes application at-most-once,
+    and it must stay that way: re-offering a message whose side effects already happened is
+    the one thing the claim protocol exists to prevent. But "never re-applied" was
+    implemented as "never touched again", so a turn that died between applying and acking
+    left its row unfinished permanently, and every thread derived from it stayed open. One
+    sat that way for two days.
+
+    Retiring is not reclaiming. The row moves to a TERMINAL state it can never leave, so
+    the message is still applied exactly once — the control plane has simply stopped
+    waiting for an answer that no live process is going to send. `_thread_status` does not
+    count `expired` as unfinished, so the thread closes with its history intact.
+    """
+    cutoff = now - timedelta(seconds=ABANDON_APPLIED_SECONDS)
+    rows = _scan(
+        table=MESSAGES_TABLE,
+        FilterExpression="#state = :applied",
+        ExpressionAttributeNames={"#state": "state"},
+        ExpressionAttributeValues={":applied": "applied"},
+    )
+    retired = []
+    for row in rows:
+        applied_at = _parse_iso(row.get("appliedAt"))
+        # No usable timestamp is not evidence of abandonment — leave it alone.
+        if applied_at is None or applied_at > cutoff:
+            continue
+        try:
+            MESSAGES_TABLE.update_item(
+                Key={"messageId": row["messageId"]},
+                UpdateExpression=(
+                    "SET #state = :expired, expiredAt = :now, expiredReason = :reason"
+                ),
+                # Conditional, so a site acking in this very window wins the race and keeps
+                # its answer: an ack is always better evidence than a clock.
+                ConditionExpression="#state = :applied",
+                ExpressionAttributeNames={"#state": "state"},
+                ExpressionAttributeValues={
+                    ":expired": "expired",
+                    ":applied": "applied",
+                    ":now": _iso(now),
+                    ":reason": "applied but never acked; no answer is coming",
+                },
+            )
+            retired.append(row["messageId"])
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                continue
+            raise
+    return retired
 
 
 def _thread_unfinished_since(messages, now):

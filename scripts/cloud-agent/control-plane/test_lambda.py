@@ -3344,3 +3344,22 @@ class ThreadStalenessTests(unittest.TestCase):
     def test_a_row_with_no_timestamps_is_treated_as_live(self):
         """Unjudgeable is not the same as stale — never retire a row we cannot date."""
         self.assertEqual(lam._thread_status([{"state": "queued"}], []), "working")
+
+
+class AbandonedMessageRetirementTests(unittest.TestCase):
+    """An applied row that never got its ack must reach a terminal state.
+
+    Retiring is not reclaiming: the row moves to `expired`, which it can never leave, so
+    the message stays applied exactly once. What stops is the waiting.
+    """
+
+    def test_expired_is_not_unfinished_so_the_thread_closes(self):
+        self.assertEqual(lam._thread_status([{"state": "expired"}], []), "answered")
+
+    def test_a_mix_of_expired_and_answered_still_closes(self):
+        messages = [{"state": "expired"}, {"state": "answered"}]
+        self.assertEqual(lam._thread_status(messages, []), "answered")
+
+    def test_the_retirement_cutoff_defaults_to_the_display_cutoff(self):
+        """Saying "stalled" and deciding "no answer is coming" start from the same clock."""
+        self.assertEqual(lam.ABANDON_APPLIED_SECONDS, lam.STALE_WORKING_SECONDS)
