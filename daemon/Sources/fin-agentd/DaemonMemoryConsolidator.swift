@@ -39,6 +39,17 @@ final class DaemonMemoryConsolidator {
     /// Mirrors `AgentRuntime.maxStoredProfileCharacters`.
     static let maxStoredProfileCharacters = 2000
 
+    /// Output budget for a compaction, independent of the agent's per-TURN budget.
+    ///
+    /// They are different jobs. A turn answers a person and wants to be brief; a compaction
+    /// emits a whole 1500-character document in one go — roughly 400 tokens — and needs
+    /// slack above that for whatever reasoning the model still does before it starts.
+    /// Inheriting the turn budget (2048) produced a profile cut off mid-word, three
+    /// headings of four, with no Preferences section at all: accepted by the structure
+    /// check, and wrong (2026-09-15). The floor is generous because the cost of being
+    /// wrong is a truncated profile that then becomes the input to the next pass.
+    static let compactionOutputTokens = 3072
+
     private let memory: DaemonMemoryClient
     private let cacheFileURL: URL
     private let holder: String
@@ -109,7 +120,8 @@ final class DaemonMemoryConsolidator {
             try await rawCompletion(
                 instruction: instruction, input: input,
                 endpointURL: endpointURL, model: modelIdentifier, apiKey: apiKey,
-                temperature: temperature, maxOutputTokens: maxOutputTokens,
+                temperature: temperature,
+                maxOutputTokens: max(maxOutputTokens, Self.compactionOutputTokens),
                 assistantPrefill: ProfileCompaction.assistantPrefill
             )
         }
@@ -213,6 +225,14 @@ final class DaemonMemoryConsolidator {
                         : ": \(trimmed.prefix(160))"))
                 return
             }
+            // NOTE ON TRUNCATION. A reply cut off by the token cap still looks structurally
+            // fine — it has headings — and it then becomes the input to the next pass. The
+            // real signal is the endpoint's `finish_reason: length`, which `rawCompletion`
+            // does not surface today; refusing on "no **Preferences** section" was tried
+            // and is wrong, because it hard-codes one instruction's last heading into the
+            // write path and rejects every legitimately short profile. The budget above is
+            // what prevents it for now; `ProfileCompactionLiveTests` is what would catch a
+            // regression.
             let bounded = String(MemoryRedactor.redact(trimmed).prefix(Self.maxStoredProfileCharacters))
             guard case .saved = await memory.writeProfile(bounded) else {
                 audit("[memory] profile compaction failed: the control plane rejected the write")

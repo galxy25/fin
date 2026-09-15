@@ -116,6 +116,13 @@ final class ProfileCompactionLiveTests: XCTestCase {
             "\(model) returned NOTHING — with a reasoning model that usually means the output "
                 + "budget went entirely on thinking. Raise FIN_LLM_MAX_TOKENS and retry."
         )
+        // A profile the model ran out of room to finish is worse than none: it looks
+        // structurally sound and becomes the input to the next pass.
+        XCTAssertTrue(
+            trimmed.contains("**Preferences**"),
+            "\(model) stopped before the last section — the reply was cut off at \(trimmed.count) "
+                + "chars. Raise the budget (DaemonMemoryConsolidator.compactionOutputTokens)."
+        )
         XCTAssertTrue(
             accepted,
             "\(model) produced text the daemon would reject: \(trimmed.count) chars, "
