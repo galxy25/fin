@@ -470,6 +470,44 @@ associated data — `fin/Vault/KeyVault.swift`). Session tokens only: a site
 token is denied by `_require_site_scope`, since a body has its own SSH
 identity (`fin-agent-ssh-key`) and never needs the user's.
 
+## Account deletion (`DELETE /account`)
+
+App Store Guideline 5.1.1(v): Sign in with Apple creates an account, so the
+app must be able to delete it. `DELETE /account` is the other half of
+`POST /auth/apple` — it erases the account and everything it owns, in this
+order (the caller's own session goes LAST, so every stage still
+authenticates):
+
+1. EC2 workers — terminated first, so a deleted account can never leave an
+   instance running and billing, then their rows dropped.
+2. `fin-sites`, `fin-messages` and their `fin-thread-events`, `fin-agents`,
+   `fin-enroll-tokens`, `fin-device-tokens` (push stops immediately).
+3. Every S3 object under `users/{userId}/` — configs, transcripts, memory,
+   goals ledgers, artifacts, the key vault, device status.
+4. Service credentials in Secrets Manager, **force-deleted** (no 30-day
+   recovery window: "delete my account" has to mean gone).
+5. The `fin-users` row, so signing in again with the same Apple ID is a new
+   account with a new `userId`.
+6. Every session, the caller's included — every device is signed out at once.
+
+**Only a Sign in with Apple session token may call it.** `_authorize` labels
+which credential answered (`event["_authKind"]`), and a site token or the
+shared operator token gets 403: a stolen EC2 body must not be able to wipe its
+owner, and the operator token sits in every daemon's config file.
+
+Each stage is best-effort and counted. A clean run answers
+`200 {"deleted": {...}}`; anything left behind answers `500` naming the stages,
+because a user told "deleted" deserves that to be true. A second call 401s (the
+session is gone), which the apps treat as success.
+
+Apple's own token revocation is deliberately not attempted: sign-in requests no
+scopes and stores no authorization code or refresh token, so there is nothing
+here to revoke with.
+
+In the apps: "Delete Fin Account" in iCloud Sync's Fin Account section
+(`fin/Views/CloudSyncStatusView.swift`) and in the TV's account section
+(`fin-tv/TVCloudAccount.swift`), both behind a confirmation dialog.
+
 ## Service credentials (write-only secret store)
 
 Third-party credentials a worker needs — a Gmail app password, an API key, an
