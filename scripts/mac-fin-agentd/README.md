@@ -50,6 +50,14 @@ an unmerged branch, and continuous merge in this same worktree is standing polic
 (`CLAUDE.md`) — a plist pointing here would become a silent `ENOENT` the first time
 someone ran `git checkout main`.
 
+**Continuous pane watching is ON in an enrolled config, and the code gates on the block's
+PRESENCE.** `enroll-config.py` writes a `sessionActivity` block, and `Daemon.swift` reads
+`if let activityConfig = config.sessionActivity` — so the `{}` it used to write, which reads
+like "nothing configured", turned the feature on with defaults. Every sentence elsewhere
+calling this off-by-default described a config the installer never produced. It now writes
+the intervals explicitly, so what is running is visible in the file. **Delete the block to
+turn it off** — that, not an empty object, is what off looks like.
+
 Everything the site owns lives under `~/Library/Application Support/fin-agentd/`:
 
 ```

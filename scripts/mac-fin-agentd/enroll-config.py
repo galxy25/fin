@@ -50,7 +50,14 @@ if api_key:
 agent.setdefault("contextWindowTokens", 8192)
 agent.setdefault("maxOutputTokens", 640)
 agent.setdefault("temperature", 0.2)
-agent.setdefault("heartbeatSeconds", 60)
+# HEARTBEAT CADENCE IS A FUNCTION OF WHERE THE BRAIN IS. Each beat can run a model turn,
+# and a turn that takes longer than the interval leaves the daemon permanently mid-turn:
+# background work that stands aside for turns never runs again (the pane inventory froze on
+# the work laptop for an hour that way, 2026-09-15), and every beat starts a turn that the
+# next beat's is already waiting behind. A loopback LM Studio answers in a few seconds, so
+# 60 s has slack; the same model over a Funnel took ~73 s per turn, which does not.
+_brain_is_local = any(h in (agent.get("endpointURL") or "") for h in ("127.0.0.1", "localhost", "[::1]"))
+agent.setdefault("heartbeatSeconds", 60 if _brain_is_local else 300)
 # A brain reached over Funnel adds a WAN round trip to every turn; the daemon's default
 # 300 s is generous enough, but a loaded remote LM Studio streaming 640 tokens has been
 # seen to need most of it, so it is made explicit here rather than left to the default.
@@ -76,7 +83,18 @@ cfg["site"] = {
     "token": r["siteToken"], "heartbeatSeconds": r.get("heartbeatSeconds", 20),
 }
 cfg.setdefault("transcript", {})
-cfg.setdefault("sessionActivity", {})
+# CONTINUOUS WATCHING, WRITTEN OUT RATHER THAN IMPLIED. This block used to be set to `{}`,
+# which reads like "off, nothing configured" and means the exact opposite: the daemon gates
+# on the block's PRESENCE (`if let activityConfig = config.sessionActivity`), so an empty
+# object turns it ON with defaults. Every doc that called it off-by-default was describing a
+# config nobody shipped. The values are the defaults it already had; what changed is that a
+# reader can now see what is running. Delete this block to turn it off — that, and not an
+# empty object, is what off looks like.
+cfg.setdefault("sessionActivity", {
+    "inventoryIntervalSeconds": 300,
+    "activityIntervalSeconds": 900,
+    "captureLines": 200,
+})
 os.makedirs(os.path.dirname(path), exist_ok=True)
 fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as fh:

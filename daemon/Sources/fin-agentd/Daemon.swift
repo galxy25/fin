@@ -391,6 +391,11 @@ final class Daemon {
     /// MaxSessions) — so the 20 s heartbeat must not open one per beat.
     private var cachedCapabilities: [String: Any] = [:]
     private var cachedCapabilitiesAt: Date?
+    /// When the pane scan last actually RAN — which is not when capabilities were last
+    /// composed. A skipped scan still refreshes `cachedCapabilitiesAt`, so measuring
+    /// staleness against that could never see a scan that is being starved.
+    private var lastPaneScanAt: Date?
+
     static let capabilitiesScanInterval: TimeInterval = 60
 
     /// Static facts plus the titled-pane inventory over the DEFAULT tmux socket, the
@@ -408,11 +413,17 @@ final class Daemon {
             "brain": ["kind": "openai-compatible", "model": config.agent.modelIdentifier],
             "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
         ]
-        if let session, !isTurnInFlight || cachedCapabilitiesAt == nil {
-            // Not mid-turn (the turn's own tool calls share the exec-channel budget)
-            // — except the very first scan, which is worth one channel even mid-turn:
-            // the launch turn on a local model runs for minutes, and until it ends
-            // the app would otherwise show a computer with no panes at all.
+        // The rule, and the bug it encodes, live in `PaneScanPolicy` — a pure function,
+        // because "not while a turn is running" quietly meant "never" on a site whose
+        // turns outlast its heartbeat interval, and that deserves a test rather than a
+        // comment.
+        let mayScan = PaneScanPolicy.shouldScan(
+            scanIsCheap: !(session?.fixedCommandsCompeteWithTurn ?? true),
+            isTurnInFlight: isTurnInFlight,
+            lastScanAt: lastPaneScanAt
+        )
+        if let session, mayScan {
+            lastPaneScanAt = Date()
             let commandLine = TmuxSessionRead.commandLine(TmuxSessionInventory.paneTitlesArguments())
             if let result = try? await session.runFixedCommand(
                 commandLine, maxResponseBytes: TmuxSessionRead.maxResponseBytes
@@ -1664,6 +1675,12 @@ final class Daemon {
                             // launchd KeepAlive respawns an exit 0; a real "stay down"
                             // needs launchctl, which is the installer's job, not the daemon's.
                             self.log("[site] \(command.kind) requested — exiting for launchd to respawn")
+                            // Cancel the heartbeat turn first. It is the one turn nobody is
+                            // waiting on, it can be minutes long on a remote brain, and
+                            // `shutdown` politely awaits work that a live turn keeps feeding.
+                            // An operator who asked for a restart has already decided the
+                            // current thought is worth less than a working daemon.
+                            self.heartbeatTurnTask?.cancel()
                             self.shutdown(exitCode: 0)
                         case "update":
                             let binary = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
@@ -2189,8 +2206,27 @@ final class Daemon {
             await transcript?.flush()
             await lastNotifyTask?.value
             try? await Task.sleep(for: .milliseconds(300))
-            terminate(exitCode)
+            self.terminateOnce(exitCode)
         }
+        // A DEADLINE ON THE POLITENESS ABOVE. Both awaits are network calls — a transcript
+        // flush and a push — and a daemon told to restart must restart even when the
+        // network it is being polite to is the thing that is broken. Whichever path gets
+        // there first wins; `terminateOnce` makes the loser a no-op.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(5))
+            self.log("shutdown: exiting without waiting for the final flush")
+            self.terminateOnce(exitCode)
+        }
+    }
+
+    /// `terminate` is a test seam, and shutdown now races two paths to it. Only the first
+    /// one may fire: a double exit in a test double is a double record, and in production
+    /// it is a second `exit(2)` from a process already inside `exit`.
+    private var didTerminate = false
+    private func terminateOnce(_ exitCode: Int32) {
+        guard !didTerminate else { return }
+        didTerminate = true
+        terminate(exitCode)
     }
 
     /// The fatal exit, through the `terminate` seam so the launch-order tests can drive

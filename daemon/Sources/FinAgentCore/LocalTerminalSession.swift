@@ -33,6 +33,19 @@ public protocol AgentTerminalTransport: AgentSessionDriving {
         maxResponseBytes: Int,
         timeout: TimeInterval
     ) async throws -> FixedCommandOutput
+
+    /// Whether a `runFixedCommand` competes with the agent's own turn for something
+    /// SCARCE, so background work should stand aside while a turn is running.
+    ///
+    /// True over SSH: every fixed command is a session on one connection, OpenSSH's
+    /// default `MaxSessions` is 10, the agent's PTY holds one, and a timed-out read cannot
+    /// give its slot back (see `HeadlessTerminalSession.runFixedCommand`). False for a
+    /// local PTY, where a fixed command is just a child process — nothing is shared, and a
+    /// background scan costs the turn nothing.
+    ///
+    /// This is a statement about COST, never about safety. Nothing is permitted on one
+    /// transport that is refused on the other.
+    var fixedCommandsCompeteWithTurn: Bool { get }
 }
 
 public extension AgentTerminalTransport {
@@ -45,7 +58,11 @@ public extension AgentTerminalTransport {
     }
 }
 
-extension HeadlessTerminalSession: AgentTerminalTransport {}
+extension HeadlessTerminalSession: AgentTerminalTransport {
+    /// Sessions on one SSH connection are a fixed, non-reclaimable budget — see the
+    /// protocol's note and `runFixedCommand`'s own.
+    public var fixedCommandsCompeteWithTurn: Bool { true }
+}
 
 public struct LocalSessionConfiguration: Sendable {
     /// The connect command, verbatim — the SAME string the SSH transport types into its
@@ -155,6 +172,10 @@ public final class LocalTerminalSession: AgentTerminalTransport {
     }
 
     public var isSessionConnected: Bool { state == .connected }
+
+    /// A child process, not a session slot: nothing here is shared with the agent's own
+    /// terminal, so background work never has to wait for a turn to end.
+    public var fixedCommandsCompeteWithTurn: Bool { false }
 
     // MARK: - Lifecycle
 

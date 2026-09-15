@@ -55,6 +55,11 @@ launchctl print gui/$(id -u)/dev.levischoen.fin.agentd | grep -E 'state|pid'
 tail -f ~/Library/Logs/fin-agentd/agentd.err.log
 ```
 
+The heartbeat interval is a function of where the brain is: a loopback LM Studio answers in
+seconds, so 60 s has slack; the same model over a Funnel takes over a minute per turn, and a
+turn longer than the interval leaves the daemon permanently mid-turn. An enrolled config
+picks 60 s or 300 s accordingly (`agent.heartbeatSeconds`).
+
 A healthy first start says, in this order: `local pty → <model>`, `connected; probing
 until the shell answers`, `tmux confinement confirmed: the shell is inside -L fin`, and
 `tmux guard armed`. Within about twenty seconds this Mac appears in **Fin's Computers** in
@@ -93,8 +98,10 @@ shell to exclude.
   proceed quietly if it is not true.
 - It can *read* a named session on the default socket through one fixed, capped, redacted
   command (`read_session`), and only when you ask it to.
-- Reading your live panes continuously (`sessionActivity`) is **off** and stays off unless
-  you add that block to `config.json` yourself.
+- Reading your live panes continuously (`sessionActivity`) is **ON**: the installer writes
+  that block, and the daemon periodically captures each coding-agent pane and summarizes it
+  through the model. Remove the `sessionActivity` block from `config.json` and restart to
+  turn it off — an empty `{}` does NOT turn it off, it turns it on with defaults.
 - Everything that leaves this Mac goes through the redactor first.
 - Fin's shell runs as **your** user. The boundary above is topological, not a kernel one;
   `daemon/README.md` has the full residual list.
