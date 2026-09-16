@@ -417,6 +417,48 @@ final class Daemon {
 
     static let capabilitiesScanInterval: TimeInterval = 60
 
+    /// What this site's brain is, including the context window it is REALLY serving.
+    ///
+    /// The window is here — in the heartbeat, next to the model name — because on
+    /// 2026-09-16 the only way to discover that the model was loaded at 8192 while the
+    /// daemon was configured for 32768 was to notice that turns came back empty and go
+    /// looking. A site that publishes `context_loaded` beside `context_configured` makes
+    /// that a glance at `GET /sites` instead of an afternoon. `context_source` says
+    /// whether the loaded number was observed or is only the config repeating itself.
+    private func brainCapability() -> [String: Any] {
+        var brain: [String: Any] = [
+            "kind": "openai-compatible",
+            "model": config.agent.modelIdentifier,
+            "context_configured": configuredContextWindowTokens,
+            "max_output_tokens": config.agent.maxOutputTokens ?? Self.defaultMaxOutputTokens,
+        ]
+        if let reading = lastContextWindowReading {
+            brain["context_loaded"] = reading.loadedTokens
+            brain["context_source"] = reading.source.rawValue
+            if let maxTokens = reading.maxTokens { brain["context_max"] = maxTokens }
+            brain["context_matches_config"] = !ContextWindowProbe.isOverstated(
+                configured: configuredContextWindowTokens, serverWindow: reading.loadedTokens
+            )
+        } else {
+            brain["context_source"] = ContextWindowReading.Source.configured.rawValue
+        }
+        return brain
+    }
+
+    /// Refreshed on the same cadence as the rest of the capabilities, so a model reloaded
+    /// at a different window (an `lms unload` followed by a JIT reload at the stock
+    /// default — see `scripts/dev/one-at-a-time.sh`) shows up within a minute.
+    private var lastContextWindowReading: ContextWindowReading?
+
+    /// The same fallbacks `makeTurnEngine` builds the engine with, so what the site
+    /// publishes can never disagree with what the engine actually budgets against.
+    static let defaultContextWindowTokens = 8192
+    static let defaultMaxOutputTokens = 640
+
+    private var configuredContextWindowTokens: Int {
+        config.agent.contextWindowTokens ?? Self.defaultContextWindowTokens
+    }
+
     /// Static facts plus the titled-pane inventory over the DEFAULT tmux socket, the
     /// same fixed-argv exec channel `read_session` uses. A machine without tmux
     /// reports no sessions; the heartbeat never fails for it.
@@ -426,11 +468,27 @@ final class Daemon {
         if let at = cachedCapabilitiesAt, Date().timeIntervalSince(at) < Self.capabilitiesScanInterval {
             return cachedCapabilities
         }
+        // Telemetry, so it never blocks or fails a heartbeat: a server that does not
+        // report a window leaves the previous reading (or none) in place.
+        if let reading = await ContextWindowProbe.probe(
+            baseURL: config.agent.endpointURL,
+            model: config.agent.modelIdentifier,
+            apiKey: config.agent.apiKey
+        ) {
+            if reading != lastContextWindowReading {
+                log("[context] endpoint serves \(reading.summary)"
+                    + (ContextWindowProbe.isOverstated(
+                        configured: configuredContextWindowTokens,
+                        serverWindow: reading.loadedTokens) ? " — SMALLER than the configured "
+                        + "\(configuredContextWindowTokens); budgets will be clamped" : ""))
+            }
+            lastContextWindowReading = reading
+        }
         var caps: [String: Any] = [
             "daemon_version": DaemonDirectiveClient.daemonVersion,
             "daemon_build": Self.runningBuildIdentity,
             "always_on": config.stayResident ?? false,
-            "brain": ["kind": "openai-compatible", "model": config.agent.modelIdentifier],
+            "brain": brainCapability(),
             "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
         ]
         // The rule, and the bug it encodes, live in `PaneScanPolicy` — a pure function,
@@ -1397,8 +1455,8 @@ final class Daemon {
                 endpointURL: config.agent.endpointURL,
                 modelIdentifier: config.agent.modelIdentifier,
                 apiKey: config.agent.apiKey,
-                contextWindowTokens: config.agent.contextWindowTokens ?? 8192,
-                maxOutputTokens: config.agent.maxOutputTokens ?? 640,
+                contextWindowTokens: configuredContextWindowTokens,
+                maxOutputTokens: config.agent.maxOutputTokens ?? Self.defaultMaxOutputTokens,
                 temperature: config.agent.temperature ?? 0.2,
                 systemPrompt: systemPrompt,
                 terminalContextLines: config.agent.terminalContextLines ?? 160
@@ -1407,6 +1465,15 @@ final class Daemon {
             tmuxGuard: tmuxGuard,
             audit: { [weak self] event in self?.record(event) }
         )
+        // ASK BEFORE THE FIRST TURN, not after a turn has already been damaged by the
+        // answer. The refusal-derived clamp still exists as a backstop, but it can only
+        // ever fire once a turn has already overrun the window; this makes the ordinary
+        // case — a model quietly loaded at a different context length than the config
+        // expects — visible at startup, in the log and in the site heartbeat.
+        Task { [weak engine] in
+            guard let engine else { return }
+            await engine.refreshContextWindow()
+        }
         refreshSystemPrompt = { [weak self, weak engine] in
             guard let self, let engine, !self.isTurnInFlight else { return }
             engine.refreshSystemPrompt(Self.composedSystemPrompt(
@@ -1626,7 +1693,7 @@ final class Daemon {
                 modelIdentifier: config.agent.modelIdentifier,
                 apiKey: config.agent.apiKey,
                 temperature: config.agent.temperature ?? 0.2,
-                maxOutputTokens: config.agent.maxOutputTokens ?? 640,
+                maxOutputTokens: config.agent.maxOutputTokens ?? Self.defaultMaxOutputTokens,
                 audit: { [weak self] line in
                     self?.log(line)
                     self?.record(AgentAuditEvent(kind: "notice", text: line))
@@ -1685,7 +1752,7 @@ final class Daemon {
                     captureLines: activityConfig.captureLines ?? SessionActivitySummarizer.defaultCaptureLines,
                     endpointURL: config.agent.endpointURL, modelIdentifier: config.agent.modelIdentifier,
                     apiKey: config.agent.apiKey, temperature: config.agent.temperature ?? 0.2,
-                    maxOutputTokens: config.agent.maxOutputTokens ?? 640,
+                    maxOutputTokens: config.agent.maxOutputTokens ?? Self.defaultMaxOutputTokens,
                     audit: { [weak self] line in
                         self?.log(line)
                         self?.record(AgentAuditEvent(kind: "notice", text: line))

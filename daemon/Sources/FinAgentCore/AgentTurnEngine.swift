@@ -294,9 +294,53 @@ public final class AgentTurnEngine {
         return min(configuration.contextWindowTokens, observed)
     }
 
-    /// Learned from a refusal, and kept for the life of the engine: the server is not
-    /// going to grow its window mid-process.
-    private var observedContextWindowTokens: Int?
+    /// Learned from a refusal or from the endpoint's model listing, and kept for the life
+    /// of the engine: the server is not going to grow its window mid-process.
+    ///
+    /// Public to read so a host can put the real window in its own telemetry (the daemon
+    /// publishes it in the site heartbeat), and so a trace never has to guess whether a
+    /// number was observed or merely configured — `source` says which.
+    public private(set) var contextWindow: ContextWindowReading?
+
+    private var observedContextWindowTokens: Int? { contextWindow?.loadedTokens }
+
+    /// The reading as the rest of the system should see it: the observed one when we have
+    /// it, otherwise the configured number labelled honestly as unverified.
+    public var effectiveContextWindow: ContextWindowReading {
+        contextWindow ?? ContextWindowReading(
+            loadedTokens: configuration.contextWindowTokens, source: .configured
+        )
+    }
+
+    /// Ask the endpoint what window it is really serving, and record it. Best effort:
+    /// a server that does not report one leaves the configured number in place. Safe to
+    /// call more than once; a later reading replaces an earlier one, and a refusal-derived
+    /// reading is never overwritten by a probe that disagrees with it downward.
+    @discardableResult
+    public func refreshContextWindow() async -> ContextWindowReading? {
+        guard let reading = await ContextWindowProbe.probe(
+            baseURL: configuration.endpointURL,
+            model: configuration.modelIdentifier,
+            apiKey: configuration.apiKey
+        ) else { return nil }
+
+        contextWindow = reading
+        if ContextWindowProbe.isOverstated(
+            configured: configuration.contextWindowTokens, serverWindow: reading.loadedTokens
+        ) {
+            record(
+                "notice",
+                ContextWindowProbe.mismatchMessage(
+                    configured: configuration.contextWindowTokens,
+                    serverWindow: reading.loadedTokens
+                ),
+                isFailure: true
+            )
+        } else {
+            record("notice", "[context] endpoint serves \(reading.summary)")
+        }
+        return reading
+    }
 
     /// The model-call attempt/retry count `record` stamps on every event — see
     /// `AgentAuditEvent.attempt`/`retryCount`. Reset to a fresh 1/0 at the top of
@@ -477,6 +521,22 @@ public final class AgentTurnEngine {
                 "assistantMessage",
                 completion.text.isEmpty ? "(tool call only)" : completion.text
             )
+            // THE NUMBERS THAT WERE MISSING. The endpoint has always reported `usage`
+            // and the engine has always thrown it away, so nothing in any trace said how
+            // much of the window a turn had used — or how much of it existed. Recorded
+            // per round trip, with the window's provenance, so "the model stopped without
+            // producing an answer" can never again be the whole story.
+            if !completion.usage.isEmpty || contextWindow != nil {
+                let window = effectiveContextWindow
+                record("notice", window.turnTelemetry(
+                    promptTokens: completion.usage.promptTokens,
+                    completionTokens: completion.usage.completionTokens,
+                    outputReserve: configuration.maxOutputTokens
+                ), isFailure: window.isStarvedOfOutputRoom(
+                    promptTokens: completion.usage.promptTokens,
+                    outputReserve: configuration.maxOutputTokens
+                ))
+            }
             if let reasoning = completion.reasoning, !reasoning.isEmpty {
                 record("reasoning", reasoning)
             }
@@ -581,7 +641,11 @@ public final class AgentTurnEngine {
                     let notice = ContextWindowProbe.mismatchMessage(
                         configured: effectiveContextWindowTokens, serverWindow: serverWindow
                     )
-                    observedContextWindowTokens = serverWindow
+                    contextWindow = ContextWindowReading(
+                        loadedTokens: serverWindow,
+                        maxTokens: contextWindow?.maxTokens,
+                        source: .refusal
+                    )
                     record("notice", notice, isFailure: true)
                     _ = transcript.compactIfNeeded(budget: contextBudget)
                 }
