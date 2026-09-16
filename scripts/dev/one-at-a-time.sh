@@ -13,16 +13,31 @@
 #      so two of these never run at once — across sessions and worktrees.
 #   2. Waits until no OTHER xcodebuild / swift-build / swift-test process is running
 #      (another session's build counts; we don't kill it, we wait).
-#   3. Waits until free memory is at least $FIN_MIN_FREE_GB (default 8) so the
+#   3. With --quiesce-fin, stops the resident fin-agentd and unloads its model,
+#      restoring both afterwards however the build ends.
+#   4. Refuses if LM Studio still holds models (see resident_model_gb).
+#   5. Waits until free memory is at least $FIN_MIN_FREE_GB (default 8) so the
 #      build never competes with a training run for the last gigabytes.
 # Each wait is logged to stderr once per minute. Ctrl-C releases the lock.
+#
+#   --quiesce-fin   Put the resident fin-agentd to sleep for the duration of the
+#                   build (bootout, unload its model) and restore it afterwards,
+#                   however the build ends. Needed on a Mac where Fin lives,
+#                   because there `lms unload --all` does not stay done — see the
+#                   JIT note above resident_model_gb. Equivalent: FIN_QUIESCE_AGENTD=1.
 set -eu
 
 LOCK="${FIN_BUILD_LOCK:-$HOME/.fin-build.lock}"
 MIN_FREE_GB="${FIN_MIN_FREE_GB:-8}"
 MAX_WAIT_S="${FIN_MAX_WAIT_S:-7200}"
+QUIESCE="${FIN_QUIESCE_AGENTD:-0}"
+AGENTD_LABEL="${FIN_AGENTD_LABEL:-dev.levischoen.fin.agentd}"
+AGENTD_DOMAIN="gui/$(id -u)"
+AGENTD_PLIST="${FIN_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}/$AGENTD_LABEL.plist"
 
-[ $# -gt 0 ] || { echo "usage: $0 <command> [args...]" >&2; exit 64; }
+if [ "${1:-}" = "--quiesce-fin" ]; then QUIESCE=1; shift; fi
+
+[ $# -gt 0 ] || { echo "usage: $0 [--quiesce-fin] <command> [args...]" >&2; exit 64; }
 
 log() { echo "[one-at-a-time] $*" >&2; }
 
@@ -65,7 +80,61 @@ other_build_pids() {
   done | tr '\n' ' '
 }
 
-release() { rm -rf "$LOCK"; }
+# Whether WE booted the daemon out, so restore only ever undoes our own doing: a
+# machine where Fin was already stopped must be left stopped.
+QUIESCED=0
+
+agentd_loaded() { launchctl print "$AGENTD_DOMAIN/$AGENTD_LABEL" >/dev/null 2>&1; }
+
+# Put Fin to sleep for the build. `launchctl stop` is NOT enough: the plist is
+# KeepAlive=true with a 15s throttle, so a stopped daemon respawns and JIT-reloads
+# the model right back into the memory this build is about to need. bootout removes
+# the job from the domain, which is the only thing that stays done.
+quiesce_agentd() {
+  agentd_loaded || { log "fin-agentd is not loaded; nothing to quiesce"; return 0; }
+  log "quiescing $AGENTD_LABEL for the build (it will be restored afterwards)"
+  launchctl bootout "$AGENTD_DOMAIN/$AGENTD_LABEL" 2>/dev/null || true
+  QUIESCED=1
+  # Only now can the unload stick. Give a turn already in flight a moment to die
+  # with its process rather than racing the unload.
+  sleep 2
+  command -v lms >/dev/null 2>&1 || return 0
+  lms unload --all >/dev/null 2>&1 || true
+  # AND WAIT FOR IT. `lms unload` returns before LM Studio has released the memory,
+  # so the resident-model check that follows was measuring the machine as it had
+  # been a second earlier and refusing a build that was already fine. Poll the same
+  # number the check uses, rather than sleeping a guess.
+  _w=0
+  while [ "$(resident_model_gb)" -ge "${FIN_MAX_RESIDENT_MODEL_GB:-2}" ]; do
+    if [ "$_w" -ge "${FIN_UNLOAD_WAIT_S:-60}" ]; then
+      log "models still resident ${_w}s after unload; letting the check below decide"
+      break
+    fi
+    [ "$_w" = 0 ] && log "waiting for LM Studio to release the model"
+    sleep 2; _w=$((_w + 2))
+  done
+}
+
+# Always paired with quiesce_agentd, on every exit path including Ctrl-C, because
+# the failure mode of forgetting is a Mac whose agent is simply gone with nothing
+# to say so. The model is deliberately NOT reloaded here: JIT brings it back on the
+# daemon's first request, at the context length its per-model default specifies,
+# which is the path we actually want exercised.
+restore_agentd() {
+  [ "$QUIESCED" = "1" ] || return 0
+  QUIESCED=0
+  if [ -f "$AGENTD_PLIST" ]; then
+    launchctl enable "$AGENTD_DOMAIN/$AGENTD_LABEL" 2>/dev/null || true
+    if launchctl bootstrap "$AGENTD_DOMAIN" "$AGENTD_PLIST" 2>/dev/null; then
+      log "restored $AGENTD_LABEL"
+      return 0
+    fi
+  fi
+  log "WARNING: could not restore $AGENTD_LABEL — Fin is DOWN on this machine."
+  log "  bring it back with: launchctl bootstrap $AGENTD_DOMAIN $AGENTD_PLIST"
+}
+
+release() { restore_agentd; rm -rf "$LOCK"; }
 
 waited=0
 while ! mkdir "$LOCK" 2>/dev/null; do
@@ -107,10 +176,27 @@ resident_model_gb() {
   command -v lms >/dev/null 2>&1 || { echo 0; return; }
   lms ps 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9.]+$/ && $(i+1) == "GB") s += $i } END { printf "%d", s + 0 }'
 }
+[ "$QUIESCE" = "1" ] && quiesce_agentd
+
+# Measured AFTER any quiesce, so the check judges the machine the build will
+# actually run on rather than the one it walked in on.
 _m=$(resident_model_gb)
 if [ "${_m:-0}" -ge "${FIN_MAX_RESIDENT_MODEL_GB:-2}" ]; then
   log "refusing to start: ${_m}GB of models are loaded in LM Studio and will compete for unified memory."
-  log "  unload them first (lms unload --all) and reload after the build, or set FIN_MAX_RESIDENT_MODEL_GB to override."
+  # TELL THE TRUTH ABOUT WHICH ADVICE WORKS HERE. On a Mac where Fin is resident,
+  # "unload them first" is advice that cannot be followed: the daemon JIT-reloads
+  # the model within seconds of the unload, so the guard stayed unsatisfiable and
+  # the only ways past it were an override or a hand-rolled bootout. Twice on
+  # 2026-09-16 the unload lost that race between one command and the next.
+  if agentd_loaded; then
+    log "  fin-agentd is running here, so \`lms unload --all\` will NOT stay done — its next"
+    log "  request reloads the model within seconds. Re-run with --quiesce-fin to stop the"
+    log "  daemon for the build and restore it afterwards:"
+    log "      $0 --quiesce-fin $*"
+  else
+    log "  unload them first (lms unload --all) and reload after the build."
+  fi
+  log "  or set FIN_MAX_RESIDENT_MODEL_GB to override."
   exit 75
 fi
 
