@@ -1561,6 +1561,9 @@ final class AgentRuntime: ObservableObject {
     private func runEndpointLoop() async -> String? {
         var client = makeClient()
         var consecutiveEmptyReplies = 0
+        // Set while a prefilled retry is in flight, so the answer the user sees is the
+        // whole sentence and not just its continuation.
+        var pendingPrefill: String?
 
         // A forced tool round from `forceToolCallIfNeeded` may already sit in the
         // transcript before this loop starts — `wireMessages` picks it up like any other
@@ -1607,13 +1610,17 @@ final class AgentRuntime: ObservableObject {
 
             // No tools requested — normally the model is answering and the turn is over,
             // but a blank non-tool "final answer" is never a valid answer. Give the model
-            // one nudge before giving up, so a single dropped-token blank reply doesn't
+            // one retry before giving up, so a single dropped-token blank reply doesn't
             // fail the whole run.
             if completion.toolCalls.isEmpty {
                 let trimmedText = completion.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard trimmedText.isEmpty else {
                     consecutiveEmptyReplies = 0
                     state = .idle
+                    if let prefill = pendingPrefill {
+                        pendingPrefill = nil
+                        return trimmedText.hasPrefix(prefill) ? trimmedText : prefill + " " + trimmedText
+                    }
                     return trimmedText
                 }
 
@@ -1624,14 +1631,24 @@ final class AgentRuntime: ObservableObject {
                     state = .failed(message)
                     return nil
                 }
-                transcript.append(AgentMessage(
-                    role: .system,
-                    text: "Your last reply was empty. Answer the user's question now: call a tool first if you need real data, then give a complete final answer."
-                ))
+                // THE RETRY IS A PREFILL, NOT A NAG — the same rule as the daemon engine's
+                // (`AgentTurnEngine`, and `ProfileCompaction` before it). An empty reply is
+                // a reasoning model that spent its whole output budget deliberating and
+                // never started writing; asking it to answer produces a second empty reply,
+                // measured live on 2026-09-16. Handing it the answer's first words removes
+                // the decision: it continues a line already begun.
+                pendingPrefill = AgentTurnEngine.answerPrefill
+                transcript.append(AgentMessage(role: .assistant, text: AgentTurnEngine.answerPrefill))
+                transcript.appendLocalNotice(
+                    "The model returned nothing — retrying with the answer's first words already written."
+                )
                 client = makeClient()
                 continue
             }
             consecutiveEmptyReplies = 0
+            // Tool calls instead: the model found its own way forward, and any prefill it
+            // was handed is not part of the answer it will eventually write.
+            pendingPrefill = nil
 
             for call in completion.toolCalls {
                 if Task.isCancelled { return nil }

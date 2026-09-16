@@ -282,8 +282,21 @@ public final class AgentTurnEngine {
     /// Rough budget headroom for the tool schemas and the model's own reply, which are
     /// part of the window but never part of the transcript we measure.
     private var contextBudget: Int {
-        max(512, configuration.contextWindowTokens - configuration.maxOutputTokens - 512)
+        max(512, effectiveContextWindowTokens - configuration.maxOutputTokens - 512)
     }
+
+    /// The window every budget is derived from: what the config claims, clamped to what
+    /// the server has actually told us it has. See `ContextWindowProbe` — a configured
+    /// window larger than the real one does not fail loudly, it produces empty
+    /// completions, which read as a model that will not answer.
+    private var effectiveContextWindowTokens: Int {
+        guard let observed = observedContextWindowTokens else { return configuration.contextWindowTokens }
+        return min(configuration.contextWindowTokens, observed)
+    }
+
+    /// Learned from a refusal, and kept for the life of the engine: the server is not
+    /// going to grow its window mid-process.
+    private var observedContextWindowTokens: Int?
 
     /// The model-call attempt/retry count `record` stamps on every event — see
     /// `AgentAuditEvent.attempt`/`retryCount`. Reset to a fresh 1/0 at the top of
@@ -555,6 +568,23 @@ public final class AgentTurnEngine {
                 if Task.isCancelled { return (nil, nil) }
                 let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 lastMessage = message
+
+                // THE SERVER JUST TOLD US ITS REAL WINDOW. Learn it, clamp every budget
+                // to it, and trim — so the retry that follows is one the server can
+                // actually answer, and so this process never again sizes a pane capture
+                // against a window four times larger than the one it has.
+                if case AgentEndpointError.http(_, let body) = error,
+                   let serverWindow = ContextWindowProbe.windowTokens(fromRefusal: body),
+                   ContextWindowProbe.isOverstated(
+                       configured: effectiveContextWindowTokens, serverWindow: serverWindow
+                   ) {
+                    let notice = ContextWindowProbe.mismatchMessage(
+                        configured: effectiveContextWindowTokens, serverWindow: serverWindow
+                    )
+                    observedContextWindowTokens = serverWindow
+                    record("notice", notice, isFailure: true)
+                    _ = transcript.compactIfNeeded(budget: contextBudget)
+                }
 
                 let retryable = AgentTurnLogic.isRetryableEndpointError(error) && attempt < Self.maxModelAttempts
                 record(
