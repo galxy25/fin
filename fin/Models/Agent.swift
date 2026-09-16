@@ -37,7 +37,7 @@ enum AgentProvider: String, Codable, CaseIterable, Identifiable {
         case .appleOnDevice:
             return "Runs entirely on this device using Apple Intelligence. Nothing is sent anywhere."
         case .openAICompatible:
-            return "Any OpenAI-compatible endpoint — LM Studio or Ollama on your own network, or a hosted provider."
+            return "Any endpoint speaking the standard chat-completions API — LM Studio or Ollama on your own network, or another server you run."
         }
     }
 }

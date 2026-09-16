@@ -79,7 +79,7 @@ struct AgentEditView: View {
                 if agent.provider == .openAICompatible {
                     MacSettingsGroup(
                         header: "Endpoint",
-                        footer: "Any OpenAI-compatible chat endpoint. For LM Studio, turn on "
+                        footer: "Any chat endpoint speaking the standard chat-completions API. For LM Studio, turn on "
                             + "\"Serve on Local Network\" and use your Tailscale address with port 1234."
                     ) {
                         endpointFields
@@ -294,7 +294,7 @@ struct AgentEditView: View {
         } header: {
             Text("Endpoint")
         } footer: {
-            Text("Any OpenAI-compatible chat endpoint. For LM Studio, turn on "
+            Text("Any chat endpoint speaking the standard chat-completions API. For LM Studio, turn on "
                 + "\"Serve on Local Network\" and use your Tailscale address with port 1234.")
         }
     }
