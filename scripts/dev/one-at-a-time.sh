@@ -87,6 +87,22 @@ trap 'release' EXIT INT TERM HUP
 # that was not running — the second time an hour after that exact hazard had been
 # written down, which is why this is a check and not a note. Unload before a
 # build; reload after. Safe whenever no daemon is running.
+#
+# WHEN A DAEMON *IS* RUNNING, `lms unload --all` does not stay done. LM Studio's
+# `justInTimeModelLoading` is on, so the resident site's next heartbeat reloads the
+# model within seconds — at its DEFAULT context length, which is not necessarily the
+# one the daemon's `contextWindowTokens` is configured for. That mismatch does not
+# fail loudly: budgets derived from the configured window come out too large for the
+# real one and turns return EMPTY completions ("the model stopped without producing
+# an answer"). It cost three live requests on 2026-09-16 before it was found.
+#
+# The default is per model, in
+#   ~/.lmstudio/.internal/user-concrete-model-default-config/<owner>/<model>.json
+#     {"preset":"","operation":{"fields":[]},
+#      "load":{"fields":[{"key":"llm.load.contextLength","value":32768}]}}
+# which a JIT load honors immediately, with LM Studio running. gemma-4-12b-qat is
+# set to 32768 there. Check with `lms ps` (CONTEXT column) after any unload/reload,
+# and see `ContextWindowProbe` for the in-daemon clamp that catches it if it slips.
 resident_model_gb() {
   command -v lms >/dev/null 2>&1 || { echo 0; return; }
   lms ps 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9.]+$/ && $(i+1) == "GB") s += $i } END { printf "%d", s + 0 }'
