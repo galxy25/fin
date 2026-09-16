@@ -170,7 +170,15 @@ final class DaemonDirectiveClient {
     /// 1.6.0: the sites contract (docs/SITES.md Phase 1c) — `config.site`, the
     /// independent heartbeat, claim/hold/ack, `site_id8`/`in_reply_to` on
     /// transcript lines. Additive; a 1.5.0 config still runs unchanged.
-    static let daemonVersion = "1.8.0"
+    /// 1.9.0: the terminal relay (`TerminalRelayClient`) — `terminal-open` site
+    /// command, `terminal_relay` capability, WebSocket PTY/tmux relay. Additive;
+    /// a pre-1.9.0 app simply never offers this daemon in the relay-site picker.
+    /// 1.9.3: moved the terminal relay's WebSocket handshake auth off HTTP
+    /// headers onto the query string (`?token=...&site=...`) — a real
+    /// URLSessionWebSocketTask bug on this OS/Foundation made a
+    /// header-carrying handshake connect and even send its first frame, then
+    /// fail the very next receive with ENOTCONN.
+    static let daemonVersion = "1.9.3"
     /// The ONE status that means "no such object" on a first-run read. S3 answers 404
     /// for a missing key when the signer may `s3:ListBucket` — the control plane's and
     /// the operator's signers hold it for exactly that reason (control-plane commit

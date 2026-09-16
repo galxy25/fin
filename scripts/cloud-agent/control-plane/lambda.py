@@ -4056,12 +4056,15 @@ def delete_site(event, site_id):
 # verbatim site -> app; "close" tears down the session row and, best-effort,
 # notifies whichever side is still connected.
 #
-# $connect authorizes with the same bearer/site-token scheme as the REST API
-# (a WebSocket $connect event carries `headers` just like an HTTP request);
-# every later frame on that connection carries no auth at all, so identity is
-# looked up by connectionId in TERMINAL_CONNECTIONS_TABLE instead of
-# re-checked. A site token only names its own sessions and never another
-# site's, exactly as sites are scoped everywhere else in this file.
+# $connect authorizes with the same bearer/site-token scheme as the REST API,
+# carried as `?token=...&site=...` query parameters rather than real headers
+# (see `_augment_websocket_query_auth` for why — a Swift client bug, not a
+# server-side choice; a caller presenting real `authorization`/`x-fin-site`
+# headers is authorized from those instead, untouched). Every later frame on
+# that connection carries no auth at all, so identity is looked up by
+# connectionId in TERMINAL_CONNECTIONS_TABLE instead of re-checked. A site
+# token only names its own sessions and never another site's, exactly as
+# sites are scoped everywhere else in this file.
 
 TERMINAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 
@@ -4111,10 +4114,35 @@ def _delete_terminal_session(session_id):
     TERMINAL_SESSIONS_TABLE.delete_item(Key={"sessionId": session_id})
 
 
+def _augment_websocket_query_auth(event):
+    """WebSocket `$connect` only. Both Swift clients (the app, the daemon) hit a
+    real client-side bug when the handshake `URLRequest` carries custom HTTP
+    headers via `setValue(_:forHTTPHeaderField:)`: `URLSessionWebSocketTask`
+    connects and even sends its first frame successfully, but the very next
+    `receive()` fails immediately with ENOTCONN — confirmed with a minimal
+    repro against this exact endpoint, and unrelated to anything server-side
+    (a plain Python client with the identical headers works fine). Both
+    clients authenticate this one handshake via query parameters instead, so
+    this folds `?token=...&site=...` into `event["headers"]` before
+    `_authorize` runs, leaving every other caller (any request that already
+    carries real headers) untouched."""
+    query = event.get("queryStringParameters") or {}
+    token = query.get("token")
+    if not token:
+        return
+    headers = dict(event.get("headers") or {})
+    headers.setdefault("authorization", "Bearer {}".format(token))
+    site_id = query.get("site")
+    if site_id:
+        headers.setdefault("x-fin-site", site_id)
+    event["headers"] = headers
+
+
 def ws_connect(event):
     """$connect — authorize exactly like the REST API and remember which
     connectionId belongs to which identity, since no later frame carries a
     bearer at all."""
+    _augment_websocket_query_auth(event)
     _authorize(event)
     connection_id = _ws_connection_id(event)
     role = "site" if event.get("_authKind") == "site" else "app"

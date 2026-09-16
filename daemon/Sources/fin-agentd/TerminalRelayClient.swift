@@ -56,14 +56,12 @@ public final class TerminalRelayClient {
     /// delivered the command may repeat it before the control plane sees this body connect.
     public func open(sessionId: String, tmuxSession: String) {
         guard sessions[sessionId] == nil else { return }
-        guard let url = Self.webSocketURL(from: relayURL) else {
+        guard let url = Self.webSocketURL(from: relayURL, siteID: siteID, siteToken: siteToken) else {
             audit("[relay] terminal-open \(sessionId): could not build a wss:// URL from \(relayURL)")
             return
         }
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(siteToken)", forHTTPHeaderField: "authorization")
-        request.setValue(siteID, forHTTPHeaderField: "X-Fin-Site")
-        let socket = urlSession.webSocketTask(with: request)
+        // Query-string auth, not headers — see `Self.webSocketURL`'s doc comment.
+        let socket = urlSession.webSocketTask(with: url)
 
         let command = "exec tmux new-session -A -s \(Self.shellQuote(tmuxSession))"
         let terminal = LocalTerminalSession(configuration: LocalSessionConfiguration(connectCommand: command))
@@ -88,18 +86,30 @@ public final class TerminalRelayClient {
 
     // MARK: - Socket loop
 
-    private func receiveLoop(sessionId: String) {
+    /// `startupAttemptsRemaining` covers the same brief post-`resume()`
+    /// handshake window `send(sessionId:frame:)` retries around: the very
+    /// first `receive()` can fail with "Socket is not connected" before the
+    /// WebSocket upgrade actually lands, and — unlike every later failure,
+    /// which is a real drop worth tearing the session down for — that one is
+    /// nothing having gone wrong yet. Only the FIRST receive gets this grace;
+    /// once a message has come through, a subsequent failure is real.
+    private func receiveLoop(sessionId: String, startupAttemptsRemaining: Int = 20) {
         guard let relay = sessions[sessionId] else { return }
         relay.socket.receive { [weak self] result in
             Task { @MainActor [weak self] in
                 guard let self, self.sessions[sessionId] != nil else { return }
                 switch result {
                 case .failure(let error):
-                    self.audit("[relay] \(sessionId): socket error — \(error.localizedDescription.prefix(160))")
-                    self.close(sessionId: sessionId, sendCloseFrame: false)
+                    guard startupAttemptsRemaining > 1 else {
+                        self.audit("[relay] \(sessionId): socket error — \(error.localizedDescription.prefix(160))")
+                        self.close(sessionId: sessionId, sendCloseFrame: false)
+                        return
+                    }
+                    try? await Task.sleep(for: .milliseconds(300))
+                    self.receiveLoop(sessionId: sessionId, startupAttemptsRemaining: startupAttemptsRemaining - 1)
                 case .success(let message):
                     self.handle(sessionId: sessionId, message: message)
-                    self.receiveLoop(sessionId: sessionId)
+                    self.receiveLoop(sessionId: sessionId, startupAttemptsRemaining: 1)
                 }
             }
         }
@@ -141,12 +151,26 @@ public final class TerminalRelayClient {
         }
     }
 
-    private func send(sessionId: String, frame: [String: Any]) {
+    /// `send(_:completionHandler:)` can fail with "Socket is not connected"
+    /// when called in the brief window right after `resume()`, before the
+    /// WebSocket handshake actually finishes — `open()` sends the first
+    /// `attach` frame synchronously in that window. A few short retries ride
+    /// out that window without the caller (or `open()`) needing to know
+    /// whether the handshake has landed yet; a failure past the last retry is
+    /// a real problem and still gets audited.
+    private func send(sessionId: String, frame: [String: Any], attemptsRemaining: Int = 20) {
         guard let relay = sessions[sessionId], let data = try? JSONSerialization.data(withJSONObject: frame) else { return }
         relay.socket.send(.data(data)) { [weak self] error in
             guard let error else { return }
+            guard attemptsRemaining > 1 else {
+                Task { @MainActor [weak self] in
+                    self?.audit("[relay] \(sessionId): send failed — \(error.localizedDescription.prefix(160))")
+                }
+                return
+            }
             Task { @MainActor [weak self] in
-                self?.audit("[relay] \(sessionId): send failed — \(error.localizedDescription.prefix(160))")
+                try? await Task.sleep(for: .milliseconds(300))
+                self?.send(sessionId: sessionId, frame: frame, attemptsRemaining: attemptsRemaining - 1)
             }
         }
     }
@@ -164,7 +188,15 @@ public final class TerminalRelayClient {
 
     // MARK: - Helpers
 
-    private static func webSocketURL(from httpish: String) -> URL? {
+    /// Auth rides the query string (`?token=...&site=...`), not headers set on a
+    /// `URLRequest`. `URLSessionWebSocketTask` has a real bug on this OS/Foundation:
+    /// a handshake `URLRequest` carrying custom HTTP headers connects and even sends
+    /// its first frame successfully, but the very next `receive()` fails immediately
+    /// with ENOTCONN — reproduced with a minimal script against this exact endpoint,
+    /// with no custom headers at all as the one thing that made it go away. The
+    /// control plane's `_augment_websocket_query_auth` folds these back into headers
+    /// server-side, so nothing else about the wire protocol changes.
+    private static func webSocketURL(from httpish: String, siteID: String, siteToken: String) -> URL? {
         guard var components = URLComponents(string: httpish.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
         switch components.scheme {
         case "https": components.scheme = "wss"
@@ -172,6 +204,10 @@ public final class TerminalRelayClient {
         case "wss", "ws": break
         default: return nil
         }
+        var query = components.queryItems ?? []
+        query.append(URLQueryItem(name: "token", value: siteToken))
+        query.append(URLQueryItem(name: "site", value: siteID))
+        components.queryItems = query
         return components.url
     }
 

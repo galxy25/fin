@@ -525,15 +525,27 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func openRelaySocket(server: Server, siteID: String, sessionId: String, generation myGeneration: Int) async {
         let wsURLString = CloudControlPlaneConfig.webSocketURL
-        guard !wsURLString.isEmpty, let wsURL = URL(string: wsURLString) else {
+        guard !wsURLString.isEmpty, var components = URLComponents(string: wsURLString) else {
             if myGeneration == generation {
                 lastError = "No terminal relay endpoint is configured."
             }
             return
         }
-        var request = URLRequest(url: wsURL)
-        request.setValue("Bearer \(CloudControlPlaneConfig.token)", forHTTPHeaderField: "authorization")
-        let socket = URLSession.shared.webSocketTask(with: request)
+        // Auth rides the query string, not a custom header on the handshake request
+        // — see the daemon's `TerminalRelayClient.webSocketURL(from:siteID:siteToken:)`
+        // for why: a real `URLSessionWebSocketTask` bug on this OS/Foundation makes a
+        // header-carrying handshake connect and even send its first frame, then fail
+        // the very next `receive()` with ENOTCONN.
+        var query = components.queryItems ?? []
+        query.append(URLQueryItem(name: "token", value: CloudControlPlaneConfig.token))
+        components.queryItems = query
+        guard let wsURL = components.url else {
+            if myGeneration == generation {
+                lastError = "Could not build the terminal relay URL."
+            }
+            return
+        }
+        let socket = URLSession.shared.webSocketTask(with: wsURL)
         socket.resume()
 
         guard myGeneration == generation else {

@@ -20,10 +20,23 @@ final class Server {
     var port: Int = 22
     var username: String = ""
     var keyID: UUID?
+    /// Backing storage for `transport`, kept as a plain optional String rather
+    /// than the enum itself: a CloudKit-synced row created before this field
+    /// existed has no value for it at all, and SwiftData's synthesized
+    /// accessor for a non-optional Codable enum force-casts that absence,
+    /// crashing every time the row is read (`swift_dynamicCastFailure` in
+    /// `ServerListView.row(for:)`, 2026-09-16 TestFlight crash). An optional
+    /// String column has no such accessor — it is simply nil — so decoding it
+    /// ourselves in `transport`'s getter can fall back to `.direct` instead of
+    /// trapping.
+    var transportRaw: String?
     /// Only meaningful for `.direct`; a `.siteRelay` server has no address of
-    /// its own — see `relaySiteId`. Defaulted so existing stored rows (all
-    /// predating this field) load as `.direct`, matching their real transport.
-    var transport: ServerTransport = ServerTransport.direct
+    /// its own — see `relaySiteId`. Absent/unrecognized `transportRaw` reads as
+    /// `.direct`, matching every row that predates this field.
+    var transport: ServerTransport {
+        get { transportRaw.flatMap(ServerTransport.init(rawValue:)) ?? .direct }
+        set { transportRaw = newValue.rawValue }
+    }
     /// The Fin site (`FinSite.siteId`) to relay through, when `transport ==
     /// .siteRelay`. nil for `.direct` and for a `.siteRelay` row that hasn't
     /// had a site picked yet.
