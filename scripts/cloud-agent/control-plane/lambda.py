@@ -4112,9 +4112,88 @@ def _word_mentioned(word, text):
     return re.search(r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])", text, re.IGNORECASE) is not None
 
 
+# Words that make a message BE about a machine, rather than merely containing a
+# word that happens to appear in one's name. "How is work going?" is not a
+# request aimed at the site called "Work laptop"; "look at my work computer" is.
+MACHINE_WORDS = (
+    "computer", "machine", "mac", "laptop", "imac", "macbook", "desktop",
+    "box", "rig", "host", "workstation", "site",
+)
+
+# Name words that identify no machine on their own. A possessive is stripped
+# before this is consulted, so "Levi's iMac" contributes only "imac".
+_SITE_NAME_STOPWORDS = frozenset({
+    "the", "a", "an", "my", "mine", "levi", "levis", "and", "of", "on", "at",
+    "local", "remote", "new", "old", "test", "main",
+})
+
+# Name words that are ordinary English before they are a machine's name. They
+# identify a site only in a message that is about a machine at all: "how is work
+# going" is not a question for the site called "Work laptop", and "look at my
+# work computer" is. Everything NOT in here (and not a stopword) counts as
+# distinctive -- "neo" is three letters and identifies exactly one machine.
+_GENERIC_NAME_WORDS = frozenset({
+    "work", "home", "office", "personal", "dev", "build", "studio", "server",
+    "cloud", "air", "pro", "mini", "max", "one", "two", "big", "little", "fast",
+})
+
+
+def _site_name_words(display_name):
+    """The words of a site's display name that could identify it in speech.
+
+    "Levi's iMac" -> ("imac",); "Work laptop" -> ("work", "laptop");
+    "Levi's MacBook Neo" -> ("macbook", "neo"). The possessive is dropped with
+    the stopword, and the curly apostrophe the app actually writes is folded to
+    the straight one first -- "Levi's Laptop" and "Levi's Laptop" must tokenize
+    the same."""
+    name = (display_name or "").replace("\u2019", "'")
+    words = re.findall(r"[A-Za-z0-9]+", name.lower())
+    return tuple(w for w in words if w not in _SITE_NAME_STOPWORDS and len(w) > 1)
+
+
+def _names_a_machine(text):
+    """Whether the message is asking about a machine at all."""
+    return any(_word_mentioned(w, text or "") for w in MACHINE_WORDS)
+
+
+def _site_named_in(text, display_name):
+    """Whether `text` names THIS site.
+
+    Live failure this exists for (2026-09-16, thread `m-b3bf22ae`): "take a look
+    at my work computer and see what's going on" routed to the iMac -- the
+    primary -- and the iMac answered for itself, while a live resident site
+    called "Work laptop" sat there unasked. Routing matched only tmux session
+    names and task vocabulary; nothing ever looked at what the machine is
+    CALLED, which is the only name a person uses out loud.
+
+    A site's distinctive words ("neo", "imac", "macbook") identify it alone. Its
+    generic words ("work", "laptop") identify it only in a message that is about
+    a machine at all -- the same "vocabulary is evidence, not a whitelist"
+    discipline the session router already states, applied to hardware."""
+    words = _site_name_words(display_name)
+    if not words:
+        return False
+    machine_context = _names_a_machine(text)
+    for word in words:
+        if not _word_mentioned(word, text or ""):
+            continue
+        # A word that is itself a machine word ("laptop") or an ordinary English
+        # one ("work") needs the message to be about a machine; a distinctive
+        # one ("neo") identifies its machine on its own.
+        if word in MACHINE_WORDS or word in _GENERIC_NAME_WORDS:
+            if machine_context:
+                return True
+        else:
+            return True
+    return False
+
+
 def _pin_for(text, context, live_sites):
     """§3.4, as a pure function. Returns (pinSiteId, routedBy, candidates):
     - `siteHint` naming a live site pins to it ("hint");
+    - otherwise a message that NAMES a live site's machine pins to it
+      ("machine") -- "look at my work computer" reaches the site called "Work
+      laptop", not whichever site happens to be primary;
     - otherwise the message text plus the sender's active session names are
       matched against every live site's tmux sessions and task vocabulary —
       exactly one site → pin ("context"); several → no pin and "clarify" with
@@ -4130,6 +4209,18 @@ def _pin_for(text, context, live_sites):
     names = context.get("activeSessionNames")
     if isinstance(names, list):
         haystack += "\n" + " ".join(str(n) for n in names if isinstance(n, str))
+
+    # THE MACHINE THE PERSON NAMED WINS, ahead of session vocabulary. Naming a
+    # machine is the most explicit routing a person can do short of a siteHint,
+    # and it must not be outvoted by a project word that happens to appear on
+    # another site. Deliberately matched against the message ALONE, never the
+    # sender's active session names: those describe where the sender is sitting,
+    # which is exactly what "my work computer" is contrasting itself with.
+    by_name = [s for s in live_sites if _site_named_in(text or "", s.get("displayName"))]
+    if len(by_name) == 1:
+        return by_name[0]["siteId"], "machine", []
+    if len(by_name) > 1:
+        return None, "clarify", [s.get("displayName") for s in by_name]
 
     matched = []
     for site in live_sites:

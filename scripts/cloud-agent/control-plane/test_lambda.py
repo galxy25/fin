@@ -1186,6 +1186,88 @@ class PinForTests(unittest.TestCase):
         self.assertEqual(sorted(candidates), sorted([self.imac["displayName"], self.cloud["displayName"]]))
 
 
+class MachineNameRoutingTests(unittest.TestCase):
+    """Routing by the name a person says out loud for a MACHINE.
+
+    Live failure (2026-09-16, thread `m-b3bf22ae`): "take a look at my work
+    computer and see what's going on" routed to the iMac -- the primary -- which
+    answered for itself, while a live resident site called "Work laptop" sat
+    unasked. Nothing in routing had ever looked at a site's display name."""
+
+    def _site(self, sid, name, sessions=None):
+        return {"siteId": sid + "-0000-4000-8000-000000000000", "siteId8": sid[:8],
+                "displayName": name,
+                "capabilities": {"tmux_sessions": sessions or []}}
+
+    def setUp(self):
+        # The real roster on 2026-09-16.
+        self.imac = self._site("imac", "Levi's iMac", [
+            {"session": "main", "tasks": ["fin project work"]}])
+        self.work = self._site("work", "Work laptop")
+        self.neo = self._site("neo0", "Levi\u2019s MacBook Neo")
+        self.all = [self.imac, self.work, self.neo]
+
+    def test_the_failing_message_now_reaches_the_work_laptop(self):
+        pin, by, _ = lam._pin_for(
+            "No, I want you to take a look at my work computer and see what are the active threads going",
+            {}, self.all)
+        self.assertEqual((pin, by), (self.work["siteId"], "machine"))
+
+    def test_a_distinctive_name_routes_without_any_machine_word(self):
+        pin, by, _ = lam._pin_for("what is neo up to", {}, self.all)
+        self.assertEqual((pin, by), (self.neo["siteId"], "machine"))
+
+    def test_the_imac_is_reachable_by_its_own_name(self):
+        pin, by, _ = lam._pin_for("what's running on the imac", {}, self.all)
+        self.assertEqual((pin, by), (self.imac["siteId"], "machine"))
+
+    def test_a_generic_name_word_alone_is_not_a_machine_reference(self):
+        # "how is work going" must not be routed at the site called "Work laptop".
+        pin, by, _ = lam._pin_for("how is work going today", {}, self.all)
+        self.assertEqual((pin, by), (None, None))
+
+    def test_the_possessive_in_a_display_name_never_routes(self):
+        # Every site of Levi's carries "Levi's"; it identifies none of them.
+        pin, by, _ = lam._pin_for("is levi around", {}, self.all)
+        self.assertEqual((pin, by), (None, None))
+
+    def test_a_curly_apostrophe_tokenizes_like_a_straight_one(self):
+        self.assertEqual(lam._site_name_words("Levi\u2019s MacBook Neo"),
+                         lam._site_name_words("Levi's MacBook Neo"))
+
+    def test_two_machines_named_at_once_ask_rather_than_guess(self):
+        pin, by, candidates = lam._pin_for("compare the imac and neo", {}, self.all)
+        self.assertIsNone(pin)
+        self.assertEqual(by, "clarify")
+        self.assertEqual(sorted(candidates), sorted([self.imac["displayName"], self.neo["displayName"]]))
+
+    def test_a_named_machine_beats_a_session_word_on_another_site(self):
+        # "fin" is the iMac's task vocabulary; the message still names the laptop.
+        pin, by, _ = lam._pin_for("on my work computer, how is the fin project going", {}, self.all)
+        self.assertEqual((pin, by), (self.work["siteId"], "machine"))
+
+    def test_the_senders_own_session_names_never_route_a_machine_question(self):
+        # The sender sits on the iMac ("main"); "my work computer" is contrasting
+        # itself with where they are sitting, so that context must not win.
+        pin, by, _ = lam._pin_for("look at my work computer",
+                                  {"activeSessionNames": ["main"]}, self.all)
+        self.assertEqual((pin, by), (self.work["siteId"], "machine"))
+
+    def test_a_site_hint_still_wins_over_a_name(self):
+        pin, by, _ = lam._pin_for("look at my work computer",
+                                  {"siteHint": self.neo["siteId8"]}, self.all)
+        self.assertEqual((pin, by), (self.neo["siteId"], "hint"))
+
+    def test_session_vocabulary_still_routes_when_no_machine_is_named(self):
+        pin, by, _ = lam._pin_for("how is the fin project work going", {}, self.all)
+        self.assertEqual((pin, by), (self.imac["siteId"], "context"))
+
+    def test_a_dead_machine_is_not_a_candidate(self):
+        # _pin_for only ever sees live sites; naming a dead one routes nowhere.
+        pin, by, _ = lam._pin_for("look at my work computer", {}, [self.imac, self.neo])
+        self.assertEqual((pin, by), (None, None))
+
+
 class EligibilityTests(unittest.TestCase):
     """§6.2 as a pure function. `now` is fixed; leases are relative to it."""
 
