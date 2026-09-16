@@ -325,6 +325,10 @@ public final class AgentTurnEngine {
     /// 2026-09-12, that detour ate the turn. Consulted wherever the roster is built.
     public var hideGoalTools = false
 
+    /// Which sessions this turn has already captured, so a pointless re-read is served
+    /// from the first one instead of replacing it. See `SessionReadLedger`.
+    private var sessionReads = SessionReadLedger()
+
     /// Replace the system prompt between turns (no-op while a turn runs: the model
     /// must not see the prompt change under it mid-turn).
     public func refreshSystemPrompt(_ systemPrompt: String) {
@@ -346,6 +350,8 @@ public final class AgentTurnEngine {
         // attempt/retry count — see `currentAttempt`'s doc comment.
         currentAttempt = 1
         currentRetryCount = 0
+        // A fresh turn has read nothing yet — see `SessionReadLedger`.
+        sessionReads.reset()
 
         transcript.append(AgentMessage(role: .user, text: trimmed))
         record("userMessage", displayText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? trimmed)
@@ -792,6 +798,23 @@ public final class AgentTurnEngine {
             }
             name = validated
         }
+        // ALREADY READ THIS TURN? Serve the first capture rather than taking a fresh one.
+        // This is deliberately ahead of the runner, the byte budget, and the audit's
+        // `toolCall` line: no tmux round trip, no second copy of the same screen in the
+        // transcript, and an audit that shows a repeat for what it is. See
+        // `SessionReadLedger` for the live failure — a duplicate read that arrived after
+        // the human cleared the pane is what the model ended up answering from.
+        if let cached = sessionReads.cached(session: name) {
+            let message = SessionReadLedger.frameRepeat(session: name, cached: cached)
+            record(
+                "toolCall",
+                name.map { "read_session: \($0) (already read this turn — served from the first read)" }
+                    ?? "read_session: list sessions (already listed this turn)",
+                toolName: toolName, toolArguments: rawArguments, target: name
+            )
+            return message
+        }
+
         // WHAT THIS ANSWER MAY COST THE CONVERSATION, derived from the window rather than
         // from a constant. `TmuxSessionRead.maxResponseBytes` bounds the exec channel;
         // this bounds the transcript, and without it one capture evicted the entire
@@ -823,9 +846,11 @@ public final class AgentTurnEngine {
             return message
         case .text(let output, let resolutionNote):
             guard let name else {
-                return TmuxSessionRead.frameListing(
+                let listing = TmuxSessionRead.frameListing(
                     TmuxSessionRead.fit(output, intoBytes: byteBudget).text
                 )
+                sessionReads.recordRead(session: nil, result: listing)
+                return listing
             }
             let fitted = TmuxSessionRead.fit(
                 TmuxSessionRead.trim(output, toLastLines: lines), intoBytes: byteBudget
@@ -840,12 +865,14 @@ public final class AgentTurnEngine {
             // folded into `output` where a hostile pane could forge an identical line.
             let combinedNote = [resolutionNote, truncationNote].compactMap { $0 }
                 .joined(separator: " ")
-            return TmuxSessionRead.frameCapture(
+            let capture = TmuxSessionRead.frameCapture(
                 session: name,
                 lines: lines,
                 output: fitted.text,
                 note: combinedNote.isEmpty ? nil : combinedNote
             )
+            sessionReads.recordRead(session: name, result: capture)
+            return capture
         }
     }
 
@@ -903,6 +930,9 @@ public final class AgentTurnEngine {
             record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
             return message
         }
+        // Keystrokes are about to land in a real pane: every capture this turn already
+        // holds is now potentially stale, so none of them may be served again.
+        sessionReads.recordSend()
         switch await onSendSession(target, text, awaitSeconds) {
         case .failed(let why):
             let message = "Error: send_session could not send to \"\(target)\": \(why)"
@@ -1196,9 +1226,15 @@ public final class AgentTurnEngine {
     private func executeReadTerminal(lines requested: Int?, rawArguments: String) async -> String {
         let lines = min(max(requested ?? configuration.terminalContextLines, 1), 400)
         let snapshot = session.eventLog.recentText(maxLines: lines)
+        // `frameTerminalResult` strips Fin's own handshake (`TerminalNoiseFilter`); the
+        // audit says so, so a "why did it answer with FIN_ENV lines" question is one grep.
+        let filtered = TerminalNoiseFilter.strip(snapshot)
+        let suffix = filtered.removedAll
+            ? " — nothing but Fin's own handshake; reported as an idle shell"
+            : ""
         record(
             "toolCall",
-            "read_terminal (\(lines) lines)",
+            "read_terminal (\(lines) lines)\(suffix)",
             toolName: AgentToolSpec.readTerminal.name,
             toolArguments: rawArguments
         )

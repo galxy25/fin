@@ -84,11 +84,31 @@ public enum AgentTurnLogic {
     /// continue the pattern of shell-like text with an invented value. Shared by both the
     /// deterministic forced path and the model-initiated path.
     static func frameTerminalResult(_ snapshot: String) -> String {
-        guard !snapshot.isEmpty else {
-            return "TERMINAL OUTPUT: the terminal is empty. There is nothing to report -- say so plainly. Do not invent any command, output, or value."
+        // Fin's own connect-time handshake is not terminal content — see
+        // `TerminalNoiseFilter`. It is stripped before the model sees anything, and a
+        // capture made of nothing else is framed as an IDLE SHELL, never as authoritative
+        // output to quote: the live 2026-09-16 failure was a reply to the owner's phone
+        // consisting entirely of `FIN_ENV_580869=…` lines, quoted exactly as this framing
+        // had just told the model to quote them.
+        let filtered = TerminalNoiseFilter.strip(snapshot)
+        if filtered.removedAll || filtered.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return idleTerminalResult
         }
-        return "TERMINAL OUTPUT (authoritative -- use this exact content when you answer; do not invent, guess, or substitute any other value, word, or number):\n\n\(snapshot)\n\nEND OF TERMINAL OUTPUT. Quote values above verbatim in your next reply."
+        return "TERMINAL OUTPUT (authoritative -- use this exact content when you answer; do not invent, guess, or substitute any other value, word, or number):\n\n\(filtered.text)\n\nEND OF TERMINAL OUTPUT. Quote values above verbatim in your next reply."
     }
+
+    /// What an empty — or handshake-only — control shell reports. It says the one true
+    /// thing (nothing is happening here) and names the tool that CAN answer a question
+    /// about the machine, because "what is running on my computer" is a read_session
+    /// question and read_terminal can never answer it.
+    static let idleTerminalResult = "TERMINAL OUTPUT: your own control shell is idle -- "
+        + "it shows no commands and no output, only (at most) Fin's own startup handshake, "
+        + "which is not user activity and must never be quoted or reported as something the "
+        + "machine is doing. There is nothing here to report -- say so plainly, and do not "
+        + "invent any command, output, or value. If the question is about what is running on "
+        + "this machine, what another session or agent is doing, or how someone's work is "
+        + "going, this is the WRONG tool: call read_session (with no arguments to list the "
+        + "panes, then with a name to read one)."
 
     /// Frames delivery plus whatever the terminal printed in response, so the model can
     /// answer from the real response instead of a follow-up read_terminal racing the

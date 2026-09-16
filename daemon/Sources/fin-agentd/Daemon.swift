@@ -778,6 +778,18 @@ final class Daemon {
         + "tick: never answer with a decision JSON — answer the person in plain language. If they ask "
         + "you (Fin) something you can answer from what you know, answer it directly rather than "
         + "relaying it anywhere."
+        + "\n\nWhen the question is what is HAPPENING — on the machine, in a session, for another "
+        + "agent — answer with the WORK, not the window. Read every pane the question covers "
+        + "(read_session with no arguments lists them; the pane list above names them), read each "
+        + "one ONCE, and then report, per pane: its target and folder, and what its screen "
+        + "actually shows it doing or having just finished — the task, the files, the result. A "
+        + "screen holding only a banner, a cleared prompt, or your own question echoed back means "
+        + "that session is IDLE: say it is idle, and say what it last finished if the screen "
+        + "shows it. Never report that a session \"is active\", \"is running\", or \"was just asked "
+        + "about\" something as if that were an answer — those describe the window, and the "
+        + "person asked about the work. Cover every pane you were asked about, including the ones "
+        + "with nothing going on, and do not end a status answer by asking what they would like "
+        + "you to do next: give them the status."
 
     /// After a user turn: one follow-up goal per pane it sent to, so the next mission
     /// tick reads the pane and notifies the user with the outcome.

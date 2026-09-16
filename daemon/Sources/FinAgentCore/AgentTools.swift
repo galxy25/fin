@@ -23,12 +23,16 @@ public struct AgentToolSpec {
 
     static let readTerminal = AgentToolSpec(
         name: "read_terminal",
-        description: "You MUST call this before answering anything about terminal output, "
-            + "state, or history — e.g. \"what did that print?\", \"what was just echoed?\", "
-            + "\"is it done yet?\". Never answer from memory or a guess; quote exact values "
-            + "(markers, numbers, filenames) verbatim from the result. Returns recent activity, "
-            + "oldest first, timestamped: \"[HH:mm:ss] > text\" is typed input, "
-            + "\"[HH:mm:ss] < text\" is terminal output.",
+        description: "Read YOUR OWN control shell — the private scratch pane you type into "
+            + "with send_input, which holds only what YOU ran. It is NOT the owner's terminal "
+            + "and NOT where their work happens. Call it before answering about something you "
+            + "yourself ran — \"what did that print?\", \"is my command done yet?\" — and quote "
+            + "exact values (markers, numbers, filenames) verbatim rather than guessing. A "
+            + "question about the MACHINE — what is running, what a session or another agent is "
+            + "doing, how someone's work is going, \"what\'s going on on my computer\" — is "
+            + "read_session\'s, never this one. Returns recent activity, oldest first, "
+            + "timestamped: \"[HH:mm:ss] > text\" is typed input, \"[HH:mm:ss] < text\" is "
+            + "terminal output.",
         parameters: [
             "type": "object",
             "properties": [
