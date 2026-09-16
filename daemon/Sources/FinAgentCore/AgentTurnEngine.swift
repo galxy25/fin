@@ -329,6 +329,26 @@ public final class AgentTurnEngine {
     /// from the first one instead of replacing it. See `SessionReadLedger`.
     private var sessionReads = SessionReadLedger()
 
+    /// The first words of an answer, handed to a model that returned nothing so it
+    /// continues rather than deliberates. Deliberately content-free: it must fit whatever
+    /// the turn turned out to be — a status report, a result, a refusal — and commit the
+    /// model to none of them.
+    static let answerPrefill = "Here's what I found:"
+
+    /// Set while a prefilled retry is in flight, so the answer the user finally sees is
+    /// the whole sentence and not just its continuation.
+    private var pendingPrefill: String?
+
+    /// The reply joined back onto the prefill it was continuing — the same assembly
+    /// `ProfileCompaction.assembled(from:)` does, including the guard against a model
+    /// that ignored the prefill and restated it.
+    private func assembledAnswer(_ reply: String) -> String {
+        guard let prefill = pendingPrefill else { return reply }
+        pendingPrefill = nil
+        if reply.hasPrefix(prefill) { return reply }
+        return prefill + " " + reply
+    }
+
     /// Replace the system prompt between turns (no-op while a turn runs: the model
     /// must not see the prompt change under it mid-turn).
     public func refreshSystemPrompt(_ systemPrompt: String) {
@@ -352,6 +372,7 @@ public final class AgentTurnEngine {
         currentRetryCount = 0
         // A fresh turn has read nothing yet — see `SessionReadLedger`.
         sessionReads.reset()
+        pendingPrefill = nil
 
         transcript.append(AgentMessage(role: .user, text: trimmed))
         record("userMessage", displayText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? trimmed)
@@ -450,7 +471,7 @@ public final class AgentTurnEngine {
             if completion.toolCalls.isEmpty {
                 let trimmedText = completion.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard trimmedText.isEmpty else {
-                    return .answered(trimmedText)
+                    return .answered(assembledAnswer(trimmedText))
                 }
 
                 consecutiveEmptyReplies += 1
@@ -460,13 +481,29 @@ public final class AgentTurnEngine {
                     record("error", message, isFailure: true)
                     return .failed(message)
                 }
-                transcript.append(AgentMessage(
-                    role: .system,
-                    text: "Your last reply was empty. Answer the user's question now: call a tool first if you need real data, then give a complete final answer."
-                ))
+                // AN EMPTY REPLY IS NOT A REFUSAL — it is a reasoning model that spent its
+                // whole output budget deliberating and never reached the point of writing
+                // the answer down. `7a9b955` measured this on gemma-4-12b for the profile
+                // rewrite (2045 of 2048 tokens on reasoning, 0 characters of content) and
+                // established the one lever that moves it: PREFILL the assistant turn, so
+                // the model is no longer deciding whether to begin — it is continuing a
+                // line already begun. A bigger budget does not help, and neither does
+                // asking: the live 2026-09-16 retest was told "your last reply was empty,
+                // answer the user's question now" and returned empty a second time, which
+                // is what took the turn down. So the retry is a prefill, not a nag.
+                pendingPrefill = Self.answerPrefill
+                transcript.append(AgentMessage(role: .assistant, text: Self.answerPrefill))
+                record(
+                    "notice",
+                    "The model returned nothing (its whole output budget went to reasoning) — "
+                        + "retrying with the answer's first words already written."
+                )
                 continue
             }
             consecutiveEmptyReplies = 0
+            // Tool calls instead: the model found its own way forward and any prefill it
+            // was handed is not part of the answer it will eventually write.
+            pendingPrefill = nil
 
             for call in completion.toolCalls {
                 if Task.isCancelled { return .failed("Cancelled.") }

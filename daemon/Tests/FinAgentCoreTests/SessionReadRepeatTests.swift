@@ -205,3 +205,38 @@ final class SessionReadRepeatTests: XCTestCase {
         XCTAssertTrue(read?.text.contains("Fin's own handshake") ?? false, read?.text ?? "no event")
     }
 }
+
+/// An empty completion is a reasoning model that never started writing, not a refusal.
+/// `7a9b955` measured the cure on gemma-4-12b (2045 of 2048 tokens spent on reasoning,
+/// 0 characters of content) and the 2026-09-16 retest proved the old cure — a system
+/// message asking it to answer — does not work: it returned empty a second time and the
+/// turn failed. The retry is a prefill.
+@MainActor
+final class EmptyReplyPrefillTests: XCTestCase {
+
+    /// A stub endpoint is out of reach here, so these assert on the pure pieces the
+    /// engine composes: the prefill is content-free, and assembly never doubles it.
+    func testThePrefillCommitsToNothingAboutTheAnswer() {
+        let prefill = AgentTurnEngine.answerPrefill
+        XCTAssertFalse(prefill.isEmpty)
+        // It must fit a status report, a result, or bad news alike.
+        for word in ["success", "done", "complete", "sorry", "error"] {
+            XCTAssertFalse(
+                prefill.localizedCaseInsensitiveContains(word),
+                "\(prefill) presumes the answer"
+            )
+        }
+    }
+
+    func testTheProfileAssemblyRuleTheEngineMirrorsNeverDoublesThePrefill() {
+        // The engine's assembledAnswer is private; this pins the shared rule it copies.
+        XCTAssertEqual(
+            ProfileCompaction.assembled(from: "**Current work**\n- a thing"),
+            "**Current work**\n- a thing",
+            "a model that restated the prefill must not get it twice"
+        )
+        XCTAssertTrue(
+            ProfileCompaction.assembled(from: "a thing").hasPrefix(ProfileCompaction.assistantPrefill)
+        )
+    }
+}
