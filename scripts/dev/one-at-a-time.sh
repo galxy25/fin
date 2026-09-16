@@ -13,31 +13,42 @@
 #      so two of these never run at once — across sessions and worktrees.
 #   2. Waits until no OTHER xcodebuild / swift-build / swift-test process is running
 #      (another session's build counts; we don't kill it, we wait).
-#   3. With --quiesce-fin, stops the resident fin-agentd and unloads its model,
-#      restoring both afterwards however the build ends.
+#   3. Stops the resident fin-agentd and unloads its model, restoring both
+#      afterwards however the build ends (disable with --no-quiesce-fin).
 #   4. Refuses if LM Studio still holds models (see resident_model_gb).
 #   5. Waits until free memory is at least $FIN_MIN_FREE_GB (default 8) so the
 #      build never competes with a training run for the last gigabytes.
 # Each wait is logged to stderr once per minute. Ctrl-C releases the lock.
 #
-#   --quiesce-fin   Put the resident fin-agentd to sleep for the duration of the
-#                   build (bootout, unload its model) and restore it afterwards,
-#                   however the build ends. Needed on a Mac where Fin lives,
-#                   because there `lms unload --all` does not stay done — see the
-#                   JIT note above resident_model_gb. Equivalent: FIN_QUIESCE_AGENTD=1.
+# BY DEFAULT this puts the resident fin-agentd to sleep for the duration of the build
+# (bootout + unload its model) and restores it afterwards, however the build ends —
+# because on a Mac where Fin lives `lms unload --all` does not stay done (see the JIT
+# note above resident_model_gb) and the guard was otherwise unsatisfiable. Fin is
+# offline for the length of the build and comes back on its own.
+#
+#   --no-quiesce-fin   Leave the resident agent running. The guard will then refuse
+#                      while its model holds memory, which is the pre-2026-09-16
+#                      behavior. Equivalent: FIN_QUIESCE_AGENTD=0.
 set -eu
 
 LOCK="${FIN_BUILD_LOCK:-$HOME/.fin-build.lock}"
 MIN_FREE_GB="${FIN_MIN_FREE_GB:-8}"
 MAX_WAIT_S="${FIN_MAX_WAIT_S:-7200}"
-QUIESCE="${FIN_QUIESCE_AGENTD:-0}"
+# ON BY DEFAULT. Levi, 2026-09-16: "the agent going offline would only affect me, and
+# only during new builds of fin that I would be working on — development iteration
+# speeds matter far more than uptime of my agent brain." So the build no longer asks
+# permission to borrow the machine back; it takes it and gives it straight back.
+# FIN_QUIESCE_AGENTD=0 (or --no-quiesce-fin) opts out for a build that must not
+# interrupt a resident agent.
+QUIESCE="${FIN_QUIESCE_AGENTD:-1}"
 AGENTD_LABEL="${FIN_AGENTD_LABEL:-dev.levischoen.fin.agentd}"
 AGENTD_DOMAIN="gui/$(id -u)"
 AGENTD_PLIST="${FIN_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}/$AGENTD_LABEL.plist"
 
 if [ "${1:-}" = "--quiesce-fin" ]; then QUIESCE=1; shift; fi
+if [ "${1:-}" = "--no-quiesce-fin" ]; then QUIESCE=0; shift; fi
 
-[ $# -gt 0 ] || { echo "usage: $0 [--quiesce-fin] <command> [args...]" >&2; exit 64; }
+[ $# -gt 0 ] || { echo "usage: $0 [--no-quiesce-fin] <command> [args...]" >&2; exit 64; }
 
 log() { echo "[one-at-a-time] $*" >&2; }
 
@@ -190,9 +201,9 @@ if [ "${_m:-0}" -ge "${FIN_MAX_RESIDENT_MODEL_GB:-2}" ]; then
   # 2026-09-16 the unload lost that race between one command and the next.
   if agentd_loaded; then
     log "  fin-agentd is running here, so \`lms unload --all\` will NOT stay done — its next"
-    log "  request reloads the model within seconds. Re-run with --quiesce-fin to stop the"
-    log "  daemon for the build and restore it afterwards:"
-    log "      $0 --quiesce-fin $*"
+    log "  request reloads the model within seconds. Quiescing it for the build is the"
+    log "  DEFAULT and something turned it off (--no-quiesce-fin, or FIN_QUIESCE_AGENTD=0);"
+    log "  drop that to let this build borrow the machine and hand it straight back."
   else
     log "  unload them first (lms unload --all) and reload after the build."
   fi
