@@ -43,6 +43,15 @@ USER_ID_FILE="${FIN_CP_USER_ID_FILE:-$HOME/.fin-control-plane-legacy-user-id}"
 CONTROL_PLANE_URL="${FIN_CONTROL_PLANE_URL:-https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com}"
 LLM_URL="${FIN_LLM_URL:-http://127.0.0.1:1234/v1}"
 MODEL="${FIN_MODEL:-google/gemma-4-12b-qat}"
+# The brain's bearer token, for a HOSTED endpoint (OpenRouter and friends). Empty for a
+# local model server, which wants no auth — and an empty value writes no apiKey field at
+# all rather than an empty one, so a local config is byte-identical to what it was.
+#
+# It belongs in site.env next to FIN_LLM_URL/FIN_MODEL, not only in config.json, because
+# a full write regenerates the agent block from these variables: a key that lives ONLY in
+# config.json is silently dropped the first time this script writes the whole file, and
+# the brain reverts to the loopback default with nobody present to notice.
+LLM_API_KEY="${FIN_LLM_API_KEY:-}"
 AGENT_ID="${FIN_AGENT_ID:-F573F461-3C9C-46E4-8E1E-30A6A4663D7B}"
 AGENT_NAME="${FIN_AGENT_NAME:-Fin}"
 SSH_USER="${FIN_SSH_USER:-$(id -un)}"
@@ -170,6 +179,10 @@ FIN_CP_USER_ID_FILE="$USER_ID_FILE" \
 FIN_CONTROL_PLANE_URL="$CONTROL_PLANE_URL" \
 FIN_LLM_URL="$LLM_URL" \
 FIN_MODEL="$MODEL" \
+FIN_LLM_API_KEY="$LLM_API_KEY" \
+FIN_CONTEXT_WINDOW_TOKENS="${FIN_CONTEXT_WINDOW_TOKENS:-}" \
+FIN_MAX_OUTPUT_TOKENS="${FIN_MAX_OUTPUT_TOKENS:-}" \
+FIN_HEARTBEAT_SECONDS="${FIN_HEARTBEAT_SECONDS:-}" \
 FIN_AGENT_ID="$AGENT_ID" \
 FIN_AGENT_NAME="$AGENT_NAME" \
 FIN_SSH_USER="$SSH_USER" \
@@ -417,15 +430,25 @@ else:
                    env["FIN_TMUX_SESSION"])
             ),
         },
-        "agent": {
-            "endpointURL": env["FIN_LLM_URL"],
-            "modelIdentifier": env["FIN_MODEL"],
-            "contextWindowTokens": 32768,
-            "maxOutputTokens": 2048,
-            "temperature": 0.2,
-            "heartbeatSeconds": 60,
-            "terminalContextLines": 160,
-        },
+        "agent": dict(
+            {
+                "endpointURL": env["FIN_LLM_URL"],
+                "modelIdentifier": env["FIN_MODEL"],
+                "contextWindowTokens": int(env.get("FIN_CONTEXT_WINDOW_TOKENS") or 32768),
+                "maxOutputTokens": int(env.get("FIN_MAX_OUTPUT_TOKENS") or 2048),
+                "temperature": 0.2,
+                # A hosted brain is metered: a full-context turn every 60s is a real bill,
+                # and nothing here is urgent enough to need one. Local stays at 60.
+                "heartbeatSeconds": int(
+                    env.get("FIN_HEARTBEAT_SECONDS")
+                    or (60 if "127.0.0.1" in env["FIN_LLM_URL"] or "localhost" in env["FIN_LLM_URL"] else 900)
+                ),
+                "terminalContextLines": 160,
+            },
+            # Stripped, and omitted entirely when empty: the daemon treats a missing key
+            # and an empty one the same, and a local config should not grow a null field.
+            **({"apiKey": env["FIN_LLM_API_KEY"].strip()} if env.get("FIN_LLM_API_KEY", "").strip() else {}),
+        ),
         "task": (
             "You are Fin, the user's terminal agent — resident on the owner's Mac, the single "
             "agent the user talks to. You are an OUTER agent: your own tmux pane is a control "

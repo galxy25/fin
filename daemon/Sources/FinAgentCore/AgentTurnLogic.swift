@@ -178,17 +178,36 @@ public enum AgentTurnLogic {
 
     /// A dropped connection or an overloaded server is worth another try; a 4xx means the
     /// request itself is wrong and will fail identically forever.
+    ///
+    /// Judged on the STATUS, wherever it arrived. A hosted endpoint reports a rate limit
+    /// or a provider outage inside a stream it has already answered `200 OK` to, and a
+    /// 429 is no less retryable for having been delivered late — see
+    /// `AgentEndpointError.streamFailure`. A mid-stream failure with no code at all is
+    /// retried too: the connection produced a partial answer, which is closer to a
+    /// dropped connection than to a malformed request.
     static func isRetryableEndpointError(_ error: Error) -> Bool {
         switch error {
         case AgentEndpointError.transport:
             return true
-        case AgentEndpointError.http(let status, _):
-            return status == 408 || status == 429 || (500..<600).contains(status)
         case AgentEndpointError.malformedResponse:
             return true
+        case let endpointError as AgentEndpointError:
+            guard let status = endpointError.statusCode else {
+                if case .streamFailure = endpointError { return true }
+                return false
+            }
+            return isRetryableStatus(status)
         default:
             return false
         }
+    }
+
+    /// Which provider codes are worth another attempt. Deliberately NOT 401/402/403:
+    /// a revoked key, an exhausted balance or a route the account may not use fails
+    /// identically forever, and retrying it just spends the remaining budget faster.
+    /// `DaemonBrainOutage` is what handles those instead.
+    static func isRetryableStatus(_ status: Int) -> Bool {
+        status == 408 || status == 429 || (500..<600).contains(status)
     }
 
     static func elapsedMS(since start: Date) -> Int {

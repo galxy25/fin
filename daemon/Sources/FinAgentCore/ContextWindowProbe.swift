@@ -82,6 +82,16 @@ public struct ContextWindowReading: Equatable, Sendable, Codable {
         /// Parsed out of an oversized request's refusal (`n_ctx`). Authoritative, but
         /// only ever learned by having already overrun the window once.
         case refusal
+        /// `GET /v1/models` — the standard listing — read for a `context_length` that
+        /// some providers publish there (OpenRouter does, on all 444 of its models).
+        ///
+        /// DELIBERATELY WEAKER THAN `modelsAPI`, and a separate case for that reason. A
+        /// catalog states what the model CAN do; `loaded_context_length` states what the
+        /// server in front of you IS doing. On an aggregator the route you actually get
+        /// may serve less than the catalog's best provider, so this is a ceiling, not an
+        /// observation — and conflating the two is exactly the mistake `source` exists
+        /// to prevent.
+        case catalog
         /// Nothing reported anything; this is `contextWindowTokens` from the config and
         /// has not been checked against reality.
         case configured
@@ -153,15 +163,50 @@ public extension ContextWindowProbe {
     /// reports id, object and owner and nothing about the window, which is precisely why
     /// this mismatch was invisible to everything in the stack.
     static func modelsAPIURL(forBaseURL baseURL: String) -> URL? {
+        // Strip the WHOLE api-path prefix, not just its last segment. Taking only "/v1"
+        // off `https://openrouter.ai/api/v1` left `…/api` and produced
+        // `https://openrouter.ai/api/api/v0/models` — a 404 with a doubled segment,
+        // which merely looked like "this server doesn't speak the dialect" instead of
+        // "this URL was built wrong".
         var trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while trimmed.hasSuffix("/") { trimmed.removeLast() }
-        // Strip the API version segment the chat endpoint carries, whatever it is.
-        for suffix in ["/v1", "/api/v0"] where trimmed.hasSuffix(suffix) {
+        for suffix in ["/api/v1", "/api/v0", "/v1", "/v0"] where trimmed.hasSuffix(suffix) {
             trimmed.removeLast(suffix.count)
             break
         }
         guard !trimmed.isEmpty else { return nil }
         return URL(string: trimmed + "/api/v0/models")
+    }
+
+    /// The standard listing the chat endpoint's own base implies: `<base>/models`.
+    static func catalogURL(forBaseURL baseURL: String) -> URL? {
+        var trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasSuffix("/") { trimmed.removeLast() }
+        guard !trimmed.isEmpty else { return nil }
+        return URL(string: trimmed + "/models")
+    }
+
+    /// A `context_length` for `model` out of a standard `/v1/models` listing.
+    ///
+    /// `top_provider.context_length` is preferred where present: on an aggregator the
+    /// root `context_length` is the model's headline number while `top_provider`
+    /// describes what is actually routable. Both are ceilings — see `Source.catalog`.
+    static func reading(fromCatalog body: Data, model: String) -> ContextWindowReading? {
+        guard let root = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+              let entries = root["data"] as? [[String: Any]]
+        else { return nil }
+
+        let wanted = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // A request slug may carry a routing suffix ("anthropic/claude-opus-5:nitro")
+        // that the catalog does not list; the base slug is what identifies the model.
+        let base = wanted.split(separator: ":").first.map(String.init) ?? wanted
+        guard let entry = entries.first(where: { ($0["id"] as? String)?.lowercased() == wanted })
+            ?? entries.first(where: { ($0["id"] as? String)?.lowercased() == base })
+        else { return nil }
+
+        let top = (entry["top_provider"] as? [String: Any])?["context_length"] as? Int
+        guard let length = top ?? (entry["context_length"] as? Int), length > 0 else { return nil }
+        return ContextWindowReading(loadedTokens: length, maxTokens: nil, source: .catalog)
     }
 
     /// Pulls the reading for `model` out of a models-listing body.
@@ -210,7 +255,26 @@ public extension ContextWindowProbe {
         apiKey: String? = nil,
         timeout: TimeInterval = 5
     ) async -> ContextWindowReading? {
-        guard let url = modelsAPIURL(forBaseURL: baseURL) else { return nil }
+        // MOST AUTHORITATIVE FIRST. `/api/v0/models` reports what the server has
+        // actually loaded; `/models` reports what the catalog says the model can do.
+        // A server that answers neither leaves the caller on its configured number.
+        if let url = modelsAPIURL(forBaseURL: baseURL),
+           let data = await fetch(url, apiKey: apiKey, timeout: timeout),
+           let reading = reading(fromModelsListing: data, model: model) {
+            return reading
+        }
+        if let url = catalogURL(forBaseURL: baseURL),
+           let data = await fetch(url, apiKey: apiKey, timeout: timeout),
+           let reading = reading(fromCatalog: data, model: model) {
+            return reading
+        }
+        return nil
+    }
+
+    /// One GET, errors swallowed. The status code is not the test: LM Studio answers an
+    /// unknown path with HTTP 200 and an `{"error": …}` body, so only a parse that finds
+    /// what it needs counts — the callers above decide that.
+    private static func fetch(_ url: URL, apiKey: String?, timeout: TimeInterval) async -> Data? {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = timeout
@@ -220,11 +284,9 @@ public extension ContextWindowProbe {
         guard let (data, response) = try? await URLSession.shared.data(for: request) else {
             return nil
         }
-        // The status code is not the test: LM Studio answers an unknown path with HTTP
-        // 200 and an `{"error": …}` body, so only a parse that finds what it needs counts.
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             return nil
         }
-        return reading(fromModelsListing: data, model: model)
+        return data
     }
 }

@@ -336,6 +336,18 @@ public final class AgentTurnEngine {
                 ),
                 isFailure: true
             )
+        } else if reading.loadedTokens > configuration.contextWindowTokens {
+            // THE OTHER DIRECTION, which costs nothing and is therefore invisible: a
+            // window larger than the config asks for is simply never used. Worth one
+            // line, because the number that matters is in a config file nobody rereads
+            // and the symptom is only ever "Fin forgot something it should have held".
+            record(
+                "notice",
+                "[context] endpoint serves \(reading.summary) but this agent is configured for "
+                    + "\(configuration.contextWindowTokens) — the extra "
+                    + "\(reading.loadedTokens - configuration.contextWindowTokens) tokens go unused. "
+                    + "Raise contextWindowTokens to use them."
+            )
         } else {
             record("notice", "[context] endpoint serves \(reading.summary)")
         }
@@ -381,6 +393,16 @@ public final class AgentTurnEngine {
     /// at all, so the model cannot detour into ledger writes — live, five times on
     /// 2026-09-12, that detour ate the turn. Consulted wherever the roster is built.
     public var hideGoalTools = false
+
+    /// Set when the last model call failed for a reason no retry and no restart can
+    /// fix — see `BrainOutage`. Cleared by the next call that succeeds, so it always
+    /// describes the current state of the brain rather than a historical failure.
+    public private(set) var lastBrainOutage: BrainOutage?
+
+    /// The longest a `Retry-After` may hold a turn. Past this the wait is worse than
+    /// the failure: the owner is waiting on an answer and a minute of silence is
+    /// already at the edge of useful.
+    static let maxRetryAfterSeconds = 90
 
     /// Which sessions this turn has already captured, so a pointless re-read is served
     /// from the first one instead of replacing it. See `SessionReadLedger`.
@@ -623,6 +645,7 @@ public final class AgentTurnEngine {
                         artifacts: onWriteArtifact != nil
                     )
                 )
+                lastBrainOutage = nil
                 return (completion, nil)
             } catch {
                 if Task.isCancelled { return (nil, nil) }
@@ -650,6 +673,15 @@ public final class AgentTurnEngine {
                     _ = transcript.compactIfNeeded(budget: contextBudget)
                 }
 
+                // CLASSIFY BEFORE COUNTING. A revoked key or an empty balance is not a
+                // transient and must not be retried into the ground, nor restarted into
+                // the same wall — see `BrainOutage`.
+                if let outage = BrainOutage.forError(error) {
+                    lastBrainOutage = outage
+                    record("error", outage.logLine, isFailure: true)
+                    return (nil, message)
+                }
+
                 let retryable = AgentTurnLogic.isRetryableEndpointError(error) && attempt < Self.maxModelAttempts
                 record(
                     "error",
@@ -657,8 +689,18 @@ public final class AgentTurnEngine {
                     isFailure: true
                 )
                 guard retryable else { break }
-                // Plain exponential backoff: 400ms, then 800ms.
-                try? await Task.sleep(for: .milliseconds(400 * (1 << (attempt - 1))))
+                // Exponential backoff — 400ms, then 800ms — UNLESS the server said when
+                // to come back. A hosted endpoint's rate limit is measured in tens of
+                // seconds, so three attempts inside two seconds is three wasted calls
+                // and a failed turn. Capped so a hostile or confused header cannot park
+                // a turn for an hour.
+                var delayMS = 400 * (1 << (attempt - 1))
+                if case AgentEndpointError.http(_, let body) = error,
+                   let after = AgentEndpointClient.retryAfterSeconds(inErrorBody: body) {
+                    delayMS = max(delayMS, min(after, Self.maxRetryAfterSeconds) * 1000)
+                    record("notice", "The endpoint asked to be retried in \(after)s; waiting.")
+                }
+                try? await Task.sleep(for: .milliseconds(delayMS))
             }
         }
         return (nil, lastMessage)

@@ -150,7 +150,28 @@ struct DaemonConfig: Decodable {
     struct AgentConfig: Decodable {
         var endpointURL: String
         var modelIdentifier: String
-        var apiKey: String?
+
+        /// The bearer token, ALWAYS trimmed — see `apiKey`. The raw decoded value is
+        /// private so nothing can reach around the trim.
+        private var rawAPIKey: String?
+
+        /// A key with surrounding whitespace is the same key.
+        ///
+        /// Live trap this closes (2026-09-16): the daemon tested only `!isEmpty` while
+        /// `launch-agentd.sh` and `enroll-config.py` both `.strip()`. A key pasted with
+        /// a trailing newline — the ordinary result of copying one out of a terminal or
+        /// a browser — therefore PASSED the launchd preflight and 401'd on every real
+        /// turn afterwards. A green light and a dead brain is the worst pair of signals
+        /// this daemon can produce, so the trim lives at the decode boundary where every
+        /// consumer gets it. An all-whitespace key becomes nil, which is what "no key"
+        /// already means everywhere downstream.
+        var apiKey: String? {
+            guard let trimmed = rawAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty
+            else { return nil }
+            return trimmed
+        }
+
         var contextWindowTokens: Int?
         var maxOutputTokens: Int?
         var temperature: Double?
@@ -160,6 +181,15 @@ struct DaemonConfig: Decodable {
         /// Seconds one model completion may take before the turn fails. Default
         /// 300: a local model under build load needs more than the app's 120.
         var requestTimeoutSeconds: Int?
+
+        /// `apiKey` in the file still decodes into `rawAPIKey`; everything else keeps
+        /// its own name.
+        enum CodingKeys: String, CodingKey {
+            case endpointURL, modelIdentifier
+            case rawAPIKey = "apiKey"
+            case contextWindowTokens, maxOutputTokens, temperature, systemPrompt
+            case terminalContextLines, heartbeatSeconds, requestTimeoutSeconds
+        }
     }
 
     /// The S3 remote-supervision channel — the same bucket contract the app's
@@ -1991,6 +2021,32 @@ final class Daemon {
                     lastError = line
                     log(line)
                     record(AgentAuditEvent(kind: "notice", text: line))
+                }
+                // A BRAIN OUTAGE IS NOT A STALL. Before the five-strikes machinery gets
+                // to decide, check whether the failure is one that restarting cannot
+                // fix — a revoked key, an exhausted balance. `fail()` below exits, and
+                // launchd's KeepAlive turns an exit into a restart into the same wall,
+                // forever, spending a metered call each time. Page once and stay up
+                // instead: a suspended daemon still answers the control plane and can
+                // still say why it is not thinking. See `BrainOutage`.
+                if let outage = engine.lastBrainOutage {
+                    let now = Date()
+                    let stallState = StallNotifyMarker.state(at: stallNotifyStatePath)
+                    if StallNotifyGate.shouldNotify(state: stallState, failure: outage.rawValue, now: now) {
+                        notify(
+                            event: "agent-stalled", message: outage.ownerMessage,
+                            messageID: failedMessageID, threadID: failedThreadID
+                        )
+                        StallNotifyMarker.write(
+                            StallNotifyGate.statePaged(after: stallState, failure: outage.rawValue, now: now),
+                            at: stallNotifyStatePath
+                        )
+                    }
+                    log(outage.logLine)
+                    record(AgentAuditEvent(kind: "error", text: outage.logLine, isFailure: true))
+                    suspendedAfterCompletion = true
+                    consecutiveFailures = 0
+                    continue
                 }
                 if consecutiveFailures >= 5 {
                     // consecutiveFailures is a local var — it does NOT survive the

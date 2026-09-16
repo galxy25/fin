@@ -68,12 +68,27 @@ note() { printf '[%s] launch: %s\n' "$(stamp)" "$*" >&2; }
 # token is what brings the model back. A model with a TTL is expected to unload; that must
 # cost the next turn three seconds, never a refusal to start.
 #
-# The one failure that does NOT wait is a model the server does not have at all: no amount
-# of patience downloads it, so that returns 2 and the caller fails fast.
+# The failures that do NOT wait are the ones no amount of patience fixes: a model the
+# server does not have at all, rejected credentials (401/403), and an account that cannot
+# pay (402). Those return 2 and the caller fails fast.
+#
+#   3. THE LISTING IS NOT THE GATE, it only tells "never" from "not yet". Asking it first
+#      broke hosted endpoints: OpenRouter's catalog omits routing variants ("…:nitro")
+#      that are valid request slugs, so a listing-first check answered "it will never
+#      serve this" about a model it serves happily — and refuse() turns that into a
+#      silent 5-minute KeepAlive loop with the daemon never starting and nothing in the
+#      log that looks wrong. The completion probe is the authoritative test on every
+#      endpoint; the listing is consulted only after it has already failed.
 BRAIN_WAIT_SECONDS="${FIN_BRAIN_WAIT_SECONDS:-300}"
 brain_probe_reason=""
 
 # $1 endpoint (…/v1), $2 model id, $3 curl -K auth file or "", $4 python
+# Sets brain_completion_status to the HTTP code (or 000 when the request never landed),
+# because WHY it failed decides whether waiting can help: a 401 from a key with a
+# trailing newline looks exactly like a cold model to a bare success/failure test, and
+# the daemon would wait out the full budget for a condition no patience fixes.
+brain_completion_status=""
+brain_completion_model=""
 brain_completion() {
 	local endpoint="$1" model="$2" keyconf="$3" python="$4" payload
 	payload="$(FIN_MODEL_ID="$model" "$python" -c 'import json, os; print(json.dumps({
@@ -82,13 +97,43 @@ brain_completion() {
     "max_tokens": 1, "temperature": 0}))')" || return 1
 	# -m 180: a COLD model has to be read off disk inside this request. The outer deadline
 	# is what actually bounds the wait; this only stops one attempt hanging forever.
+	# No -f: a 4xx body is thrown away either way, but -w needs the request to "succeed"
+	# for the code to be reported. The body is kept because a 200 is not proof the
+	# endpoint served what was ASKED for — see the served-model check below.
+	local out
+	out="$(mktemp -t fin-brain-probe)" || return 1
 	if [ -n "$keyconf" ]; then
-		curl -fsS -m 180 -K "$keyconf" -H 'content-type: application/json' \
-			-d "$payload" "$endpoint/chat/completions" >/dev/null 2>&1
+		brain_completion_status="$(curl -sS -o "$out" -w '%{http_code}' -m 180 -K "$keyconf" \
+			-H 'content-type: application/json' -d "$payload" "$endpoint/chat/completions" 2>/dev/null)"
 	else
-		curl -fsS -m 180 -H 'content-type: application/json' \
-			-d "$payload" "$endpoint/chat/completions" >/dev/null 2>&1
+		brain_completion_status="$(curl -sS -o "$out" -w '%{http_code}' -m 180 \
+			-H 'content-type: application/json' -d "$payload" "$endpoint/chat/completions" 2>/dev/null)"
 	fi
+	brain_completion_model="$(FIN_PROBE_BODY="$out" "$python" -c 'import json, os
+try:
+    print(json.load(open(os.environ["FIN_PROBE_BODY"])).get("model") or "")
+except Exception:
+    print("")' 2>/dev/null)"
+	rm -f "$out"
+	case "$brain_completion_status" in
+		2??) ;;
+		*) return 1 ;;
+	esac
+	# A 200 IS NOT PROOF IT SERVED WHAT YOU ASKED FOR. LM Studio answers a request for a
+	# model it has never heard of by quietly substituting whichever model is loaded, and
+	# returning 200 with that model's id in the body (verified 2026-09-16: asked for
+	# "nope/not-a-model", got "google/gemma-4-12b-qat"). Without this the daemon would
+	# start happily on a brain the operator did not choose and never say so. Compared on
+	# the base slug, because a hosted endpoint may legitimately normalize away a routing
+	# suffix ("…:nitro" served as the plain model).
+	if [ -n "$model" ] && [ -n "$brain_completion_model" ]; then
+		local want="${model%%:*}"
+		case "$brain_completion_model" in
+			"$want"|"$want":*) ;;
+			*) return 1 ;;
+		esac
+	fi
+	return 0
 }
 
 # 0 = serving, 1 = still not serving when the budget ran out, 2 = it will never serve this
@@ -98,19 +143,40 @@ brain_wait() {
 	local started elapsed body rc announced=0
 	started="$(date +%s)"
 	while :; do
+		# ASK THE AUTHORITATIVE QUESTION FIRST: can this endpoint actually serve the
+		# model? The listing was only ever a proxy for that, and on a hosted aggregator
+		# it is a bad one — OpenRouter's catalog omits routing variants ("…:nitro") that
+		# are perfectly valid request slugs, so a listing-first gate returned "it will
+		# never serve this" for a model the endpoint serves happily, and refuse() turned
+		# that into a silent 5-minute KeepAlive loop in which the daemon never started.
+		if brain_completion "$endpoint" "$model" "$keyconf" "$python"; then
+			return 0
+		fi
+		# It did not serve. WHY decides whether waiting can help.
+		if [ -n "$brain_completion_model" ] && [ -n "$model" ] \
+			&& [ "${brain_completion_model%%:*}" != "${model%%:*}" ]; then
+			brain_probe_reason="$endpoint served \"$brain_completion_model\" when asked for \"$model\" — it does not have that model and substituted the one it has; fix agent.modelIdentifier"
+			return 2
+		fi
+		case "$brain_completion_status" in
+			401|403)
+				brain_probe_reason="$endpoint rejected the credentials for $model (HTTP $brain_completion_status) — check agent.apiKey; note a trailing newline in the key is enough to cause this"
+				return 2 ;;
+			402)
+				brain_probe_reason="$endpoint says the account cannot pay for $model (HTTP 402) — add credit or lower the spend limit's reach"
+				return 2 ;;
+		esac
 		if [ -n "$keyconf" ]; then
 			body="$(curl -fsS -m 15 -K "$keyconf" "$endpoint/models" 2>/dev/null)"; rc=$?
 		else
 			body="$(curl -fsS -m 15 "$endpoint/models" 2>/dev/null)"; rc=$?
 		fi
-		if [ "$rc" -eq 0 ]; then
-			if [ -n "$model" ] && ! printf '%s' "$body" | grep -qF -- "$model"; then
-				brain_probe_reason="$endpoint answers, but has no model called $model — check the id, or download it on the machine serving it"
-				return 2
-			fi
-			if brain_completion "$endpoint" "$model" "$keyconf" "$python"; then
-				return 0
-			fi
+		# The listing is now only used to tell "not yet" from "never": the endpoint is up,
+		# it will not serve this model, and it does not even list it. A model that IS
+		# listed but will not serve yet is the cold-model case, and that waits.
+		if [ "$rc" -eq 0 ] && [ -n "$model" ] && ! printf '%s' "$body" | grep -qF -- "$model"; then
+			brain_probe_reason="$endpoint answers and will not serve $model, which it does not list — check the id, or download it on the machine serving it"
+			return 2
 		fi
 		elapsed=$(( $(date +%s) - started ))
 		if [ "$elapsed" -ge "$BRAIN_WAIT_SECONDS" ]; then

@@ -54,6 +54,59 @@ Beyond `server`, `agent`, and `task`, every field is optional:
 | `controlPlane` | — | Endpoint + bearer token of the serverless control plane; turns notify events into APNs pushes (below) |
 | `site` | — | This body's identity on the control plane (below); requires `controlPlane` |
 
+### Choosing a brain: a local server, or a hosted one
+
+`agent.endpointURL` is any OpenAI-dialect chat-completions base. LM Studio on loopback is
+the default; a hosted provider such as OpenRouter works too, and the difference is four
+fields:
+
+```json
+"agent": {
+  "endpointURL": "https://openrouter.ai/api/v1",
+  "modelIdentifier": "anthropic/claude-opus-5",
+  "apiKey": "sk-or-v1-…",
+  "contextWindowTokens": 128000,
+  "maxOutputTokens": 4096,
+  "heartbeatSeconds": 900,
+  "requestTimeoutSeconds": 300
+}
+```
+
+Provision it rather than hand-editing, so a later full write does not silently revert the
+brain to loopback: put `FIN_LLM_URL`, `FIN_MODEL` and `FIN_LLM_API_KEY` in the 0600
+`site.env`. `provision-config.sh` reads all three, omits `apiKey` entirely when the key is
+empty (so a local config is unchanged), and defaults `heartbeatSeconds` to 900 for a
+non-loopback brain — a full-context turn every 60s against a metered endpoint is a real
+bill and nothing here is that urgent.
+
+Four things are worth knowing before you point it at a paid endpoint:
+
+- **The model must support tool calling.** Every agent turn sends `tools` and
+  `tool_choice: "auto"`; `read_session`, `send_session` and `read_terminal` are the whole
+  job. On OpenRouter, check the catalog entry's `supported_parameters` for `tools`.
+- **`contextWindowTokens` is yours to set, and it is a ceiling you are trusting.** The
+  daemon probes `/api/v0/models` (the LM Studio dialect, which reports what is actually
+  loaded) and falls back to the standard `/models` listing for a published
+  `context_length`. The second is recorded as `source: catalog` because it is what the
+  model *can* do, not what the route in front of you *is* doing — on an aggregator those
+  differ. Budgets always take the smaller of configured and observed, and the log says so
+  either way, including when the window is larger than you configured and going unused.
+- **Failures arrive late.** A hosted endpoint answers `200 OK` as soon as some provider
+  accepts, then reports rate limits, outages and exhausted credit inside the stream. Those
+  are surfaced as real errors with the provider's own message (`streamFailure`), retried
+  when the status says to, and a `Retry-After` is honored up to 90s.
+- **A revoked key or an empty balance suspends the daemon; it does not restart it.** 401,
+  403 and 402 are classified as a `BrainOutage`: the owner is paged once and the process
+  stays up, reporting, instead of exiting into a launchd restart loop against a wall no
+  restart moves. There is no spend cap in this repo — set a per-key credit limit with your
+  provider, which is the only enforceable one.
+
+The launcher's preflight (`scripts/mac-fin-agentd/launch-agentd.sh`) proves the brain can
+serve *the model you asked for* before the daemon starts: a one-token completion, then a
+check that the response's `model` is the one requested — LM Studio answers a request for a
+model it does not have by quietly substituting whichever model is loaded, and returning
+200. 401/403/402 fail fast with the reason; anything else waits for the budget.
+
 Inside `server`, `connectCommand` (typed into the shell once the PTY is up — on a resident
 site `exec tmux -L <socket> new-session -A -s <session> \; set status off`, which is where the
 agent's own tmux SERVER is chosen; see "The tmux boundary") and `environment` (extra SSH

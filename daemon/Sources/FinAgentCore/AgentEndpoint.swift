@@ -57,6 +57,19 @@ enum AgentEndpointError: LocalizedError {
     case transport(String)
     case http(status: Int, body: String)
     case malformedResponse(String)
+    /// The response began `200 OK` and then failed PART WAY THROUGH THE STREAM.
+    ///
+    /// A hosted endpoint — OpenRouter especially, which answers as soon as some
+    /// upstream provider accepts — reports rate limits, exhausted credit, provider
+    /// outages, moderation and context overflow this way: inside the SSE body, as
+    /// `{"error": {...}}` or a choice with `finish_reason: "error"`, long after the
+    /// status line said everything was fine. Until this existed the accumulator read
+    /// only `usage` and `delta`, so every one of those arrived as an EMPTY completion
+    /// and was reported to the owner as "the model stopped without producing an
+    /// answer" — the provider's own explanation discarded on the floor. `status`
+    /// carries the provider's code when it gives one, so the retry rules can treat a
+    /// mid-stream 429 exactly like a 429 in a status line.
+    case streamFailure(status: Int?, message: String)
 
     var errorDescription: String? {
         switch self {
@@ -70,6 +83,20 @@ enum AgentEndpointError: LocalizedError {
             return "Endpoint returned HTTP \(status)\(detail)"
         case .malformedResponse(let detail):
             return "Couldn't read the endpoint's response: \(detail)"
+        case .streamFailure(let status, let message):
+            let code = status.map { " \($0)" } ?? ""
+            return "The endpoint accepted the request and then failed mid-response"
+                + "\(code.isEmpty ? "" : " (provider error\(code))") — \(message.prefix(400))"
+        }
+    }
+
+    /// The provider's status code, wherever it arrived — a status line or a stream
+    /// frame. One accessor so the retry rules never have to care which.
+    var statusCode: Int? {
+        switch self {
+        case .http(let status, _): return status
+        case .streamFailure(let status, _): return status
+        default: return nil
         }
     }
 }
@@ -256,10 +283,15 @@ struct AgentEndpointClient {
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             var body = Data()
             for try await byte in bytes { body.append(byte) }
-            throw AgentEndpointError.http(
-                status: http.statusCode,
-                body: String(data: body, encoding: .utf8) ?? ""
-            )
+            var text = String(data: body, encoding: .utf8) ?? ""
+            // The server's own answer to "when should I come back?", which the backoff
+            // would otherwise replace with a 400ms guess. Folded into the body rather
+            // than added to the case so every existing `.http` construction still
+            // compiles and every reader still sees one string.
+            if let after = Self.retryAfterSeconds(http) {
+                text = "[retry-after: \(after)s] " + text
+            }
+            throw AgentEndpointError.http(status: http.statusCode, body: text)
         }
 
         do {
@@ -282,6 +314,13 @@ struct AgentEndpointClient {
             return completion
         }
 
+        // A FAILURE MID-STREAM IS A FAILED CALL, not a short answer. Thrown rather than
+        // returned so it reaches the retry rules and the audit trail with the
+        // provider's own message intact — the alternative, which is what used to
+        // happen, is an empty completion the engine reports as "the model stopped
+        // without producing an answer" while the real reason is discarded.
+        if let failure = accumulator.failure { throw failure }
+
         return accumulator.finish()
     }
 
@@ -295,6 +334,9 @@ struct AgentEndpointClient {
 
         private(set) var sawStreamFraming = false
         private(set) var rawBody = ""
+        /// Set when the stream reported a failure after its 200. Read by the caller,
+        /// which throws it instead of returning a truncated completion.
+        private(set) var failure: AgentEndpointError?
 
         private var text = ""
         private var reasoning = ""
@@ -330,9 +372,28 @@ struct AgentEndpointClient {
                 usage = AgentEndpointClient.parseUsage(usageObject)
             }
 
+            // A FAILURE CAN ARRIVE AFTER `200 OK`. Read it before anything else in the
+            // frame: an error frame may still carry a choices array, and a half-written
+            // answer must not be returned as though it were a whole one.
+            if let failure = AgentEndpointClient.streamFailure(in: object) {
+                self.failure = failure
+                return true
+            }
+
             guard let choices = object["choices"] as? [[String: Any]],
                   let choice = choices.first
             else { return false }
+
+            // `finish_reason: "error"` is the other shape of the same event, and it
+            // rides on the choice rather than the root.
+            if let reason = choice["finish_reason"] as? String,
+               reason == "error" || reason == "content_filter" {
+                self.failure = .streamFailure(
+                    status: nil,
+                    message: "the provider ended the response early (finish_reason: \(reason))"
+                )
+                return true
+            }
 
             let delta = choice["delta"] as? [String: Any] ?? [:]
             let now = Date()
@@ -493,6 +554,59 @@ struct AgentEndpointClient {
             wire["tool_call_id"] = toolCallID
         }
         return wire
+    }
+
+    /// Pulls a provider error out of one decoded SSE frame, in the shapes seen in the
+    /// wild: `{"error": {"message", "code"}}`, `{"error": "some string"}`, and the
+    /// OpenRouter variant that nests the upstream's own body under `metadata.raw`.
+    /// Pure and internal so it can be tested against captured frames without a server.
+    /// `Retry-After`, in seconds, as either a delta or an HTTP date. OpenRouter sets it
+    /// around 60s on a rate limit; honoring it is the difference between waiting once
+    /// and burning three attempts inside two seconds for nothing.
+    static func retryAfterSeconds(_ response: HTTPURLResponse) -> Int? {
+        guard let raw = response.value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty
+        else { return nil }
+        if let seconds = Int(raw) { return max(0, seconds) }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = formatter.date(from: raw) else { return nil }
+        return max(0, Int(date.timeIntervalSinceNow.rounded()))
+    }
+
+    /// The wait a failed attempt asked for, parsed back out of the error's text.
+    static func retryAfterSeconds(inErrorBody body: String) -> Int? {
+        guard let range = body.range(of: #"\[retry-after: ([0-9]{1,5})s\]"#, options: [.regularExpression]),
+              let digits = body[range].range(of: #"[0-9]{1,5}"#, options: [.regularExpression]),
+              let seconds = Int(body[digits])
+        else { return nil }
+        return seconds
+    }
+
+    static func streamFailure(in object: [String: Any]) -> AgentEndpointError? {
+        guard let raw = object["error"] else { return nil }
+        if let message = raw as? String {
+            return .streamFailure(status: nil, message: message)
+        }
+        guard let error = raw as? [String: Any] else {
+            return .streamFailure(status: nil, message: "\(raw)")
+        }
+        // `code` is an int on OpenRouter and a string on some OpenAI-dialect servers.
+        let status = (error["code"] as? Int)
+            ?? (error["code"] as? String).flatMap { Int($0) }
+            ?? (error["status"] as? Int)
+        var message = (error["message"] as? String) ?? "the provider reported an error"
+        // The upstream provider's own words, when the aggregator passes them through.
+        if let metadata = error["metadata"] as? [String: Any] {
+            if let raw = metadata["raw"] as? String, !raw.isEmpty {
+                message += " — \(raw)"
+            } else if let provider = metadata["provider_name"] as? String, !provider.isEmpty {
+                message += " (provider: \(provider))"
+            }
+        }
+        return .streamFailure(status: status, message: message)
     }
 
     private static func parseCompletion(_ data: Data) throws -> AgentCompletion {
