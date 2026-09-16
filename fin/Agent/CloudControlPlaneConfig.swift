@@ -21,6 +21,10 @@ enum CloudControlPlaneConfig {
     /// Defined in `KeyVault` so the tvOS target reads the same iCloud KVS slot.
     static let endpointURLKey = KeyVault.endpointURLKey
     static let tokenKey = "fin.cloudcp.token"
+    /// A WebSocket API Gateway gets its own execute-api domain — distinct from
+    /// `endpointURL`'s HTTP API — so the terminal relay's socket address is
+    /// separate, synced configuration, not derived from the REST endpoint.
+    static let webSocketURLKey = "fin.cloudcp.wsURL"
 
     /// Posted when `SyncedDeviceConfig`'s pull adopts an externally changed
     /// endpoint, so UI showing the redacted value can refresh without a relaunch.
@@ -68,9 +72,22 @@ enum CloudControlPlaneConfig {
     /// a token without an endpoint has nowhere to go.
     static var isConfigured: Bool { !endpointURL.isEmpty && !token.isEmpty }
 
+    /// Local-cache read, same convention as `endpointURL`. Empty means the
+    /// terminal relay simply isn't available yet — `.siteRelay` servers are
+    /// still listed, but connecting reports the missing configuration rather
+    /// than failing silently.
+    static var webSocketURL: String {
+        UserDefaults.standard.string(forKey: webSocketURLKey) ?? ""
+    }
+
     static func setEndpointURL(_ url: String) {
         UserDefaults.standard.set(url, forKey: endpointURLKey)
         SyncedDeviceConfig.push(url, forKey: endpointURLKey)
+    }
+
+    static func setWebSocketURL(_ url: String) {
+        UserDefaults.standard.set(url, forKey: webSocketURLKey)
+        SyncedDeviceConfig.push(url, forKey: webSocketURLKey)
     }
 
     static func setToken(_ token: String) {

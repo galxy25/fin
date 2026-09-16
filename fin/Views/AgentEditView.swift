@@ -221,6 +221,11 @@ struct AgentEditView: View {
                     get: { CloudControlPlaneConfig.endpointURL },
                     set: { CloudControlPlaneConfig.setEndpointURL($0) }
                 )
+                cloudURLField(
+                    label: "Control Plane WebSocket URL",
+                    get: { CloudControlPlaneConfig.webSocketURL },
+                    set: { CloudControlPlaneConfig.setWebSocketURL($0) }
+                )
                 AppleSignInButton()
                 cloudURLField(
                     label: "Control Plane Token",

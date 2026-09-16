@@ -304,11 +304,20 @@ final class SessionManager: ObservableObject {
         activeServerID = server.id
         let session = session(for: server)
         guard session.state == .disconnected else { return session }
-        guard let credentials = resolveCredentials(server) else {
-            session.reportMissingCredentials()
-            return session
+        switch server.transport {
+        case .direct:
+            guard let credentials = resolveCredentials(server) else {
+                session.reportMissingCredentials()
+                return session
+            }
+            session.connect(server: server, credentials: credentials)
+        case .siteRelay:
+            guard let siteID = server.relaySiteId, !siteID.isEmpty else {
+                session.reportMissingRelaySite()
+                return session
+            }
+            session.connectSiteRelay(server: server, siteID: siteID)
         }
-        session.connect(server: server, credentials: credentials)
         return session
     }
 
@@ -331,9 +340,16 @@ final class SessionManager: ObservableObject {
             guard !session.isConnected else { return }
         }
         guard let server = servers.first(where: { $0.id == activeServerID }) else { return }
-        guard let credentials = resolveCredentials(server) else { return }
-        session.markNeedsReconnect()
-        session.connect(server: server, credentials: credentials)
+        switch server.transport {
+        case .direct:
+            guard let credentials = resolveCredentials(server) else { return }
+            session.markNeedsReconnect()
+            session.connect(server: server, credentials: credentials)
+        case .siteRelay:
+            guard let siteID = server.relaySiteId, !siteID.isEmpty else { return }
+            session.markNeedsReconnect()
+            session.connectSiteRelay(server: server, siteID: siteID)
+        }
     }
 
     /// Re-arms a persisted monitor on foregrounding without requiring the user to
@@ -372,8 +388,17 @@ final class SessionManager: ObservableObject {
         // A relaunch that lands on the reader or home screen never opens the terminal,
         // so the active session may not exist yet; connect it here the same way
         // `open` would, minus re-stamping the active route.
-        if session.state == .disconnected, let credentials = resolveCredentials(server) {
-            session.connect(server: server, credentials: credentials)
+        if session.state == .disconnected {
+            switch server.transport {
+            case .direct:
+                if let credentials = resolveCredentials(server) {
+                    session.connect(server: server, credentials: credentials)
+                }
+            case .siteRelay:
+                if let siteID = server.relaySiteId, !siteID.isEmpty {
+                    session.connectSiteRelay(server: server, siteID: siteID)
+                }
+            }
         }
         // An existing runtime whose earlier resume poll expired while the app was
         // suspended gets a fresh one; a freshly-created runtime starts its own.

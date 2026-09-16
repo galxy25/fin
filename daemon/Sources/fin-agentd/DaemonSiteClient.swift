@@ -42,6 +42,9 @@ actor DaemonSiteClient {
     struct Command: Equatable {
         let id: String
         let kind: String
+        /// Free-form per-kind payload, e.g. `terminal-open`'s `sessionId`/`tmuxSession`.
+        /// Every other kind ignores it.
+        var args: [String: String] = [:]
     }
 
     /// One heartbeat's answer, decoded tolerantly: every field optional, unknown
@@ -436,7 +439,8 @@ actor DaemonSiteClient {
         }
         let commands = (object["commands"] as? [[String: Any]] ?? []).compactMap { entry -> Command? in
             guard let id = entry["id"] as? String, let kind = entry["kind"] as? String else { return nil }
-            return Command(id: id, kind: kind)
+            let args = (entry["args"] as? [String: Any] ?? [:]).compactMapValues { $0 as? String }
+            return Command(id: id, kind: kind, args: args)
         }
         return HeartbeatResponse(
             role: object["role"] as? String,

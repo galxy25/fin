@@ -186,7 +186,7 @@ struct ControlStripView: View {
     private func color(for state: SessionState) -> Color {
         switch state {
         case .connected: return .green
-        case .connecting, .reconnecting: return .yellow
+        case .connecting, .reconnecting, .waking: return .yellow
         case .disconnected: return .red
         }
     }

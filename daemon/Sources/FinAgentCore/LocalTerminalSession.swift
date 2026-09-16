@@ -146,6 +146,11 @@ public final class LocalTerminalSession: AgentTerminalTransport {
     public private(set) var state: HeadlessSessionState = .disconnected
     public private(set) var lastError: String?
 
+    /// Fired with each chunk of raw PTY output as it's read, in addition to (never instead
+    /// of) `eventLog.recordOutput` — a live sink for a caller relaying this session's bytes
+    /// somewhere else in real time (e.g. a WebSocket) without polling the event log.
+    public var onRawOutput: ((Data) -> Void)?
+
     private let configuration: LocalSessionConfiguration
 
     /// The PTY master. -1 when there is no child.
@@ -332,6 +337,21 @@ public final class LocalTerminalSession: AgentTerminalTransport {
         pendingLock.unlock()
         guard !bytes.isEmpty else { return }
         eventLog.recordOutput(bytes)
+        onRawOutput?(Data(bytes))
+    }
+
+    /// Live resize — `connect()`'s `winsize` only sets the INITIAL size; a relayed caller
+    /// whose viewport changes calls this instead of reconnecting. `TIOCSCTTY`'d PTYs signal
+    /// the foreground process group with `SIGWINCH` automatically once `TIOCSWINSZ` lands.
+    public func resize(columns: Int, rows: Int) {
+        guard masterFD >= 0 else { return }
+        var window = winsize(
+            ws_row: UInt16(max(rows, 1)),
+            ws_col: UInt16(max(columns, 1)),
+            ws_xpixel: 0,
+            ws_ypixel: 0
+        )
+        _ = ioctl(masterFD, TIOCSWINSZ, &window)
     }
 
     private func watchForExit(pid: pid_t, generation myGeneration: Int) {

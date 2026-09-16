@@ -45,7 +45,10 @@ extension NSUbiquitousKeyValueStore: SyncedKeyValueStore {}
 enum SyncedDeviceConfig {
     /// Every synced key, in one place, so the launch pull, the external-change
     /// pull, and the setter pushes can never disagree about what syncs.
-    static let stringKeys: [String] = [CloudControlPlaneConfig.endpointURLKey]
+    static let stringKeys: [String] = [
+        CloudControlPlaneConfig.endpointURLKey,
+        CloudControlPlaneConfig.webSocketURLKey,
+    ]
     static let boolKeys: [String] = [RemoteSupervisionConfig.enabledKey]
 
     /// The live KVS replica, or nil when iCloud KVS is unavailable to this
@@ -143,7 +146,7 @@ enum SyncedDeviceConfig {
     /// (its handler is cheap and idempotent for a URL that didn't change).
     private static func postDomainNotifications(for changed: Set<String>) {
         guard !changed.isEmpty else { return }
-        if changed.contains(CloudControlPlaneConfig.endpointURLKey) {
+        if changed.contains(CloudControlPlaneConfig.endpointURLKey) || changed.contains(CloudControlPlaneConfig.webSocketURLKey) {
             NotificationCenter.default.post(
                 name: CloudControlPlaneConfig.changedNotification, object: nil
             )

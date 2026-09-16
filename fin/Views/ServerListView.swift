@@ -234,12 +234,26 @@ struct ServerListView: View {
     private func row(for server: Server) -> some View {
         HStack {
             statusDot(for: server)
+            if server.transport == .siteRelay {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .foregroundStyle(.secondary)
+            }
             VStack(alignment: .leading) {
                 Text(server.name).font(.headline)
-                Text("\(server.username)@\(server.host):\(server.port)")
+                Text(subtitle(for: server))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private func subtitle(for server: Server) -> String {
+        switch server.transport {
+        case .direct:
+            return "\(server.username)@\(server.host):\(server.port)"
+        case .siteRelay:
+            let siteName = sites.sites.first { $0.siteId == server.relaySiteId }?.displayName
+            return "via \(siteName ?? "a Fin site") · \(server.tmuxSessionName)"
         }
     }
 

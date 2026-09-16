@@ -101,6 +101,20 @@ enum ControlPlaneClient {
             }
     }
 
+    /// Wakes a site's daemon to attach a local PTY to `tmuxSession` and open its
+    /// end of the terminal-relay WebSocket for `sessionId`. Delivered on the
+    /// site's next heartbeat (`SiteDirectory`'s ~20s cadence), not instantly —
+    /// `SiteRelayTerminalSession` accounts for that with its own "waking…" state.
+    static func openTerminalRelay(_ siteID: String, sessionId: String, tmuxSession: String) async -> Result<Void, Failure> {
+        await perform(request("POST", path: "/sites/\(siteID)/commands", body: [
+            "kind": "terminal-open",
+            "args": ["sessionId": sessionId, "tmuxSession": tmuxSession],
+        ]))
+        .flatMap { status, body in
+            (200...299).contains(status) ? .success(()) : .failure(.http(status, errorMessage(status: status, body: body)))
+        }
+    }
+
     static func deleteSite(_ siteID: String) async -> Result<Void, Failure> {
         await perform(request("DELETE", path: "/sites/\(siteID)"))
             .flatMap { status, body in

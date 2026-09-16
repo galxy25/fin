@@ -28,7 +28,10 @@ MESSAGES_TABLE=fin-messages
 AGENTS_TABLE=fin-agents
 ENROLL_TOKENS_TABLE=fin-enroll-tokens
 THREAD_EVENTS_TABLE=fin-thread-events
+TERMINAL_CONNECTIONS_TABLE=fin-terminal-connections
+TERMINAL_SESSIONS_TABLE=fin-terminal-sessions
 API_NAME=fin-control-plane
+WS_API_NAME=fin-control-plane-ws
 RULE=fin-worker-sweep
 WAKE_RULE=fin-worker-wake
 BUCKET=fin-agent-directives-011183829623
@@ -183,6 +186,40 @@ if ! aws dynamodb describe-table --table-name "$THREAD_EVENTS_TABLE" >/dev/null 
   aws dynamodb update-time-to-live --table-name "$THREAD_EVENTS_TABLE" \
     --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
   echo "==> Created DynamoDB table $THREAD_EVENTS_TABLE (on-demand, TTL on ttl)"
+fi
+
+# Terminal relay (docs/SITES.md's outbound-only channel, extended to carry
+# interactive bytes): one row per open WebSocket connection, keyed by the
+# connection itself, so $disconnect (which gets only a connectionId, never a
+# body or bearer) can find who it was and what session it belonged to. TTL is
+# a safety net for a connection whose $disconnect never fires (Lambda cold
+# start, network blip) — real cleanup happens on the $disconnect route.
+if ! aws dynamodb describe-table --table-name "$TERMINAL_CONNECTIONS_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$TERMINAL_CONNECTIONS_TABLE" \
+    --attribute-definitions AttributeName=connectionId,AttributeType=S \
+    --key-schema AttributeName=connectionId,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$TERMINAL_CONNECTIONS_TABLE"
+  aws dynamodb update-time-to-live --table-name "$TERMINAL_CONNECTIONS_TABLE" \
+    --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
+  echo "==> Created DynamoDB table $TERMINAL_CONNECTIONS_TABLE (on-demand, TTL on ttl)"
+fi
+
+# One row per open terminal (app<->site relay), keyed by the app-minted
+# sessionId, holding both sides' connectionId once each has attached. TTL is
+# a short safety net — these are interactive sessions, never meant to
+# outlive a sitting, so a stuck row expires fast rather than lingering.
+if ! aws dynamodb describe-table --table-name "$TERMINAL_SESSIONS_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$TERMINAL_SESSIONS_TABLE" \
+    --attribute-definitions AttributeName=sessionId,AttributeType=S \
+    --key-schema AttributeName=sessionId,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$TERMINAL_SESSIONS_TABLE"
+  aws dynamodb update-time-to-live --table-name "$TERMINAL_SESSIONS_TABLE" \
+    --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
+  echo "==> Created DynamoDB table $TERMINAL_SESSIONS_TABLE (on-demand, TTL on ttl)"
 fi
 
 # --- model-factory data lake -------------------------------------------------
@@ -341,6 +378,24 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": ["dynamodb:PutItem", "dynamodb:Query", "dynamodb:DeleteItem"],
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$THREAD_EVENTS_TABLE"
+    },
+    {
+      "Sid": "TerminalConnectionsTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$TERMINAL_CONNECTIONS_TABLE"
+    },
+    {
+      "Sid": "TerminalSessionsTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$TERMINAL_SESSIONS_TABLE"
+    },
+    {
+      "Sid": "TerminalRelayManageConnections",
+      "Effect": "Allow",
+      "Action": "execute-api:ManageConnections",
+      "Resource": "arn:aws:execute-api:$REGION:$ACCOUNT:*/*/POST/@connections/*"
     },
     {
       "Sid": "AccountDeletion",
@@ -695,6 +750,56 @@ if ! aws apigatewayv2 get-stage --api-id "$API_ID" --stage-name '$default' >/dev
   echo '==> Created $default stage (auto-deploy)'
 fi
 
+# --- terminal-relay WebSocket API ---------------------------------------------
+# Separate from the HTTP API on purpose: API Gateway v2 doesn't let one API mix
+# protocol types, and this is the only thing in the control plane that needs a
+# push-capable, full-duplex connection (interactive terminal bytes — the 20s
+# site heartbeat above is far too slow for keystrokes). Nothing here costs
+# anything while no terminal is open: WebSocket API Gateway bills per
+# connection-minute and per message, and a connection only exists for the
+# lifetime of one open terminal (docs/SITES.md's forced-command queue wakes the
+# site's daemon to dial in on demand — see the "terminal-open" site command).
+WS_API_ID=$(aws apigatewayv2 get-apis --query "Items[?Name=='$WS_API_NAME'].ApiId | [0]" --output text)
+if [ "$WS_API_ID" = "None" ] || [ -z "$WS_API_ID" ]; then
+  WS_API_ID=$(aws apigatewayv2 create-api --name "$WS_API_NAME" --protocol-type WEBSOCKET \
+    --route-selection-expression '$request.body.action' \
+    --description "fin terminal relay (app <-> resident site)" --query ApiId --output text)
+  echo "==> Created WebSocket API $WS_API_ID"
+fi
+
+# WebSocket integrations are payload-format 1.0 only (2.0 is HTTP-API-only), so
+# this can't reuse the HTTP API's integration above even though it targets the
+# same Lambda.
+WS_INTEGRATION_ID=$(aws apigatewayv2 get-integrations --api-id "$WS_API_ID" \
+  --query "Items[?IntegrationUri=='$LAMBDA_ARN'].IntegrationId | [0]" --output text)
+if [ "$WS_INTEGRATION_ID" = "None" ] || [ -z "$WS_INTEGRATION_ID" ]; then
+  WS_INTEGRATION_ID=$(aws apigatewayv2 create-integration --api-id "$WS_API_ID" \
+    --integration-type AWS_PROXY --integration-uri "$LAMBDA_ARN" \
+    --integration-method POST --payload-format-version 1.0 \
+    --query IntegrationId --output text)
+  echo "==> Created WebSocket AWS_PROXY integration $WS_INTEGRATION_ID"
+fi
+
+WS_EXISTING_ROUTES=$(aws apigatewayv2 get-routes --api-id "$WS_API_ID" \
+  --query "Items[].RouteKey" --output text </dev/null | tr '\t' '\n')
+while read -r ROUTE_KEY; do
+  [ -n "$ROUTE_KEY" ] || continue
+  if ! printf '%s\n' "$WS_EXISTING_ROUTES" | grep -Fxq -- "$ROUTE_KEY"; then
+    aws apigatewayv2 create-route --api-id "$WS_API_ID" --route-key "$ROUTE_KEY" \
+      --target "integrations/$WS_INTEGRATION_ID" >/dev/null </dev/null
+    echo "==> Created WebSocket route $ROUTE_KEY"
+  fi
+done <<'WS_ROUTES'
+$connect
+$disconnect
+$default
+WS_ROUTES
+
+if ! aws apigatewayv2 get-stage --api-id "$WS_API_ID" --stage-name '$default' >/dev/null 2>&1; then
+  aws apigatewayv2 create-stage --api-id "$WS_API_ID" --stage-name '$default' --auto-deploy >/dev/null
+  echo '==> Created WebSocket $default stage (auto-deploy)'
+fi
+
 # --- sweep schedule ----------------------------------------------------------
 if ! aws events describe-rule --name "$RULE" >/dev/null 2>&1; then
   aws events put-rule --name "$RULE" --schedule-expression 'rate(10 minutes)' \
@@ -733,6 +838,13 @@ case "$POLICY" in
      echo "==> Allowed the HTTP API to invoke $FUNCTION" ;;
 esac
 case "$POLICY" in
+  *fin-cp-ws*) ;;
+  *) aws lambda add-permission --function-name "$FUNCTION" --statement-id fin-cp-ws \
+       --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
+       --source-arn "arn:aws:execute-api:$REGION:$ACCOUNT:$WS_API_ID/*/*" >/dev/null
+     echo "==> Allowed the WebSocket API to invoke $FUNCTION" ;;
+esac
+case "$POLICY" in
   *fin-cp-sweep*) ;;
   *) aws lambda add-permission --function-name "$FUNCTION" --statement-id fin-cp-sweep \
        --action lambda:InvokeFunction --principal events.amazonaws.com \
@@ -748,8 +860,10 @@ case "$POLICY" in
 esac
 
 ENDPOINT=$(aws apigatewayv2 get-api --api-id "$API_ID" --query ApiEndpoint --output text)
+WS_ENDPOINT=$(aws apigatewayv2 get-api --api-id "$WS_API_ID" --query ApiEndpoint --output text)
 echo
 echo "==> Control plane ready"
-echo "    Endpoint: $ENDPOINT"
-echo "    Token:    $TOKEN_FILE"
-echo "    Smoke:    curl -sS -H \"authorization: Bearer \$(cat $TOKEN_FILE)\" $ENDPOINT/workers"
+echo "    Endpoint:    $ENDPOINT"
+echo "    WS endpoint: $WS_ENDPOINT/\$default"
+echo "    Token:       $TOKEN_FILE"
+echo "    Smoke:       curl -sS -H \"authorization: Bearer \$(cat $TOKEN_FILE)\" $ENDPOINT/workers"

@@ -28,6 +28,12 @@ struct FinSite: Decodable, Equatable, Identifiable {
         let browser: Bool?
         let brain: Brain?
         let tmuxSessions: [TmuxSession]?
+        /// Whether this site's daemon can host a relayed terminal (wakes on a
+        /// `terminal-open` site command, attaches a local PTY to tmux, and pumps
+        /// bytes through the control plane's WebSocket relay). Optional so an
+        /// older daemon that predates the feature simply omits it — nil reads as
+        /// unsupported, never as a crash or a false yes.
+        let terminalRelay: Bool?
 
         struct Brain: Decodable, Equatable {
             let kind: String?
@@ -61,6 +67,7 @@ struct FinSite: Decodable, Equatable, Identifiable {
             case daemonVersion = "daemon_version"
             case alwaysOn = "always_on"
             case tmuxSessions = "tmux_sessions"
+            case terminalRelay = "terminal_relay"
         }
     }
 

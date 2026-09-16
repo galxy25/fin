@@ -227,6 +227,12 @@ struct DaemonConfig: Decodable {
         var endpointURL: String
         /// The control plane's bearer token — a credential; it must never reach a log line.
         var token: String
+        /// The WebSocket API Gateway endpoint for the terminal relay, e.g.
+        /// wss://<ws-api-id>.execute-api.us-west-2.amazonaws.com/production. Absent =
+        /// this daemon can't be reached for an interactive relayed terminal — the
+        /// `terminal_relay` capability reports false and `terminal-open` commands are
+        /// ignored.
+        var terminalRelayURL: String?
     }
 
     /// The cloud transcript the iOS app renders for a remote agent: hourly S3 chunks
@@ -383,6 +389,7 @@ final class Daemon {
     private var transcript: DaemonTranscriptUplink?
     /// The site heartbeat + claim protocol; nil without `config.site`.
     private var siteClient: DaemonSiteClient?
+    private var terminalRelayClient: TerminalRelayClient?
     /// True from submit to outcome. Read by the site heartbeat from its own task, so
     /// a long turn reports `working` instead of going silent.
     private var isTurnInFlight = false
@@ -520,6 +527,7 @@ final class Daemon {
             "always_on": config.stayResident ?? false,
             "brain": brainCapability(),
             "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
+            "terminal_relay": config.controlPlane?.terminalRelayURL != nil,
         ]
         // The rule, and the bug it encodes, live in `PaneScanPolicy` — a pure function,
         // because "not while a turn is running" quietly meant "never" on a site whose
@@ -1800,6 +1808,16 @@ final class Daemon {
                     + "activity notes every \(activityInterval)s")
             }
 
+            if let site = config.site, let relayURL = config.controlPlane?.terminalRelayURL {
+                terminalRelayClient = TerminalRelayClient(
+                    siteID: site.id, siteToken: site.token, relayURL: relayURL,
+                    audit: { [weak self] line in
+                        self?.log(line)
+                        self?.record(AgentAuditEvent(kind: "notice", text: line))
+                    }
+                )
+            }
+
             if let site = config.site {
                 let client = DaemonSiteClient(
                     siteID: site.id,
@@ -1852,6 +1870,12 @@ final class Daemon {
                                     self.shutdown(exitCode: 0)
                                 }
                             }
+                        case "terminal-open":
+                            guard let sessionId = command.args["sessionId"], let tmuxSession = command.args["tmuxSession"] else {
+                                self.log("[relay] terminal-open command missing sessionId/tmuxSession — ignored")
+                                return
+                            }
+                            self.terminalRelayClient?.open(sessionId: sessionId, tmuxSession: tmuxSession)
                         default:
                             break // drain is handled inside the client
                         }

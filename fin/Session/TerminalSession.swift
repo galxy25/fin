@@ -15,6 +15,11 @@ enum SessionState: Equatable {
     case connecting
     case connected
     case reconnecting
+    /// `.siteRelay` only: the control plane has been asked to wake the remote
+    /// site's daemon (via its next heartbeat, ~20s worst case) and this end's
+    /// socket is open, but no `output` frame has arrived yet — there is
+    /// nothing on the other end of the pipe to call `.connecting` a dial to.
+    case waking
 }
 
 struct ServerCredentials {
@@ -98,6 +103,16 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var lastServer: Server?
     private var lastCredentials: ServerCredentials?
     private var lastEnvironment: [String: String] = [:]
+    /// Set only on the `.siteRelay` path — reconnecting after a drop replays
+    /// the same wake-then-open dance against this site rather than the
+    /// direct-SSH `run()` loop.
+    private var lastRelaySiteID: String?
+    /// Live only while a `.siteRelay` session is open or opening. `send(bytes:)`
+    /// and `resize(cols:rows:)` write here instead of `stdinWriter` when it's
+    /// set; the two are mutually exclusive by construction (one server, one
+    /// transport, decided once at `connect`/`connectSiteRelay` time).
+    private var relaySocket: URLSessionWebSocketTask?
+    private var relaySessionId: String?
     /// Bumped on every connect()/disconnect(). A `run()` invocation checks its captured
     /// generation before touching shared state, so a superseded (stale) connection attempt
     /// can never clobber a newer one's `client`/`stdinWriter`/`state` once it finally unwinds.
@@ -151,7 +166,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     #endif
 
     var isConnected: Bool {
-        client?.isConnected ?? false
+        if let client { return client.isConnected }
+        // The relay socket has no protocol-level "connected" flag of its own
+        // (unlike Citadel's `SSHClient`) — `state` already tracks exactly this
+        // for the relay path (flips to `.connected` on the first `output` frame).
+        return relaySocket != nil && state == .connected
     }
 
     /// `environment` is sent as SSH env requests with the PTY; the server's sshd only
@@ -181,6 +200,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         client = nil
         stdinWriter = nil
+        relaySocket?.cancel(with: .goingAway, reason: nil)
+        relaySocket = nil
+        relaySessionId = nil
         // Queued writes belong to the connection being replaced; letting them drain into
         // the new one would deliver stale keystrokes to a fresh shell.
         writeChain?.cancel()
@@ -189,6 +211,39 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         runTask = Task { [weak self] in
             await self?.run(server: server, credentials: credentials, environment: environment, generation: myGeneration)
+        }
+    }
+
+    /// The `.siteRelay` counterpart to `connect(server:credentials:)`: no SSH
+    /// dial at all. `siteID` is `server.relaySiteId` (validated non-nil/non-empty
+    /// by the caller — `SessionManager.open`).
+    func connectSiteRelay(server: Server, siteID: String) {
+        guard state == .disconnected || state == .reconnecting else { return }
+        state = state == .reconnecting ? .reconnecting : .waking
+        lastError = nil
+        lastServer = server
+        lastRelaySiteID = siteID
+
+        generation += 1
+        let myGeneration = generation
+        runTask?.cancel()
+
+        if let staleClient = client {
+            Task { try? await staleClient.close() }
+        }
+        client = nil
+        stdinWriter = nil
+        lastCredentials = nil
+        relaySocket?.cancel(with: .goingAway, reason: nil)
+        relaySocket = nil
+        relaySessionId = nil
+        writeChain?.cancel()
+        writeChain = nil
+        lastSendTask = nil
+
+        let sessionId = UUID().uuidString
+        runTask = Task { [weak self] in
+            await self?.runSiteRelay(server: server, siteID: siteID, sessionId: sessionId, generation: myGeneration)
         }
     }
 
@@ -201,6 +256,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastError = "No private key configured for this server."
     }
 
+    func reportMissingRelaySite() {
+        lastError = "No Fin site is selected for this server."
+    }
+
     func disconnect() {
         generation += 1
         runTask?.cancel()
@@ -210,8 +269,25 @@ final class TerminalSession: ObservableObject, Identifiable {
         let closingClient = client
         client = nil
         stdinWriter = nil
+        let closingSocket = relaySocket
+        let closingSessionId = relaySessionId
+        relaySocket = nil
+        relaySessionId = nil
         state = .disconnected
         Task { try? await closingClient?.close() }
+        if let closingSocket, let closingSessionId {
+            Task {
+                // Best-effort: tells the relay (and, once forwarded, the
+                // daemon) to tear the PTY down promptly rather than waiting
+                // out its idle timeout. The socket closes either way.
+                if let payload = try? JSONSerialization.data(withJSONObject: [
+                    "action": "close", "sessionId": closingSessionId,
+                ]) {
+                    try? await closingSocket.send(.data(payload))
+                }
+                closingSocket.cancel(with: .goingAway, reason: nil)
+            }
+        }
     }
 
     /// Transport-level write. Every caller — keystrokes, the accessory row, pasted
@@ -235,6 +311,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     @discardableResult
     func send(bytes: [UInt8]) -> Task<Bool, Never> {
         let writer = stdinWriter
+        let socket = relaySocket
+        let sessionId = relaySessionId
         let previousWrite = writeChain
         #if DEBUG
         let simulatedOutcome = simulatedWriteOutcome
@@ -254,18 +332,34 @@ final class TerminalSession: ObservableObject, Identifiable {
                 return simulatedOutcome
             }
             #endif
-            guard let writer else {
-                self.lastError = "Input was not sent: the terminal session is not connected."
-                return false
+            if let writer {
+                do {
+                    try await writer.write(ByteBuffer(bytes: bytes))
+                    self.eventLog.recordInput(bytes)
+                    return true
+                } catch {
+                    self.lastError = "Input was not sent: \(error)"
+                    return false
+                }
             }
-            do {
-                try await writer.write(ByteBuffer(bytes: bytes))
-                self.eventLog.recordInput(bytes)
-                return true
-            } catch {
-                self.lastError = "Input was not sent: \(error)"
-                return false
+            if let socket, let sessionId {
+                guard let payload = try? JSONSerialization.data(withJSONObject: [
+                    "action": "input", "sessionId": sessionId, "data": Data(bytes).base64EncodedString(),
+                ]) else {
+                    self.lastError = "Input was not sent: could not encode the relay frame."
+                    return false
+                }
+                do {
+                    try await socket.send(.data(payload))
+                    self.eventLog.recordInput(bytes)
+                    return true
+                } catch {
+                    self.lastError = "Input was not sent: \(error)"
+                    return false
+                }
             }
+            self.lastError = "Input was not sent: the terminal session is not connected."
+            return false
         }
         writeChain = thisWrite
         lastSendTask = thisWrite
@@ -296,9 +390,16 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func resize(cols: Int, rows: Int) {
-        guard let stdinWriter, cols > 0, rows > 0 else { return }
-        Task {
-            try? await stdinWriter.changeSize(cols: cols, rows: rows, pixelWidth: 0, pixelHeight: 0)
+        guard cols > 0, rows > 0 else { return }
+        if let stdinWriter {
+            Task {
+                try? await stdinWriter.changeSize(cols: cols, rows: rows, pixelWidth: 0, pixelHeight: 0)
+            }
+        } else if let relaySocket, let relaySessionId {
+            guard let payload = try? JSONSerialization.data(withJSONObject: [
+                "action": "resize", "sessionId": relaySessionId, "cols": cols, "rows": rows,
+            ]) else { return }
+            Task { try? await relaySocket.send(.data(payload)) }
         }
     }
 
@@ -386,6 +487,127 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         if shouldAutoReconnect, let server = lastServer, let credentials = lastCredentials {
             connect(server: server, credentials: credentials, environment: lastEnvironment)
+        }
+    }
+
+    /// The `.siteRelay` counterpart to `run()`. No PTY dial happens here at
+    /// all — `terminal-open` just asks the site's daemon to attach one on its
+    /// next heartbeat (~20s worst case), which is why `state` sits in
+    /// `.waking` rather than `.connecting` until the first `output` frame
+    /// proves someone is actually on the other end.
+    private func runSiteRelay(server: Server, siteID: String, sessionId: String, generation myGeneration: Int) async {
+        if case .failure(let failure) = await ControlPlaneClient.openTerminalRelay(
+            siteID, sessionId: sessionId, tmuxSession: server.tmuxSessionName
+        ) {
+            if myGeneration == generation {
+                lastError = "Could not reach the control plane: \(failure)"
+            }
+        } else {
+            await openRelaySocket(server: server, siteID: siteID, sessionId: sessionId, generation: myGeneration)
+        }
+
+        guard myGeneration == generation else { return }
+        // Same reasoning as `run()`'s auto-reconnect: only a session that made
+        // it to `.connected` and then dropped retries itself silently. A wake
+        // or dial that never got an `output` frame is left for the user (or an
+        // explicit reconnect trigger) rather than spinning against a site
+        // that may not be reachable at all.
+        let shouldAutoReconnect = state == .connected
+        relaySocket = nil
+        relaySessionId = nil
+        if state != .disconnected {
+            state = .disconnected
+        }
+        if shouldAutoReconnect, let server = lastServer, let siteID = lastRelaySiteID {
+            connectSiteRelay(server: server, siteID: siteID)
+        }
+    }
+
+    private func openRelaySocket(server: Server, siteID: String, sessionId: String, generation myGeneration: Int) async {
+        let wsURLString = CloudControlPlaneConfig.webSocketURL
+        guard !wsURLString.isEmpty, let wsURL = URL(string: wsURLString) else {
+            if myGeneration == generation {
+                lastError = "No terminal relay endpoint is configured."
+            }
+            return
+        }
+        var request = URLRequest(url: wsURL)
+        request.setValue("Bearer \(CloudControlPlaneConfig.token)", forHTTPHeaderField: "authorization")
+        let socket = URLSession.shared.webSocketTask(with: request)
+        socket.resume()
+
+        guard myGeneration == generation else {
+            socket.cancel(with: .goingAway, reason: nil)
+            return
+        }
+        relaySocket = socket
+        relaySessionId = sessionId
+
+        guard let openFrame = try? JSONSerialization.data(withJSONObject: [
+            "action": "open", "sessionId": sessionId, "siteId": siteID, "tmuxSession": server.tmuxSessionName,
+        ]) else {
+            lastError = "Could not open the terminal relay: could not encode the open frame."
+            return
+        }
+        do {
+            try await socket.send(.data(openFrame))
+        } catch {
+            if myGeneration == generation {
+                lastError = "Could not open the terminal relay: \(error)"
+            }
+            return
+        }
+
+        while myGeneration == generation {
+            let message: URLSessionWebSocketTask.Message
+            do {
+                message = try await socket.receive()
+            } catch {
+                if myGeneration == generation {
+                    lastError = String(describing: error)
+                }
+                return
+            }
+            guard myGeneration == generation else { return }
+            switch message {
+            case .data(let data):
+                handleRelayFrame(data, generation: myGeneration)
+            case .string(let text):
+                handleRelayFrame(Data(text.utf8), generation: myGeneration)
+            @unknown default:
+                break
+            }
+        }
+    }
+
+    /// Frames from the relay: `attached` (the site's daemon has dialed in and
+    /// is running the PTY — the earliest proof someone is on the other end,
+    /// arriving before any real output when the tmux session started quiet)
+    /// and `output` (PTY bytes) both promote `.waking`/`.reconnecting` to
+    /// `.connected`; `close` means the daemon or the relay itself ended the
+    /// session.
+    private func handleRelayFrame(_ data: Data, generation myGeneration: Int) {
+        guard myGeneration == generation,
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let action = object["action"] as? String
+        else { return }
+        switch action {
+        case "attached":
+            if state != .connected {
+                state = .connected
+            }
+        case "output":
+            guard let encoded = object["data"] as? String, let bytes = Data(base64Encoded: encoded) else { return }
+            if state != .connected {
+                state = .connected
+            }
+            let byteArray = [UInt8](bytes)
+            eventLog.recordOutput(byteArray)
+            terminalView.feed(byteArray: byteArray[...])
+        case "close":
+            relaySocket?.cancel(with: .normalClosure, reason: nil)
+        default:
+            break
         }
     }
 

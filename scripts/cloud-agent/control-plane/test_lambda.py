@@ -3445,3 +3445,248 @@ class AbandonedMessageRetirementTests(unittest.TestCase):
     def test_the_retirement_cutoff_defaults_to_the_display_cutoff(self):
         """Saying "stalled" and deciding "no answer is coming" start from the same clock."""
         self.assertEqual(lam.ABANDON_APPLIED_SECONDS, lam.STALE_WORKING_SECONDS)
+
+
+class TerminalOpenCommandKindTests(_SitesTestCase):
+    """"terminal-open" queues and drains exactly like restart/update/stop/drain
+    — it carries no special validation of its own, only what queue_site_command
+    already does for every kind."""
+
+    def setUp(self):
+        super().setUp()
+        self.site = self.enroll()
+
+    def test_terminal_open_is_a_recognized_kind(self):
+        self.assertIn("terminal-open", lam.SITE_COMMAND_KINDS)
+
+    def test_terminal_open_queues_with_its_args_intact(self):
+        response = lam.queue_site_command(
+            {"_userId": "user-1", "body": json.dumps(
+                {"kind": "terminal-open", "args": {"sessionId": "s-1", "tmuxSession": "kio"}}
+            )},
+            self.site["siteId"],
+        )
+        command = json.loads(response["body"])["command"]
+        self.assertEqual(command["kind"], "terminal-open")
+        self.assertEqual(command["args"], {"sessionId": "s-1", "tmuxSession": "kio"})
+
+    def test_terminal_open_drains_on_the_next_heartbeat_like_any_other_kind(self):
+        lam.queue_site_command(
+            {"_userId": "user-1", "body": json.dumps({"kind": "terminal-open", "args": {"sessionId": "s-1"}})},
+            self.site["siteId"],
+        )
+        beat = lam.site_heartbeat(
+            {"_userId": "user-1", "_siteId": self.site["siteId"], "body": json.dumps({})},
+            self.site["siteId"],
+        )
+        self.assertEqual([c["kind"] for c in json.loads(beat["body"])["commands"]], ["terminal-open"])
+
+    def test_a_site_still_cannot_queue_its_own_terminal_open(self):
+        # Same reasoning as every other command kind (SiteTokenScopeTests): a
+        # body that can queue its own commands could tell itself to open a
+        # terminal nobody asked for.
+        with self.assertRaises(lam.ApiError) as caught:
+            lam._require_site_scope(
+                {"_siteId": self.site["siteId"]}, "POST", ["sites", self.site["siteId"], "commands"]
+            )
+        self.assertEqual(caught.exception.status, 403)
+
+
+class _FakeManagementClient:
+    """Records every post_to_connection call; raises GoneException for any
+    connectionId pre-declared gone, exactly like a stale WebSocket peer."""
+
+    def __init__(self, gone_ids=()):
+        self.gone_ids = set(gone_ids)
+        self.sent = []
+
+    def post_to_connection(self, ConnectionId, Data):
+        if ConnectionId in self.gone_ids:
+            raise lam.ClientError({"Error": {"Code": "GoneException", "Message": "gone"}}, "PostToConnection")
+        self.sent.append((ConnectionId, json.loads(Data.decode("utf-8"))))
+
+
+class _TerminalRelayTestCase(unittest.TestCase):
+    """Wires fake tables for the two terminal-relay tables and a fake
+    management-API client in place of the real WebSocket send, the same
+    approach _SitesTestCase uses for the REST tables."""
+
+    def setUp(self):
+        self.addCleanup(setattr, lam, "TERMINAL_CONNECTIONS_TABLE", lam.TERMINAL_CONNECTIONS_TABLE)
+        self.addCleanup(setattr, lam, "TERMINAL_SESSIONS_TABLE", lam.TERMINAL_SESSIONS_TABLE)
+        self.addCleanup(setattr, lam, "SITES_TABLE", lam.SITES_TABLE)
+        lam.TERMINAL_CONNECTIONS_TABLE = _FakeDynamoTable("connectionId")
+        lam.TERMINAL_SESSIONS_TABLE = _FakeDynamoTable("sessionId")
+        lam.SITES_TABLE = _FakeDynamoTable("siteId")
+        self.management = _FakeManagementClient()
+        self.addCleanup(setattr, lam, "_ws_management_client", lam._ws_management_client)
+        lam._ws_management_client = lambda event: self.management
+        self.site_id = "a4a1d987-0000-4000-8000-000000000000"
+        lam.SITES_TABLE.items[self.site_id] = {"siteId": self.site_id, "userId": "user-1", "state": "working"}
+
+    def _ws_event(self, connection_id, body=None):
+        event = {"requestContext": {"connectionId": connection_id, "eventType": "MESSAGE",
+                                     "domainName": "example.invalid", "stage": "$default"}}
+        if body is not None:
+            event["body"] = json.dumps(body)
+        return event
+
+    def _connect(self, connection_id, role, **extra):
+        item = {"connectionId": connection_id, "role": role, "userId": "user-1"}
+        item.update(extra)
+        lam.TERMINAL_CONNECTIONS_TABLE.items[connection_id] = item
+
+
+class WebsocketEventDetectionTests(unittest.TestCase):
+    def test_a_websocket_event_is_detected(self):
+        event = {"requestContext": {"connectionId": "c1", "eventType": "MESSAGE"}}
+        self.assertTrue(lam._is_websocket_event(event))
+
+    def test_an_http_api_event_is_not_detected_as_websocket(self):
+        event = {"requestContext": {"http": {"method": "GET"}}, "rawPath": "/sites"}
+        self.assertFalse(lam._is_websocket_event(event))
+
+
+class TerminalRelayOpenAttachTests(_TerminalRelayTestCase):
+    def test_app_open_creates_a_session_row_pointed_at_the_app_connection(self):
+        self._connect("app-1", "app")
+        response = lam.ws_message(self._ws_event(
+            "app-1", {"action": "open", "sessionId": "s-1", "siteId": self.site_id, "tmuxSession": "kio"}
+        ))
+        self.assertEqual(response["statusCode"], 200)
+        session = lam.TERMINAL_SESSIONS_TABLE.items["s-1"]
+        self.assertEqual(session["appConnectionId"], "app-1")
+        self.assertEqual(session["siteId"], self.site_id)
+
+    def test_a_site_cannot_open_a_session(self):
+        self._connect("site-1", "site", siteId=self.site_id)
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.ws_message(self._ws_event("site-1", {"action": "open", "sessionId": "s-1", "siteId": self.site_id}))
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_opening_against_someone_elses_site_404s(self):
+        self._connect("app-1", "app", userId="attacker")
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.ws_message(self._ws_event(
+                "app-1", {"action": "open", "sessionId": "s-1", "siteId": self.site_id}
+            ))
+        self.assertEqual(caught.exception.status, 404)
+
+    def test_site_attach_records_the_daemon_connection_and_notifies_the_app(self):
+        self._connect("app-1", "app")
+        lam.ws_message(self._ws_event(
+            "app-1", {"action": "open", "sessionId": "s-1", "siteId": self.site_id, "tmuxSession": "kio"}
+        ))
+        self._connect("site-1", "site", siteId=self.site_id)
+        response = lam.ws_message(self._ws_event("site-1", {"action": "attach", "sessionId": "s-1"}))
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(lam.TERMINAL_SESSIONS_TABLE.items["s-1"]["daemonConnectionId"], "site-1")
+        self.assertIn(("app-1", {"action": "attached", "sessionId": "s-1"}), self.management.sent)
+
+    def test_an_app_cannot_attach(self):
+        self._connect("app-1", "app")
+        lam.ws_message(self._ws_event("app-1", {"action": "open", "sessionId": "s-1", "siteId": self.site_id}))
+        self._connect("app-2", "app")
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.ws_message(self._ws_event("app-2", {"action": "attach", "sessionId": "s-1"}))
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_a_site_cannot_attach_to_another_sites_session(self):
+        self._connect("app-1", "app")
+        lam.ws_message(self._ws_event("app-1", {"action": "open", "sessionId": "s-1", "siteId": self.site_id}))
+        self._connect("site-2", "site", siteId="some-other-site")
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.ws_message(self._ws_event("site-2", {"action": "attach", "sessionId": "s-1"}))
+        self.assertEqual(caught.exception.status, 404)
+
+
+class TerminalRelayForwardingTests(_TerminalRelayTestCase):
+    def _open_and_attach(self):
+        self._connect("app-1", "app")
+        lam.ws_message(self._ws_event("app-1", {"action": "open", "sessionId": "s-1", "siteId": self.site_id}))
+        self._connect("site-1", "site", siteId=self.site_id)
+        lam.ws_message(self._ws_event("site-1", {"action": "attach", "sessionId": "s-1"}))
+
+    def test_input_is_forwarded_from_app_to_the_attached_site(self):
+        self._open_and_attach()
+        lam.ws_message(self._ws_event("app-1", {"action": "input", "sessionId": "s-1", "data": "aGk="}))
+        self.assertIn(("site-1", {"action": "input", "sessionId": "s-1", "data": "aGk="}), self.management.sent)
+
+    def test_output_is_forwarded_from_site_to_the_attached_app(self):
+        self._open_and_attach()
+        lam.ws_message(self._ws_event("site-1", {"action": "output", "sessionId": "s-1", "data": "aGk="}))
+        self.assertIn(("app-1", {"action": "output", "sessionId": "s-1", "data": "aGk="}), self.management.sent)
+
+    def test_input_before_the_site_attaches_is_pending_not_an_error(self):
+        self._connect("app-1", "app")
+        lam.ws_message(self._ws_event("app-1", {"action": "open", "sessionId": "s-1", "siteId": self.site_id}))
+        response = lam.ws_message(self._ws_event("app-1", {"action": "input", "sessionId": "s-1", "data": "aGk="}))
+        self.assertEqual(response["statusCode"], 202)
+
+    def test_the_site_cannot_forward_input_impersonating_the_app_role(self):
+        self._open_and_attach()
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.ws_message(self._ws_event("site-1", {"action": "input", "sessionId": "s-1", "data": "aGk="}))
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_a_gone_site_connection_is_cleared_from_the_session_row(self):
+        self._open_and_attach()
+        self.management.gone_ids.add("site-1")
+        lam.ws_message(self._ws_event("app-1", {"action": "input", "sessionId": "s-1", "data": "aGk="}))
+        self.assertNotIn("daemonConnectionId", lam.TERMINAL_SESSIONS_TABLE.items["s-1"])
+
+
+class TerminalRelayCloseAndDisconnectTests(_TerminalRelayTestCase):
+    def _open_and_attach(self):
+        self._connect("app-1", "app")
+        lam.ws_message(self._ws_event("app-1", {"action": "open", "sessionId": "s-1", "siteId": self.site_id}))
+        self._connect("site-1", "site", siteId=self.site_id)
+        lam.ws_message(self._ws_event("site-1", {"action": "attach", "sessionId": "s-1"}))
+
+    def test_close_from_either_side_tears_down_the_session_row(self):
+        self._open_and_attach()
+        lam.ws_message(self._ws_event("app-1", {"action": "close", "sessionId": "s-1"}))
+        self.assertNotIn("s-1", lam.TERMINAL_SESSIONS_TABLE.items)
+
+    def test_close_notifies_the_still_connected_peer(self):
+        self._open_and_attach()
+        lam.ws_message(self._ws_event("app-1", {"action": "close", "sessionId": "s-1", "reason": "done"}))
+        self.assertIn(("site-1", {"action": "close", "sessionId": "s-1", "reason": "done"}), self.management.sent)
+
+    def test_disconnect_tears_down_the_session_and_notifies_the_peer(self):
+        self._open_and_attach()
+        response = lam.ws_disconnect(self._ws_event("app-1"))
+        self.assertEqual(response["statusCode"], 200)
+        self.assertNotIn("s-1", lam.TERMINAL_SESSIONS_TABLE.items)
+        self.assertIn(("site-1", {"action": "close", "sessionId": "s-1", "reason": "peer disconnected"}),
+                       self.management.sent)
+
+    def test_disconnect_with_no_known_connection_is_a_no_op(self):
+        response = lam.ws_disconnect(self._ws_event("ghost-connection"))
+        self.assertEqual(response["statusCode"], 200)
+
+
+class UnknownConnectionMessageTests(_TerminalRelayTestCase):
+    def test_a_message_from_an_untracked_connection_is_rejected(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.ws_message(self._ws_event("ghost", {"action": "input", "sessionId": "s-1"})).status
+        self.assertEqual(caught.exception.status, 401)
+
+
+class TerminalRelayDeployTests(SiteRouteRegistrationTests):
+    """Same reasoning as SiteRouteRegistrationTests: the WebSocket routes and
+    the two new tables/policy statements need to actually exist in deploy.sh,
+    or the Lambda code above ships against infrastructure nobody created."""
+
+    def test_the_websocket_routes_are_registered(self):
+        for route in ("$connect", "$disconnect", "$default"):
+            self.assertIn(route + "\n", self.deploy_sh, route)
+        self.assertIn("--protocol-type WEBSOCKET", self.deploy_sh)
+
+    def test_the_terminal_relay_tables_are_created_and_granted(self):
+        self.assertIn("TERMINAL_CONNECTIONS_TABLE=fin-terminal-connections", self.deploy_sh)
+        self.assertIn("TERMINAL_SESSIONS_TABLE=fin-terminal-sessions", self.deploy_sh)
+        self.assertIn('"Sid": "TerminalConnectionsTable"', self.deploy_sh)
+        self.assertIn('"Sid": "TerminalSessionsTable"', self.deploy_sh)
+        self.assertIn('"Sid": "TerminalRelayManageConnections"', self.deploy_sh)
+        self.assertIn("execute-api:ManageConnections", self.deploy_sh)
