@@ -303,7 +303,17 @@ final class SessionManager: ObservableObject {
     func open(_ server: Server) -> TerminalSession {
         activeServerID = server.id
         let session = session(for: server)
-        guard session.state == .disconnected else { return session }
+        guard session.state == .disconnected else {
+            if server.transport == .siteRelay {
+                // The state most likely to strand a tap silently: a prior attempt
+                // that never got past `.waking` (the site never came online, or its
+                // WebSocket never delivered a first frame) leaves nothing for the
+                // user to retry against — this line is what tells us that happened
+                // instead of "nothing happened" looking identical to "it worked".
+                ControlPlaneClient.logClientEvent(.relayConnectBlocked, detail: ["reason": "session_not_disconnected", "state": String(describing: session.state)])
+            }
+            return session
+        }
         switch server.transport {
         case .direct:
             guard let credentials = resolveCredentials(server) else {
@@ -313,6 +323,7 @@ final class SessionManager: ObservableObject {
             session.connect(server: server, credentials: credentials)
         case .siteRelay:
             guard let siteID = server.relaySiteId, !siteID.isEmpty else {
+                ControlPlaneClient.logClientEvent(.relayConnectBlocked, detail: ["reason": "no_site_selected"])
                 session.reportMissingRelaySite()
                 return session
             }

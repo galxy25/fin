@@ -122,6 +122,33 @@ enum ControlPlaneClient {
             }
     }
 
+    // MARK: - Client telemetry
+
+    /// A named, closed vocabulary of terminal-relay breadcrumbs (must match
+    /// `CLIENT_EVENT_KINDS` in the control plane's `lambda.py`) — without this,
+    /// a connect blocked by a client-side guard, a command the control plane
+    /// never saw, and a socket that opened and died immediately all look
+    /// identical from the operator's side: silence. Fire-and-forget: a failed
+    /// telemetry post must never affect the relay it is reporting on, so this
+    /// returns nothing and the caller does not await failure.
+    enum ClientEventKind: String {
+        case relayConnectBlocked = "relay_connect_blocked"
+        case relayCommandQueued = "relay_command_queued"
+        case relayCommandFailed = "relay_command_failed"
+        case relayWSOpen = "relay_ws_open"
+        case relayWSOpenFailed = "relay_ws_open_failed"
+        case relayWSReceiveFailed = "relay_ws_receive_failed"
+        case relayWSMessage = "relay_ws_message"
+        case relayState = "relay_state"
+        case relayClosed = "relay_closed"
+    }
+
+    static func logClientEvent(_ kind: ClientEventKind, detail: [String: Any] = [:]) {
+        var body: [String: Any] = ["kind": kind.rawValue]
+        if !detail.isEmpty { body["detail"] = detail }
+        Task { _ = await perform(request("POST", path: "/client-events", body: body)) }
+    }
+
     // MARK: - Account
 
     /// What `DELETE /account` reports it removed, so the app can tell the user

@@ -218,7 +218,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// dial at all. `siteID` is `server.relaySiteId` (validated non-nil/non-empty
     /// by the caller — `SessionManager.open`).
     func connectSiteRelay(server: Server, siteID: String) {
-        guard state == .disconnected || state == .reconnecting else { return }
+        guard state == .disconnected || state == .reconnecting else {
+            ControlPlaneClient.logClientEvent(.relayConnectBlocked, detail: ["reason": "not_disconnected", "state": String(describing: state)])
+            return
+        }
         state = state == .reconnecting ? .reconnecting : .waking
         lastError = nil
         lastServer = server
@@ -499,10 +502,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         if case .failure(let failure) = await ControlPlaneClient.openTerminalRelay(
             siteID, sessionId: sessionId, tmuxSession: server.tmuxSessionName
         ) {
+            ControlPlaneClient.logClientEvent(.relayCommandFailed, detail: ["siteId": siteID, "error": String(describing: failure)])
             if myGeneration == generation {
                 lastError = "Could not reach the control plane: \(failure)"
             }
         } else {
+            ControlPlaneClient.logClientEvent(.relayCommandQueued, detail: ["siteId": siteID, "sessionId": sessionId])
             await openRelaySocket(server: server, siteID: siteID, sessionId: sessionId, generation: myGeneration)
         }
 
@@ -547,6 +552,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         let socket = URLSession.shared.webSocketTask(with: wsURL)
         socket.resume()
+        ControlPlaneClient.logClientEvent(.relayWSOpen, detail: ["siteId": siteID, "sessionId": sessionId])
 
         guard myGeneration == generation else {
             socket.cancel(with: .goingAway, reason: nil)
@@ -558,12 +564,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard let openFrame = try? JSONSerialization.data(withJSONObject: [
             "action": "open", "sessionId": sessionId, "siteId": siteID, "tmuxSession": server.tmuxSessionName,
         ]) else {
+            ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "encode_open_frame"])
             lastError = "Could not open the terminal relay: could not encode the open frame."
             return
         }
         do {
             try await socket.send(.data(openFrame))
         } catch {
+            ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "send_open_frame", "error": String(describing: error)])
             if myGeneration == generation {
                 lastError = "Could not open the terminal relay: \(error)"
             }
@@ -575,6 +583,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             do {
                 message = try await socket.receive()
             } catch {
+                ControlPlaneClient.logClientEvent(.relayWSReceiveFailed, detail: ["sessionId": sessionId, "error": String(describing: error)])
                 if myGeneration == generation {
                     lastError = String(describing: error)
                 }

@@ -24,6 +24,7 @@ public final class TerminalRelayClient {
     private let siteID: String
     private let siteToken: String
     private let relayURL: String
+    private let controlPlaneURL: String?
     private let urlSession: URLSession
     private let audit: (String) -> Void
 
@@ -41,14 +42,39 @@ public final class TerminalRelayClient {
     private var sessions: [String: RelaySession] = [:]
 
     public init(
-        siteID: String, siteToken: String, relayURL: String,
+        siteID: String, siteToken: String, relayURL: String, controlPlaneURL: String? = nil,
         urlSession: URLSession = .shared, audit: @escaping (String) -> Void
     ) {
         self.siteID = siteID
         self.siteToken = siteToken
         self.relayURL = relayURL
+        self.controlPlaneURL = controlPlaneURL
         self.urlSession = urlSession
         self.audit = audit
+    }
+
+    /// Best-effort breadcrumb to the same `/client-events` endpoint the app posts
+    /// to (`kind` must match `CLIENT_EVENT_KINDS` in the control plane's
+    /// `lambda.py`), so a session that dies on this body's end shows up next to
+    /// the app's side of the same story instead of only in a local log file
+    /// nobody but this Mac can read. Never awaited, never lets a failure here
+    /// touch the relay it's reporting on.
+    private func logClientEvent(_ kind: String, sessionId: String, detail: [String: Any] = [:]) {
+        guard let controlPlaneURL, var components = URLComponents(string: controlPlaneURL) else { return }
+        components.path += (components.path.hasSuffix("/") ? "" : "/") + "client-events"
+        guard let url = components.url else { return }
+        var body: [String: Any] = ["kind": kind]
+        var fullDetail = detail
+        fullDetail["sessionId"] = sessionId
+        body["detail"] = fullDetail
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(siteToken)", forHTTPHeaderField: "authorization")
+        request.setValue(siteID, forHTTPHeaderField: "X-Fin-Site")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = payload
+        urlSession.dataTask(with: request) { _, _, _ in }.resume()
     }
 
     /// Handles a `terminal-open` command's args (`sessionId`, `tmuxSession`). Idempotent —
@@ -77,6 +103,7 @@ public final class TerminalRelayClient {
         }
 
         socket.resume()
+        logClientEvent("relay_ws_open", sessionId: sessionId, detail: ["tmuxSession": tmuxSession])
         send(sessionId: sessionId, frame: ["action": "attach", "sessionId": sessionId])
         terminal.connect()
         armIdleTimeout(sessionId: sessionId)
@@ -102,6 +129,7 @@ public final class TerminalRelayClient {
                 case .failure(let error):
                     guard startupAttemptsRemaining > 1 else {
                         self.audit("[relay] \(sessionId): socket error — \(error.localizedDescription.prefix(160))")
+                        self.logClientEvent("relay_ws_receive_failed", sessionId: sessionId, detail: ["error": String(describing: error)])
                         self.close(sessionId: sessionId, sendCloseFrame: false)
                         return
                     }
@@ -184,6 +212,7 @@ public final class TerminalRelayClient {
         relay.terminal.disconnect()
         relay.socket.cancel(with: .normalClosure, reason: nil)
         audit("[relay] \(sessionId): closed")
+        logClientEvent("relay_closed", sessionId: sessionId, detail: ["sendCloseFrame": sendCloseFrame])
     }
 
     // MARK: - Helpers

@@ -1811,6 +1811,7 @@ final class Daemon {
             if let site = config.site, let relayURL = config.controlPlane?.terminalRelayURL {
                 terminalRelayClient = TerminalRelayClient(
                     siteID: site.id, siteToken: site.token, relayURL: relayURL,
+                    controlPlaneURL: config.controlPlane?.endpointURL,
                     audit: { [weak self] line in
                         self?.log(line)
                         self?.record(AgentAuditEvent(kind: "notice", text: line))

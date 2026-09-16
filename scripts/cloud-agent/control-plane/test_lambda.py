@@ -3506,6 +3506,50 @@ class _FakeManagementClient:
         self.sent.append((ConnectionId, json.loads(Data.decode("utf-8"))))
 
 
+class ClientEventTests(unittest.TestCase):
+    """POST /client-events — the diagnostic breadcrumb the app/daemon emit at
+    each step of the terminal relay, since with no telemetry a blocked guard,
+    a dropped command, and a socket that died on open all look identical from
+    the operator's side: silence."""
+
+    def test_recognized_kind_logs_and_acks(self):
+        response = lam.ingest_client_event({
+            "_userId": "user-1",
+            "body": json.dumps({"kind": "relay_connect_blocked", "detail": {"reason": "no_site"}}),
+        })
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(json.loads(response["body"]), {"ok": True})
+
+    def test_detail_is_optional(self):
+        response = lam.ingest_client_event({"_userId": "user-1", "body": json.dumps({"kind": "relay_ws_open"})})
+        self.assertEqual(response["statusCode"], 200)
+
+    def test_unknown_kind_is_rejected(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.ingest_client_event({"_userId": "user-1", "body": json.dumps({"kind": "made_up_kind"})})
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_non_object_detail_is_rejected(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.ingest_client_event({
+                "_userId": "user-1", "body": json.dumps({"kind": "relay_ws_open", "detail": "not an object"}),
+            })
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_oversized_body_is_rejected(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam.ingest_client_event({
+                "_userId": "user-1",
+                "body": json.dumps({"kind": "relay_ws_open", "detail": {"pad": "x" * lam.MAX_CLIENT_EVENT_BYTES}}),
+            })
+        self.assertEqual(caught.exception.status, 413)
+
+    def test_a_site_token_may_post_its_own_events(self):
+        # No 403 from _require_site_scope's allow-list — a daemon must be able
+        # to report a relay failure the same as the app can.
+        lam._require_site_scope({"_siteId": "a4a1d987-0000-4000-8000-000000000000"}, "POST", ["client-events"])
+
+
 class _TerminalRelayTestCase(unittest.TestCase):
     """Wires fake tables for the two terminal-relay tables and a fake
     management-API client in place of the real WebSocket send, the same

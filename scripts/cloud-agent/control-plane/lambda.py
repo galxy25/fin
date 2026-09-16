@@ -1452,6 +1452,48 @@ FEEDBACK_KEYS = {
 # One stored document. Trajectories bigger than this are chunked app-side.
 MAX_FEEDBACK_BYTES = 1024 * 1024
 
+# A closed, named vocabulary rather than free text: this is a diagnostic
+# breadcrumb an operator greps out of CloudWatch by kind, not an open event
+# bus, and every kind here should read as a specific moment in the terminal
+# relay's life a human would otherwise have to reconstruct from silence (an
+# app that never calls out at all looks identical to one blocked by a guard,
+# a dropped command, or a socket that opened and immediately died — this is
+# the difference between those).
+CLIENT_EVENT_KINDS = frozenset({
+    "relay_connect_blocked", "relay_command_queued", "relay_command_failed",
+    "relay_ws_open", "relay_ws_open_failed", "relay_ws_receive_failed",
+    "relay_ws_message", "relay_state", "relay_closed",
+})
+MAX_CLIENT_EVENT_BYTES = 4096
+
+
+def ingest_client_event(event):
+    """POST /client-events — {"kind": one of CLIENT_EVENT_KINDS, "detail": object|null}.
+
+    A small structured breadcrumb the app or a site emits at each step of the
+    terminal relay a human can't otherwise observe — logged to CloudWatch only
+    (`aws logs tail /aws/lambda/fin-control-plane | grep client-event`), never
+    stored, never paged on. `detail` is for small, non-sensitive context
+    (a site id, a session id, an error's localizedDescription) — callers must
+    not put secrets or free-form user text in it; this is diagnostic, not an
+    audit log."""
+    raw = event.get("body") or ""
+    if len(raw.encode("utf-8")) > MAX_CLIENT_EVENT_BYTES:
+        raise ApiError(413, "body exceeds {} bytes".format(MAX_CLIENT_EVENT_BYTES))
+    body = _body(event)
+    kind = str(body.get("kind") or "").strip()
+    if kind not in CLIENT_EVENT_KINDS:
+        raise ApiError(400, "kind must be one of: {}".format(", ".join(sorted(CLIENT_EVENT_KINDS))))
+    detail = body.get("detail")
+    if detail is not None and not isinstance(detail, dict):
+        raise ApiError(400, "detail must be a JSON object or null")
+    role = "site:{}".format(event["_siteId"]) if event.get("_siteId") else "app"
+    LOG.info(
+        "client-event kind=%s role=%s userId=%s detail=%s",
+        kind, role, event.get("_userId"), json.dumps(detail or {}, default=str)[:2000],
+    )
+    return _response(200, {"ok": True})
+
 
 def ingest_feedback(event):
     """POST /feedback — the FROZEN ingest contract the app team builds against.
@@ -6035,6 +6077,8 @@ def _require_site_scope(event, method, parts):
         return
     if method == "POST" and parts == ["feedback"]:
         return
+    if method == "POST" and parts == ["client-events"]:
+        return
     if len(parts) == 3 and parts[0] == "agents" and parts[2] == "goals":
         return
     # Reading (never writing — every thread write is a side effect of a route
@@ -6107,6 +6151,8 @@ def _route(event):
         return presign(event)
     if method == "POST" and parts == ["feedback"]:
         return ingest_feedback(event)
+    if method == "POST" and parts == ["client-events"]:
+        return ingest_client_event(event)
     if method == "PUT" and parts == ["device-tokens"]:
         return put_device_token(event)
     if method == "POST" and parts == ["notify"]:
