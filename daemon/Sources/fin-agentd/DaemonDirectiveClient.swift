@@ -174,11 +174,16 @@ final class DaemonDirectiveClient {
     /// command, `terminal_relay` capability, WebSocket PTY/tmux relay. Additive;
     /// a pre-1.9.0 app simply never offers this daemon in the relay-site picker.
     /// 1.9.3: moved the terminal relay's WebSocket handshake auth off HTTP
-    /// headers onto the query string (`?token=...&site=...`) — a real
-    /// URLSessionWebSocketTask bug on this OS/Foundation made a
-    /// header-carrying handshake connect and even send its first frame, then
-    /// fail the very next receive with ENOTCONN.
-    static let daemonVersion = "1.9.3"
+    /// headers onto the query string (`?token=...&site=...`) — which did NOT
+    /// fix it; see 1.10.0.
+    /// 1.10.0: the terminal relay is no longer API Gateway. That endpoint and
+    /// `URLSessionWebSocketTask` are incompatible (connect and first send
+    /// succeed, the next receive fails ENOTCONN, always — the query-string
+    /// change above was chasing the wrong cause), so the relay is now an
+    /// ordinary WebSocket server on an on-demand instance. `terminal-open`
+    /// therefore carries `relayHost`/`relayPort` and a command without them is
+    /// ignored; `controlPlane.terminalRelayURL` is gone from the config.
+    static let daemonVersion = "1.10.0"
     /// The ONE status that means "no such object" on a first-run read. S3 answers 404
     /// for a missing key when the signer may `s3:ListBucket` — the control plane's and
     /// the operator's signers hold it for exactly that reason (control-plane commit

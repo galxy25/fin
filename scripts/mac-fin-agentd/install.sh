@@ -69,8 +69,15 @@ DOMAIN="gui/$(id -u)"
 # Recognized keys (all optional): FIN_TRANSPORT, FIN_LLM_URL, FIN_LLM_API_KEY, FIN_MODEL, FIN_PRIORITY,
 # FIN_CONTROL_PLANE_ENDPOINT, FIN_DISPLAY_NAME, FIN_TMUX_SOCKET.
 ENV_FILE=""
-for i in $(seq 1 $#); do
-	if [ "${!i}" = "--env-file" ]; then j=$((i + 1)); ENV_FILE="${!j:-}"; fi
+# Walks the arguments themselves rather than indices. The index version used
+# `seq 1 $#`, and BSD seq COUNTS DOWN when the end is below the start: with no
+# arguments at all, `seq 1 0` emits "1 0" instead of nothing, the loop ran, and
+# `${!1}` was an unbound variable under `set -u` — so `install.sh` with no flags
+# died on line one while `install.sh --start` worked fine.
+prev=""
+for arg in "$@"; do
+	if [ "$prev" = "--env-file" ]; then ENV_FILE="$arg"; fi
+	prev="$arg"
 done
 [ -n "$ENV_FILE" ] || { [ -f "$SCRIPT_DIR/site.env" ] && ENV_FILE="$SCRIPT_DIR/site.env"; }
 if [ -n "$ENV_FILE" ]; then
