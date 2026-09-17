@@ -147,6 +147,11 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: EC27UF79GL
         MARKETING_VERSION: "1.0.1"
+        # visionOS 1.0.1 is already approved on the App Store (Ready for Distribution)
+        # — Apple closes a pre-release train to new builds once it's approved, so this
+        # platform alone needs to be one step ahead of iOS/macOS, which are still on
+        # their first 1.0.1 review.
+        "MARKETING_VERSION[sdk=xros*]": "1.0.2"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1,2"
