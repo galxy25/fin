@@ -111,7 +111,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// and `resize(cols:rows:)` write here instead of `stdinWriter` when it's
     /// set; the two are mutually exclusive by construction (one server, one
     /// transport, decided once at `connect`/`connectSiteRelay` time).
-    private var relaySocket: URLSessionWebSocketTask?
+    private var relaySocket: RelayWebSocket?
     private var relaySessionId: String?
     /// How many two-second tries the relay gets to come up — 90 seconds, sized
     /// for a cold `t4g.nano` installing python and starting the service, since
@@ -205,7 +205,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         client = nil
         stdinWriter = nil
-        relaySocket?.cancel(with: .goingAway, reason: nil)
+        relaySocket?.cancel()
         relaySocket = nil
         relaySessionId = nil
         // Queued writes belong to the connection being replaced; letting them drain into
@@ -242,7 +242,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         client = nil
         stdinWriter = nil
         lastCredentials = nil
-        relaySocket?.cancel(with: .goingAway, reason: nil)
+        relaySocket?.cancel()
         relaySocket = nil
         relaySessionId = nil
         writeChain?.cancel()
@@ -291,9 +291,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                 if let payload = try? JSONSerialization.data(withJSONObject: [
                     "action": "close", "sessionId": closingSessionId,
                 ]) {
-                    try? await closingSocket.send(.data(payload))
+                    try? await closingSocket.send(payload)
                 }
-                closingSocket.cancel(with: .goingAway, reason: nil)
+                closingSocket.cancel()
             }
         }
     }
@@ -358,7 +358,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     return false
                 }
                 do {
-                    try await socket.send(.data(payload))
+                    try await socket.send(payload)
                     self.eventLog.recordInput(bytes)
                     return true
                 } catch {
@@ -407,7 +407,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             guard let payload = try? JSONSerialization.data(withJSONObject: [
                 "action": "resize", "sessionId": relaySessionId, "cols": cols, "rows": rows,
             ]) else { return }
-            Task { try? await relaySocket.send(.data(payload)) }
+            Task { try? await relaySocket.send(payload) }
         }
     }
 
@@ -551,41 +551,31 @@ final class TerminalSession: ObservableObject, Identifiable {
         server: Server, siteID: String, sessionId: String,
         relay: ControlPlaneClient.RelayAddress, generation myGeneration: Int
     ) async {
-        guard let wsURL = URL(string: "wss://\(relay.relayHost):\(relay.relayPort)/") else {
-            ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "bad_relay_address", "host": relay.relayHost])
+        guard let openFrame = try? JSONSerialization.data(withJSONObject: [
+            "action": "open", "sessionId": sessionId, "siteId": siteID, "tmuxSession": server.tmuxSessionName,
+        ]) else {
+            ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "encode_open_frame"])
             if myGeneration == generation {
-                lastError = "The terminal relay returned an unusable address."
+                lastError = "Could not open the terminal relay: could not encode the open frame."
             }
             return
         }
-        // Pinned, not name-checked: the relay's certificate is the same one
-        // every time even though its address is not. See RelayCertificatePin.
-        let session = URLSession(configuration: .default, delegate: RelayPinningDelegate(), delegateQueue: nil)
-        defer { session.invalidateAndCancel() }
 
-        var socket: URLSessionWebSocketTask?
+        var socket: RelayWebSocket?
         var attemptsRemaining = relayConnectAttempts
         while myGeneration == generation, attemptsRemaining > 0 {
             attemptsRemaining -= 1
-            let candidate = session.webSocketTask(with: wsURL)
-            candidate.resume()
-            let openFrame = try? JSONSerialization.data(withJSONObject: [
-                "action": "open", "sessionId": sessionId, "siteId": siteID, "tmuxSession": server.tmuxSessionName,
-            ])
-            guard let openFrame else {
-                ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "encode_open_frame"])
-                lastError = "Could not open the terminal relay: could not encode the open frame."
-                candidate.cancel(with: .goingAway, reason: nil)
-                return
-            }
+            // Pinned, not name-checked, and on Network.framework rather than
+            // URLSession — see RelayWebSocket for why ATS leaves no other way
+            // to accept the relay's certificate at all.
+            let candidate = RelayWebSocket(host: relay.relayHost, port: relay.relayPort)
             do {
-                // The send is the reachability test: a relay that is still
-                // booting refuses the connection here rather than at resume().
-                try await candidate.send(.data(openFrame))
+                try await candidate.connect()
+                try await candidate.send(openFrame)
                 socket = candidate
                 break
             } catch {
-                candidate.cancel(with: .goingAway, reason: nil)
+                candidate.cancel()
                 if attemptsRemaining == 0 {
                     ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: [
                         "reason": "relay_unreachable", "host": relay.relayHost, "error": String(describing: error),
@@ -599,7 +589,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             }
         }
         guard let socket, myGeneration == generation else {
-            socket?.cancel(with: .goingAway, reason: nil)
+            socket?.cancel()
             return
         }
         ControlPlaneClient.logClientEvent(.relayWSOpen, detail: [
@@ -609,9 +599,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         relaySessionId = sessionId
 
         while myGeneration == generation {
-            let message: URLSessionWebSocketTask.Message
+            let frame: Data
             do {
-                message = try await socket.receive()
+                frame = try await socket.receive()
             } catch {
                 ControlPlaneClient.logClientEvent(.relayWSReceiveFailed, detail: ["sessionId": sessionId, "error": String(describing: error)])
                 if myGeneration == generation {
@@ -620,14 +610,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 return
             }
             guard myGeneration == generation else { return }
-            switch message {
-            case .data(let data):
-                handleRelayFrame(data, generation: myGeneration)
-            case .string(let text):
-                handleRelayFrame(Data(text.utf8), generation: myGeneration)
-            @unknown default:
-                break
-            }
+            handleRelayFrame(frame, generation: myGeneration)
         }
     }
 
@@ -656,7 +639,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             eventLog.recordOutput(byteArray)
             terminalView.feed(byteArray: byteArray[...])
         case "close":
-            relaySocket?.cancel(with: .normalClosure, reason: nil)
+            relaySocket?.cancel()
         default:
             break
         }
