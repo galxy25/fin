@@ -204,6 +204,9 @@ RELAY_IDLE_SECONDS = 900
 # A relay row older than this with no instance behind it is stale bookkeeping,
 # not a live relay — re-launch rather than hand out a dead address.
 RELAY_ROW_MAX_AGE_SECONDS = 24 * 3600
+# Tries at appending one command to a site's row. Each attempt re-reads, so
+# this is a bound on how many heartbeats may interleave, not on time.
+_SITE_COMMAND_WRITE_ATTEMPTS = 4
 AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 
 DEFAULT_INSTANCE_TYPE = "t4g.nano"
@@ -4222,29 +4225,44 @@ def queue_site_command(event, site_id):
         relay = _ensure_relay_worker(event["_userId"], _now())
         args = dict(args, **relay)
 
-    pending = list(site.get("commands") or [])
-    if len(pending) >= MAX_SITE_COMMANDS:
-        # A site that is not draining its queue is not listening; piling more on
-        # helps nobody and is how a row grows without bound.
-        raise ApiError(409, "this site has {} undelivered commands".format(len(pending)))
     command = {"id": "c-" + str(uuid.uuid4()), "kind": kind, "args": args, "queuedAt": _iso(_now())}
-    pending.append(command)
 
-    try:
-        SITES_TABLE.update_item(
-            Key={"siteId": site_id},
-            UpdateExpression="SET commands = :c, rev = :next",
-            ConditionExpression="rev = :rev",
-            ExpressionAttributeValues={
-                ":c": pending,
-                ":rev": int(site.get("rev") or 0),
-                ":next": int(site.get("rev") or 0) + 1,
-            },
-        )
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            raise ApiError(409, "site row changed underneath this write; retry")
-        raise
+    # RETRIED, because losing this race is normal rather than exceptional. The
+    # row's `rev` is bumped by the site's own heartbeat every 20 seconds, and
+    # ensuring a relay above can take most of that (an EC2 launch, then waiting
+    # for its address) — so a first-time "terminal-open" reliably read `rev`,
+    # spent ten seconds launching, and then lost the conditional write to a
+    # heartbeat that landed meanwhile. The user saw "could not reach the
+    # control plane" while an instance they were now paying for sat idle with
+    # nobody told to dial it (2026-09-17). Re-reading and re-appending is the
+    # whole fix: the command is built once, above, and only its placement in a
+    # freshly-read queue is retried.
+    for attempt in range(_SITE_COMMAND_WRITE_ATTEMPTS):
+        if attempt:
+            site = _owned_site(event, site_id)
+        pending = list(site.get("commands") or [])
+        if len(pending) >= MAX_SITE_COMMANDS:
+            # A site that is not draining its queue is not listening; piling more on
+            # helps nobody and is how a row grows without bound.
+            raise ApiError(409, "this site has {} undelivered commands".format(len(pending)))
+        pending.append(command)
+        try:
+            SITES_TABLE.update_item(
+                Key={"siteId": site_id},
+                UpdateExpression="SET commands = :c, rev = :next",
+                ConditionExpression="rev = :rev",
+                ExpressionAttributeValues={
+                    ":c": pending,
+                    ":rev": int(site.get("rev") or 0),
+                    ":next": int(site.get("rev") or 0) + 1,
+                },
+            )
+            break
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+            if attempt == _SITE_COMMAND_WRITE_ATTEMPTS - 1:
+                raise ApiError(409, "site row changed underneath this write; retry")
     payload = {"command": command}
     if relay:
         payload.update(relay)

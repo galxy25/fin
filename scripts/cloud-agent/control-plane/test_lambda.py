@@ -3649,6 +3649,40 @@ class RelayWorkerTests(_SitesTestCase):
         self.assertEqual(self.ec2.launched[0]["SecurityGroupIds"], ["sg-relay"])
         self.assertEqual(self.ec2.launched[0]["InstanceType"], lam.RELAY_INSTANCE_TYPE)
 
+    def test_a_heartbeat_landing_mid_launch_does_not_lose_the_command(self):
+        # The race that actually happened: ensuring a relay takes most of a
+        # heartbeat interval (EC2 launch, then waiting for an address), so the
+        # `rev` read before it is routinely stale by the time the command is
+        # written. Losing that write left an instance running that nobody had
+        # been told to dial, and the phone showing "could not reach the control
+        # plane".
+        site = self.enroll()
+        real_update = lam.SITES_TABLE.update_item
+        state = {"beat": True}
+
+        def update_with_a_heartbeat_first(**kwargs):
+            if state["beat"]:
+                # One heartbeat slips in between the read and this write.
+                state["beat"] = False
+                row = lam.SITES_TABLE.items[site["siteId"]]
+                row["rev"] = int(row.get("rev") or 0) + 1
+            return real_update(**kwargs)
+
+        lam.SITES_TABLE.update_item = update_with_a_heartbeat_first
+        self.addCleanup(setattr, lam.SITES_TABLE, "update_item", real_update)
+
+        response = lam.queue_site_command(
+            {"_userId": "user-1", "body": json.dumps(
+                {"kind": "terminal-open", "args": {"sessionId": "s-1", "tmuxSession": "kio"}}
+            )},
+            site["siteId"],
+        )
+        self.assertEqual(response["statusCode"], 200)
+        queued = lam.SITES_TABLE.items[site["siteId"]]["commands"]
+        self.assertEqual([c["kind"] for c in queued], ["terminal-open"])
+        # And exactly once — a retry must not leave two copies behind.
+        self.assertEqual(len(queued), 1)
+
     def test_only_terminal_open_ensures_a_relay(self):
         # Every other command kind must stay free: launching an instance
         # because someone asked a site to restart would be an absurd bill.
