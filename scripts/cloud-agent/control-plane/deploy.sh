@@ -30,6 +30,8 @@ ENROLL_TOKENS_TABLE=fin-enroll-tokens
 THREAD_EVENTS_TABLE=fin-thread-events
 TERMINAL_CONNECTIONS_TABLE=fin-terminal-connections
 TERMINAL_SESSIONS_TABLE=fin-terminal-sessions
+RELAY_WORKERS_TABLE=fin-relay-workers
+RELAY_SECURITY_GROUP=fin-relay-ingress
 API_NAME=fin-control-plane
 WS_API_NAME=fin-control-plane-ws
 RULE=fin-worker-sweep
@@ -222,6 +224,69 @@ if ! aws dynamodb describe-table --table-name "$TERMINAL_SESSIONS_TABLE" >/dev/n
   echo "==> Created DynamoDB table $TERMINAL_SESSIONS_TABLE (on-demand, TTL on ttl)"
 fi
 
+# One row per user: the terminal relay instance currently serving them, if any.
+# No TTL — the row is cheap and `_live_relay_address` verifies against EC2
+# anyway, so an expired row would buy nothing and a mid-session reap would cost
+# a needless second launch.
+if ! aws dynamodb describe-table --table-name "$RELAY_WORKERS_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$RELAY_WORKERS_TABLE" \
+    --attribute-definitions AttributeName=userId,AttributeType=S \
+    --key-schema AttributeName=userId,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$RELAY_WORKERS_TABLE"
+  echo "==> Created DynamoDB table $RELAY_WORKERS_TABLE (on-demand)"
+fi
+
+# --- the terminal relay: security group, certificate, script -----------------
+# The ONE security group in this system that accepts inbound traffic. Every
+# other body here dials out only (docs/SITES.md); a relay is the meeting point
+# for two parties that each can only dial out, so it has to listen. 443 alone,
+# because a locked-down corporate network is the exact situation this feature
+# exists to cross.
+if ! aws ec2 describe-security-groups --group-names "$RELAY_SECURITY_GROUP" >/dev/null 2>&1; then
+  RELAY_SG_ID=$(aws ec2 create-security-group \
+    --group-name "$RELAY_SECURITY_GROUP" \
+    --description "Fin terminal relay: inbound wss on 443" \
+    --query GroupId --output text)
+  aws ec2 authorize-security-group-ingress \
+    --group-id "$RELAY_SG_ID" \
+    --ip-permissions 'IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp=0.0.0.0/0,Description="app and site dial in"}]' >/dev/null
+  echo "==> Created security group $RELAY_SECURITY_GROUP ($RELAY_SG_ID, inbound 443)"
+fi
+
+# The relay's identity, generated once and reused by every instance: both Swift
+# clients pin its SHA-256, so a cert regenerated per launch would mean an app
+# release per launch. The private half lives only in this private bucket and on
+# the instances that fetch it with a presigned URL — the same way the daemon's
+# own config (which carries a site token) already travels.
+if ! aws s3api head-object --bucket "$BUCKET" --key fin/relay/cert.pem >/dev/null 2>&1; then
+  RELAY_TLS_DIR=$(mktemp -d)
+  openssl req -x509 -newkey rsa:2048 \
+    -keyout "$RELAY_TLS_DIR/key.pem" -out "$RELAY_TLS_DIR/cert.pem" \
+    -days 3650 -nodes -subj "/CN=fin-terminal-relay" \
+    -addext "subjectAltName=DNS:fin-terminal-relay" 2>/dev/null
+  aws s3api put-object --bucket "$BUCKET" --key fin/relay/cert.pem \
+    --body "$RELAY_TLS_DIR/cert.pem" >/dev/null
+  aws s3api put-object --bucket "$BUCKET" --key fin/relay/key.pem \
+    --body "$RELAY_TLS_DIR/key.pem" >/dev/null
+  rm -rf "$RELAY_TLS_DIR"
+  echo "==> Generated the relay certificate (10y) and stored it in s3://$BUCKET/fin/relay/"
+fi
+
+aws s3api put-object --bucket "$BUCKET" --key fin/relay/relay.py \
+  --body "$HERE/../relay/relay.py" >/dev/null
+echo "==> Uploaded relay.py"
+
+# The pin both Swift clients compile in. Printed on every deploy so a mismatch
+# between what is deployed and what is shipping is visible here, not in a
+# silent connection failure on someone's phone.
+RELAY_PIN_DIR=$(mktemp -d)
+aws s3api get-object --bucket "$BUCKET" --key fin/relay/cert.pem "$RELAY_PIN_DIR/cert.pem" >/dev/null
+RELAY_PIN=$(openssl x509 -in "$RELAY_PIN_DIR/cert.pem" -outform der | shasum -a 256 | awk '{print $1}')
+rm -rf "$RELAY_PIN_DIR"
+echo "==> Relay certificate pin (SHA-256 of DER): $RELAY_PIN"
+
 # --- model-factory data lake -------------------------------------------------
 # Private bucket for training telemetry (see scripts/model-factory/README.md).
 # raw/ expires after 180 days; datasets/, models/, and evals/ persist.
@@ -392,6 +457,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$TERMINAL_SESSIONS_TABLE"
     },
     {
+      "Sid": "RelayWorkers",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Scan"],
+      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$RELAY_WORKERS_TABLE"
+    },
+    {
       "Sid": "TerminalRelayManageConnections",
       "Effect": "Allow",
       "Action": "execute-api:ManageConnections",
@@ -527,6 +598,23 @@ cat > "$BUILD/policy.json" <<JSON
 JSON
 aws iam put-role-policy --role-name "$ROLE" --policy-name fin-control-plane \
   --policy-document "file://$BUILD/policy.json"
+
+# The relay terminates ITSELF when it goes quiet — that self-termination is the
+# entire cost model, so the permission for it has to exist or an idle relay
+# bills forever. Scoped by tag to instances launched as relays: a relay can end
+# a relay, and nothing else. It lives here rather than in launch.sh (which
+# creates the role) because this script is the one that actually gets re-run.
+cat > "$BUILD/relay-self-terminate.json" <<JSON
+{"Version": "2012-10-17",
+ "Statement": [{"Sid": "RelaySelfTerminate",
+   "Effect": "Allow",
+   "Action": "ec2:TerminateInstances",
+   "Resource": "arn:aws:ec2:$REGION:$ACCOUNT:instance/*",
+   "Condition": {"StringEquals": {"ec2:ResourceTag/fin-role": "terminal-relay"}}}]}
+JSON
+aws iam put-role-policy --role-name "$AGENT_ROLE" --policy-name fin-relay-self-terminate \
+  --policy-document "file://$BUILD/relay-self-terminate.json"
+echo "==> Granted $AGENT_ROLE self-termination on relay-tagged instances"
 
 # --- bearer token ------------------------------------------------------------
 if [ -n "${FIN_CP_TOKEN:-}" ]; then

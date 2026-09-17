@@ -889,8 +889,83 @@ class _FakeEventsTable:
         return sorted((r for r in self.rows if r["threadId"] == thread_id), key=lambda r: r["seq"])
 
 
+class _FakeRelayEC2:
+    """Enough EC2 for the terminal relay's launch path: a security group that
+    exists, instances that come up with an address, and a record of what was
+    asked for. `public_ip_delay` models the real gap between RunInstances
+    answering and a public IP being attached, which is the one piece of that
+    call the relay launch actually has to wait on."""
+
+    def __init__(self, public_ip="203.0.113.7", public_ip_delay=0, security_groups=("fin-relay-ingress",)):
+        self.public_ip = public_ip
+        self.public_ip_delay = public_ip_delay
+        self.security_groups = list(security_groups)
+        self.launched = []
+        self.terminated = []
+        self.states = {}
+        self._describe_calls = 0
+
+    def describe_security_groups(self, Filters):
+        wanted = Filters[0]["Values"][0]
+        if wanted not in self.security_groups:
+            return {"SecurityGroups": []}
+        return {"SecurityGroups": [{"GroupId": "sg-relay"}]}
+
+    def run_instances(self, **kwargs):
+        self.launched.append(kwargs)
+        instance_id = "i-relay{}".format(len(self.launched))
+        self.states[instance_id] = "running"
+        instance = {"InstanceId": instance_id}
+        if self.public_ip_delay <= 0:
+            instance["PublicIpAddress"] = self.public_ip
+        return {"Instances": [instance]}
+
+    def describe_instances(self, InstanceIds=None, **kwargs):
+        self._describe_calls += 1
+        ids = InstanceIds or []
+        instances = []
+        for instance_id in ids:
+            instance = {"InstanceId": instance_id, "State": {"Name": self.states.get(instance_id, "running")}}
+            if self._describe_calls >= self.public_ip_delay:
+                instance["PublicIpAddress"] = self.public_ip
+            instances.append(instance)
+        return {"Reservations": [{"Instances": instances}]}
+
+    def get_paginator(self, name):
+        outer = self
+
+        class _Paginator:
+            def paginate(self, Filters):
+                ids = Filters[0]["Values"]
+                return [{"Reservations": [{"Instances": [
+                    {"InstanceId": i, "State": {"Name": outer.states[i]}} for i in ids if i in outer.states
+                ]}]}]
+
+        return _Paginator()
+
+    def terminate_instances(self, InstanceIds):
+        for instance_id in InstanceIds:
+            self.terminated.append(instance_id)
+            self.states[instance_id] = "shutting-down"
+        return {}
+
+
 class _SitesTestCase(unittest.TestCase):
     def setUp(self):
+        # The relay's table and EC2, faked for every sites test: queueing a
+        # "terminal-open" now ensures a relay, so a test that never heard of
+        # relays would otherwise reach real AWS.
+        self.addCleanup(setattr, lam, "RELAY_WORKERS_TABLE", lam.RELAY_WORKERS_TABLE)
+        lam.RELAY_WORKERS_TABLE = _FakeDynamoTable("userId")
+        self.addCleanup(setattr, lam, "EC2", lam.EC2)
+        self.ec2 = _FakeRelayEC2()
+        lam.EC2 = self.ec2
+        self.addCleanup(setattr, lam, "_ami_id", lam._ami_id)
+        lam._ami_id = lambda: "ami-test"
+        # The relay launch waits a second at a time for a public IP; no test
+        # should pay that in wall clock.
+        self.addCleanup(setattr, lam.time, "sleep", lam.time.sleep)
+        lam.time.sleep = lambda _seconds: None
         for attr, key in (("SITES_TABLE", "siteId"), ("MESSAGES_TABLE", "messageId"), ("AGENTS_TABLE", "agentKey")):
             orig = getattr(lam, attr)
             setattr(lam, attr, _FakeDynamoTable(key))
@@ -3468,7 +3543,14 @@ class TerminalOpenCommandKindTests(_SitesTestCase):
         )
         command = json.loads(response["body"])["command"]
         self.assertEqual(command["kind"], "terminal-open")
-        self.assertEqual(command["args"], {"sessionId": "s-1", "tmuxSession": "kio"})
+        # The caller's args survive verbatim, plus the relay address the site
+        # needs in order to know where to dial — the app gets the same address
+        # from the response body, so the two sides can only ever meet.
+        self.assertEqual(command["args"], {
+            "sessionId": "s-1", "tmuxSession": "kio", "relayHost": "203.0.113.7", "relayPort": 443,
+        })
+        body = json.loads(response["body"])
+        self.assertEqual((body["relayHost"], body["relayPort"]), ("203.0.113.7", 443))
 
     def test_terminal_open_drains_on_the_next_heartbeat_like_any_other_kind(self):
         lam.queue_site_command(
@@ -3504,6 +3586,77 @@ class _FakeManagementClient:
         if ConnectionId in self.gone_ids:
             raise lam.ClientError({"Error": {"Code": "GoneException", "Message": "gone"}}, "PostToConnection")
         self.sent.append((ConnectionId, json.loads(Data.decode("utf-8"))))
+
+
+class RelayWorkerTests(_SitesTestCase):
+    """`_ensure_relay_worker` — the on-demand body both sides of a terminal
+    meet on. The cost model of the whole feature lives here: launch only when
+    a terminal is actually being opened, reuse while one is live, and let the
+    relay terminate itself when it goes quiet."""
+
+    def test_first_call_launches_and_records_the_address(self):
+        address = lam._ensure_relay_worker("user-1", lam._now())
+        self.assertEqual(address, {"relayHost": "203.0.113.7", "relayPort": 443})
+        self.assertEqual(len(self.ec2.launched), 1)
+        row = lam.RELAY_WORKERS_TABLE.items["user-1"]
+        self.assertEqual((row["instanceId"], row["publicIp"]), ("i-relay1", "203.0.113.7"))
+
+    def test_second_call_reuses_the_live_relay(self):
+        # Every terminal opened while one relay is up must land on THAT relay:
+        # a second instance would be both a second bill and a second switch,
+        # and the daemon and app could end up on different ones.
+        first = lam._ensure_relay_worker("user-1", lam._now())
+        second = lam._ensure_relay_worker("user-1", lam._now())
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.ec2.launched), 1)
+
+    def test_a_terminated_relay_is_replaced_rather_than_handed_out(self):
+        # The relay terminates ITSELF when idle and tells nobody, so a row
+        # outliving its instance is normal, not corruption — and handing out
+        # its address would strand the session at a dead IP.
+        lam._ensure_relay_worker("user-1", lam._now())
+        self.ec2.states["i-relay1"] = "terminated"
+        lam._ensure_relay_worker("user-1", lam._now())
+        self.assertEqual(len(self.ec2.launched), 2)
+        self.assertEqual(lam.RELAY_WORKERS_TABLE.items["user-1"]["instanceId"], "i-relay2")
+
+    def test_a_stale_row_is_not_trusted_even_if_ec2_still_lists_it(self):
+        lam._ensure_relay_worker("user-1", lam._now())
+        old = lam._now() - timedelta(seconds=lam.RELAY_ROW_MAX_AGE_SECONDS + 60)
+        lam.RELAY_WORKERS_TABLE.items["user-1"]["launchedAt"] = lam._iso(old)
+        lam._ensure_relay_worker("user-1", lam._now())
+        self.assertEqual(len(self.ec2.launched), 2)
+
+    def test_waits_for_the_public_ip_before_answering(self):
+        # RunInstances usually answers before an address is attached; returning
+        # then would hand both sides a session with nowhere to meet.
+        lam.EC2 = self.ec2 = _FakeRelayEC2(public_ip_delay=3)
+        address = lam._ensure_relay_worker("user-1", lam._now())
+        self.assertEqual(address["relayHost"], "203.0.113.7")
+
+    def test_missing_security_group_is_a_clear_503(self):
+        lam.EC2 = self.ec2 = _FakeRelayEC2(security_groups=())
+        with self.assertRaises(lam.ApiError) as caught:
+            lam._ensure_relay_worker("user-1", lam._now())
+        self.assertEqual(caught.exception.status, 503)
+        self.assertIn("fin-relay-ingress", caught.exception.message)
+
+    def test_relay_launches_on_its_own_ingress_group_never_the_egress_one(self):
+        # The agent group is egress-only by design; a relay has to accept
+        # inbound connections from both the app and the site, so reusing that
+        # group would silently produce a relay nobody can reach.
+        lam._ensure_relay_worker("user-1", lam._now())
+        self.assertEqual(self.ec2.launched[0]["SecurityGroupIds"], ["sg-relay"])
+        self.assertEqual(self.ec2.launched[0]["InstanceType"], lam.RELAY_INSTANCE_TYPE)
+
+    def test_only_terminal_open_ensures_a_relay(self):
+        # Every other command kind must stay free: launching an instance
+        # because someone asked a site to restart would be an absurd bill.
+        site = self.enroll()
+        lam.queue_site_command(
+            {"_userId": "user-1", "body": json.dumps({"kind": "restart"})}, site["siteId"]
+        )
+        self.assertEqual(self.ec2.launched, [])
 
 
 class ClientEventTests(unittest.TestCase):

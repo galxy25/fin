@@ -172,11 +172,38 @@ THREAD_EVENTS_TABLE_NAME = os.environ.get("FIN_CP_THREAD_EVENTS_TABLE", "fin-thr
 # sessionId and holds both sides' connectionId once each has attached.
 TERMINAL_CONNECTIONS_TABLE_NAME = os.environ.get("FIN_CP_TERMINAL_CONNECTIONS_TABLE", "fin-terminal-connections")
 TERMINAL_SESSIONS_TABLE_NAME = os.environ.get("FIN_CP_TERMINAL_SESSIONS_TABLE", "fin-terminal-sessions")
+RELAY_WORKERS_TABLE_NAME = os.environ.get("FIN_CP_RELAY_WORKERS_TABLE", "fin-relay-workers")
 # Safety nets only — real cleanup happens on $disconnect / "close" frames.
 TERMINAL_CONNECTION_TTL_SECONDS = 6 * 3600
 TERMINAL_SESSION_TTL_SECONDS = 3600
 SECURITY_GROUP_NAME = "fin-agent-egress"
 INSTANCE_PROFILE_NAME = "fin-agent-ssm"
+
+# --- the self-hosted terminal relay (scripts/cloud-agent/relay/relay.py) ------
+# Both Swift clients' `URLSessionWebSocketTask` cannot talk to an API Gateway
+# WebSocket endpoint at all (connect and first send succeed, the next receive
+# fails with ENOTCONN, every time — reproduced 2026-09-16 with a 30-line Swift
+# program, while the same program against an ordinary WebSocket server works
+# and a Python client against API Gateway also works). So the relay's data
+# plane is an ordinary WebSocket server we host ourselves, on an instance that
+# exists only while a terminal is open. Unlike `SECURITY_GROUP_NAME`, this one
+# takes INBOUND connections — both the app and the site dial in to it — which
+# is exactly why it cannot reuse the egress-only group.
+RELAY_SECURITY_GROUP_NAME = "fin-relay-ingress"
+RELAY_SCRIPT_KEY = "fin/relay/relay.py"
+# ONE certificate for every relay instance, not one per launch: both clients
+# pin its SHA-256, so a per-instance cert would mean a per-instance app build.
+# The instance's IP changes freely underneath it; the pinned identity does not.
+RELAY_CERT_KEY = "fin/relay/cert.pem"
+RELAY_TLS_KEY_KEY = "fin/relay/key.pem"
+# 443, not a high port: this whole feature exists for a laptop on a network
+# that may not allow much else out.
+RELAY_PORT = 443
+RELAY_INSTANCE_TYPE = "t4g.nano"
+RELAY_IDLE_SECONDS = 900
+# A relay row older than this with no instance behind it is stale bookkeeping,
+# not a live relay — re-launch rather than hand out a dead address.
+RELAY_ROW_MAX_AGE_SECONDS = 24 * 3600
 AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 
 DEFAULT_INSTANCE_TYPE = "t4g.nano"
@@ -262,6 +289,7 @@ THREAD_EVENTS_TABLE = _DYNAMODB.Table(THREAD_EVENTS_TABLE_NAME)
 ENROLL_TOKENS_TABLE = _DYNAMODB.Table(os.environ.get("FIN_CP_ENROLL_TOKENS_TABLE", "fin-enroll-tokens"))
 TERMINAL_CONNECTIONS_TABLE = _DYNAMODB.Table(TERMINAL_CONNECTIONS_TABLE_NAME)
 TERMINAL_SESSIONS_TABLE = _DYNAMODB.Table(TERMINAL_SESSIONS_TABLE_NAME)
+RELAY_WORKERS_TABLE = _DYNAMODB.Table(RELAY_WORKERS_TABLE_NAME)
 
 # Byte-for-byte the bootstrap from launch.sh; the two presigned URLs are the only
 # substitutions. Any change to launch.sh's user-data belongs here too —
@@ -358,6 +386,44 @@ with sync_playwright() as p:
     browser.close()
 print("BROWSER SMOKE OK")
 PYSMOKE
+"""
+
+# The relay body's whole boot: python, the `websockets` library, the one pinned
+# certificate, the relay script, and a systemd unit to keep it up. Deliberately
+# NOT the agent bootstrap above — a relay runs no agent, holds no site token,
+# and has no tmux; it is a switch that copies frames between two sockets and
+# terminates itself when nobody is using it.
+RELAY_USER_DATA = """#!/bin/bash
+set -euxo pipefail
+dnf install -y python3 python3-pip
+python3 -m pip install --quiet websockets boto3
+
+mkdir -p /etc/fin-relay
+curl -fsSL -o /etc/fin-relay/relay.py '{script_url}'
+curl -fsSL -o /etc/fin-relay/cert.pem '{cert_url}'
+curl -fsSL -o /etc/fin-relay/key.pem '{key_url}'
+chmod 600 /etc/fin-relay/key.pem
+
+cat > /etc/systemd/system/fin-relay.service <<'UNIT'
+[Unit]
+Description=Fin terminal relay
+After=network-online.target
+
+[Service]
+# Root, because it binds 443 — the one port this feature can count on getting
+# out of a locked-down network. Nothing else on this instance is exposed.
+ExecStart=/usr/bin/python3 /etc/fin-relay/relay.py
+Environment=FIN_RELAY_PORT={port}
+Environment=FIN_RELAY_IDLE_SECONDS={idle_seconds}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now fin-relay.service
 """
 
 
@@ -998,6 +1064,20 @@ def _security_group_id():
     return groups[0]["GroupId"]
 
 
+def _relay_security_group_id():
+    groups = EC2.describe_security_groups(
+        Filters=[{"Name": "group-name", "Values": [RELAY_SECURITY_GROUP_NAME]}]
+    ).get("SecurityGroups", [])
+    if not groups:
+        raise ApiError(
+            503,
+            "security group {} is missing; run control-plane/deploy.sh once to create it".format(
+                RELAY_SECURITY_GROUP_NAME
+            ),
+        )
+    return groups[0]["GroupId"]
+
+
 def _ami_id():
     return SSM.get_parameter(Name=AMI_PARAMETER)["Parameter"]["Value"]
 
@@ -1119,6 +1199,96 @@ def _provision_config(user_id, agent, config_key):
 
 
 # --- routes ------------------------------------------------------------------
+
+
+def _live_relay_address(row, now):
+    """The address in `row` if the instance behind it is really still there.
+
+    Bookkeeping outlives instances in both directions — a relay self-terminates
+    when idle without telling anyone, and a row can be written for an instance
+    that then failed to boot — so this trusts EC2's state, never the row alone.
+    """
+    if not row or not row.get("instanceId") or not row.get("publicIp"):
+        return None
+    launched = _parse_iso(row.get("launchedAt"))
+    if launched is not None and (now - launched).total_seconds() > RELAY_ROW_MAX_AGE_SECONDS:
+        return None
+    state = _instance_states([row["instanceId"]]).get(row["instanceId"])
+    if state not in ("pending", "running"):
+        return None
+    return {"relayHost": row["publicIp"], "relayPort": RELAY_PORT}
+
+
+def _ensure_relay_worker(user_id, now):
+    """The address of this user's terminal relay, launching one if none is live.
+
+    Returns `{relayHost, relayPort}`. The instance may still be booting when
+    this returns — a `t4g.nano` needs roughly a minute to install python and
+    start the service — so both clients treat "connection refused" as "not yet"
+    and keep retrying rather than failing the session. That boot wait is the
+    price of the on-demand cost model: nothing runs, and nothing is billed,
+    between terminals.
+    """
+    existing = RELAY_WORKERS_TABLE.get_item(Key={"userId": user_id}).get("Item")
+    address = _live_relay_address(existing, now)
+    if address:
+        RELAY_WORKERS_TABLE.update_item(
+            Key={"userId": user_id},
+            UpdateExpression="SET lastUsedAt = :t",
+            ExpressionAttributeValues={":t": _iso(now)},
+        )
+        return address
+
+    user_data = RELAY_USER_DATA.format(
+        script_url=_presign("get_object", RELAY_SCRIPT_KEY),
+        cert_url=_presign("get_object", RELAY_CERT_KEY),
+        key_url=_presign("get_object", RELAY_TLS_KEY_KEY),
+        port=RELAY_PORT,
+        idle_seconds=RELAY_IDLE_SECONDS,
+    )
+    instance = EC2.run_instances(
+        ImageId=_ami_id(),
+        InstanceType=RELAY_INSTANCE_TYPE,
+        MinCount=1,
+        MaxCount=1,
+        SecurityGroupIds=[_relay_security_group_id()],
+        IamInstanceProfile={"Name": INSTANCE_PROFILE_NAME},
+        UserData=user_data,
+        MetadataOptions={"HttpTokens": "required"},
+        TagSpecifications=[{"ResourceType": "instance", "Tags": [
+            {"Key": "Name", "Value": "fin-terminal-relay"},
+            {"Key": "fin-user", "Value": user_id},
+            {"Key": "fin-managed", "Value": "control-plane"},
+            {"Key": "fin-role", "Value": "terminal-relay"},
+        ]}],
+    )["Instances"][0]
+    instance_id = instance["InstanceId"]
+
+    # RunInstances usually answers before the public IP is attached, so read it
+    # back. A few seconds here buys the clients a real address instead of a
+    # "try again later" they would have to model; if it is still not assigned,
+    # say so plainly rather than handing out a half-built session.
+    public_ip = instance.get("PublicIpAddress")
+    for _ in range(6):
+        if public_ip:
+            break
+        time.sleep(1)
+        described = EC2.describe_instances(InstanceIds=[instance_id])
+        for reservation in described.get("Reservations", []):
+            for found in reservation.get("Instances", []):
+                public_ip = found.get("PublicIpAddress") or public_ip
+    if not public_ip:
+        raise ApiError(503, "the terminal relay is starting but has no address yet; try again shortly")
+
+    RELAY_WORKERS_TABLE.put_item(Item={
+        "userId": user_id,
+        "instanceId": instance_id,
+        "publicIp": public_ip,
+        "launchedAt": _iso(now),
+        "lastUsedAt": _iso(now),
+    })
+    LOG.info("relay launched %s at %s for %s", instance_id, public_ip, user_id)
+    return {"relayHost": public_ip, "relayPort": RELAY_PORT}
 
 
 def _launch_worker(user_id, agent, instance_type, idle_minutes, browser, now, clear_inbox=True):
@@ -4028,6 +4198,17 @@ def queue_site_command(event, site_id):
     if not isinstance(args, dict):
         raise ApiError(400, "args must be an object")
 
+    # "terminal-open" is the one kind that needs somewhere for the two sides to
+    # MEET. Ensuring the relay here — rather than in a separate call the app
+    # would have to make first — is what keeps the address consistent between
+    # the two parties: the daemon reads it out of the command's args, the app
+    # reads it out of this response, and neither can be pointed at a different
+    # relay than the other.
+    relay = None
+    if kind == "terminal-open":
+        relay = _ensure_relay_worker(event["_userId"], _now())
+        args = dict(args, **relay)
+
     pending = list(site.get("commands") or [])
     if len(pending) >= MAX_SITE_COMMANDS:
         # A site that is not draining its queue is not listening; piling more on
@@ -4051,7 +4232,10 @@ def queue_site_command(event, site_id):
         if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             raise ApiError(409, "site row changed underneath this write; retry")
         raise
-    return _response(200, {"command": command})
+    payload = {"command": command}
+    if relay:
+        payload.update(relay)
+    return _response(200, payload)
 
 
 def delete_site(event, site_id):
