@@ -2504,7 +2504,20 @@ def notify(event):
     if not thread_id and push_event == "request-input":
         asking = _asking_site(event, user_id, agent, origin_device_id8)
         if asking:
-            thread_id = _root_question_thread(asking, user_id, agent, text, _now()) or ""
+            # A daemon restart while still blocked on the same question
+            # (crash, launchd relaunch, the `fail()` path) drops its
+            # in-memory awaitingUserInput guard and re-asks — reuse the
+            # site's still-live pendingThreadId instead of rooting a second
+            # thread for what is, from the ledger's point of view, the same
+            # unanswered stall (2026-09-17: two "stalled" threads for one
+            # issue). `pendingThreadId` is cleared the beat the site leaves
+            # needs-input, so its presence here means the prior thread is
+            # still open.
+            existing_thread = asking.get("pendingThreadId")
+            if existing_thread and asking.get("state") == "needs-input":
+                thread_id = existing_thread
+            else:
+                thread_id = _root_question_thread(asking, user_id, agent, text, _now()) or ""
 
     fin = {}
     if agent_id:
@@ -3385,16 +3398,33 @@ def put_memory_profile(event):
     """PUT /memory/profile — {"content"} replaces the profile wholesale. Last-writer-
     wins, same accepted risk `put_memory_entry` already documents — the claim lock
     keeps concurrent COMPACTION passes from racing, but a plain profile write outside
-    that flow (rare) can still land at any time."""
+    that flow (rare) can still land at any time.
+
+    `updatedAt` only advances when `content` actually changes (2026-09-15: a
+    pull-then-echo-back PUT of unchanged content was bumping `updatedAt` with
+    no re-summarization, which the daemon's due-check read as "profile is
+    fresh" for weeks — see AgentMemorySyncService.swift). A no-op PUT returns
+    the existing document, timestamp untouched, instead of writing a new one."""
     body = _body(event)
     content = body.get("content")
     if not isinstance(content, str):
         raise ApiError(400, "content must be a string")
     if len(content.encode("utf-8")) > MAX_PROFILE_BYTES:
         raise ApiError(400, "content exceeds {} bytes".format(MAX_PROFILE_BYTES))
+    key = PROFILE_KEY.format(user=event["_userId"])
+    try:
+        raw = S3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+        existing = json.loads(raw)
+    except (ClientError, ValueError):
+        existing = None
+    if isinstance(existing, dict) and existing.get("content") == content:
+        return _response(200, {
+            "content": content,
+            "updatedAt": existing.get("updatedAt"),
+        })
     document = {"content": content, "updatedAt": _iso(_now())}
     S3.put_object(
-        Bucket=BUCKET, Key=PROFILE_KEY.format(user=event["_userId"]),
+        Bucket=BUCKET, Key=key,
         Body=json.dumps(document, sort_keys=True).encode("utf-8"),
         ContentType="application/json",
     )

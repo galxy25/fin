@@ -2015,6 +2015,39 @@ class _FakeS3:
         return {"Contents": [{"Key": k} for k in keys]}
 
 
+class MemoryProfileTests(unittest.TestCase):
+    """updatedAt only advances when content actually changes (2026-09-17: a
+    pull-then-echo-back PUT of unchanged content was bumping updatedAt with
+    no re-summarization, which read as a fresh profile for weeks)."""
+
+    def setUp(self):
+        self._orig_s3 = lam.S3
+        lam.S3 = _FakeS3()
+        self.addCleanup(setattr, lam, "S3", self._orig_s3)
+        self.clock = [datetime.now(timezone.utc)]
+        self.addCleanup(setattr, lam, "_now", lam._now)
+        lam._now = lambda: self.clock[0]
+
+    def _put(self, content):
+        self.clock[0] = self.clock[0] + timedelta(seconds=1)
+        return json.loads(lam.put_memory_profile(
+            {"_userId": "user-1", "body": json.dumps({"content": content})}
+        )["body"])
+
+    def test_changed_content_advances_updated_at(self):
+        first = self._put("likes short replies")
+        second = self._put("likes short replies, terse commits")
+        self.assertNotEqual(first["updatedAt"], second["updatedAt"])
+        self.assertEqual(second["content"], "likes short replies, terse commits")
+
+    def test_a_re_put_of_the_same_content_leaves_updated_at_untouched(self):
+        first = self._put("likes short replies")
+        echoed = self._put("likes short replies")
+        self.assertEqual(echoed["updatedAt"], first["updatedAt"])
+        stored = json.loads(lam.S3.objects[lam.PROFILE_KEY.format(user="user-1")])
+        self.assertEqual(stored["updatedAt"], first["updatedAt"])
+
+
 class KeyVaultTests(unittest.TestCase):
     """The vault stores ciphertext only, per user, for session tokens only."""
 
@@ -2682,6 +2715,37 @@ class NotifyThreadTests(_ThreadsTestCase):
         self.beat(self.imac, state="needs-input")
         self.beat(self.imac, state="working")
         self.assertNotIn("pendingThreadId", lam.SITES_TABLE.items[self.imac["siteId"]])
+
+    def test_a_re_asked_question_while_still_needs_input_reuses_the_thread(self):
+        # 2026-09-17: a daemon restart while still blocked on the same
+        # question (its in-memory awaitingUserInput guard resets) re-asks,
+        # and a second request-input push must not root a second "stalled"
+        # thread for the same stall — reuse the site's still-live
+        # pendingThreadId instead.
+        self.beat(self.imac, state="needs-input")
+        first_status, first = self.notify(event="request-input", agent="Fin", site=self.imac,
+                                           body="Fix the two loose ends, or leave them?")
+        thread_id = first["threadId"]
+        self.assertEqual(lam.SITES_TABLE.items[self.imac["siteId"]]["pendingThreadId"], thread_id)
+        second_status, second = self.notify(event="request-input", agent="Fin", site=self.imac,
+                                             body="Fix the two loose ends, or leave them?")
+        self.assertEqual(second["threadId"], thread_id)
+        # Still one question row — no second thread root was conjured.
+        self.assertEqual(sum(1 for m in lam.MESSAGES_TABLE.items.values() if m.get("source") == "agent"), 1)
+
+    def test_a_question_after_the_prior_one_was_answered_gets_a_fresh_thread(self):
+        # Once the site leaves needs-input, pendingThreadId is cleared (the
+        # existing test above covers that); the next question must NOT reuse
+        # the old, now-closed thread.
+        status, first = self.notify(event="request-input", agent="Fin", site=self.imac,
+                                     body="Fix the two loose ends, or leave them?")
+        first_thread = first["threadId"]
+        self.beat(self.imac, state="needs-input")
+        self.beat(self.imac, state="working")
+        self.assertNotIn("pendingThreadId", lam.SITES_TABLE.items[self.imac["siteId"]])
+        status, second = self.notify(event="request-input", agent="Fin", site=self.imac,
+                                      body="A different question now")
+        self.assertNotEqual(second["threadId"], first_thread)
 
     def test_the_daemons_operator_token_push_is_attributed_by_its_device_id8(self):
         # The daemon's notify client carries the operator token and its own

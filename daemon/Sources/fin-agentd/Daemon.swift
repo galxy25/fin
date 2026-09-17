@@ -1196,6 +1196,16 @@ final class Daemon {
             .path
     }
 
+    /// The `request_input` pause marker (`AwaitingUserInputMarker`), same sibling-file
+    /// directory. Read once at startup, before the first heartbeat, so a restart while
+    /// still blocked on the same question restores the pause instead of resetting it.
+    private var awaitingUserInputStatePath: String {
+        URL(fileURLWithPath: auditLogPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("fin-agentd-awaiting-input.json")
+            .path
+    }
+
     /// The model's recent `notify` pushes (`NotifyDedupe`), same sibling-file directory.
     /// On disk, not in memory, because the crash loop that spams is the one that
     /// restarts the process — an in-memory list would forget every push at each restart.
@@ -1367,6 +1377,9 @@ final class Daemon {
     }
 
     func run() async {
+        // Before anything else: a restart while still blocked on an unanswered
+        // request_input question must not get a free first heartbeat that re-asks it.
+        restoreAwaitingUserInput()
         guard let session = await launch() else { return }
         session.connect()
         do {
@@ -1542,7 +1555,7 @@ final class Daemon {
                 event: "request-input", message: question,
                 messageID: self.inFlightSiteMessageID, threadID: self.inFlightThreadID
             )
-            self.pauseHeartbeatForUserInput()
+            self.pauseHeartbeatForUserInput(question: question)
         }
         // The model's monitor tool drives the daemon's own heartbeat loop.
         engine.onMonitorStart = { [weak self] requested in
@@ -2297,7 +2310,15 @@ final class Daemon {
     /// request_input's beat gate: without it every heartbeat re-asks the question and
     /// re-fires the notify hook — live-proven as one push notification per interval,
     /// forever. The daemon stays connected and keeps polling; only beats pause.
-    func pauseHeartbeatForUserInput() {
+    func pauseHeartbeatForUserInput(question: String) {
+        // Persisted BEFORE the in-memory flag flips — see `restoreAwaitingUserInput`:
+        // a daemon that crashes between the two must still find the marker on restart.
+        AwaitingUserInputMarker.write(
+            AwaitingUserInputState(
+                question: question, messageID: inFlightSiteMessageID, threadID: inFlightThreadID, since: Date()
+            ),
+            at: awaitingUserInputStatePath
+        )
         guard !awaitingUserInput else { return }
         awaitingUserInput = true
         let line = "[monitor] paused awaiting user input"
@@ -2308,9 +2329,33 @@ final class Daemon {
     /// Lifts the request_input pause. Called on the next directive application — the
     /// daemon's only explicit submit path, and the only way an answer reaches it.
     func resumeHeartbeatAfterUserInput() {
+        // Cleared even when `awaitingUserInput` was already false in memory: a restart
+        // restores the flag but not this method's early-out state, and an incoming
+        // message must still delete the marker so a LATER restart doesn't resurrect a
+        // pause that was already answered.
+        AwaitingUserInputMarker.clear(at: awaitingUserInputStatePath)
         guard awaitingUserInput else { return }
         awaitingUserInput = false
         let line = "[monitor] resumed — user input received"
+        log(line)
+        record(AgentAuditEvent(kind: "notice", text: line))
+    }
+
+    /// Restores the request_input pause across a restart, called once before the run
+    /// loop's first heartbeat. Without this, `awaitingUserInput` resets to `false` on
+    /// every restart — including the 5-consecutive-failure `fail()` path and a plain
+    /// crash-loop respawn — and a daemon still blocked on the SAME unanswered question
+    /// runs a fresh heartbeat turn that asks it again, one push (and, before the
+    /// control plane's own thread-reuse dedup, one "stalled" thread) it already sent.
+    /// Restoring `inFlightSiteMessageID`/`inFlightThreadID` alongside the flag keeps the
+    /// eventual `resumeHeartbeatAfterUserInput`/`settleInFlightMessage` call consistent
+    /// with the pause it is lifting.
+    func restoreAwaitingUserInput() {
+        guard let state = AwaitingUserInputMarker.state(at: awaitingUserInputStatePath) else { return }
+        awaitingUserInput = true
+        inFlightSiteMessageID = inFlightSiteMessageID ?? state.messageID
+        inFlightThreadID = inFlightThreadID ?? state.threadID
+        let line = "[monitor] restored paused-awaiting-input from a prior run: \(state.question)"
         log(line)
         record(AgentAuditEvent(kind: "notice", text: line))
     }
