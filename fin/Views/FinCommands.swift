@@ -12,8 +12,9 @@ import SwiftUI
 /// does not want. ⌘←/⌘→ in particular are NOT bound: SwiftTerm maps them to
 /// `moveToLeftEndOfLine:`/`moveToRightEndOfLine:` and sends ESC b / ESC f, i.e. the
 /// shell's back-word / forward-word, and a menu equivalent would silently take that
-/// away from every session. ⌘↑/⌘↓ and ⇧⌘arrow fall through SwiftTerm's unhandled
-/// selector default and send nothing, so they are free.
+/// away from every session. ⇧⌘arrow falls through SwiftTerm's unhandled-selector
+/// default and sends nothing, so it is free — which is why tab cycling lives there,
+/// matching Terminal.app and Safari rather than inventing a chord.
 struct FinCommands: Commands {
     @ObservedObject var sessionManager: SessionManager
 
@@ -28,25 +29,16 @@ struct FinCommands: Commands {
         }
 
         CommandGroup(after: .windowArrangement) {
+            // ONE pair, not three. An earlier version bound ⌘↑/⌘↓ and offered
+            // ⇧⌘arrow and ⇧⌘[ ] as aliases, which cost six Window-menu items for
+            // two actions — SwiftUI allows one shortcut per item, so every alias is
+            // a visible duplicate. ⇧⌘← / ⇧⌘→ is the chord Terminal.app trains, so
+            // it is the chord, and the menu reads as two commands again.
             Button("Next Tab") { sessionManager.selectTab(offset: 1) }
-                .keyboardShortcut(.downArrow, modifiers: .command)
-                .disabled(!canCycle)
-            Button("Previous Tab") { sessionManager.selectTab(offset: -1) }
-                .keyboardShortcut(.upArrow, modifiers: .command)
-                .disabled(!canCycle)
-            // The Terminal.app/Safari pairs, as aliases on the same actions —
-            // SwiftUI allows one shortcut per item, so muscle memory needs its own.
-            Button("Show Next Tab") { sessionManager.selectTab(offset: 1) }
                 .keyboardShortcut(.rightArrow, modifiers: [.command, .shift])
                 .disabled(!canCycle)
-            Button("Show Previous Tab") { sessionManager.selectTab(offset: -1) }
+            Button("Previous Tab") { sessionManager.selectTab(offset: -1) }
                 .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
-                .disabled(!canCycle)
-            Button("Select Next Tab") { sessionManager.selectTab(offset: 1) }
-                .keyboardShortcut("]", modifiers: [.command, .shift])
-                .disabled(!canCycle)
-            Button("Select Previous Tab") { sessionManager.selectTab(offset: -1) }
-                .keyboardShortcut("[", modifiers: [.command, .shift])
                 .disabled(!canCycle)
 
             Divider()
