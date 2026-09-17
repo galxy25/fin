@@ -98,6 +98,11 @@ struct RootView: View {
             sessionManager.isAppActive = newPhase == .active
             if newPhase == .active {
                 sessionManager.recordLifecycleEvent("[app] foregrounded")
+                // Restored tabs are just ids until something resolves them, and a
+                // server can be deleted on another device while this one is closed —
+                // so the list is reconciled against the real rows here, where the
+                // query lives, before anything tries to route to one.
+                sessionManager.pruneDormantTabs(existingServerIDs: Set(servers.map(\.id)))
                 sessionManager.resumeActiveSessionIfNeeded(servers: servers)
                 // An armed monitor must come back even when the user reopens to the
                 // reader or home screen and never touches the terminal screen (whose

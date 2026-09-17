@@ -22,6 +22,11 @@ final class CloudSyncActivityMonitor: ObservableObject {
         case idle
         case inFlight
         case succeeded(Date)
+        /// A partial failure: some records synced, some did not. Distinct from
+        /// `.failed` because the sync itself completed, and distinct from
+        /// `.succeeded` because something in it did not — the state that used to be
+        /// misfiled as success and hid a total outage.
+        case degraded(String, Date)
         case failed(String, Date)
 
         fileprivate var isFailed: Bool {
@@ -31,6 +36,10 @@ final class CloudSyncActivityMonitor: ObservableObject {
     }
 
     @Published private(set) var activity: Activity = .idle
+    /// Reported in the app site's heartbeat so a sync problem is visible from the
+    /// control plane, not only to whoever has this screen open on that device.
+    @Published private(set) var partialFailureCount = 0
+    @Published private(set) var lastErrorDescription: String?
 
     private static let logger = Logger(subsystem: "dev.levischoen.fin", category: "CloudSyncActivityMonitor")
 
@@ -64,6 +73,7 @@ final class CloudSyncActivityMonitor: ObservableObject {
         }
         let wasFailed = activity.isFailed
         if let error = event.error {
+            lastErrorDescription = error.localizedDescription
             if Self.isKnownBenignPartialFailure(error) {
                 // Verified against the CloudKit Dashboard's own Production logs
                 // (2026-09-08): every partialFailure this container has ever
@@ -78,8 +88,17 @@ final class CloudSyncActivityMonitor: ObservableObject {
                 // successful sync rather than alarm the user
                 // with "Sync Problem" for Apple's own housekeeping; still audit it
                 // so a real regression would still leave a trail.
-                activity = .succeeded(endDate)
-                audit("[icloud] ignoring benign partial failure (CloudKit system housekeeping, not app data): \(error.localizedDescription)")
+                // NO LONGER REPORTED AS SUCCESS. The 2026-09-08 reasoning below held
+                // that every partialFailure this container sees is CloudKit's own
+                // _pcs_data housekeeping — and on 2026-09-17 that was falsified in the
+                // worst way: a synced model (RemoteInputPairing) had NO record type in
+                // the CloudKit schema at all, so every export failed with exactly this
+                // error, nothing synced between devices for an unknown length of time,
+                // and this branch reported it as a healthy sync the whole time. A false
+                // alarm costs a glance; swallowing a total outage cost a day.
+                partialFailureCount += 1
+                activity = .degraded(error.localizedDescription, endDate)
+                audit("[icloud] partial failure (\(partialFailureCount) so far): \(error.localizedDescription)")
                 return
             }
             let detail = error.localizedDescription
@@ -323,7 +342,7 @@ struct CloudSyncStatusView: View {
         switch monitor.activity {
         case .idle, .inFlight: return "arrow.triangle.2.circlepath.icloud"
         case .succeeded: return "checkmark.icloud"
-        case .failed: return "exclamationmark.icloud"
+        case .degraded, .failed: return "exclamationmark.icloud"
         }
     }
 
@@ -331,7 +350,7 @@ struct CloudSyncStatusView: View {
         guard status == .available else { return .secondary }
         switch monitor.activity {
         case .succeeded: return .green
-        case .failed: return .orange
+        case .degraded, .failed: return .orange
         case .idle, .inFlight: return .secondary
         }
     }
@@ -349,6 +368,7 @@ struct CloudSyncStatusView: View {
         case .idle: return "Waiting to Sync"
         case .inFlight: return "Syncing\u{2026}"
         case .succeeded: return "Synced"
+        case .degraded: return "Partly Synced"
         case .failed: return "Sync Problem"
         }
     }
@@ -373,6 +393,10 @@ struct CloudSyncStatusView: View {
             return "Transferring changes with iCloud now."
         case .succeeded(let date):
             return "Last synced \(date.formatted(.relative(presentation: .named)))."
+        case .degraded(let message, let date):
+            // Named plainly rather than folded into "Synced": this is the state that
+            // was reported as success while nothing actually synced (2026-09-17).
+            return "Some changes did not sync \(date.formatted(.relative(presentation: .named))). \(message)"
         case .failed(let message, let date):
             return "\(message) (\(date.formatted(.relative(presentation: .named))))"
         }

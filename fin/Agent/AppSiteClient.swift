@@ -140,8 +140,7 @@ final class AppSiteClient: ObservableObject {
         guard let target else {
             let body: [String: Any] = [
                 "schema": 2, "state": "idle", "wantsPrimary": false, "held": [], "unacked": [],
-                "capabilities": ["kind": "app", "hosts_runtime": false,
-                                 "app_build": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""],
+                "capabilities": appCapabilities(hostsRuntime: false),
             ]
             if let (status, _) = await siteRequest("POST", "/sites/\(siteID)/heartbeat", body: body, siteID: siteID, token: siteToken),
                !(200...299).contains(status) {
@@ -186,7 +185,7 @@ final class AppSiteClient: ObservableObject {
             "schema": 2, "state": state, "wantsPrimary": true,
             "held": held.filter { $0.repliesAtSubmit == nil }.map(\.id),
             "unacked": [],
-            "capabilities": ["kind": "app", "app_build": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""],
+            "capabilities": appCapabilities(),
         ]
         guard let (status, data) = await siteRequest("POST", "/sites/\(siteID)/heartbeat", body: body, siteID: siteID, token: siteToken) else { return }
         guard (200...299).contains(status) else {
@@ -237,6 +236,22 @@ final class AppSiteClient: ObservableObject {
         siteID = nil; siteToken = nil
         UserDefaults.standard.removeObject(forKey: Self.siteIDKey)
         try? KeychainStore.saveLocalSecret("", forKey: Self.siteTokenKey)
+    }
+
+    /// What this install reports about itself. iCloud state rides along because the
+    /// heartbeat only proves this app can reach the CONTROL PLANE — a different
+    /// channel, with different auth, from the CloudKit mirror that carries servers
+    /// and agents between devices. Without these fields, a device that is perfectly
+    /// live and perfectly unable to sync looks identical to a healthy one from here
+    /// (2026-09-17).
+    private func appCapabilities(hostsRuntime: Bool? = nil) -> [String: Any] {
+        var fields: [String: Any] = [
+            "kind": "app",
+            "app_build": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "",
+        ]
+        if let hostsRuntime { fields["hosts_runtime"] = hostsRuntime }
+        fields.merge(CloudSyncTelemetry.capabilities()) { current, _ in current }
+        return fields
     }
 
     private func siteRequest(_ method: String, _ path: String, body: [String: Any], siteID: String, token: String) async -> (Int, Data)? {

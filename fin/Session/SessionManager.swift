@@ -3,6 +3,7 @@ import Foundation
 @MainActor
 final class SessionManager: ObservableObject {
     private static let lastActiveKey = "lastActiveServerID"
+    private static let openTabsKey = "openTabServerIDs"
     private static let lastActiveTouchedAtKey = "lastActiveServerTouchedAt"
 
     @Published private(set) var sessions: [UUID: TerminalSession] = [:]
@@ -25,8 +26,19 @@ final class SessionManager: ObservableObject {
     /// The open terminals, in the order their tabs are shown. `sessions` is a
     /// dictionary, so order has to be kept explicitly — the same reason the
     /// directive channel sorts its targets rather than iterating the dict.
-    /// Invariant: `Set(tabOrder) == Set(sessions.keys)`.
-    @Published private(set) var tabOrder: [UUID] = []
+    ///
+    /// A tab may be DORMANT: present here with no entry in `sessions`. That is what
+    /// a relaunch restores — the list of tabs you had, without dialing any of them.
+    /// `TerminalScreen` opens a server that has no session when it renders one, so a
+    /// dormant tab connects when you focus it and costs nothing until then. (The
+    /// invariant used to be `Set(tabOrder) == Set(sessions.keys)`; restoring tabs is
+    /// exactly the case that had to relax it.)
+    @Published private(set) var tabOrder: [UUID] = [] {
+        didSet {
+            guard !isRestoringFromStorage, tabOrder != oldValue else { return }
+            UserDefaults.standard.set(tabOrder.map(\.uuidString), forKey: Self.openTabsKey)
+        }
+    }
 
     /// The server picker. Lives here rather than in a view's `@State` because two
     /// places present it — the ⌘T menu command (which is outside the view
@@ -232,12 +244,18 @@ final class SessionManager: ObservableObject {
     private var lifecycleSequence = 0
 
     init() {
+        isRestoringFromStorage = true
+        // The tabs first, then which one was focused — restoring focus into a list
+        // that does not contain it would leave the strip and the route disagreeing.
+        if let storedTabs = UserDefaults.standard.array(forKey: Self.openTabsKey) as? [String] {
+            tabOrder = storedTabs.compactMap(UUID.init(uuidString:))
+        }
         if let stored = UserDefaults.standard.string(forKey: Self.lastActiveKey),
            let uuid = UUID(uuidString: stored) {
-            isRestoringFromStorage = true
             activeServerID = uuid
-            isRestoringFromStorage = false
+            if !tabOrder.contains(uuid) { tabOrder.append(uuid) }
         }
+        isRestoringFromStorage = false
         directiveChannel.liveTargets = { [weak self] in
             guard let self else { return [] }
             // Active server's runtime first, so a "*" directive lands where the
@@ -311,8 +329,26 @@ final class SessionManager: ObservableObject {
         // Membership is tied to the session existing, not to how it was created:
         // `resumeArmedAgentMonitor` also mints sessions, and a live session with
         // no tab would be invisible in the strip and impossible to close there.
-        tabOrder.append(server.id)
+        // Guarded, because a restored dormant tab is ALREADY in this list and
+        // appending again would show the same terminal twice.
+        if !tabOrder.contains(server.id) {
+            tabOrder.append(server.id)
+        }
         return session
+    }
+
+    /// Drops restored tabs whose server no longer exists — deleted on this device or
+    /// on another and synced in. Called by the view that owns the `Server` query,
+    /// since this class deliberately knows nothing about SwiftData. Only dormant tabs
+    /// are dropped: a live session is closed through `close(_:)`, which also tears
+    /// down its transport.
+    func pruneDormantTabs(existingServerIDs: Set<UUID>) {
+        let survivors = tabOrder.filter { existingServerIDs.contains($0) || sessions[$0] != nil }
+        guard survivors != tabOrder else { return }
+        tabOrder = survivors
+        if let active = activeServerID, !survivors.contains(active) {
+            activeServerID = survivors.last
+        }
     }
 
     /// Cycles focus through the open tabs, wrapping at both ends. Deliberately does
