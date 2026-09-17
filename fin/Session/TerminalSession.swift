@@ -531,6 +531,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func openRelaySocket(server: Server, siteID: String, sessionId: String, generation myGeneration: Int) async {
         let wsURLString = CloudControlPlaneConfig.webSocketURL
         guard !wsURLString.isEmpty, var components = URLComponents(string: wsURLString) else {
+            ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "no_ws_endpoint_configured"])
             if myGeneration == generation {
                 lastError = "No terminal relay endpoint is configured."
             }
