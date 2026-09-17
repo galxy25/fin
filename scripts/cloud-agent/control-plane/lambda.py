@@ -52,6 +52,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -204,6 +205,13 @@ RELAY_IDLE_SECONDS = 900
 # A relay row older than this with no instance behind it is stale bookkeeping,
 # not a live relay — re-launch rather than hand out a dead address.
 RELAY_ROW_MAX_AGE_SECONDS = 24 * 3600
+# Below this age a relay is assumed to be booting rather than dead, so it is
+# never probed: a probe would fail and launch a second instance for a session
+# the first is about to serve.
+RELAY_BOOT_GRACE_SECONDS = 150
+# The probe is on the request path, so it is short. A relay that cannot answer
+# a TCP connect in this long is not one a terminal should be pointed at.
+RELAY_PROBE_TIMEOUT_SECONDS = 2
 # Tries at appending one command to a site's row. Each attempt re-reads, so
 # this is a bound on how many heartbeats may interleave, not on time.
 _SITE_COMMAND_WRITE_ATTEMPTS = 4
@@ -1211,20 +1219,49 @@ def _provision_config(user_id, agent, config_key):
 # --- routes ------------------------------------------------------------------
 
 
+def _relay_is_accepting(host):
+    """Does something actually answer on the relay's port right now?
+
+    EC2's instance state is not enough, and that gap is not theoretical: the
+    relay ends itself by powering off when idle, which EC2 reports as "running"
+    for the ~minute the machine takes to die. A request landing in that window
+    was handed the address of a relay that had already decided to exit, and the
+    clients then retried against a corpse for 90 seconds before giving up
+    (2026-09-17). A relay that will not accept a connection is not a relay,
+    whatever EC2 says about it."""
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    connection.settimeout(RELAY_PROBE_TIMEOUT_SECONDS)
+    try:
+        connection.connect((host, RELAY_PORT))
+        return True
+    except OSError:
+        return False
+    finally:
+        connection.close()
+
+
 def _live_relay_address(row, now):
-    """The address in `row` if the instance behind it is really still there.
+    """The address in `row` if the relay behind it is really still there.
 
     Bookkeeping outlives instances in both directions — a relay self-terminates
     when idle without telling anyone, and a row can be written for an instance
-    that then failed to boot — so this trusts EC2's state, never the row alone.
+    that then failed to boot — so this trusts neither the row nor EC2 alone.
     """
     if not row or not row.get("instanceId") or not row.get("publicIp"):
         return None
     launched = _parse_iso(row.get("launchedAt"))
-    if launched is not None and (now - launched).total_seconds() > RELAY_ROW_MAX_AGE_SECONDS:
+    if launched is None:
+        return None
+    age = (now - launched).total_seconds()
+    if age > RELAY_ROW_MAX_AGE_SECONDS:
         return None
     state = _instance_states([row["instanceId"]]).get(row["instanceId"])
     if state not in ("pending", "running"):
+        return None
+    # A young relay is still installing python and has nothing listening yet;
+    # probing it would fail and launch a SECOND instance for a session the
+    # first one is about to serve. Past that, silence means death.
+    if age > RELAY_BOOT_GRACE_SECONDS and not _relay_is_accepting(row["publicIp"]):
         return None
     return {"relayHost": row["publicIp"], "relayPort": RELAY_PORT}
 

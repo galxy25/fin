@@ -3602,10 +3602,40 @@ class RelayWorkerTests(_SitesTestCase):
         self.assertEqual((row["instanceId"], row["publicIp"]), ("i-relay1", "203.0.113.7"))
 
     def test_second_call_reuses_the_live_relay(self):
+        self.addCleanup(setattr, lam, "_relay_is_accepting", lam._relay_is_accepting)
+        lam._relay_is_accepting = lambda host: True
         # Every terminal opened while one relay is up must land on THAT relay:
         # a second instance would be both a second bill and a second switch,
         # and the daemon and app could end up on different ones.
         first = lam._ensure_relay_worker("user-1", lam._now())
+        second = lam._ensure_relay_worker("user-1", lam._now())
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.ec2.launched), 1)
+
+    def test_a_relay_that_stopped_accepting_is_replaced_even_while_ec2_says_running(self):
+        # The gap that actually bit: the relay ends itself by powering off, and
+        # EC2 keeps reporting "running" for the ~minute the machine takes to
+        # die. A request landing in that window got the address of a relay that
+        # had already decided to exit, and both clients then retried against a
+        # corpse until they gave up.
+        lam._ensure_relay_worker("user-1", lam._now())
+        old_enough = lam._now() - timedelta(seconds=lam.RELAY_BOOT_GRACE_SECONDS + 60)
+        lam.RELAY_WORKERS_TABLE.items["user-1"]["launchedAt"] = lam._iso(old_enough)
+        self.addCleanup(setattr, lam, "_relay_is_accepting", lam._relay_is_accepting)
+        lam._relay_is_accepting = lambda host: False
+
+        lam._ensure_relay_worker("user-1", lam._now())
+        self.assertEqual(len(self.ec2.launched), 2)
+
+    def test_a_booting_relay_is_not_probed_and_not_duplicated(self):
+        # The opposite error, and the reason the probe is age-gated: a relay
+        # launched seconds ago has nothing listening yet, so probing it would
+        # fail and launch a SECOND instance for the session the first one is
+        # about to serve.
+        first = lam._ensure_relay_worker("user-1", lam._now())
+        self.addCleanup(setattr, lam, "_relay_is_accepting", lam._relay_is_accepting)
+        lam._relay_is_accepting = lambda host: self.fail("a booting relay must not be probed")
+
         second = lam._ensure_relay_worker("user-1", lam._now())
         self.assertEqual(first, second)
         self.assertEqual(len(self.ec2.launched), 1)
