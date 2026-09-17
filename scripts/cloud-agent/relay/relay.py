@@ -59,15 +59,27 @@ SELF_TERMINATE = os.environ.get("FIN_RELAY_SELF_TERMINATE", "1") == "1"
 # kilobytes. Base64 of a 64 KiB read is ~87 KiB, so this leaves generous room.
 MAX_FRAME_BYTES = 256 * 1024
 
+# How long one side may hold a session open alone. Generous enough for the
+# site's ~20s heartbeat plus a slow dial, short enough that an abandoned
+# half-session cannot keep this instance alive and billing.
+HALF_OPEN_SECONDS = 180
+
 
 class Session:
-    """One terminal: the app on one side, the site's daemon on the other."""
+    """One terminal: the app on one side, the site's daemon on the other.
+
+    EITHER may arrive first, and which one does is a coin flip: the app dials
+    as soon as the control plane answers, while the site only learns of the
+    session on its next heartbeat — but the app may also still be retrying
+    against a relay that is booting. Requiring the app first meant a daemon
+    that got there early was told "no such session", closed, and never came
+    back, so the terminal could never form (2026-09-17)."""
 
     __slots__ = ("session_id", "app", "site", "created_at")
 
-    def __init__(self, session_id, app):
+    def __init__(self, session_id):
         self.session_id = session_id
-        self.app = app
+        self.app = None
         self.site = None
         self.created_at = time.monotonic()
 
@@ -142,39 +154,34 @@ async def handler(websocket):
                 return
 
             if session is None:
-                # --- joining ---
-                if action == "open":
-                    existing = sessions.get(session_id)
-                    if existing is not None:
-                        # A retry of an open the relay already has (the app
-                        # reconnecting after a drop): take over the app slot
-                        # rather than refusing, so a flaky phone network
-                        # doesn't strand a session the daemon is still holding.
-                        await _send(existing.app, {"action": "close", "reason": "replaced by a newer app connection"})
-                        existing.app = websocket
-                        session = existing
-                    else:
-                        session = Session(session_id, websocket)
-                        sessions[session_id] = session
-                    role = "app"
-                    _mark_busy()
-                    LOG.info("session %s opened by app", session_id)
-                    continue
-                if action == "attach":
-                    session = sessions.get(session_id)
-                    if session is None:
-                        # The daemon woke on a heartbeat for a session whose app
-                        # already gave up. Say so plainly instead of hanging.
-                        await _send(websocket, {"action": "close", "sessionId": session_id, "reason": "no such session"})
-                        return
+                # --- joining, from either side, in either order ---
+                if action not in ("open", "attach"):
+                    await _send(websocket, {"action": "close", "reason": "first frame must be open or attach"})
+                    return
+                role = "app" if action == "open" else "site"
+                session = sessions.get(session_id)
+                if session is None:
+                    session = Session(session_id)
+                    sessions[session_id] = session
+                previous = session.app if role == "app" else session.site
+                if previous is not None:
+                    # A reconnect of a side the relay already holds (a flaky
+                    # phone network, or a daemon that redialled): the newcomer
+                    # wins, so a stale socket cannot strand the session.
+                    await _send(previous, {"action": "close", "reason": "replaced by a newer connection"})
+                if role == "app":
+                    session.app = websocket
+                else:
                     session.site = websocket
-                    role = "site"
-                    _mark_busy()
+                _mark_busy()
+                LOG.info("session %s joined by %s", session_id, role)
+                # `attached` is the app's cue that there is something on the far
+                # end, so it fires when the PAIR is complete — not when the site
+                # happens to arrive, which may be first.
+                if session.app is not None and session.site is not None:
                     await _send(session.app, {"action": "attached", "sessionId": session_id})
-                    LOG.info("session %s attached by site", session_id)
-                    continue
-                await _send(websocket, {"action": "close", "reason": "first frame must be open or attach"})
-                return
+                    LOG.info("session %s paired", session_id)
+                continue
 
             # --- joined: relay or close ---
             if session_id != session.session_id:
@@ -215,9 +222,23 @@ def _terminate_self():
     subprocess.run(["shutdown", "-h", "now"], check=False)
 
 
+async def _expire_half_open():
+    """A session only one side ever joined is not a terminal, and left alone it
+    would keep `sessions` non-empty forever — which would hold this instance up
+    past its idle timeout and bill for a relay nobody is using."""
+    now = time.monotonic()
+    stale = [
+        session for session in sessions.values()
+        if (session.app is None or session.site is None) and now - session.created_at > HALF_OPEN_SECONDS
+    ]
+    for session in stale:
+        await _close_session(session, "the other side never arrived", notify=None)
+
+
 async def idle_watchdog():
     while True:
         await asyncio.sleep(30)
+        await _expire_half_open()
         if sessions or idle_since is None:
             continue
         if time.monotonic() - idle_since < IDLE_SECONDS:

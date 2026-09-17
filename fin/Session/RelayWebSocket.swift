@@ -94,11 +94,31 @@ final class RelayWebSocket: @unchecked Sendable {
         connection = NWConnection(to: .url(url), using: parameters)
     }
 
-    /// Resolves once the socket is usable, or throws. Every exit path from the
-    /// state handler resumes exactly once: `takeConnectContinuation` hands the
-    /// continuation out at most one time, so a `.failed` arriving after a
-    /// `.ready` (or a cancel racing either) cannot double-resume.
-    func connect() async throws {
+    /// Resolves once the socket is usable, or throws. Every exit path resumes
+    /// exactly once: `takeConnectContinuation` hands the continuation out at
+    /// most one time, so a `.failed` arriving after a `.ready` — or the
+    /// deadline racing either — cannot double-resume.
+    ///
+    /// `.waiting` IS NOT AN ERROR HERE, and treating it as one is what broke
+    /// the first real connection from a phone: it failed every attempt with
+    /// `ENETDOWN "Network is down"` (2026-09-17). `.waiting` means
+    /// Network.framework cannot connect *yet* and will retry itself when
+    /// conditions change — on a phone that is the ordinary state while a path
+    /// is being brought up, and it usually becomes `.ready` a moment later. A
+    /// wired Mac goes straight to `.ready` and never shows it, which is
+    /// exactly why a local test could not see this.
+    ///
+    /// So waiting is allowed to wait, and a DEADLINE is what stops it being
+    /// unbounded — the caller's dial loop still owns retrying, it just gets
+    /// told after `timeout` instead of on the first hiccup.
+    func connect(timeout: TimeInterval = 8) async throws {
+        let deadline = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(timeout))
+            guard !Task.isCancelled else { return }
+            self?.failConnect(Failure.connect("no relay answered within \(Int(timeout))s"))
+        }
+        defer { deadline.cancel() }
+
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             lock.lock()
             connectContinuation = continuation
@@ -113,19 +133,22 @@ final class RelayWebSocket: @unchecked Sendable {
                     self.takeConnectContinuation()?.resume(throwing: Failure.connect(String(describing: error)))
                 case .cancelled:
                     self.takeConnectContinuation()?.resume(throwing: Failure.closed)
-                case .waiting(let error):
-                    // `.waiting` is Network.framework holding the attempt open
-                    // for a path that might appear — for a relay that is still
-                    // booting that would mean hanging instead of retrying, and
-                    // the caller's dial loop is the thing that owns retrying.
-                    self.connection.cancel()
-                    self.takeConnectContinuation()?.resume(throwing: Failure.connect(String(describing: error)))
                 default:
+                    // Including `.waiting` — see the note above.
                     break
                 }
             }
             connection.start(queue: queue)
         }
+    }
+
+    /// Ends a connect attempt from outside the state handler (the deadline),
+    /// tearing down the connection so a superseded attempt cannot later
+    /// become ready behind the caller's back.
+    private func failConnect(_ failure: Failure) {
+        guard let continuation = takeConnectContinuation() else { return }
+        connection.cancel()
+        continuation.resume(throwing: failure)
     }
 
     private func takeConnectContinuation() -> CheckedContinuation<Void, Error>? {
