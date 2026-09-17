@@ -720,6 +720,7 @@ PUT /inbox/{agent}/lock
 DELETE /inbox/{agent}/lock
 POST /presign
 POST /feedback
+POST /client-events
 PUT /secrets/{service}
 GET /secrets
 DELETE /secrets/{service}
