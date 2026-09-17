@@ -480,7 +480,8 @@ cat > "$BUILD/policy.json" <<JSON
       "Action": "s3:GetObject",
       "Resource": [
         "arn:aws:s3:::$BUCKET/users/*/fin/*",
-        "arn:aws:s3:::$BUCKET/fin/agentd/*"
+        "arn:aws:s3:::$BUCKET/fin/agentd/*",
+        "arn:aws:s3:::$BUCKET/fin/relay/*"
       ]
     },
     {
@@ -599,22 +600,10 @@ JSON
 aws iam put-role-policy --role-name "$ROLE" --policy-name fin-control-plane \
   --policy-document "file://$BUILD/policy.json"
 
-# The relay terminates ITSELF when it goes quiet — that self-termination is the
-# entire cost model, so the permission for it has to exist or an idle relay
-# bills forever. Scoped by tag to instances launched as relays: a relay can end
-# a relay, and nothing else. It lives here rather than in launch.sh (which
-# creates the role) because this script is the one that actually gets re-run.
-cat > "$BUILD/relay-self-terminate.json" <<JSON
-{"Version": "2012-10-17",
- "Statement": [{"Sid": "RelaySelfTerminate",
-   "Effect": "Allow",
-   "Action": "ec2:TerminateInstances",
-   "Resource": "arn:aws:ec2:$REGION:$ACCOUNT:instance/*",
-   "Condition": {"StringEquals": {"ec2:ResourceTag/fin-role": "terminal-relay"}}}]}
-JSON
-aws iam put-role-policy --role-name "$AGENT_ROLE" --policy-name fin-relay-self-terminate \
-  --policy-document "file://$BUILD/relay-self-terminate.json"
-echo "==> Granted $AGENT_ROLE self-termination on relay-tagged instances"
+# NOTE: no EC2 permission is granted for the relay's self-termination, and none
+# is needed. It ends itself by powering off, and its instance is launched with
+# InstanceInitiatedShutdownBehavior=terminate — so the smallest possible
+# privilege (none) does the job that an ec2:TerminateInstances grant would.
 
 # --- bearer token ------------------------------------------------------------
 if [ -n "${FIN_CP_TOKEN:-}" ]; then

@@ -36,8 +36,8 @@ import json
 import logging
 import os
 import ssl
+import subprocess
 import time
-import urllib.request
 
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
@@ -202,32 +202,17 @@ async def handler(websocket):
             await _close_session(session, "peer disconnected", notify=websocket)
 
 
-def _imds(path):
-    """IMDSv2 — the instance's own identity, for terminating itself."""
-    token_request = urllib.request.Request(
-        "http://169.254.169.254/latest/api/token",
-        method="PUT",
-        headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
-    )
-    with urllib.request.urlopen(token_request, timeout=5) as response:
-        token = response.read().decode()
-    request = urllib.request.Request(
-        "http://169.254.169.254/latest/meta-data/" + path,
-        headers={"X-aws-ec2-metadata-token": token},
-    )
-    with urllib.request.urlopen(request, timeout=5) as response:
-        return response.read().decode()
-
-
 def _terminate_self():
     """The whole cost model in one call: no sessions for IDLE_SECONDS, so stop
-    existing. The instance profile is scoped to terminating only this instance."""
-    import boto3
+    existing.
 
-    instance_id = _imds("instance-id")
-    region = _imds("placement/region")
-    LOG.info("idle for %ss — terminating %s", IDLE_SECONDS, instance_id)
-    boto3.client("ec2", region_name=region).terminate_instances(InstanceIds=[instance_id])
+    By powering off, not by asking EC2 to terminate us — the instance is
+    launched with `InstanceInitiatedShutdownBehavior=terminate`, so halting IS
+    terminating. That means this process needs no AWS SDK (boto3 is a large
+    install for a 412 MB box) and the instance needs no EC2 permissions at all:
+    the smallest possible thing that can end a machine's own life."""
+    LOG.info("idle for %ss — powering off (shutdown behavior is terminate)", IDLE_SECONDS)
+    subprocess.run(["shutdown", "-h", "now"], check=False)
 
 
 async def idle_watchdog():

@@ -395,8 +395,14 @@ PYSMOKE
 # terminates itself when nobody is using it.
 RELAY_USER_DATA = """#!/bin/bash
 set -euxo pipefail
-dnf install -y python3 python3-pip
-python3 -m pip install --quiet websockets boto3
+# NO `dnf install` HERE. A t4g.nano has 412 MB usable, and AL2023's dnf needs
+# more than that to chew through 79 MB of repo metadata: the first relay ever
+# launched died with `dnf install -y python3 python3-pip` OOM-killed, boot
+# unfinished, nothing listening (2026-09-17). It was never needed — the image
+# already ships python3, and ensurepip provides pip without touching dnf. The
+# only thing fetched is `websockets`, a small pure-python wheel.
+python3 -m ensurepip --upgrade
+python3 -m pip install --quiet websockets
 
 mkdir -p /etc/fin-relay
 curl -fsSL -o /etc/fin-relay/relay.py '{script_url}'
@@ -411,7 +417,8 @@ After=network-online.target
 
 [Service]
 # Root, because it binds 443 — the one port this feature can count on getting
-# out of a locked-down network. Nothing else on this instance is exposed.
+# out of a locked-down network, and because going idle means powering the
+# machine off. Nothing else on this instance is exposed.
 ExecStart=/usr/bin/python3 /etc/fin-relay/relay.py
 Environment=FIN_RELAY_PORT={port}
 Environment=FIN_RELAY_IDLE_SECONDS={idle_seconds}
@@ -1255,6 +1262,12 @@ def _ensure_relay_worker(user_id, now):
         IamInstanceProfile={"Name": INSTANCE_PROFILE_NAME},
         UserData=user_data,
         MetadataOptions={"HttpTokens": "required"},
+        # The relay ends itself by powering off when it goes idle, so "halt"
+        # has to mean "terminate" — otherwise an idle relay would linger as a
+        # stopped instance, and the next launch would leave another behind it.
+        # This is also why the relay needs no EC2 permissions of its own: it
+        # never calls an AWS API to die, it just shuts down.
+        InstanceInitiatedShutdownBehavior="terminate",
         TagSpecifications=[{"ResourceType": "instance", "Tags": [
             {"Key": "Name", "Value": "fin-terminal-relay"},
             {"Key": "fin-user", "Value": user_id},

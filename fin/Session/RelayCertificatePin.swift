@@ -27,7 +27,7 @@ import CryptoKit
 enum RelayCertificatePin {
     /// Printed by `scripts/cloud-agent/control-plane/deploy.sh` as
     /// "Relay certificate pin (SHA-256 of DER)".
-    static let sha256 = "PLACEHOLDER_SET_BY_DEPLOY"
+    static let sha256 = "6886b52b6494b30696a2b27a27b4f5ca11e0de160d8e1887f4cae84aa37e230d"
 
     static func matches(_ certificate: SecCertificate) -> Bool {
         let der = SecCertificateCopyData(certificate) as Data
