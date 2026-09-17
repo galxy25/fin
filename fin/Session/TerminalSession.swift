@@ -579,17 +579,33 @@ final class TerminalSession: ObservableObject, Identifiable {
             return
         }
 
+        // The daemon's `TerminalRelayClient.receiveLoop` carries the same grace
+        // window for the same reason: the very first `receive()` after
+        // `resume()` can fail with "Socket is not connected" before the
+        // WebSocket upgrade has actually finished, on this OS/Foundation's
+        // `URLSessionWebSocketTask` — confirmed reproducible even with
+        // query-string auth, so it is the handshake itself racing `receive()`,
+        // not anything about how this connection authenticates. Only the
+        // first receive gets this grace; once a message has come through, a
+        // later failure is a real drop.
+        var startupAttemptsRemaining = 20
         while myGeneration == generation {
             let message: URLSessionWebSocketTask.Message
             do {
                 message = try await socket.receive()
             } catch {
+                if startupAttemptsRemaining > 1 {
+                    startupAttemptsRemaining -= 1
+                    try? await Task.sleep(for: .milliseconds(300))
+                    continue
+                }
                 ControlPlaneClient.logClientEvent(.relayWSReceiveFailed, detail: ["sessionId": sessionId, "error": String(describing: error)])
                 if myGeneration == generation {
                     lastError = String(describing: error)
                 }
                 return
             }
+            startupAttemptsRemaining = 1
             guard myGeneration == generation else { return }
             switch message {
             case .data(let data):
