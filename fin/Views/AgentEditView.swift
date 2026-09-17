@@ -229,19 +229,6 @@ struct AgentEditView: View {
                     redact: CloudControlPlaneConfig.redactedToken
                 )
             }
-            // Unconditional, unlike the fields above: this is the terminal
-            // relay's endpoint (Servers → "Fin site relay" transport), which
-            // has nothing to do with where THIS agent's brain is hosted — a
-            // device with a local/on-device brain still needs it to relay a
-            // terminal to some other site. Gating it on `hostingMode == .cloud`
-            // (as it originally was, alongside the brain-hosting fields) meant
-            // the field silently never rendered for anyone not in cloud mode,
-            // which is exactly what made this impossible to find on 2026-09-16.
-            cloudURLField(
-                label: "Control Plane WebSocket URL",
-                get: { CloudControlPlaneConfig.webSocketURL },
-                set: { CloudControlPlaneConfig.setWebSocketURL($0) }
-            )
         }
     }
 

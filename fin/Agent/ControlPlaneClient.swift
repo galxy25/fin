@@ -101,18 +101,29 @@ enum ControlPlaneClient {
             }
     }
 
+    /// Where this session's two halves meet: the relay the control plane
+    /// launched (or reused) for it. Delivered per session rather than
+    /// configured, because the relay is an on-demand body whose address is new
+    /// every time one is launched — and because both sides being told the same
+    /// address by the same call is what makes it impossible for the app and
+    /// the site to end up on different relays.
+    struct RelayAddress: Decodable, Equatable {
+        let relayHost: String
+        let relayPort: Int
+    }
+
     /// Wakes a site's daemon to attach a local PTY to `tmuxSession` and open its
-    /// end of the terminal-relay WebSocket for `sessionId`. Delivered on the
-    /// site's next heartbeat (`SiteDirectory`'s ~20s cadence), not instantly —
-    /// `SiteRelayTerminalSession` accounts for that with its own "waking…" state.
-    static func openTerminalRelay(_ siteID: String, sessionId: String, tmuxSession: String) async -> Result<Void, Failure> {
+    /// end of the terminal-relay WebSocket for `sessionId`, and returns the
+    /// relay address to dial. Delivered on the site's next heartbeat
+    /// (`SiteDirectory`'s ~20s cadence), not instantly — and the relay itself
+    /// may still be booting when this returns, which is why the caller's
+    /// "waking…" state covers both waits.
+    static func openTerminalRelay(_ siteID: String, sessionId: String, tmuxSession: String) async -> Result<RelayAddress, Failure> {
         await perform(request("POST", path: "/sites/\(siteID)/commands", body: [
             "kind": "terminal-open",
             "args": ["sessionId": sessionId, "tmuxSession": tmuxSession],
         ]))
-        .flatMap { status, body in
-            (200...299).contains(status) ? .success(()) : .failure(.http(status, errorMessage(status: status, body: body)))
-        }
+        .flatMap { decode(RelayAddress.self, status: $0.0, body: $0.1) }
     }
 
     static func deleteSite(_ siteID: String) async -> Result<Void, Failure> {

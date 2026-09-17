@@ -113,6 +113,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// transport, decided once at `connect`/`connectSiteRelay` time).
     private var relaySocket: URLSessionWebSocketTask?
     private var relaySessionId: String?
+    /// How many two-second tries the relay gets to come up — 90 seconds, sized
+    /// for a cold `t4g.nano` installing python and starting the service, since
+    /// the relay only exists while a terminal does and the first session after
+    /// a quiet spell always pays a boot.
+    private let relayConnectAttempts = 45
     /// Bumped on every connect()/disconnect(). A `run()` invocation checks its captured
     /// generation before touching shared state, so a superseded (stale) connection attempt
     /// can never clobber a newer one's `client`/`stdinWriter`/`state` once it finally unwinds.
@@ -499,16 +504,21 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// `.waking` rather than `.connecting` until the first `output` frame
     /// proves someone is actually on the other end.
     private func runSiteRelay(server: Server, siteID: String, sessionId: String, generation myGeneration: Int) async {
-        if case .failure(let failure) = await ControlPlaneClient.openTerminalRelay(
+        switch await ControlPlaneClient.openTerminalRelay(
             siteID, sessionId: sessionId, tmuxSession: server.tmuxSessionName
         ) {
+        case .failure(let failure):
             ControlPlaneClient.logClientEvent(.relayCommandFailed, detail: ["siteId": siteID, "error": String(describing: failure)])
             if myGeneration == generation {
                 lastError = "Could not reach the control plane: \(failure)"
             }
-        } else {
-            ControlPlaneClient.logClientEvent(.relayCommandQueued, detail: ["siteId": siteID, "sessionId": sessionId])
-            await openRelaySocket(server: server, siteID: siteID, sessionId: sessionId, generation: myGeneration)
+        case .success(let relay):
+            ControlPlaneClient.logClientEvent(.relayCommandQueued, detail: [
+                "siteId": siteID, "sessionId": sessionId, "relayHost": relay.relayHost,
+            ])
+            await openRelaySocket(
+                server: server, siteID: siteID, sessionId: sessionId, relay: relay, generation: myGeneration
+            )
         }
 
         guard myGeneration == generation else { return }
@@ -528,84 +538,87 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    private func openRelaySocket(server: Server, siteID: String, sessionId: String, generation myGeneration: Int) async {
-        let wsURLString = CloudControlPlaneConfig.webSocketURL
-        guard !wsURLString.isEmpty, var components = URLComponents(string: wsURLString) else {
-            ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "no_ws_endpoint_configured"])
+    /// Dials the relay the control plane just named, and pumps it until the
+    /// session ends.
+    ///
+    /// The connect is retried, at length, because the relay is an ON-DEMAND
+    /// body: when no terminal has been open recently there is no instance at
+    /// all, and the one this session just caused to launch needs about a
+    /// minute to install python and start listening. "Connection refused" for
+    /// the first while is therefore the normal path, not an error — the cost
+    /// of never paying for an idle relay. `.waking` covers the whole wait.
+    private func openRelaySocket(
+        server: Server, siteID: String, sessionId: String,
+        relay: ControlPlaneClient.RelayAddress, generation myGeneration: Int
+    ) async {
+        guard let wsURL = URL(string: "wss://\(relay.relayHost):\(relay.relayPort)/") else {
+            ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "bad_relay_address", "host": relay.relayHost])
             if myGeneration == generation {
-                lastError = "No terminal relay endpoint is configured."
+                lastError = "The terminal relay returned an unusable address."
             }
             return
         }
-        // Auth rides the query string, not a custom header on the handshake request
-        // — see the daemon's `TerminalRelayClient.webSocketURL(from:siteID:siteToken:)`
-        // for why: a real `URLSessionWebSocketTask` bug on this OS/Foundation makes a
-        // header-carrying handshake connect and even send its first frame, then fail
-        // the very next `receive()` with ENOTCONN.
-        var query = components.queryItems ?? []
-        query.append(URLQueryItem(name: "token", value: CloudControlPlaneConfig.token))
-        components.queryItems = query
-        guard let wsURL = components.url else {
-            if myGeneration == generation {
-                lastError = "Could not build the terminal relay URL."
-            }
-            return
-        }
-        let socket = URLSession.shared.webSocketTask(with: wsURL)
-        socket.resume()
-        ControlPlaneClient.logClientEvent(.relayWSOpen, detail: ["siteId": siteID, "sessionId": sessionId])
+        // Pinned, not name-checked: the relay's certificate is the same one
+        // every time even though its address is not. See RelayCertificatePin.
+        let session = URLSession(configuration: .default, delegate: RelayPinningDelegate(), delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
 
-        guard myGeneration == generation else {
-            socket.cancel(with: .goingAway, reason: nil)
+        var socket: URLSessionWebSocketTask?
+        var attemptsRemaining = relayConnectAttempts
+        while myGeneration == generation, attemptsRemaining > 0 {
+            attemptsRemaining -= 1
+            let candidate = session.webSocketTask(with: wsURL)
+            candidate.resume()
+            let openFrame = try? JSONSerialization.data(withJSONObject: [
+                "action": "open", "sessionId": sessionId, "siteId": siteID, "tmuxSession": server.tmuxSessionName,
+            ])
+            guard let openFrame else {
+                ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "encode_open_frame"])
+                lastError = "Could not open the terminal relay: could not encode the open frame."
+                candidate.cancel(with: .goingAway, reason: nil)
+                return
+            }
+            do {
+                // The send is the reachability test: a relay that is still
+                // booting refuses the connection here rather than at resume().
+                try await candidate.send(.data(openFrame))
+                socket = candidate
+                break
+            } catch {
+                candidate.cancel(with: .goingAway, reason: nil)
+                if attemptsRemaining == 0 {
+                    ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: [
+                        "reason": "relay_unreachable", "host": relay.relayHost, "error": String(describing: error),
+                    ])
+                    if myGeneration == generation {
+                        lastError = "The terminal relay did not come up in time."
+                    }
+                    return
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        guard let socket, myGeneration == generation else {
+            socket?.cancel(with: .goingAway, reason: nil)
             return
         }
+        ControlPlaneClient.logClientEvent(.relayWSOpen, detail: [
+            "siteId": siteID, "sessionId": sessionId, "relayHost": relay.relayHost,
+        ])
         relaySocket = socket
         relaySessionId = sessionId
 
-        guard let openFrame = try? JSONSerialization.data(withJSONObject: [
-            "action": "open", "sessionId": sessionId, "siteId": siteID, "tmuxSession": server.tmuxSessionName,
-        ]) else {
-            ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "encode_open_frame"])
-            lastError = "Could not open the terminal relay: could not encode the open frame."
-            return
-        }
-        do {
-            try await socket.send(.data(openFrame))
-        } catch {
-            ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: ["reason": "send_open_frame", "error": String(describing: error)])
-            if myGeneration == generation {
-                lastError = "Could not open the terminal relay: \(error)"
-            }
-            return
-        }
-
-        // The daemon's `TerminalRelayClient.receiveLoop` carries the same grace
-        // window for the same reason: the very first `receive()` after
-        // `resume()` can fail with "Socket is not connected" before the
-        // WebSocket upgrade has actually finished, on this OS/Foundation's
-        // `URLSessionWebSocketTask` — confirmed reproducible even with
-        // query-string auth, so it is the handshake itself racing `receive()`,
-        // not anything about how this connection authenticates. Only the
-        // first receive gets this grace; once a message has come through, a
-        // later failure is a real drop.
-        var startupAttemptsRemaining = 20
         while myGeneration == generation {
             let message: URLSessionWebSocketTask.Message
             do {
                 message = try await socket.receive()
             } catch {
-                if startupAttemptsRemaining > 1 {
-                    startupAttemptsRemaining -= 1
-                    try? await Task.sleep(for: .milliseconds(300))
-                    continue
-                }
                 ControlPlaneClient.logClientEvent(.relayWSReceiveFailed, detail: ["sessionId": sessionId, "error": String(describing: error)])
                 if myGeneration == generation {
                     lastError = String(describing: error)
                 }
                 return
             }
-            startupAttemptsRemaining = 1
             guard myGeneration == generation else { return }
             switch message {
             case .data(let data):

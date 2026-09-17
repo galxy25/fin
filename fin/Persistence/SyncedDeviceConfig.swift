@@ -47,7 +47,6 @@ enum SyncedDeviceConfig {
     /// pull, and the setter pushes can never disagree about what syncs.
     static let stringKeys: [String] = [
         CloudControlPlaneConfig.endpointURLKey,
-        CloudControlPlaneConfig.webSocketURLKey,
     ]
     static let boolKeys: [String] = [RemoteSupervisionConfig.enabledKey]
 
@@ -146,7 +145,7 @@ enum SyncedDeviceConfig {
     /// (its handler is cheap and idempotent for a URL that didn't change).
     private static func postDomainNotifications(for changed: Set<String>) {
         guard !changed.isEmpty else { return }
-        if changed.contains(CloudControlPlaneConfig.endpointURLKey) || changed.contains(CloudControlPlaneConfig.webSocketURLKey) {
+        if changed.contains(CloudControlPlaneConfig.endpointURLKey) {
             NotificationCenter.default.post(
                 name: CloudControlPlaneConfig.changedNotification, object: nil
             )

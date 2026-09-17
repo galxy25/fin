@@ -5,13 +5,20 @@ import FoundationNetworking
 #endif
 
 /// Relays one interactive terminal — a local PTY attached to the caller's own tmux session,
-/// via `LocalTerminalSession` — over a short-lived WebSocket to the control plane's terminal
-/// relay endpoint. Woken by a `terminal-open` site command (`DaemonSiteClient.Command`,
-/// delivered on the next 20s heartbeat, per docs/SITES.md's forced-command precedent), not
-/// held open continuously: a session's socket opens on `open(sessionId:tmuxSession:)` and
-/// closes on a `close` frame, a socket error, or 10 minutes with no input. That keeps the
-/// WebSocket API Gateway's connection-minute charge at zero between uses — this body pays
-/// for the relay only while someone is actually looking at the terminal.
+/// via `LocalTerminalSession` — over a short-lived WebSocket to the terminal relay
+/// (`scripts/cloud-agent/relay/relay.py`). Woken by a `terminal-open` site command
+/// (`DaemonSiteClient.Command`, delivered on the next 20s heartbeat, per docs/SITES.md's
+/// forced-command precedent), not held open continuously: a session's socket opens on
+/// `open(sessionId:tmuxSession:relayHost:relayPort:)` and closes on a `close` frame, a
+/// socket error, or 10 minutes with no input.
+///
+/// The relay used to be an API Gateway WebSocket API, and could not be: `URLSessionWebSocketTask`
+/// cannot hold a connection to one (connect and first send succeed, the next receive fails
+/// ENOTCONN, every time — see relay.py's header for the full repro). It is now an ordinary
+/// WebSocket server on an instance the control plane launches per demand and which terminates
+/// itself when idle, so this body still pays for a relay only while someone is looking at a
+/// terminal — and the address, being new on every launch, arrives with the command rather than
+/// living in config.
 ///
 /// No SSH anywhere in this path: the daemon execs `tmux new-session -A` itself, exactly the
 /// way `LocalTerminalSession` already does for the agent's own pane (see that file's header
@@ -23,10 +30,16 @@ public final class TerminalRelayClient {
 
     private let siteID: String
     private let siteToken: String
-    private let relayURL: String
     private let controlPlaneURL: String?
     private let urlSession: URLSession
     private let audit: (String) -> Void
+
+    /// How many two-second dials the relay gets before this body gives up on a
+    /// session. The relay is launched ON DEMAND by the same control-plane call
+    /// that queued this command, so the first session after a quiet spell is
+    /// dialing an instance that is still installing python — a refused
+    /// connection for the first minute is the normal path, not a failure.
+    static let connectAttempts = 45
 
     private final class RelaySession {
         let socket: URLSessionWebSocketTask
@@ -42,14 +55,16 @@ public final class TerminalRelayClient {
     private var sessions: [String: RelaySession] = [:]
 
     public init(
-        siteID: String, siteToken: String, relayURL: String, controlPlaneURL: String? = nil,
-        urlSession: URLSession = .shared, audit: @escaping (String) -> Void
+        siteID: String, siteToken: String, controlPlaneURL: String? = nil,
+        urlSession: URLSession? = nil, audit: @escaping (String) -> Void
     ) {
         self.siteID = siteID
         self.siteToken = siteToken
-        self.relayURL = relayURL
         self.controlPlaneURL = controlPlaneURL
+        // Pinned by default: the relay has no name worth checking, so its
+        // certificate IS its identity (see RelayCertificatePin).
         self.urlSession = urlSession
+            ?? URLSession(configuration: .default, delegate: RelayPinningDelegate(), delegateQueue: nil)
         self.audit = audit
     }
 
@@ -77,18 +92,68 @@ public final class TerminalRelayClient {
         urlSession.dataTask(with: request) { _, _, _ in }.resume()
     }
 
-    /// Handles a `terminal-open` command's args (`sessionId`, `tmuxSession`). Idempotent —
-    /// a duplicate open for a session already relaying is ignored, since the heartbeat that
-    /// delivered the command may repeat it before the control plane sees this body connect.
-    public func open(sessionId: String, tmuxSession: String) {
+    /// Handles a `terminal-open` command's args. Idempotent — a duplicate open
+    /// for a session already relaying is ignored, since the heartbeat that
+    /// delivered the command may repeat it before the control plane sees this
+    /// body connect.
+    ///
+    /// `relayHost`/`relayPort` come from the command rather than from config:
+    /// the relay is an on-demand instance with a fresh address every launch,
+    /// and taking it from the same control-plane call that told the app makes
+    /// it impossible for the two sides to dial different relays.
+    public func open(sessionId: String, tmuxSession: String, relayHost: String, relayPort: Int) {
         guard sessions[sessionId] == nil else { return }
-        guard let url = Self.webSocketURL(from: relayURL, siteID: siteID, siteToken: siteToken) else {
-            audit("[relay] terminal-open \(sessionId): could not build a wss:// URL from \(relayURL)")
+        guard let url = URL(string: "wss://\(relayHost):\(relayPort)/") else {
+            audit("[relay] terminal-open \(sessionId): unusable relay address \(relayHost):\(relayPort)")
+            logClientEvent("relay_ws_open_failed", sessionId: sessionId, detail: ["reason": "bad_relay_address"])
             return
         }
-        // Query-string auth, not headers — see `Self.webSocketURL`'s doc comment.
-        let socket = urlSession.webSocketTask(with: url)
+        dial(sessionId: sessionId, tmuxSession: tmuxSession, url: url, attemptsRemaining: Self.connectAttempts)
+    }
 
+    /// One dial attempt. A fresh task per attempt on purpose: once a
+    /// `URLSessionWebSocketTask` has failed its connection there is nothing to
+    /// retry ON — it has to be replaced, not resent.
+    private func dial(sessionId: String, tmuxSession: String, url: URL, attemptsRemaining: Int) {
+        guard sessions[sessionId] == nil else { return }
+        let socket = urlSession.webSocketTask(with: url)
+        socket.resume()
+        guard let attach = try? JSONSerialization.data(withJSONObject: [
+            "action": "attach", "sessionId": sessionId,
+        ]) else { return }
+        // The attach send doubles as the reachability test: a relay still
+        // booting refuses here, and the session has not been created yet, so
+        // there is nothing to unwind before trying again.
+        socket.send(.data(attach)) { [weak self] error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let error else {
+                    self.startRelaying(sessionId: sessionId, tmuxSession: tmuxSession, socket: socket)
+                    return
+                }
+                socket.cancel(with: .goingAway, reason: nil)
+                guard attemptsRemaining > 1 else {
+                    self.audit("[relay] \(sessionId): relay never came up — \(error.localizedDescription.prefix(160))")
+                    self.logClientEvent("relay_ws_open_failed", sessionId: sessionId, detail: [
+                        "reason": "relay_unreachable", "error": String(describing: error),
+                    ])
+                    return
+                }
+                try? await Task.sleep(for: .seconds(2))
+                self.dial(
+                    sessionId: sessionId, tmuxSession: tmuxSession, url: url,
+                    attemptsRemaining: attemptsRemaining - 1
+                )
+            }
+        }
+    }
+
+    /// The socket is up and attached: bring up the PTY and start pumping.
+    private func startRelaying(sessionId: String, tmuxSession: String, socket: URLSessionWebSocketTask) {
+        guard sessions[sessionId] == nil else {
+            socket.cancel(with: .goingAway, reason: nil)
+            return
+        }
         let command = "exec tmux new-session -A -s \(Self.shellQuote(tmuxSession))"
         let terminal = LocalTerminalSession(configuration: LocalSessionConfiguration(connectCommand: command))
         let relay = RelaySession(socket: socket, terminal: terminal)
@@ -102,9 +167,7 @@ public final class TerminalRelayClient {
             }
         }
 
-        socket.resume()
         logClientEvent("relay_ws_open", sessionId: sessionId, detail: ["tmuxSession": tmuxSession])
-        send(sessionId: sessionId, frame: ["action": "attach", "sessionId": sessionId])
         terminal.connect()
         armIdleTimeout(sessionId: sessionId)
         receiveLoop(sessionId: sessionId)
@@ -113,31 +176,26 @@ public final class TerminalRelayClient {
 
     // MARK: - Socket loop
 
-    /// `startupAttemptsRemaining` covers the same brief post-`resume()`
-    /// handshake window `send(sessionId:frame:)` retries around: the very
-    /// first `receive()` can fail with "Socket is not connected" before the
-    /// WebSocket upgrade actually lands, and — unlike every later failure,
-    /// which is a real drop worth tearing the session down for — that one is
-    /// nothing having gone wrong yet. Only the FIRST receive gets this grace;
-    /// once a message has come through, a subsequent failure is real.
-    private func receiveLoop(sessionId: String, startupAttemptsRemaining: Int = 20) {
+    /// No startup grace here any more. The old version retried the first
+    /// `receive()` for six seconds because against API Gateway it ALWAYS
+    /// failed once (ENOTCONN) even though the socket had just connected and
+    /// sent — the retry was papering over the incompatibility this whole relay
+    /// exists to escape. Against an ordinary WebSocket server the first
+    /// receive works, so a failure here is now a real drop and is treated as
+    /// one immediately rather than being sat on.
+    private func receiveLoop(sessionId: String) {
         guard let relay = sessions[sessionId] else { return }
         relay.socket.receive { [weak self] result in
             Task { @MainActor [weak self] in
                 guard let self, self.sessions[sessionId] != nil else { return }
                 switch result {
                 case .failure(let error):
-                    guard startupAttemptsRemaining > 1 else {
-                        self.audit("[relay] \(sessionId): socket error — \(error.localizedDescription.prefix(160))")
-                        self.logClientEvent("relay_ws_receive_failed", sessionId: sessionId, detail: ["error": String(describing: error)])
-                        self.close(sessionId: sessionId, sendCloseFrame: false)
-                        return
-                    }
-                    try? await Task.sleep(for: .milliseconds(300))
-                    self.receiveLoop(sessionId: sessionId, startupAttemptsRemaining: startupAttemptsRemaining - 1)
+                    self.audit("[relay] \(sessionId): socket error — \(error.localizedDescription.prefix(160))")
+                    self.logClientEvent("relay_ws_receive_failed", sessionId: sessionId, detail: ["error": String(describing: error)])
+                    self.close(sessionId: sessionId, sendCloseFrame: false)
                 case .success(let message):
                     self.handle(sessionId: sessionId, message: message)
-                    self.receiveLoop(sessionId: sessionId, startupAttemptsRemaining: 1)
+                    self.receiveLoop(sessionId: sessionId)
                 }
             }
         }
@@ -179,26 +237,16 @@ public final class TerminalRelayClient {
         }
     }
 
-    /// `send(_:completionHandler:)` can fail with "Socket is not connected"
-    /// when called in the brief window right after `resume()`, before the
-    /// WebSocket handshake actually finishes — `open()` sends the first
-    /// `attach` frame synchronously in that window. A few short retries ride
-    /// out that window without the caller (or `open()`) needing to know
-    /// whether the handshake has landed yet; a failure past the last retry is
-    /// a real problem and still gets audited.
-    private func send(sessionId: String, frame: [String: Any], attemptsRemaining: Int = 20) {
+    /// Only ever called on a socket that already completed its attach, so a
+    /// failure is a real drop rather than a handshake still in flight — the
+    /// retries this used to carry were the API Gateway workaround, removed
+    /// with the rest of it.
+    private func send(sessionId: String, frame: [String: Any]) {
         guard let relay = sessions[sessionId], let data = try? JSONSerialization.data(withJSONObject: frame) else { return }
         relay.socket.send(.data(data)) { [weak self] error in
             guard let error else { return }
-            guard attemptsRemaining > 1 else {
-                Task { @MainActor [weak self] in
-                    self?.audit("[relay] \(sessionId): send failed — \(error.localizedDescription.prefix(160))")
-                }
-                return
-            }
             Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(300))
-                self?.send(sessionId: sessionId, frame: frame, attemptsRemaining: attemptsRemaining - 1)
+                self?.audit("[relay] \(sessionId): send failed — \(error.localizedDescription.prefix(160))")
             }
         }
     }
@@ -216,29 +264,6 @@ public final class TerminalRelayClient {
     }
 
     // MARK: - Helpers
-
-    /// Auth rides the query string (`?token=...&site=...`), not headers set on a
-    /// `URLRequest`. `URLSessionWebSocketTask` has a real bug on this OS/Foundation:
-    /// a handshake `URLRequest` carrying custom HTTP headers connects and even sends
-    /// its first frame successfully, but the very next `receive()` fails immediately
-    /// with ENOTCONN — reproduced with a minimal script against this exact endpoint,
-    /// with no custom headers at all as the one thing that made it go away. The
-    /// control plane's `_augment_websocket_query_auth` folds these back into headers
-    /// server-side, so nothing else about the wire protocol changes.
-    private static func webSocketURL(from httpish: String, siteID: String, siteToken: String) -> URL? {
-        guard var components = URLComponents(string: httpish.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
-        switch components.scheme {
-        case "https": components.scheme = "wss"
-        case "http": components.scheme = "ws"
-        case "wss", "ws": break
-        default: return nil
-        }
-        var query = components.queryItems ?? []
-        query.append(URLQueryItem(name: "token", value: siteToken))
-        query.append(URLQueryItem(name: "site", value: siteID))
-        components.queryItems = query
-        return components.url
-    }
 
     /// Single-quotes a tmux session name for `sh -c`, the same defensive posture
     /// `LocalTerminalSession`'s own connect commands are built with elsewhere in the daemon.
