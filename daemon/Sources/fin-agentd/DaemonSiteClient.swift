@@ -439,7 +439,19 @@ actor DaemonSiteClient {
         }
         let commands = (object["commands"] as? [[String: Any]] ?? []).compactMap { entry -> Command? in
             guard let id = entry["id"] as? String, let kind = entry["kind"] as? String else { return nil }
-            let args = (entry["args"] as? [String: Any] ?? [:]).compactMapValues { $0 as? String }
+            // Numbers are STRINGIFIED, not dropped. This was `compactMapValues
+            // { $0 as? String }`, which silently discarded any non-string value
+            // — so `terminal-open`'s `relayPort` (a JSON number) vanished here,
+            // the arg guard downstream saw a command missing its port, and both
+            // daemons ignored every relayed-terminal request without a trace
+            // while the app sat in "waking" (2026-09-17). A free-form payload
+            // that quietly deletes the values it does not recognize is worse
+            // than one that refuses them.
+            let args = (entry["args"] as? [String: Any] ?? [:]).compactMapValues { value -> String? in
+                if let text = value as? String { return text }
+                if let number = value as? NSNumber { return number.stringValue }
+                return nil
+            }
             return Command(id: id, kind: kind, args: args)
         }
         return HeartbeatResponse(
