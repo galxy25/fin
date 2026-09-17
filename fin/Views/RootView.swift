@@ -56,6 +56,11 @@ struct RootView: View {
                 PaywallView()
             }
         }
+        // Tells FinCommands that THIS scene is the one holding terminal tabs, so ⌘W
+        // closes a tab here while still closing the window over the Agent Hub or a
+        // Markdown reader. See TerminalTabsSceneKey for why it has to be a focused
+        // scene value rather than a check inside the command's action.
+        .focusedSceneValue(\.hostsTerminalTabs, true)
         // The one server picker: ⌘T and the control strip's server button both set
         // this flag, and it lives on RootView rather than the control strip because
         // ⌘T must work on the home and markdown routes, where no strip exists.

@@ -1,5 +1,25 @@
 import SwiftUI
 
+/// Marks the scene that actually owns terminal tabs.
+///
+/// Menu commands are app-global, but ⌘W is not: pressed over the Agent Hub or a
+/// Markdown window it has to close THAT window, not reach across and kill a
+/// terminal the user can't even see. A focused scene value is how a global menu
+/// asks "is the window in front the one I act on" — it resolves to nil in every
+/// other scene, which disables Close Tab, and a disabled item does not consume its
+/// key equivalent, so ⌘W falls through to AppKit's own Close. That fall-through is
+/// the whole mechanism; without it this would need window-identifier sniffing.
+private struct TerminalTabsSceneKey: FocusedValueKey {
+    typealias Value = Bool
+}
+
+extension FocusedValues {
+    var hostsTerminalTabs: Bool? {
+        get { self[TerminalTabsSceneKey.self] }
+        set { self[TerminalTabsSceneKey.self] = newValue }
+    }
+}
+
 /// The app's menu bar. Declared once and ungated: macOS and visionOS get real menu
 /// items, iPadOS surfaces the same shortcuts as key commands, and iPhone — with no
 /// menu bar and no ⌘ key — simply never fires them, which is why every action here
@@ -17,6 +37,7 @@ import SwiftUI
 /// matching Terminal.app and Safari rather than inventing a chord.
 struct FinCommands: Commands {
     @ObservedObject var sessionManager: SessionManager
+    @FocusedValue(\.hostsTerminalTabs) private var hostsTerminalTabs
 
     var body: some Commands {
         CommandGroup(after: .newItem) {
@@ -26,6 +47,18 @@ struct FinCommands: Commands {
                 sessionManager.isServerPickerPresented = true
             }
             .keyboardShortcut("t", modifiers: .command)
+
+            // ⌘W, the chord every Mac user already has in their fingers, and the one
+            // Terminal.app spends on exactly this. It deliberately shadows the
+            // standard Close only while a tab is actually open in the front window;
+            // with no tabs it stays disabled and ⌘W means Close Window again, so the
+            // shortcut is never dead.
+            Button("Close Tab") {
+                guard let serverID = sessionManager.activeServerID else { return }
+                sessionManager.close(serverID)
+            }
+            .keyboardShortcut("w", modifiers: .command)
+            .disabled(!canCloseTab)
         }
 
         CommandGroup(after: .windowArrangement) {
@@ -54,4 +87,10 @@ struct FinCommands: Commands {
     }
 
     private var canCycle: Bool { sessionManager.tabOrder.count > 1 }
+
+    /// Both halves matter: a terminal has to be frontmost (`hostsTerminalTabs`) AND
+    /// there has to be a tab to close. Either one false leaves ⌘W to the window.
+    private var canCloseTab: Bool {
+        hostsTerminalTabs == true && sessionManager.activeServerID != nil
+    }
 }
