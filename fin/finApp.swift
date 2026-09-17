@@ -420,6 +420,10 @@ struct FinApp: App {
                 .onOpenURL { url in openActivityLink(url) }
         }
         .modelContainer(modelContainer)
+        // The menu bar (⌘T and tab cycling). Attached to the main window group
+        // because that is the scene the terminal tabs live in; see FinCommands for
+        // why these are menu commands rather than SwiftUI key handling.
+        .commands { FinCommands(sessionManager: sessionManager) }
         #if os(macOS) || os(visionOS)
         // The agent hub (settings, logs/traces, memory, remote, artifacts, key) opens
         // as its own resizable window on macOS/visionOS instead of pushing over the

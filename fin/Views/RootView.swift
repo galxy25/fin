@@ -45,32 +45,33 @@ struct RootView: View {
     var body: some View {
         Group {
             if isUnlocked {
-                switch route {
-                case .terminal(let server):
-                    TerminalScreen(server: server)
-                case .markdown(let document):
-                    #if os(macOS) || os(visionOS)
-                    // The file itself opens in its own window (see
-                    // MarkdownReaderWindowView) rather than taking over the whole
-                    // app view — the root content stays HomeView.
-                    HomeView()
-                        .task(id: document.id) {
-                            guard !hasOpenedResumedMarkdownWindow else { return }
-                            hasOpenedResumedMarkdownWindow = true
-                            openWindow(id: FinScene.markdownReader, value: document.id)
-                        }
-                    #else
-                    NavigationStack {
-                        MarkdownReaderView(document: document, isRoot: true)
-                    }
-                    #endif
-                case .home:
-                    HomeView()
+                VStack(spacing: 0) {
+                    // Above the route switch, because it must stay on screen on the
+                    // home and markdown routes too — tabs can be open while the user
+                    // is picking a server or reading a file.
+                    TerminalTabBarView()
+                    routedContent
                 }
             } else {
                 PaywallView()
             }
         }
+        // The one server picker: ⌘T and the control strip's server button both set
+        // this flag, and it lives on RootView rather than the control strip because
+        // ⌘T must work on the home and markdown routes, where no strip exists.
+        .sheet(isPresented: $sessionManager.isServerPickerPresented) {
+            // Same gate as the root switch: a lapse mid-presentation must not leave
+            // a working picker over the paywall.
+            if isUnlocked {
+                HomeView(isSheet: true)
+            } else {
+                PaywallView()
+            }
+        }
+        .onChange(of: sessionManager.isServerPickerPresented) { _, isPresented in
+            if !isPresented { focusActiveTerminal() }
+        }
+        .onChange(of: sessionManager.activeServerID) { _, _ in focusActiveTerminal() }
         .onChange(of: sessionManager.pendingAgentOpen) { _, _ in openPendingRemoteAgentIfNeeded() }
         .onAppear { openPendingRemoteAgentIfNeeded() }
         // A tap queued while the paywall was up gets claimed the moment the
@@ -158,6 +159,42 @@ struct RootView: View {
             sessionManager.forceReconnectActiveSessionAfterWake(servers: servers)
         }
         #endif
+    }
+
+    @ViewBuilder
+    private var routedContent: some View {
+        switch route {
+        case .terminal(let server):
+            TerminalScreen(server: server)
+        case .markdown(let document):
+            #if os(macOS) || os(visionOS)
+            // The file itself opens in its own window (see
+            // MarkdownReaderWindowView) rather than taking over the whole
+            // app view — the root content stays HomeView.
+            HomeView()
+                .task(id: document.id) {
+                    guard !hasOpenedResumedMarkdownWindow else { return }
+                    hasOpenedResumedMarkdownWindow = true
+                    openWindow(id: FinScene.markdownReader, value: document.id)
+                }
+            #else
+            NavigationStack {
+                MarkdownReaderView(document: document, isRoot: true)
+            }
+            #endif
+        case .home:
+            HomeView()
+        }
+    }
+
+    /// Hands first responder back to the focused terminal after the picker closes or
+    /// the tab changes. Deferred a turn: the newly-focused session's view is only
+    /// reparented into the window once this render lands, and `makeFirstResponder`
+    /// on a view with no window is a silent no-op.
+    private func focusActiveTerminal() {
+        guard let serverID = sessionManager.activeServerID,
+              let session = sessionManager.sessions[serverID] else { return }
+        Task { @MainActor in session.focusTerminalView() }
     }
 
     /// Release builds gate on entitlements alone. The Debug-only auto-session mode

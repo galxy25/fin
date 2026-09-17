@@ -72,6 +72,15 @@ struct TerminalScreen: View {
             )
             HStack(spacing: 0) {
                 TerminalViewRepresentable(session: session, theme: theme)
+                    // Identity, not decoration: every tab renders at this same
+                    // structural position, and the representable deliberately hands
+                    // back the SESSION's persistent terminal view while `update`
+                    // only re-applies theme — without a new identity per session,
+                    // switching tabs would keep showing the previous one's view.
+                    // On the representable rather than on TerminalScreen, so a
+                    // switch doesn't unmount the screen and fire the iOS
+                    // `.onDisappear` that clears `isIdleTimerDisabled`.
+                    .id(session.id)
                 if prefersSidePanel, isAgentPanelVisible, let runtime {
                     Divider()
                     AgentConsoleView(runtime: runtime) {

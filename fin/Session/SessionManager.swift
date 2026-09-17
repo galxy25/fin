@@ -22,6 +22,18 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    /// The open terminals, in the order their tabs are shown. `sessions` is a
+    /// dictionary, so order has to be kept explicitly — the same reason the
+    /// directive channel sorts its targets rather than iterating the dict.
+    /// Invariant: `Set(tabOrder) == Set(sessions.keys)`.
+    @Published private(set) var tabOrder: [UUID] = []
+
+    /// The server picker. Lives here rather than in a view's `@State` because two
+    /// places present it — the ⌘T menu command (which is outside the view
+    /// hierarchy and can't reach `@EnvironmentObject`) and the control strip's
+    /// server button — and one flag is what keeps them from presenting two.
+    @Published var isServerPickerPresented = false
+
     /// One queued notification tap: which agent to open, and — when the payload
     /// carried it — which device the signal originated on. Origin is what the
     /// routing fork trusts first: every device keeps its OWN transcript for the
@@ -296,7 +308,29 @@ final class SessionManager: ObservableObject {
             self?.recordLifecycleEvent(text)
         }
         sessions[server.id] = session
+        // Membership is tied to the session existing, not to how it was created:
+        // `resumeArmedAgentMonitor` also mints sessions, and a live session with
+        // no tab would be invisible in the strip and impossible to close there.
+        tabOrder.append(server.id)
         return session
+    }
+
+    /// Cycles focus through the open tabs, wrapping at both ends. Deliberately does
+    /// NOT go through `open(_:)`: cycling past a dropped `.siteRelay` tab must never
+    /// dial its site (up to 90 seconds of `.waking` while the relay boots) — clicking
+    /// that tab is the explicit gesture that revives it.
+    func selectTab(offset: Int) {
+        guard tabOrder.count > 1 else { return }
+        let current = activeServerID.flatMap { tabOrder.firstIndex(of: $0) } ?? 0
+        let count = tabOrder.count
+        activeServerID = tabOrder[((current + offset) % count + count) % count]
+    }
+
+    /// ⌘1…⌘9, zero-based. Index 8 and up means "the last tab", the Terminal.app and
+    /// Safari convention for ⌘9.
+    func selectTab(at index: Int) {
+        guard !tabOrder.isEmpty, index >= 0 else { return }
+        activeServerID = tabOrder[index >= 8 ? tabOrder.count - 1 : min(index, tabOrder.count - 1)]
     }
 
     @discardableResult
@@ -445,6 +479,22 @@ final class SessionManager: ObservableObject {
             replaced.suspend()
             replaced.endConversation()
         }
+        // DELIBERATELY NOT retiring this agent's runtimes on OTHER sessions.
+        //
+        // An earlier version of this did, reasoning that two live runtimes for one
+        // agent means duplicate heartbeats and arbitrary relay/notification routing
+        // (the 2026-09-12 storm class). But this function is called from
+        // `TerminalScreen.content(for:)` — view body — for whichever tab is focused,
+        // and every tab resolves the same agent via `agents.first`. So retiring here
+        // meant that merely glancing at another tab cancelled the in-flight turn on
+        // the tab you left, marked its conversation stopped, and dropped it from the
+        // watchdog and relay targets, while the UI still reported it armed. Returning
+        // built a fresh runtime with a new conversation id, splitting the transcript.
+        // One keystroke destroying a running agent is far worse than the duplication
+        // it was guarding against — which is also not new: navigating between servers
+        // has always left the previous session's runtime alive in this dictionary.
+        // If the duplicate-heartbeat case needs an answer, it belongs where heartbeats
+        // are decided, not in a view-body side effect.
         let runtime = AgentRuntime(
             agent: agent,
             session: session,
@@ -538,8 +588,23 @@ final class SessionManager: ObservableObject {
         agentRuntimes.removeValue(forKey: serverID)
         sessions[serverID]?.disconnect()
         sessions.removeValue(forKey: serverID)
+        // Resolved BEFORE the id leaves `tabOrder`, so the neighbour is the one that
+        // was next to it: closing the focused tab while others are still open has to
+        // land on another terminal, not drop the whole app back to the home route.
+        let successor = successorTab(after: serverID)
+        tabOrder.removeAll { $0 == serverID }
         if activeServerID == serverID {
-            activeServerID = nil
+            activeServerID = successor
         }
+    }
+
+    /// The tab that inherits focus when `serverID`'s closes: the one after it, or the
+    /// new last one when it was the rightmost. Nil when nothing else is open.
+    private func successorTab(after serverID: UUID) -> UUID? {
+        guard let index = tabOrder.firstIndex(of: serverID) else { return nil }
+        var remaining = tabOrder
+        remaining.remove(at: index)
+        guard !remaining.isEmpty else { return nil }
+        return remaining[min(index, remaining.count - 1)]
     }
 }

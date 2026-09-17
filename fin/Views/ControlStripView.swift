@@ -11,7 +11,6 @@ struct ControlStripView: View {
     @EnvironmentObject private var sessionManager: SessionManager
     @Query(sort: \Agent.createdAt) private var agents: [Agent]
 
-    @State private var showingServers = false
     @State private var showingClipboard = false
     @State private var showingTheme = false
     @State private var showingPageButtons = false
@@ -36,7 +35,9 @@ struct ControlStripView: View {
                     .foregroundStyle(.red)
             }
             Button {
-                showingServers = true
+                // The same flag ⌘T sets, so the menu command and this button can
+                // never end up presenting two pickers.
+                sessionManager.isServerPickerPresented = true
             } label: {
                 Image(systemName: "server.rack")
             }
@@ -133,9 +134,6 @@ struct ControlStripView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Color.black)
-        .sheet(isPresented: $showingServers) {
-            HomeView(isSheet: true)
-        }
         // Notification-tap deep link: the tapped agent's console opens in whichever
         // presentation this layout uses. Checked on appear too, for taps that landed
         // before this screen existed.

@@ -170,6 +170,17 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
     #endif
 
+    /// Hands keyboard focus back to this session's terminal. macOS only by design:
+    /// a sheet presented over an NSViewRepresentable drops first responder, and a
+    /// terminal view reparented by a tab switch starts out unfocused — either reads
+    /// as "typing is dead". Deliberately a no-op elsewhere, where the equivalent
+    /// would raise the on-screen keyboard behind the user's back.
+    func focusTerminalView() {
+        #if os(macOS)
+        terminalView.window?.makeFirstResponder(terminalView)
+        #endif
+    }
+
     var isConnected: Bool {
         if let client { return client.isConnected }
         // The relay socket has no protocol-level "connected" flag of its own
