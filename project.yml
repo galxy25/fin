@@ -101,6 +101,21 @@ targets:
         # arbitrary internet HTTP, so this doesn't weaken ATS for anything else the app does.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+          # TEMPORARY, AND TRACKED: remove this the moment the terminal relay's
+          # socket moves to Network.framework (ATS does not apply there).
+          #
+          # The relay presents a self-signed certificate at a raw public IP that
+          # changes every launch, and ATS refuses it no matter what the
+          # URLSessionDelegate pinning override says — proven by running one
+          # binary two ways: as a bare CLI it connects and exchanges frames, and
+          # inside an .app bundle the identical code fails -1200 (2026-09-17).
+          # NSAllowsLocalNetworking above does NOT cover it, since the relay is a
+          # public address rather than a local one.
+          #
+          # This is a blunt instrument — it drops ATS for everything the app
+          # does, not just the relay — accepted deliberately and briefly to prove
+          # the end-to-end path while the Network.framework client is built.
+          NSAllowsArbitraryLoads: true
         UIViewControllerBasedStatusBarAppearance: false
         UIStatusBarStyle: UIStatusBarStyleLightContent
         # Required by the Mac App Store validator (LSApplicationCategoryType);
