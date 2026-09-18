@@ -1,5 +1,24 @@
 # Recording the Apple TV demo for App Review
 
+**Update 2026-09-18 (submission `933fad82`, rejected 2.1 + 2.1(b)).** The ask got
+sharper. Apple now wants "a demo video that shows a physical Apple device and the
+designated hardware pairing together and interacting during the use of the app" —
+they read the SSH server (your Mac) as "designated hardware". Concretely:
+
+- The app running on a **physical Apple TV, not a simulator**.
+- "The initial pairing process between the app and the designated hardware" — for
+  Fin that is: the server appearing in the list (iCloud sync) and the first connect.
+- "The entire app workflow with the designated hardware", filmed so **both** the Apple
+  TV's screen and the Mac it is driving are visible. A phone-camera video of the room
+  (TV on one side, Mac screen on the other) satisfies this literally; a QuickTime
+  mirror of the TV alone (Option A below) shows only half of what they asked for.
+- Delivery is a **link** in App Review Information (Distribution → tvOS → App Review
+  Information → Notes/Attachment), THEN a reply to the message — not a reply
+  attachment alone. iCloud Drive share link, unlisted YouTube, or the Attachment field.
+
+The original notes below still apply for what to show and in what order; Option A
+remains the easy way to capture the TV half if you want a clean second angle.
+
 Apple asked for "a screen recording captured on a physical device, running the
 latest operating system, demonstrating the app's functionality," starting with
 launching the app. tvOS has no built-in screen recorder, so the capture happens
