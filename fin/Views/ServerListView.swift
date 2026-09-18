@@ -194,6 +194,13 @@ struct ServerListView: View {
             if let at = site.lastHeartbeatAt {
                 detailLine("Last heartbeat", at.formatted(.relative(presentation: .named)))
             }
+            if site.state == "unavailable" {
+                if let failure = site.capabilities.launchFailure {
+                    detailLine("Problem", failure)
+                } else if let stage = site.capabilities.launchStage {
+                    detailLine("Launch", stage)
+                }
+            }
             let sessions = site.capabilities.tmuxSessions ?? []
             if !sessions.isEmpty {
                 detailLine("tmux", sessions.map(\.session).joined(separator: ", "))

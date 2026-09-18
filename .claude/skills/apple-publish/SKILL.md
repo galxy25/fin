@@ -1,36 +1,55 @@
 ---
 name: apple-publish
-description: Publish the native Fin iOS app to TestFlight from the command line (local archive → distribution-sign → upload to App Store Connect). Use when asked to "publish to testflight", "ship a testflight build", "upload to testflight", "make a testflight build", "release a beta", or to get a new build onto iPhone/iPad over the air. Sibling of apple-build (which produces local/simulator/device builds); this one does App Store Connect distribution.
+description: Publish the native Fin app to TestFlight from the command line, across all four platforms — iOS, macOS, tvOS, visionOS (local archive → distribution-sign → upload to App Store Connect). Use when asked to "publish to testflight", "ship a testflight build", "upload to testflight", "make a testflight build", "release a beta", or to get a new build onto a device over the air. Per CLAUDE.md, every ship goes to all four platforms together, never a subset. Sibling of apple-build (which produces local/simulator/device builds); this one does App Store Connect distribution.
 ---
 
-# Publish Fin to TestFlight (iOS)
+# Publish Fin to TestFlight (iOS, macOS, tvOS, visionOS)
 
 This is the **local-archive** path — build on this Mac, then push the signed `.ipa`
 straight to App Store Connect. **No Xcode Cloud.** (Xcode Cloud's "Grant Access to
 Your Source Code" dialog wants to clone the whole repo through GitHub's App
 integration — skip it entirely; nothing here needs it.)
 
-One command does everything — **fully headless: no Xcode GUI, no env vars, no
-keychain prompts**, the same pattern already proven out on PocketDJ. Credentials
+Four sibling scripts, one per platform — **fully headless: no Xcode GUI, no env vars,
+no keychain prompts**, the same pattern already proven out on PocketDJ. Credentials
 auto-load from `~/.config/pocketdj/asc.env`; signing uses the shared `pocketdj-ci`
 keychain (see "Headless signing" below):
 
 ```bash
-scripts/testflight.sh
+scripts/testflight.sh            # iOS
+scripts/testflight-macos.sh      # native macOS (fin/fin-macOS.entitlements)
+scripts/testflight-tvos.sh       # tvOS — separate fin-tv target/scheme
+scripts/testflight-visionos.sh   # native visionOS (Vision Pro)
 ```
 
-`scripts/testflight.sh` runs: `xcodegen generate` → `xcodebuild archive` (Release,
-iOS, distribution-signed via cloud signing) → `xcodebuild -exportArchive` with
-`destination=upload` to deliver to App Store Connect using the API key. Build number
-defaults to a unix timestamp (`CURRENT_PROJECT_VERSION`), so uploads never collide.
-Unlike PocketDJ, `project.yml` / `fin.xcodeproj` live at the **repo root**, not under
-an `apple/` subdirectory, so the script just `cd`s up to the repo root (one level above
-its own `scripts/` directory) — there's no nested Apple-platform folder to step into.
+Per CLAUDE.md ("Ship all platforms in sync", Levi 2026-09-12): every TestFlight ship
+goes to all four together, never a subset — run all four scripts, not just the one
+platform that changed. **Serialize them** through `scripts/dev/one-at-a-time.sh`
+(machine-safety policy — never run concurrent xcodebuild/swift-build on this machine);
+it queues on a machine-wide lock, so it's safe to fire all four in the background and
+let them run one at a time:
 
-Fin is a plain single-target iOS app (no widget extension, no CarPlay, no macOS or
-visionOS target), so there's nothing here beyond this one script — no
-`testflight-macos.sh` / `testflight-visionos.sh` siblings, and no extra App ID
-capability to enable before archiving.
+```bash
+scripts/dev/one-at-a-time.sh scripts/testflight.sh
+scripts/dev/one-at-a-time.sh scripts/testflight-macos.sh
+scripts/dev/one-at-a-time.sh scripts/testflight-tvos.sh
+scripts/dev/one-at-a-time.sh scripts/testflight-visionos.sh
+```
+
+Each runs: `xcodegen generate` → `xcodebuild archive` (Release, distribution-signed via
+cloud signing) → `xcodebuild -exportArchive` with `destination=upload` to deliver to
+App Store Connect using the API key. Build number defaults to a unix timestamp
+(`CURRENT_PROJECT_VERSION`), so uploads never collide. `project.yml` / `fin.xcodeproj`
+live at the **repo root**, not under an `apple/` subdirectory (unlike PocketDJ), so each
+script just `cd`s up to the repo root (one level above its own `scripts/` directory) —
+there's no nested Apple-platform folder to step into.
+
+iOS, macOS, and visionOS all build from the single multiplatform `fin` target
+(`supportedDestinations: [iOS, macOS, visionOS]` in `project.yml`); tvOS is the
+separate `fin-tv` target/scheme (SwiftTerm's UIKit view excludes tvOS, so it uses a
+vendored headless engine instead — see `testflight-tvos.sh`'s header). The app's
+non-iOS platforms in App Store Connect are created automatically on each one's first
+successful upload — no separate "New App" step per platform.
 
 ## Headless signing (the `pocketdj-ci` keychain)
 
@@ -119,8 +138,24 @@ needs recreating from scratch, that procedure lives in **PocketDJ's own
 
 - **Build number** auto-increments (unix timestamp) — fine for iterating within a
   version.
-- **Marketing version** is `MARKETING_VERSION` in `project.yml` (currently `1.0.0`).
-  Bump it when you want a new user-facing version, then run the script.
+- **Marketing version** is `MARKETING_VERSION` in `project.yml`'s `fin` target
+  (shared by iOS/macOS/visionOS) and separately in the `fin-tv` target (tvOS). Bump the
+  one(s) you need, `xcodegen generate`, then run the affected script(s).
+- **A platform's pre-release train closes once Apple approves that version** — a new
+  build under the same `MARKETING_VERSION` then fails export with `Invalid Pre-Release
+  Train … is closed for new build submissions` / `must contain a higher version than
+  that of the previously approved version`. Live 2026-09-17: visionOS 1.0.1 went to
+  Ready for Distribution while iOS/macOS/tvOS were still mid-review on 1.0.1, so
+  visionOS alone needed 1.0.2. Because the `fin` target's `MARKETING_VERSION` is shared
+  across iOS/macOS/visionOS, bump just the affected platform with an SDK-conditional
+  override rather than the base key (visionOS's SDK is `xros`):
+  ```yaml
+  MARKETING_VERSION: "1.0.1"
+  "MARKETING_VERSION[sdk=xros*]": "1.0.2"
+  ```
+  (mirrors the existing `CODE_SIGN_IDENTITY[sdk=appletvos*]`-style per-SDK overrides
+  already in `project.yml`). Only re-run the script for the platform(s) actually bumped
+  — the others' already-uploaded builds at the old version stand.
 
 ## Troubleshooting
 
@@ -146,6 +181,10 @@ needs recreating from scratch, that procedure lives in **PocketDJ's own
   headless). `testflight.sh` already passes `-authenticationKey{Path,ID,IssuerID}` to
   the archive step too (cloud signing), so this shouldn't recur unless those flags get
   dropped in an edit.
+- **`Invalid Pre-Release Train … is closed for new build submissions` /
+  `CFBundleShortVersionString […] must contain a higher version than that of the
+  previously approved version`** → that platform's current `MARKETING_VERSION` was
+  already approved by App Review; see "Versioning" above for the per-platform bump.
 - **Archive `CodeSign failed … errSecInternalComponent`** → codesign can't use the
   signing key non-interactively. Check the `pocketdj-ci` keychain (see "Headless
   signing"): is it in `security list-keychains`? Does `security find-identity -v -p

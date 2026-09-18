@@ -50,7 +50,7 @@ Everything lives in `scripts/cloud-agent/control-plane/lambda.py`. Existing rout
 
 Request:
 ```json
-{ "schema": 2, "state": "idle|working|needs-input|task-complete|draining",
+{ "schema": 2, "state": "idle|working|needs-input|task-complete|draining|unavailable",
   "wantsPrimary": true, "runId": "…", "transcriptKey": "fin/sites/fin/3f9a1c2e/runs/….jsonl",
   "held": ["m-…"], "unacked": ["m-…"], "urlsExpireAt": "…",
   "capabilities": {

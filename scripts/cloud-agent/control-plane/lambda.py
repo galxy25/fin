@@ -3960,7 +3960,13 @@ SITE_HEARTBEAT_SECONDS = 20
 # expiry from its own clock, so a site with a skewed clock cannot forge a lease.
 SITE_LEASE_SECONDS = 60
 
-SITE_STATES = ("idle", "working", "needs-input", "task-complete", "draining")
+# "unavailable": the daemon is up and can reach us but cannot attach its terminal
+# yet (connecting, probing, or a launch that failed and is about to exit). It
+# beats so the operator can see WHY a body is not working — the work laptop
+# crash-looped in silence for 12 hours on 2026-09-17/18 because the heartbeat
+# only started after the terminal was ready — and is otherwise inert: never
+# live, never primary, never offered or renewing messages.
+SITE_STATES = ("idle", "working", "needs-input", "task-complete", "draining", "unavailable")
 # "terminal-open" (args: {sessionId, tmuxSession}) wakes the site to dial the
 # terminal-relay WebSocket for that one session — see the WS route handlers
 # below. It is delivered and drained exactly like the others, on the site's
@@ -3988,7 +3994,7 @@ def _site_token_hash(token):
 
 def _site_is_live(site, now=None):
     now = _now() if now is None else now
-    if site.get("state") == "retired":
+    if site.get("state") in ("retired", "unavailable"):
         return False
     lease_until = _parse_iso(site.get("leaseUntil"))
     return lease_until is not None and now < lease_until
@@ -4218,7 +4224,10 @@ def site_heartbeat(event, site_id):
     # LEAVES needs-input. Not on any non-needs-input beat — the question is
     # pushed mid-turn, and the beat that lands before the turn ends still says
     # "working" (live on 2026-09-14: the id was gone before the state flipped).
-    if site.get("state") == "needs-input" and state != "needs-input":
+    # Nor on an "unavailable" beat: a daemon restarting while it waits on the
+    # answer says "no terminal yet", not "I stopped waiting" — and it restores
+    # needs-input the moment its terminal is back (AwaitingUserInputMarker).
+    if site.get("state") == "needs-input" and state not in ("needs-input", "unavailable"):
         updated.pop("pendingThreadId", None)
 
     try:
@@ -4419,6 +4428,23 @@ def _elect_primary(user_id, agent, site, now):
         if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             return "standby"
         raise
+
+
+def _release_primary(user_id, agent, site_id):
+    """An unavailable body that still holds primary hands it back at once, so a
+    standby's next beat wins the election instead of waiting out the lease —
+    the iMac should pick up the laptop's work the moment the laptop says it
+    cannot type, not a lease later."""
+    try:
+        AGENTS_TABLE.update_item(
+            Key={"agentKey": _agent_key(user_id, agent)},
+            UpdateExpression="REMOVE primarySiteId, primaryPriority, primaryLeaseUntil",
+            ConditionExpression="primarySiteId = :me",
+            ExpressionAttributeValues={":me": site_id},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
 
 
 def _primary_is_live(agent_row, now):
@@ -5103,8 +5129,15 @@ def _heartbeat_dispatch(site, body, now):
     crash recovery, and the eligible rows to offer. Returns the fields to
     merge into the heartbeat response."""
     user_id, agent = site["userId"], site["agent"]
-    wants_primary = bool(body.get("wantsPrimary", True))
+    # An "unavailable" body beats to be SEEN, and for nothing else: it must not
+    # win primary, keep renewing leases on messages it cannot run (another body
+    # should get them when they lapse), or be offered new ones. Its unacked
+    # ledger is still honoured below — those turns already ran.
+    unavailable = body.get("state") == "unavailable"
+    wants_primary = bool(body.get("wantsPrimary", True)) and not unavailable
     role = _elect_primary(user_id, agent, site, now) if wants_primary else "standby"
+    if unavailable:
+        _release_primary(user_id, agent, site["siteId"])
     agent_row = _read_agent_row(user_id, agent)
     is_primary = agent_row.get("primarySiteId") == site["siteId"] and _primary_is_live(agent_row, now)
     primary_live = _primary_is_live(agent_row, now)
@@ -5113,7 +5146,7 @@ def _heartbeat_dispatch(site, body, now):
     unacked = [m for m in (body.get("unacked") or []) if isinstance(m, str) and MESSAGE_ID_RE.match(m)]
 
     renewed_until = _iso(now + timedelta(seconds=MESSAGE_LEASE_SECONDS_DEFAULT))
-    for message_id in held[:MESSAGES_PER_HEARTBEAT * 2]:
+    for message_id in ([] if unavailable else held[:MESSAGES_PER_HEARTBEAT * 2]):
         try:
             MESSAGES_TABLE.update_item(
                 Key={"messageId": message_id},
@@ -5164,7 +5197,8 @@ def _heartbeat_dispatch(site, body, now):
         return live_cache[site_id]
 
     offers = []
-    for row in sorted(_open_messages(user_id, agent), key=lambda r: r.get("createdAt") or ""):
+    candidates = [] if unavailable else sorted(_open_messages(user_id, agent), key=lambda r: r.get("createdAt") or "")
+    for row in candidates:
         if row.get("messageId") in held:
             continue
         if _eligible(row, site["siteId"], is_primary, primary_live, target_live, now):

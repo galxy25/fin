@@ -113,6 +113,26 @@ public struct LocalSessionConfiguration: Sendable {
     }
 }
 
+/// The local transport's own failures. It used to borrow `HeadlessSessionError`, whose
+/// text says "SSH" — so a work laptop with no sshd by design logged `SSH connection
+/// didn't come up` for twelve hours while what had actually happened was a tmux pane
+/// that would not answer an echo (2026-09-17/18). An error message that names the wrong
+/// subsystem costs more than no message.
+public enum LocalSessionError: Error, LocalizedError, Equatable {
+    case startTimeout(seconds: Int)
+    case shellNotReady(seconds: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .startTimeout(let seconds):
+            return "the local terminal did not start within \(seconds)s."
+        case .shellNotReady(let seconds):
+            return "the shell inside the local terminal never answered a readiness probe within "
+                + "\(seconds)s — the pane's foreground process is not a shell, or tmux is not responding."
+        }
+    }
+}
+
 /// A PTY on this machine, with no SSH under it.
 ///
 /// Structurally a mirror of `HeadlessTerminalSession` — same states, same generation
@@ -413,7 +433,7 @@ public final class LocalTerminalSession: AgentTerminalTransport {
             }
             try await Task.sleep(for: .milliseconds(100))
         }
-        throw HeadlessSessionError.connectTimeout(seconds: Int(timeout))
+        throw LocalSessionError.startTimeout(seconds: Int(timeout))
     }
 
     /// Identical in shape and in reasoning to the SSH transport's: type `echo FIN_READY_<n>`
@@ -424,7 +444,7 @@ public final class LocalTerminalSession: AgentTerminalTransport {
         let deadline = Date().addingTimeInterval(timeout)
         while !didDispatchConnectCommand || state != .connected {
             guard Date() < deadline else {
-                throw HeadlessSessionError.connectTimeout(seconds: Int(timeout))
+                throw LocalSessionError.shellNotReady(seconds: Int(timeout))
             }
             try await Task.sleep(for: .milliseconds(150))
         }
@@ -444,7 +464,7 @@ public final class LocalTerminalSession: AgentTerminalTransport {
                 try await Task.sleep(for: .milliseconds(150))
             }
         }
-        throw HeadlessSessionError.connectTimeout(seconds: Int(timeout))
+        throw LocalSessionError.shellNotReady(seconds: Int(timeout))
     }
 
     /// See `HeadlessTerminalSession.probeEnvironment` for why this is a log line and never

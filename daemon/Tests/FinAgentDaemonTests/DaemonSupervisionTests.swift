@@ -185,7 +185,7 @@ final class DaemonResidencyTests: XCTestCase {
     /// question and then completed doesn't stay half-paused.
     func testResumeAlsoLiftsTheRequestInputPause() throws {
         let daemon = try makeDaemon(stayResident: true)
-        daemon.pauseHeartbeatForUserInput()
+        daemon.pauseHeartbeatForUserInput(question: "which branch?")
         _ = daemon.handleTaskComplete()
         XCTAssertTrue(daemon.awaitingUserInput)
         XCTAssertTrue(daemon.suspendedAfterCompletion)

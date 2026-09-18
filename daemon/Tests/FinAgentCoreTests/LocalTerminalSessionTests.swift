@@ -55,6 +55,26 @@ final class LocalTerminalSessionTests: XCTestCase {
         session.disconnect()
     }
 
+    /// A pane whose foreground process is not a shell never answers an echo probe. The
+    /// failure must say THAT — it used to borrow the SSH transport's "SSH connection
+    /// didn't come up", which on a Mac with no sshd by design sent a night of debugging
+    /// the wrong subsystem (2026-09-17/18).
+    func testAForegroundThatIsNotAShellIsReportedAsSuchNotAsSSH() async throws {
+        let session = makeSession(command: "exec /bin/sleep 30")
+        session.connect()
+        try await session.waitForConnection(timeout: 10)
+        do {
+            try await session.waitForShellReady(timeout: 2)
+            XCTFail("sleep answered a readiness probe")
+        } catch let error as LocalSessionError {
+            XCTAssertEqual(error, .shellNotReady(seconds: 2))
+            let text = error.localizedDescription
+            XCTAssertTrue(text.contains("local terminal"), text)
+            XCTAssertFalse(text.contains("SSH"), text)
+        }
+        session.disconnect()
+    }
+
     /// An empty connect command is a config error, not a session that silently does
     /// nothing: under this transport there would be no process at all.
     func testEmptyConnectCommandFailsLoudly() async {

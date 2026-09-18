@@ -34,6 +34,11 @@ struct FinSite: Decodable, Equatable, Identifiable {
         /// older daemon that predates the feature simply omits it — nil reads as
         /// unsupported, never as a crash or a false yes.
         let terminalRelay: Bool?
+        /// Where the daemon's launch stands (`starting`, `connecting`, `probing`,
+        /// `ready`, `failed`) and what stopped it — reported while `state` is
+        /// "unavailable", so a body that cannot attach its terminal says why.
+        let launchStage: String?
+        let launchFailure: String?
 
         struct Brain: Decodable, Equatable {
             let kind: String?
@@ -68,6 +73,8 @@ struct FinSite: Decodable, Equatable, Identifiable {
             case alwaysOn = "always_on"
             case tmuxSessions = "tmux_sessions"
             case terminalRelay = "terminal_relay"
+            case launchStage = "launch_stage"
+            case launchFailure = "launch_failure"
         }
     }
 
@@ -91,6 +98,10 @@ struct FinSite: Decodable, Equatable, Identifiable {
 
     var statusLabel: String {
         if state == "retired" { return "retired" }
+        // Before the liveness check: an unavailable body is deliberately not "live"
+        // (it must not be offered work), but it IS reporting — "offline" would hide
+        // the one fact it came to tell.
+        if state == "unavailable" { return "can\u{2019}t reach its terminal" }
         if !live { return state == "stale" ? "lost contact" : "offline" }
         switch state {
         case "working": return "working"

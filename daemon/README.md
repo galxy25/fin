@@ -746,7 +746,11 @@ the same bucket contract the app's `AgentDirectiveChannel` speaks:
 With the block, `DaemonSiteClient` (an actor, on its own task so a long turn
 never goes silent) heartbeats `POST /sites/{id}/heartbeat` with `state`
 (`working` while a turn runs, `needs-input` while waiting on the user, else
-`idle`/`task-complete`), the ids it holds and has not yet acked, and its
+`idle`/`task-complete`; `unavailable` from process start until the shell inside
+the terminal answers a readiness probe, with `capabilities.launch_stage` and, on
+a fatal launch, `launch_failure` — so a body that cannot attach its terminal is a
+row with a reason, not a silence; the control plane never elects, offers to, or
+counts an `unavailable` body as live), the ids it holds and has not yet acked, and its
 capabilities — daemon version, brain, and `tmux_sessions`: every session on the
 DEFAULT tmux socket with each pane's **title** (coding agents set it to their
 current task), command, and cwd's last component, rescanned at most once a

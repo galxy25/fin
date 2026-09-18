@@ -384,6 +384,13 @@ final class Daemon {
     /// The site heartbeat + claim protocol; nil without `config.site`.
     private var siteClient: DaemonSiteClient?
     private var terminalRelayClient: TerminalRelayClient?
+    /// False until the shell inside the terminal has answered a readiness probe. While
+    /// false the site heartbeat says "unavailable" — visible to the operator, inert to
+    /// the control plane — and carries `launchStage`/`launchFailure`, so a body that
+    /// cannot attach its terminal is a row with a reason rather than a silence.
+    private var terminalReady = false
+    private var launchStage = "starting"
+    private var launchFailure: String?
     /// True from submit to outcome. Read by the site heartbeat from its own task, so
     /// a long turn reports `working` instead of going silent.
     private var isTurnInFlight = false
@@ -496,6 +503,20 @@ final class Daemon {
     private func siteCapabilities(
         session: (any AgentTerminalTransport)?, registry: SessionRoutingRegistry?, hostname: String
     ) async -> [String: Any] {
+        guard terminalReady else {
+            // Nothing to scan and no brain worth probing yet: the cheap facts, plus
+            // where the launch is and what stopped it.
+            var caps: [String: Any] = [
+                "daemon_version": DaemonDirectiveClient.daemonVersion,
+                "daemon_build": Self.runningBuildIdentity,
+                "always_on": config.stayResident ?? false,
+                "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
+                "terminal_relay": config.site != nil,
+                "launch_stage": launchStage,
+            ]
+            if let launchFailure { caps["launch_failure"] = launchFailure }
+            return caps
+        }
         if let at = cachedCapabilitiesAt, Date().timeIntervalSince(at) < Self.capabilitiesScanInterval {
             return cachedCapabilities
         }
@@ -1381,6 +1402,13 @@ final class Daemon {
         // request_input question must not get a free first heartbeat that re-asks it.
         restoreAwaitingUserInput()
         guard let session = await launch() else { return }
+        // The site heartbeat starts HERE, before the terminal exists, saying
+        // "unavailable": a body whose terminal never comes up is then a row the
+        // operator can read — stage, reason, fresh timestamp — instead of twelve hours
+        // of "stale" (the work laptop, 2026-09-17/18). It is reconfigured with its full
+        // providers once the engine exists; `start()` is idempotent.
+        await startSiteHeartbeatBeforeReadiness()
+        launchStage = "connecting"
         session.connect()
         do {
             try await session.waitForConnection(timeout: 30)
@@ -1389,14 +1417,28 @@ final class Daemon {
                 + "failed: \(error.localizedDescription)")
         }
         log("connected; probing until the shell answers")
+        launchStage = "probing"
+        // The tmux guard's notion of "my own server": socket and session, both parsed out
+        // of connectCommand. Armed whenever this host has a tmux connect command or a
+        // routing registry — a host with neither has no tmux server to stay on and is left
+        // untouched. Computed before the probes because shell recovery needs it.
+        let tmuxGuard = TmuxSendGuard.forHost(
+            connectCommand: config.server.connectCommand,
+            registryFileURL: URL(fileURLWithPath: routingRegistryPath)
+        )
         // Probe-based readiness: echo probes until the shell inside the tmux attach
         // demonstrably executes one, so the task is never typed into a shell that is
         // still spawning (whose startup flush would silently eat it).
         do {
             try await session.waitForShellReady(timeout: 30)
         } catch {
-            await fail("shell never became ready: \(error.localizedDescription)")
+            log("shell not ready: \(error.localizedDescription) — attempting recovery")
+            guard await recoverUnreadyShell(session: session, tmuxGuard: tmuxGuard) else {
+                await fail("shell never became ready: \(error.localizedDescription)")
+            }
         }
+        terminalReady = true
+        launchStage = "ready"
 
         // Session routing and the mission ledger ride in here, read once: the daemon
         // composes its system prompt exactly once (engine construction — headless mode
@@ -1405,15 +1447,6 @@ final class Daemon {
         // ledger itself, so goal CONTENT stays fresh; only the taxonomy section is
         // launch-pinned.) The marker checks are safe: both markers are load-bearing
         // strings the prompt-gating tests key on.
-        // The tmux guard's notion of "my own server": socket and session, both parsed out
-        // of connectCommand. Armed whenever this host has a tmux connect command or a
-        // routing registry — a host with neither has no tmux server to stay on and is left
-        // untouched.
-        let tmuxGuard = TmuxSendGuard.forHost(
-            connectCommand: config.server.connectCommand,
-            registryFileURL: URL(fileURLWithPath: routingRegistryPath)
-        )
-
         // PROVE THE SHELL LANDED ON ITS OWN TMUX SERVER, rather than assuming the
         // connectCommand worked. Everything the private-socket design promises rests on
         // `$TMUX` pointing at Fin's own socket: if the attach failed quietly — tmux not
@@ -1834,75 +1867,21 @@ final class Daemon {
                 )
             }
 
-            if let site = config.site {
-                let client = DaemonSiteClient(
-                    siteID: site.id,
-                    displayName: site.displayName ?? config.server.describedHost,
-                    token: site.token,
-                    heartbeatSeconds: site.heartbeatSeconds,
-                    endpointURL: block.endpointURL,
-                    ledgerPath: siteLedgerPath,
-                    agentID: agentID,
-                    originDeviceID8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
-                    audit: { [weak self] line in
-                        self?.log(line)
-                        self?.record(AgentAuditEvent(kind: "notice", text: line))
-                    }
-                )
+            // The client `startSiteHeartbeatBeforeReadiness` already started, given its
+            // full providers now that the engine exists; a fresh one only when that
+            // early start had nothing to start (no control plane block).
+            if config.site != nil, let client = siteClient ?? makeSiteClient() {
                 let registry = sessionRoutingRegistry
                 let hostname = ProcessInfo.processInfo.hostName
                 let runID = transcript?.runID.uuidString
                 await client.configure(
                     runID: runID,
-                    state: { @MainActor [weak self] in
-                        guard let self else { return "idle" }
-                        if self.isTurnInFlight { return "working" }
-                        if self.awaitingUserInput { return "needs-input" }
-                        return self.idleStateName
-                    },
+                    state: { @MainActor [weak self] in self?.siteStateName ?? "idle" },
                     capabilities: { @MainActor [weak self, weak session] in
                         guard let self else { return [:] }
                         return await self.siteCapabilities(session: session, registry: registry, hostname: hostname)
                     },
-                    onCommand: { @MainActor [weak self] command in
-                        guard let self else { return }
-                        switch command.kind {
-                        case "restart", "stop":
-                            // launchd KeepAlive respawns an exit 0; a real "stay down"
-                            // needs launchctl, which is the installer's job, not the daemon's.
-                            self.log("[site] \(command.kind) requested — exiting for launchd to respawn")
-                            // Cancel the heartbeat turn first. It is the one turn nobody is
-                            // waiting on, it can be minutes long on a remote brain, and
-                            // `shutdown` politely awaits work that a live turn keeps feeding.
-                            // An operator who asked for a restart has already decided the
-                            // current thought is worth less than a working daemon.
-                            self.heartbeatTurnTask?.cancel()
-                            self.shutdown(exitCode: 0)
-                        case "update":
-                            let binary = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
-                            Task { [weak self] in
-                                guard let self, let client = self.siteClient else { return }
-                                if await client.performUpdate(binaryPath: binary) != nil {
-                                    self.shutdown(exitCode: 0)
-                                }
-                            }
-                        case "terminal-open":
-                            guard let sessionId = command.args["sessionId"],
-                                  let tmuxSession = command.args["tmuxSession"],
-                                  let relayHost = command.args["relayHost"],
-                                  let relayPort = command.args["relayPort"].flatMap(Int.init)
-                            else {
-                                self.log("[relay] terminal-open command missing sessionId/tmuxSession/relay address — ignored")
-                                return
-                            }
-                            self.terminalRelayClient?.open(
-                                sessionId: sessionId, tmuxSession: tmuxSession,
-                                relayHost: relayHost, relayPort: relayPort
-                            )
-                        default:
-                            break // drain is handled inside the client
-                        }
-                    }
+                    onCommand: { @MainActor [weak self] command in self?.handleSiteCommand(command) }
                 )
                 await client.setClaimHandler { @MainActor [weak self] in
                     guard let self, let task = self.heartbeatTurnTask else { return }
@@ -2406,6 +2385,201 @@ final class Daemon {
         suspendedAfterCompletion ? "task-complete" : "idle"
     }
 
+    /// What the site heartbeat says this body is doing. "unavailable" until the shell
+    /// has answered a readiness probe, whatever else is true — a body that cannot type
+    /// is not idle, and must not be offered work.
+    var siteStateName: String {
+        if !terminalReady { return "unavailable" }
+        if isTurnInFlight { return "working" }
+        if awaitingUserInput { return "needs-input" }
+        return idleStateName
+    }
+
+    private func makeSiteClient() -> DaemonSiteClient? {
+        guard let site = config.site, let block = config.controlPlane else { return nil }
+        return DaemonSiteClient(
+            siteID: site.id,
+            displayName: site.displayName ?? config.server.describedHost,
+            token: site.token,
+            heartbeatSeconds: site.heartbeatSeconds,
+            endpointURL: block.endpointURL,
+            ledgerPath: siteLedgerPath,
+            agentID: agentID,
+            originDeviceID8: config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8,
+            audit: { [weak self] line in
+                self?.log(line)
+                self?.record(AgentAuditEvent(kind: "notice", text: line))
+            }
+        )
+    }
+
+    /// Starts the site heartbeat before the terminal exists — see `run()`. The
+    /// providers here are the cheap pre-readiness ones; the engine's block later
+    /// reconfigures the same client with the full set.
+    private func startSiteHeartbeatBeforeReadiness() async {
+        guard siteClient == nil, let client = makeSiteClient() else { return }
+        let hostname = ProcessInfo.processInfo.hostName
+        await client.configure(
+            runID: transcript?.runID.uuidString,
+            state: { @MainActor [weak self] in self?.siteStateName ?? "unavailable" },
+            capabilities: { @MainActor [weak self] in
+                guard let self else { return [:] }
+                return await self.siteCapabilities(session: nil, registry: nil, hostname: hostname)
+            },
+            onCommand: { @MainActor [weak self] command in self?.handleSiteCommand(command) }
+        )
+        siteClient = client
+        await client.start()
+        log("site heartbeat enabled before the terminal is ready: \(client.displayName) "
+            + "(\(client.siteID8)) reports \"unavailable\" until the shell answers")
+    }
+
+    private func handleSiteCommand(_ command: DaemonSiteClient.Command) {
+        switch command.kind {
+        case "restart", "stop":
+            // launchd KeepAlive respawns an exit 0; a real "stay down" needs launchctl,
+            // which is the installer's job, not the daemon's.
+            log("[site] \(command.kind) requested — exiting for launchd to respawn")
+            // Cancel the heartbeat turn first. It is the one turn nobody is waiting on,
+            // it can be minutes long on a remote brain, and `shutdown` politely awaits
+            // work that a live turn keeps feeding. An operator who asked for a restart
+            // has already decided the current thought is worth less than a working daemon.
+            heartbeatTurnTask?.cancel()
+            shutdown(exitCode: 0)
+        case "update":
+            let binary = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
+            Task { [weak self] in
+                guard let self, let client = self.siteClient else { return }
+                if await client.performUpdate(binaryPath: binary) != nil {
+                    self.shutdown(exitCode: 0)
+                }
+            }
+        case "terminal-open":
+            guard let sessionId = command.args["sessionId"],
+                  let tmuxSession = command.args["tmuxSession"],
+                  let relayHost = command.args["relayHost"],
+                  let relayPort = command.args["relayPort"].flatMap(Int.init)
+            else {
+                log("[relay] terminal-open command missing sessionId/tmuxSession/relay address — ignored")
+                return
+            }
+            terminalRelayClient?.open(
+                sessionId: sessionId, tmuxSession: tmuxSession,
+                relayHost: relayHost, relayPort: relayPort
+            )
+        default:
+            break // drain is handled inside the client
+        }
+    }
+
+    /// After a restart the daemon re-attaches to whatever its pane was doing when the
+    /// last process died — mid-command, inside a program, or on a tmux server the
+    /// sleep/wake left unresponsive — and none of those answer an echo probe. Failing
+    /// here only relaunches into the same pane: the work laptop did exactly that every
+    /// 90 s for twelve hours (2026-09-17/18). Two steps, least destructive first, both
+    /// confined to Fin's OWN tmux server:
+    ///   1. `new-window` on Fin's session — a fresh shell the attached client follows;
+    ///      whatever was running keeps running in the old window.
+    ///   2. Only when the server did not even answer that: kill Fin's own server and
+    ///      reconnect. Never on the default socket — that server is the human's.
+    /// Returns true when a probe was answered afterwards.
+    private func recoverUnreadyShell(
+        session: any AgentTerminalTransport, tmuxGuard: TmuxSendGuard
+    ) async -> Bool {
+        guard tmuxGuard.isEnforced, let ownSession = tmuxGuard.ownSession else {
+            log("shell recovery skipped: the connectCommand names no tmux session to recover")
+            return false
+        }
+        let tmux = Self.tmuxInvocation(for: tmuxGuard.ownSocket)
+        var serverAnswered = true
+        do {
+            _ = try await session.runFixedCommand(
+                "\(tmux) new-window -t \(Self.shellQuoted(ownSession))", maxResponseBytes: 4096, timeout: 10
+            )
+            log("shell recovery: opened a fresh window on Fin's tmux session \"\(ownSession)\" — probing again")
+            do {
+                try await session.waitForShellReady(timeout: 30)
+                let line = "shell recovery succeeded: the previous window's foreground process was not "
+                    + "a shell; it is still running in the old window"
+                log(line)
+                record(AgentAuditEvent(kind: "notice", text: line))
+                return true
+            } catch {
+                log("shell recovery: a fresh window did not answer either (\(error.localizedDescription)) "
+                    + "— the shell itself is not starting; nothing here can fix that")
+                return false
+            }
+        } catch let error as HeadlessSessionError {
+            if case .commandTimedOut = error { serverAnswered = false }
+            log("shell recovery: new-window \(serverAnswered ? "failed" : "hung"): \(error.localizedDescription)")
+        } catch {
+            log("shell recovery: new-window failed: \(error.localizedDescription)")
+        }
+        if !serverAnswered {
+            guard tmuxGuard.ownSocket != .standard else {
+                log("shell recovery: the default tmux socket is the human's server — not touching it")
+                return false
+            }
+            let line = "shell recovery: Fin's tmux server (\(tmuxGuard.ownSocket.described)) is not "
+                + "answering — killing it and reconnecting; whatever it was running is lost"
+            log(line)
+            record(AgentAuditEvent(kind: "error", text: line, isFailure: true))
+            _ = try? await session.runFixedCommand("\(tmux) kill-server", maxResponseBytes: 1024, timeout: 5)
+            if let pattern = Self.tmuxServerProcessPattern(for: tmuxGuard.ownSocket) {
+                let quoted = Self.shellQuoted(pattern)
+                _ = try? await session.runFixedCommand(
+                    "pkill -TERM -f \(quoted); sleep 1; pkill -KILL -f \(quoted); true",
+                    maxResponseBytes: 1024, timeout: 10
+                )
+            }
+        }
+        session.disconnect()
+        session.connect()
+        do {
+            try await session.waitForConnection(timeout: 30)
+            try await session.waitForShellReady(timeout: 30)
+        } catch {
+            log("shell recovery failed after reconnecting: \(error.localizedDescription)")
+            return false
+        }
+        let line = "shell recovery succeeded after reconnecting to \(serverAnswered ? "the" : "a fresh") tmux server"
+        log(line)
+        record(AgentAuditEvent(kind: "notice", text: line))
+        return true
+    }
+
+    nonisolated static func tmuxInvocation(for socket: TmuxSocket) -> String {
+        switch socket {
+        case .standard: return "tmux"
+        case .name(let value): return "tmux -L \(shellQuoted(value))"
+        case .path(let value): return "tmux -S \(shellQuoted(value))"
+        }
+    }
+
+    /// The `pkill -f` pattern for Fin's own tmux server: its argv is the first client's
+    /// (`tmux -L fin new-session …` — macOS tmux has no setproctitle), anchored so the
+    /// `sh -c pkill …` carrying this very pattern does not match itself (its argv has
+    /// `(` after the name, not a space). Nil for the default socket, and for a socket
+    /// name plain `pkill` and tmux might read differently — then the kill is skipped
+    /// rather than risked.
+    nonisolated static func tmuxServerProcessPattern(for socket: TmuxSocket) -> String? {
+        switch socket {
+        case .standard: return nil
+        case .name(let value): return regexSafe(value).map { "(^|/)tmux -L \($0)( |$)" }
+        case .path(let value): return regexSafe(value).map { "(^|/)tmux -S \($0)( |$)" }
+        }
+    }
+
+    private nonisolated static func regexSafe(_ value: String) -> String? {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-/."))
+        guard !value.isEmpty, value.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
+        return value.replacingOccurrences(of: ".", with: "\\.")
+    }
+
+    nonisolated static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     /// Every audit line goes to both sinks: the local JSONL trail, and — when configured
     /// — the redacted cloud transcript the app renders.
     private func record(_ event: AgentAuditEvent) {
@@ -2505,6 +2679,16 @@ final class Daemon {
     private func abort(_ message: String) async {
         log("fatal: \(message)")
         record(AgentAuditEvent(kind: "error", text: message, isFailure: true))
+        // The last thing the control plane hears from this process is WHY it died: one
+        // "unavailable" beat carrying the reason, bounded by the client's request
+        // timeout. launchd's respawn beats "starting" seconds later, so the row never
+        // goes quiet between the two.
+        if let siteClient {
+            terminalReady = false
+            launchStage = "failed"
+            launchFailure = message
+            await siteClient.beat()
+        }
         await transcript?.flush()
         // The giving-up push (5 consecutive failures) precedes some fail()s; let it land.
         await lastNotifyTask?.value

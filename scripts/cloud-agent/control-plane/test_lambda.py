@@ -1948,6 +1948,47 @@ class HeartbeatDispatchTests(_MessagesTestCase):
         self.assertEqual(result["role"], "primary")
         self.assertEqual([m["id"] for m in result["messages"]], [sent["messageId"]])
 
+    def test_an_unavailable_body_is_seen_but_never_used(self):
+        # 2026-09-17/18: the work laptop's daemon crash-looped for 12 hours on a
+        # terminal that never became ready, and nobody could see why, because the
+        # heartbeat only started once the terminal was ready. Now it beats
+        # "unavailable" from the start — visible, with a reason — and is inert.
+        sent = self.send("hello")
+        result = self.beat(self.imac, state="unavailable",
+                           capabilities={"launch_failure": "shell never became ready"})
+        self.assertEqual((result["role"], result["messages"]), ("standby", []))
+        row = lam.SITES_TABLE.items[self.imac["siteId"]]
+        self.assertEqual(row["state"], "unavailable")
+        self.assertEqual(row["capabilities"]["launch_failure"], "shell never became ready")
+        self.assertFalse(lam._site_is_live(row, lam._now()), "an unavailable body is not a live one")
+        # Its heartbeat is fresh, so the app can tell "can't attach" from "gone".
+        self.assertEqual(row["lastHeartbeatAt"], _iso(lam._now()))
+        # The other body is primary and gets the work.
+        cloud = self.beat(self.cloud)
+        self.assertEqual((cloud["role"], [m["id"] for m in cloud["messages"]]), ("primary", [sent["messageId"]]))
+
+    def test_an_unavailable_body_does_not_keep_renewing_a_held_lease(self):
+        self.beat(self.imac)
+        sent = self.send("hello")
+        self.claim(self.imac, sent["messageId"])
+        soon = _iso(lam._now() + timedelta(seconds=5))
+        self.row(sent["messageId"])["leaseUntil"] = soon
+        self.beat(self.imac, state="unavailable", held=[sent["messageId"]])
+        # Lapses on schedule, so a body that CAN run it gets it.
+        self.assertEqual(self.row(sent["messageId"])["leaseUntil"], soon)
+
+    def test_an_unavailable_beat_keeps_the_pending_question_thread(self):
+        # A daemon restarting mid-question beats "unavailable" before it can say
+        # "needs-input" again; that must not read as "the question was answered".
+        self.beat(self.imac, state="needs-input")
+        lam.SITES_TABLE.items[self.imac["siteId"]]["pendingThreadId"] = "m-11111111-2222-4333-8444-555555555555"
+        self.beat(self.imac, state="unavailable")
+        self.assertEqual(lam.SITES_TABLE.items[self.imac["siteId"]]["pendingThreadId"],
+                         "m-11111111-2222-4333-8444-555555555555")
+        self.beat(self.imac, state="needs-input")
+        self.beat(self.imac, state="idle")
+        self.assertNotIn("pendingThreadId", lam.SITES_TABLE.items[self.imac["siteId"]])
+
 
 class LegacyRegisterTests(_MessagesTestCase):
     def test_registering_twice_creates_once(self):
