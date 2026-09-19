@@ -209,6 +209,18 @@ final class SiteDirectory: ObservableObject {
     /// throws; an unconfigured control plane yields an empty list quietly.
     @discardableResult
     func refresh(force: Bool = false, now: Date = Date()) async -> [FinSite] {
+        #if !os(tvOS)
+        // A screenshot capture shows Fin's computers as a curated demo, never the
+        // real fleet: a live listing carries the owner's machine names and the
+        // titles of every tmux pane, and a screenshot is a public artifact. Checked
+        // BEFORE the unit-test gate: a capture runs under FIN_UI_TESTING too.
+        if ScreenshotFixtures.isEnabled {
+            sites = ScreenshotFixtures.demoSites(now: now)
+            fetchedAt = now
+            lastError = nil
+            return sites
+        }
+        #endif
         if TestHost.isUnitTest { return sites }
         if !force, let fetchedAt, now.timeIntervalSince(fetchedAt) < Self.cacheLifetime { return sites }
         if let inFlight { return await inFlight.value }

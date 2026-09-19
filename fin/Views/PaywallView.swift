@@ -14,9 +14,13 @@ struct PaywallView: View {
                 .foregroundStyle(.secondary)
 
             VStack(spacing: 8) {
-                Text("Your Fin trial has ended")
+                // The crown button opens this mid-trial too; "has ended" was wrong
+                // for every one of those opens (seen in the App Store capture).
+                Text(entitlementStore.isTrialActive ? "Fin Pro" : "Your Fin trial has ended")
                     .font(.title2.bold())
-                Text("Subscribe or buy lifetime access to keep connecting to your servers.")
+                Text(entitlementStore.isTrialActive
+                    ? "\(entitlementStore.trialDaysRemaining) days left in your free trial. Subscribe or buy lifetime access whenever you're ready."
+                    : "Subscribe or buy lifetime access to keep connecting to your servers.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)

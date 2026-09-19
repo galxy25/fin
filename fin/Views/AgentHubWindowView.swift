@@ -87,6 +87,7 @@ struct AgentHubWindowView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(minWidth: 760, minHeight: 480)
+            .onAppear { ScreenshotFixtures.sizeWindowForCapture(width: 1440, height: 900) }
             // No identifier on this HStack itself: it has no AX surface of its own,
             // and live-testing showed SwiftUI on macOS hoists an ancestor's
             // `.accessibilityIdentifier` onto the nearest accessible descendant —
@@ -122,7 +123,7 @@ struct AgentHubWindowView: View {
                 }
                 sidebarRow(.artifacts)
             }
-            if CloudControlPlaneConfig.isConfigured {
+            if threadStore.isAvailable {
                 Section("Threads") {
                     if threadStore.openThreads.isEmpty {
                         Text(threadStore.lastFetchAt == nil ? "Loading…" : "No open threads")

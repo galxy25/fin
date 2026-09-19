@@ -116,21 +116,40 @@ struct FinApp: App {
             // RemoteInputPairing (the account's key-vault key, see KeyVault) joins the
             // synced set: it exists to be read by the user's OTHER devices — the
             // private database's access control is the whole point of storing it there.
-            let syncedConfig = ModelConfiguration(
-                "Synced",
-                schema: Schema([
-                    Server.self, KeyMetadata.self, Agent.self, AgentMemory.self,
-                    AgentSignal.self, AgentRelayMessage.self, RemoteInputPairing.self,
-                ]),
-                cloudKitDatabase: .automatic
-            )
-            // AgentLogEntry is local-only and stays that way: the trail quotes raw terminal
-            // output, which is the likeliest place for a server's secrets to appear.
-            let localConfig = ModelConfiguration(
-                "Local",
-                schema: Schema([Clipping.self, MarkdownDocument.self, AgentLogEntry.self]),
-                cloudKitDatabase: .none
-            )
+            let syncedSchema = Schema([
+                Server.self, KeyMetadata.self, Agent.self, AgentMemory.self,
+                AgentSignal.self, AgentRelayMessage.self, RemoteInputPairing.self,
+            ])
+            let localSchema = Schema([Clipping.self, MarkdownDocument.self, AgentLogEntry.self])
+            let syncedConfig: ModelConfiguration
+            let localConfig: ModelConfiguration
+            if let isolated = ScreenshotFixtures.isolatedStoreDirectory() {
+                // A screenshot capture (FIN_SCREENSHOT_MODE=1) runs against a throwaway
+                // store with NO CloudKit mirroring. Before this, a capture on a Mac seeded
+                // its demo rows into the real synced container, and they showed up on
+                // every device on the Apple Account — which is why the fixtures stayed
+                // too thin to make a real product page. Wiped on every capture launch.
+                syncedConfig = ModelConfiguration(
+                    "Synced", schema: syncedSchema,
+                    url: isolated.appendingPathComponent("Synced.store"),
+                    cloudKitDatabase: .none
+                )
+                localConfig = ModelConfiguration(
+                    "Local", schema: localSchema,
+                    url: isolated.appendingPathComponent("Local.store"),
+                    cloudKitDatabase: .none
+                )
+            } else {
+                syncedConfig = ModelConfiguration(
+                    "Synced", schema: syncedSchema, cloudKitDatabase: .automatic
+                )
+                // AgentLogEntry is local-only and stays that way: the trail quotes raw
+                // terminal output, which is the likeliest place for a server's secrets
+                // to appear.
+                localConfig = ModelConfiguration(
+                    "Local", schema: localSchema, cloudKitDatabase: .none
+                )
+            }
             container = try ModelContainer(
                 for: Schema([
                     Server.self, KeyMetadata.self, Agent.self, AgentMemory.self,
@@ -159,6 +178,16 @@ struct FinApp: App {
 
         manager.resolveCredentials = { server in
             guard let keyID = server.keyID else { return nil }
+            // The capture's loopback key never touches the Keychain: an ad-hoc-signed
+            // test build cannot add an iCloud-synchronizable item, and a silently
+            // failed save left the terminal screenshot showing a blank, disconnected
+            // session (2026-09-18).
+            if ScreenshotFixtures.isEnabled, keyID == ScreenshotFixtures.loopbackKeyID,
+               let keyPEM = ScreenshotFixtures.loopbackKeyPEM() {
+                return ServerCredentials(
+                    username: server.username, keyPEM: keyPEM, keyType: .ed25519, passphrase: nil
+                )
+            }
             let descriptor = FetchDescriptor<KeyMetadata>(predicate: #Predicate { $0.id == keyID })
             guard let metadata = try? context.fetch(descriptor).first,
                   let keyData = KeychainStore.loadPrivateKey(for: keyID),

@@ -66,7 +66,12 @@ enum CloudControlPlaneConfig {
 
     /// Both halves or nothing: an endpoint without a token only earns 401s, and
     /// a token without an endpoint has nowhere to go.
-    static var isConfigured: Bool { !endpointURL.isEmpty && !token.isEmpty }
+    /// True during a screenshot capture too: the "Fin's computers" surfaces render
+    /// only when a control plane is configured, and the capture's isolated store
+    /// has none — the sites they show come from `ScreenshotFixtures.demoSites`.
+    static var isConfigured: Bool {
+        ScreenshotFixtures.isEnabled || (!endpointURL.isEmpty && !token.isEmpty)
+    }
 
     static func setEndpointURL(_ url: String) {
         UserDefaults.standard.set(url, forKey: endpointURLKey)

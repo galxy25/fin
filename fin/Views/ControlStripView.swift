@@ -57,6 +57,7 @@ struct ControlStripView: View {
                             prefersSidePanel && isAgentPanelVisible ? Color.accentColor : Color.white
                         )
                 }
+                .accessibilityIdentifier("controlStrip_agent")
                 .sheet(isPresented: $showingAgent) {
                     if let runtime = sessionManager.agentRuntime(
                         for: session,

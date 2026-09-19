@@ -194,6 +194,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// harness to mark its sessions so the dev machine's shell profile can tell them apart
     /// from a real interactive login.
     func connect(server: Server, credentials: ServerCredentials, environment: [String: String] = [:]) {
+        var environment = environment
+        // A screenshot capture's loopback session must land in a PLAIN shell:
+        // the capturing Mac's login shell auto-attaches its owner's own tmux for
+        // remote sessions (`~/.config/fish/config.fish`), and the marker below is
+        // the same one the agent tests use to opt out of that. The fixture's
+        // connectCommand then attaches a session of its own.
+        if ScreenshotFixtures.isEnabled { environment["LC_FIN_AGENT_TEST"] = "1" }
         guard state == .disconnected || state == .reconnecting else { return }
         state = state == .reconnecting ? .reconnecting : .connecting
         lastError = nil

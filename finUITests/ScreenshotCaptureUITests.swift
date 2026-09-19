@@ -168,6 +168,143 @@ final class ScreenshotCaptureUITests: XCTestCase {
         }
     }
 
+    /// The product-page story on a Mac, with real content: the seeded servers and
+    /// Fin's computers, a LIVE loopback terminal ("This Mac", see
+    /// ScreenshotFixtures) with the agent console beside it showing a restored
+    /// conversation, then the hub's settings, memory and traces. Every window is
+    /// attached on its own; scripts/screenshots/compose-mac.py frames them.
+    func testCaptureMacStory() throws {
+        let app = app()
+
+        var terminalTab = element(app, id: "homeMode_Terminal")
+        if !terminalTab.waitForExistence(timeout: 10) {
+            let servers = element(app, id: "controlStrip_servers")
+            XCTAssertTrue(servers.waitForExistence(timeout: 10), "no way into the tabs")
+            servers.tapCenter()
+            terminalTab = element(app, id: "homeMode_Terminal")
+        }
+        XCTAssertTrue(terminalTab.waitForExistence(timeout: 15))
+        // Fin's computers arrive a beat after the servers (the directory refresh
+        // runs in a task); shooting before they settle catches the list
+        // mid-insertion, scrolled past its first row.
+        _ = firstStartingWith(app, "siteRow_").waitForExistence(timeout: 10)
+        // Only one window exists this early, so firstMatch is the main window;
+        // once the hub is open it is whichever is frontmost (run 6's "paywall"
+        // was a photo of the Logs window), so the last shot re-finds the main
+        // window by the control strip instead.
+        let main = app.windows.firstMatch
+        // The list keeps its offset relative to the Servers section when the
+        // computers section lands above it, hiding the first computer under the
+        // header. A hop to Files and back rebuilds the list at the top with the
+        // computers already present.
+        element(app, id: "homeMode_Files").tapCenter()
+        sleep(1)
+        element(app, id: "homeMode_Terminal").tapCenter()
+        sleep(2)
+        shootWindow(main, "story-01-servers")
+
+        // The live row. Identified by label, not id: the id carries a UUID minted
+        // at seed time.
+        let thisMac = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'serverRow_' AND label CONTAINS 'This Mac'"))
+            .firstMatch
+        XCTAssertTrue(thisMac.waitForExistence(timeout: 10), "the loopback server row is missing — was the key prepared?")
+        thisMac.tapCenter()
+        // The tab bar only renders with two or more tabs; the control strip is
+        // what proves the terminal screen is up.
+        let strip = element(app, id: "controlStrip_agent")
+        XCTAssertTrue(strip.waitForExistence(timeout: 20), "the terminal screen never opened")
+        // SSH handshake + tmux attach, then a prompt. Generous on purpose: a
+        // capture that types into a shell that is still spawning loses the line.
+        sleep(8)
+        main.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.5)).click()
+        app.typeText("clear; sw_vers; echo; xcodebuild -version; echo; top -l 1 -n 8 -stats pid,command,cpu,mem | head -20\n")
+        sleep(5)
+        shootWindow(main, "story-02-terminal")
+
+        // The console beside the terminal: history restored from the seeded trail.
+        let agentButton = element(app, id: "controlStrip_agent")
+        XCTAssertTrue(agentButton.waitForExistence(timeout: 10))
+        agentButton.tapCenter()
+        sleep(3)
+        shootWindow(main, "story-03-terminal-agent")
+
+        // Into the agent hub: Agents live behind the server-rack button once a
+        // terminal is open (the picker sheet), same as testCaptureMacWindows.
+        let servers = element(app, id: "controlStrip_servers")
+        XCTAssertTrue(servers.waitForExistence(timeout: 10))
+        servers.tapCenter()
+        let agentsTab = element(app, id: "homeMode_Agents")
+        XCTAssertTrue(agentsTab.waitForExistence(timeout: 15), "Agents tab never appeared")
+        agentsTab.tapCenter()
+        sleep(1)
+        shootWindow(main, "story-04-agents")
+
+        // First row is "Fin": the fixture seeds it first and the list sorts by
+        // creation. (A label match fails here — the row's label is its custom view.)
+        let agentRow = firstStartingWith(app, "agentRow_")
+        XCTAssertTrue(agentRow.waitForExistence(timeout: 10))
+        agentRow.tapCenter()
+        // Found by its sidebar, which every hub section keeps — a handle keyed on
+        // the settings form stops matching the moment Memory replaces it, and the
+        // memory shot then silently skips (run 5).
+        let hub = app.windows.containing(.any, identifier: "hubSidebar").firstMatch
+        XCTAssertTrue(hub.waitForExistence(timeout: 15), "agent hub window never opened")
+        XCTAssertTrue(element(app, id: "agentSettingsForm").waitForExistence(timeout: 10))
+        sleep(3)
+        shootWindow(hub, "story-05-agent-settings")
+
+        // Bring the hub to the front — it opens centred on top of a main window
+        // of the same size, and a List's rows are not reliably in the
+        // accessibility tree for a window that is not key (runs 2-4: the
+        // sidebar existed, its rows did not).
+        hub.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02)).click()
+        sleep(1)
+        XCTAssertTrue(element(app, id: "hubSidebar").waitForExistence(timeout: 15), "hub sidebar never appeared")
+        for (section, name) in [("memory", "story-06-memory"), ("logs", "story-07-logs")] {
+            let row = hub.descendants(matching: .any).matching(identifier: "hubSidebarRow_\(section)").firstMatch
+            guard row.waitForExistence(timeout: 15) else {
+                // Leave the tree behind so the next run can see what the sidebar
+                // actually exposed, rather than guessing.
+                let dump = XCTAttachment(string: hub.debugDescription)
+                dump.name = "hub-tree-\(section)"
+                dump.lifetime = .keepAlways
+                add(dump)
+                XCTFail("hub sidebar row \(section) never appeared")
+                continue
+            }
+            row.tapCenter()
+            sleep(3)
+            shootWindow(hub, name)
+        }
+
+        // The paywall last, from the picker sheet still open in the main window:
+        // dismissing it with Escape mid-flow also unsettled the sheet the agent
+        // row lives in, and the hub never opened (run 4).
+        // A window screenshot on macOS is a screen-region grab of that window's
+        // frame, and the hub is sized to the SAME frame as the main window — so
+        // while the hub is up, "the main window" photographs the hub (runs 6, 9,
+        // 10). Close the hub first; the main window is then the only one there.
+        hub.buttons[XCUIIdentifierCloseWindow].firstMatch.click()
+        sleep(2)
+        // SwiftUI names a WindowGroup's windows "<id>-AppWindow-N"; the hub is
+        // its own group ("agent-hub-AppWindow-1"), so this cannot resolve to it.
+        let mainAgain = app.windows.matching(identifier: "main-AppWindow-1").firstMatch
+        XCTAssertTrue(mainAgain.waitForExistence(timeout: 10), "main window lost")
+        XCTAssertFalse(hub.exists, "the hub window is still open; the paywall shot would photograph it")
+        mainAgain.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02)).click()
+        sleep(1)
+        for key in ["Fin Pro subscription", "Fin Pro"] {
+            let proButton = app.buttons[key].firstMatch
+            if proButton.waitForExistence(timeout: 5) {
+                proButton.tapCenter()
+                sleep(3)
+                shootWindow(mainAgain, "story-08-paywall")
+                break
+            }
+        }
+    }
+
     private func shootWindow(_ window: XCUIElement, _ name: String) {
         guard window.exists else { return }
         let attachment = XCTAttachment(screenshot: window.screenshot())

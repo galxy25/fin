@@ -61,6 +61,7 @@ struct RootView: View {
         // Markdown reader. See TerminalTabsSceneKey for why it has to be a focused
         // scene value rather than a check inside the command's action.
         .focusedSceneValue(\.hostsTerminalTabs, true)
+        .onAppear { ScreenshotFixtures.sizeWindowForCapture(width: 1440, height: 900) }
         // The one server picker: ⌘T and the control strip's server button both set
         // this flag, and it lives on RootView rather than the control strip because
         // ⌘T must work on the home and markdown routes, where no strip exists.

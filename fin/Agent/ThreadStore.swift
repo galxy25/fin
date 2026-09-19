@@ -35,7 +35,12 @@ final class ThreadStore: ObservableObject {
         }
     }
 
-    var isAvailable: Bool { CloudControlPlaneConfig.isConfigured && !TestHost.isUnitTest && !agentName.isEmpty }
+    // Not during a screenshot capture: the control plane reads as configured there
+    // (for the demo sites) but has no endpoint, so a thread fetch would only ever
+    // leave "Loading…" in the hub sidebar.
+    var isAvailable: Bool {
+        CloudControlPlaneConfig.isConfigured && !TestHost.isUnitTest && !ScreenshotFixtures.isEnabled && !agentName.isEmpty
+    }
 
     var selectedThread: ThreadSummary? {
         selectedThreadID.flatMap { id in threads.first { $0.threadId == id } }
