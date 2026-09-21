@@ -170,10 +170,14 @@ enum ScreenshotFixtures {
         for base in FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask) {
             candidates.append(base.appendingPathComponent("fin-screenshots/id_ed25519"))
         }
+        #if os(macOS)
+        // `homeDirectoryForCurrentUser` is unavailable on iOS; the sandboxed
+        // Application Support directory above is the only candidate there.
         candidates.append(
             FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/fin-screenshots/id_ed25519")
         )
+        #endif
         for url in candidates {
             if let pem = try? String(contentsOf: url, encoding: .utf8), pem.contains("PRIVATE KEY") {
                 return pem
