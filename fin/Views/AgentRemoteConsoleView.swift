@@ -138,6 +138,12 @@ struct AgentRemoteConsoleView: View {
     @StateObject private var threadStore: ThreadStore
     /// A thread to open on (a notification tap, the hub sidebar); nil = default rule.
     private let initialThreadID: String?
+    /// Set while a Retry send is in flight, so the button can't be double-tapped.
+    @State private var isRetryingThread = false
+    /// The thread a delete confirmation is pending for (`.alert` needs a value,
+    /// not just a bool, so the alert still names the right thread after the
+    /// picker's next poll changes `selectedThreadID` out from under it).
+    @State private var threadPendingDelete: ThreadSummary?
 
     init(agent: Agent, reader: AgentMirrorReader = AgentMirrorReader(), initialThreadID: String? = nil) {
         self.agent = agent
@@ -197,6 +203,18 @@ struct AgentRemoteConsoleView: View {
         }
         .sheet(isPresented: $showingRemembered) {
             RememberedConversationsView(agent: agent)
+        }
+        .alert(
+            "Delete this thread?",
+            isPresented: Binding(get: { threadPendingDelete != nil }, set: { if !$0 { threadPendingDelete = nil } }),
+            presenting: threadPendingDelete
+        ) { thread in
+            Button("Delete", role: .destructive) {
+                Task { await threadStore.delete(thread.threadId) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { thread in
+            Text("\"\(thread.displayTitle)\" and everything in it will be gone for good.")
         }
         .task {
             // Cross-device banners are the whole point of this screen, so this is
@@ -264,6 +282,30 @@ struct AgentRemoteConsoleView: View {
                     ThreadPicker(store: threadStore, compact: true)
                     if let thread = threadStore.selectedThread {
                         ThreadChipView(chip: thread.status.chip)
+                        if thread.status.isRetryable {
+                            Button {
+                                isRetryingThread = true
+                                Task {
+                                    await threadStore.retry(thread.threadId)
+                                    isRetryingThread = false
+                                }
+                            } label: {
+                                Label("Retry", systemImage: "arrow.clockwise")
+                                    .font(.caption2)
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(isRetryingThread)
+                            .accessibilityIdentifier("threadRetryButton")
+                        }
+                        Button {
+                            threadPendingDelete = thread
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("threadDeleteButton")
                         if let goal = thread.openGoal {
                             Label("follow-up \(goal.suffix(6))", systemImage: "flag")
                                 .font(.caption2)

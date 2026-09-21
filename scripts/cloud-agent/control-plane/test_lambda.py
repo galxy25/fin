@@ -3110,6 +3110,69 @@ class ThreadGetTests(_ThreadsTestCase):
             self.assertEqual(lam._route(event)["statusCode"], 200, path)
 
 
+class ThreadDeleteTests(_ThreadsTestCase):
+    def delete_thread(self, thread_id, user="user-1"):
+        response = lam.delete_thread({"_userId": user}, thread_id)
+        return response["statusCode"], json.loads(response["body"])
+
+    def test_deletes_every_member_message_and_every_event(self):
+        root = self.send("root")
+        self.tick()
+        reply = self.send("reply", threadId=root["messageId"])
+        self.tick()
+        self.claim(self.imac, reply["messageId"])
+        self.tick()
+        self.ack(self.imac, reply["messageId"], "applied", runId="run-1")
+        status, body = self.delete_thread(root["messageId"])
+        self.assertEqual(status, 200)
+        self.assertEqual(body["deletedMessages"], 2)
+        self.assertGreater(body["deletedEvents"], 0)
+        self.assertIsNone(lam.MESSAGES_TABLE.get_item(Key={"messageId": root["messageId"]}).get("Item"))
+        self.assertIsNone(lam.MESSAGES_TABLE.get_item(Key={"messageId": reply["messageId"]}).get("Item"))
+        self.assertEqual(self.events.for_thread(root["messageId"]), [])
+        status, body = self.list_threads()
+        self.assertEqual(status, 200)
+        self.assertNotIn(root["messageId"], [t["threadId"] for t in body["threads"]])
+
+    def test_also_deletes_events_still_under_a_members_own_pre_assignment_key(self):
+        root = self.send("root")
+        self.tick()
+        moved = self.send("moved")
+        self.tick()
+        self.claim(self.imac, moved["messageId"])
+        self.tick()
+        # Joins root's thread at applied time; its own `message.queued` event
+        # stays filed under its own (pre-assignment) key, per `_thread_timeline`.
+        self.ack(self.imac, moved["messageId"], "applied", threadId=root["messageId"], threadReason="pane:main:2.0")
+        self.assertNotEqual(self.events.for_thread(moved["messageId"]), [])
+        status, body = self.delete_thread(root["messageId"])
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events.for_thread(moved["messageId"]), [])
+        self.assertEqual(self.events.for_thread(root["messageId"]), [])
+
+    def test_a_member_id_a_foreign_id_and_garbage_are_404(self):
+        root = self.send("root")
+        reply = self.send("reply", threadId=root["messageId"])
+        theirs = self.send("theirs", user="user-2")
+        for bad in (reply["messageId"], theirs["messageId"], "m-00000000-nothing", "nope"):
+            with self.assertRaises(lam.ApiError, msg=bad) as caught:
+                lam.delete_thread({"_userId": "user-1"}, bad)
+            self.assertEqual(caught.exception.status, 404)
+        # None of the failed attempts touched the real thread.
+        self.assertIsNotNone(lam.MESSAGES_TABLE.get_item(Key={"messageId": root["messageId"]}).get("Item"))
+
+    def test_a_site_token_cannot_delete_a_thread(self):
+        with self.assertRaises(lam.ApiError) as caught:
+            lam._require_site_scope({"_siteId": "s"}, "DELETE", ["threads", "m-1"])
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_the_router_reaches_the_delete_route(self):
+        message_id = self.lifecycle()
+        event = {"_userId": "user-1", "rawPath": "/threads/" + message_id,
+                  "requestContext": {"http": {"method": "DELETE"}}}
+        self.assertEqual(lam._route(event)["statusCode"], 200)
+
+
 class ThreadSiteScopeTests(unittest.TestCase):
     def test_a_site_may_read_threads(self):
         for parts in (["threads"], ["threads", "m-1"], ["threads", "m-1", "events"]):
@@ -3124,7 +3187,10 @@ class ThreadSiteScopeTests(unittest.TestCase):
 
 class ThreadRouteRegistrationTests(SiteRouteRegistrationTests):
     def test_every_threads_route_is_registered(self):
-        for route in ("GET /threads", "GET /threads/{threadId}", "GET /threads/{threadId}/events"):
+        for route in (
+            "GET /threads", "GET /threads/{threadId}", "GET /threads/{threadId}/events",
+            "DELETE /threads/{threadId}",
+        ):
             self.assertIn(route + "\n", self.deploy_sh, route)
 
     def test_the_thread_events_table_is_created_and_granted(self):

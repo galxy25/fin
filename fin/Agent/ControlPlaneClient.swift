@@ -338,4 +338,14 @@ enum ControlPlaneClient {
             .flatMap { decode(ThreadEventsResponse.self, status: $0.0, body: $0.1) }
             .map(\.events)
     }
+
+    /// Permanently drops a thread — every member message and every event row.
+    /// Not reachable with a site token (the control plane's `_require_site_scope`
+    /// denies DELETE by omission); only the signed-in user's own session does this.
+    static func deleteThread(id: String) async -> Result<Void, Failure> {
+        await perform(request("DELETE", path: "/threads/\(id)"))
+            .flatMap { status, body in
+                (200...299).contains(status) ? .success(()) : .failure(.http(status, errorMessage(status: status, body: body)))
+            }
+    }
 }

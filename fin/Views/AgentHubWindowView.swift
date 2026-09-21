@@ -28,6 +28,8 @@ struct AgentHubWindowView: View {
     /// docs/THREADS.md §4: the "Threads" sidebar section — one row per open
     /// thread, selecting one opens the conversation filtered to it.
     @StateObject private var threadStore = ThreadStore()
+    /// The thread a swipe-to-delete confirmation is pending for.
+    @State private var threadPendingDelete: ThreadSummary?
 
     private enum HubSection: Hashable {
         case settings, logs, memory, remote, artifacts, key
@@ -160,6 +162,18 @@ struct AgentHubWindowView: View {
         .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 260)
         .task(id: agent.name) { threadStore.start(agentName: agent.name) }
         .onDisappear { threadStore.stop() }
+        .alert(
+            "Delete this thread?",
+            isPresented: Binding(get: { threadPendingDelete != nil }, set: { if !$0 { threadPendingDelete = nil } }),
+            presenting: threadPendingDelete
+        ) { thread in
+            Button("Delete", role: .destructive) {
+                Task { await threadStore.delete(thread.threadId) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { thread in
+            Text("\"\(thread.displayTitle)\" and everything in it will be gone for good.")
+        }
     }
 
     private func threadRow(_ thread: ThreadSummary) -> some View {
@@ -177,6 +191,21 @@ struct AgentHubWindowView: View {
         }
         .tag(HubSection.thread(thread.threadId))
         .accessibilityIdentifier("hubSidebarThread_\(thread.threadId.prefix(8))")
+        .swipeActions(edge: .trailing) {
+            Button(role: .destructive) {
+                threadPendingDelete = thread
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+            if thread.status.isRetryable {
+                Button {
+                    Task { await threadStore.retry(thread.threadId) }
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .tint(.blue)
+            }
+        }
     }
 
     /// One sidebar row, identified for UI-test/automation drive-through

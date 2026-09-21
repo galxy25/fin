@@ -107,6 +107,21 @@ enum ThreadStatus: String, Decodable, Equatable, CaseIterable {
         self = ThreadStatus(rawValue: raw) ?? .unknown
     }
 
+    /// Whether Retry belongs on this thread: `stalled` (a queued/applied
+    /// message nothing will ever reclaim) and `waitingOnYou` (a question,
+    /// often Fin's own `question.asked` root, that never got an answer
+    /// attached to THIS thread) are the two statuses that can sit forever
+    /// with no path forward otherwise. `working` and `answered` have one
+    /// already in flight or done; retrying either would just root a
+    /// redundant duplicate of exactly the kind this button exists to stop
+    /// creating more of.
+    var isRetryable: Bool {
+        switch self {
+        case .stalled, .waitingOnYou: return true
+        case .working, .answered, .unknown: return false
+        }
+    }
+
     /// The chip: label, SF Symbol, and a tint name the views map to a color.
     /// Pure so the mapping is table-tested.
     var chip: ThreadChip {

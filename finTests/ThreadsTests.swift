@@ -173,6 +173,14 @@ final class ThreadsTests: XCTestCase {
         XCTAssertEqual(ThreadStatus(rawValue: "waiting_on_you"), .waitingOnYou)
     }
 
+    func testOnlyStalledAndWaitingOnYouAreRetryable() {
+        XCTAssertTrue(ThreadStatus.stalled.isRetryable)
+        XCTAssertTrue(ThreadStatus.waitingOnYou.isRetryable)
+        XCTAssertFalse(ThreadStatus.working.isRetryable, "already has a turn in flight")
+        XCTAssertFalse(ThreadStatus.answered.isRetryable, "nothing to retry")
+        XCTAssertFalse(ThreadStatus.unknown.isRetryable)
+    }
+
     func testDefaultSelectionIsNewestUnansweredElseNewest() {
         let answeredNewest = ThreadSummary(threadId: "m-a", title: "a", status: .answered, lastActivityAt: at(300))
         let workingOlder = ThreadSummary(threadId: "m-b", title: "b", status: .working, lastActivityAt: at(200))
@@ -203,6 +211,100 @@ final class ThreadsTests: XCTestCase {
         XCTAssertNil(store.selectedThreadID, "an explicit All activity survives a refresh")
         store.preselect("m-c")
         XCTAssertEqual(store.selectedThread?.title, "c")
+    }
+
+    // MARK: - Retry / Delete
+
+    private func withControlPlaneConfigured(_ body: () async throws -> Void) async rethrows {
+        let endpoint = CloudControlPlaneConfig.endpointURL
+        let token = CloudControlPlaneConfig.token
+        let transport = ControlPlaneClient.transport
+        CloudControlPlaneConfig.setEndpointURL("https://cp.example")
+        CloudControlPlaneConfig.setToken("cp-token")
+        defer {
+            CloudControlPlaneConfig.setEndpointURL(endpoint)
+            CloudControlPlaneConfig.setToken(token)
+            ControlPlaneClient.transport = transport
+        }
+        try await body()
+    }
+
+    /// Retry re-sends the thread's root text as a FRESH message, explicitly
+    /// threaded — never the dead id, which is exactly what would leave a
+    /// permanently `queued` row queued forever (the 2026-09-21 incident:
+    /// a message pinned to a site that never came back to claim it).
+    @MainActor
+    func testRetryResendsTheRootTextAsAFreshMessageExplicitlyThreaded() async throws {
+        try await withControlPlaneConfigured {
+            let store = ThreadStore(agentName: "Fin")
+            let root = try self.decodeMessage(self.messageJSON("m-stuck", thread: nil, text: "please retry me", state: "queued", created: 0))
+            store.adopt(detail: ControlPlaneClient.ThreadDetail(
+                thread: ThreadSummary(threadId: "m-stuck", title: "please retry me", status: .stalled, lastActivityAt: self.at(0)),
+                messages: [root], events: []
+            ))
+
+            var captured: [URLRequest] = []
+            ControlPlaneClient.transport = { request in
+                captured.append(request)
+                return (Data(#"{"messageId":"m-new","agent":"Fin","state":"queued","threadId":"m-stuck"}"#.utf8),
+                        HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            }
+
+            let result = await store.retry("m-stuck")
+            guard case .success(let sent) = result else { return XCTFail("expected success") }
+            XCTAssertEqual(sent.threadId, "m-stuck")
+
+            let post = try XCTUnwrap(captured.first { $0.httpMethod == "POST" && $0.url?.path == "/messages" })
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(post.httpBody)) as? [String: Any])
+            XCTAssertEqual(body["text"] as? String, "please retry me")
+            XCTAssertEqual(body["threadId"] as? String, "m-stuck")
+            XCTAssertNotEqual(body["messageId"] as? String, "m-stuck", "a fresh id — retry never re-sends the dead one")
+        }
+    }
+
+    @MainActor
+    func testRetryFailsCleanlyWhenTheRootTextIsUnknown() async throws {
+        try await withControlPlaneConfigured {
+            let store = ThreadStore(agentName: "Fin")
+            ControlPlaneClient.transport = { request in
+                XCTFail("no request should be sent without a root text: \(request)")
+                return (Data(), HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+            }
+            let result = await store.retry("m-unknown")
+            guard case .failure = result else { return XCTFail("expected failure") }
+        }
+    }
+
+    /// Delete removes the thread from the local list the moment the server
+    /// confirms it — not on the next poll — and falls back to the default
+    /// selection rule if the deleted thread was the one open.
+    @MainActor
+    func testDeleteRemovesTheThreadLocallyAndFallsBackSelection() async throws {
+        try await withControlPlaneConfigured {
+            let store = ThreadStore(agentName: "Fin")
+            store.merge([
+                ThreadSummary(threadId: "m-a", title: "a", status: .answered, lastActivityAt: self.at(300)),
+                ThreadSummary(threadId: "m-b", title: "b", status: .stalled, lastActivityAt: self.at(200)),
+            ])
+            store.select("m-b")
+            XCTAssertEqual(store.selectedThreadID, "m-b")
+
+            var captured: [URLRequest] = []
+            ControlPlaneClient.transport = { request in
+                captured.append(request)
+                return (Data(#"{"threadId":"m-b","deletedMessages":1,"deletedEvents":1}"#.utf8),
+                        HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            }
+
+            let result = await store.delete("m-b")
+            guard case .success = result else { return XCTFail("expected success") }
+            let delete = try XCTUnwrap(captured.first)
+            XCTAssertEqual(delete.httpMethod, "DELETE")
+            XCTAssertEqual(delete.url?.path, "/threads/m-b")
+            XCTAssertFalse(store.threads.contains { $0.threadId == "m-b" })
+            XCTAssertNil(store.detail(for: "m-b"))
+            XCTAssertEqual(store.selectedThreadID, "m-a", "falls back to the default rule once the selected thread is gone")
+        }
     }
 
     func testPickerMenuTitleCarriesChipTitleAndRelativeTime() {

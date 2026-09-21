@@ -164,6 +164,64 @@ final class ThreadStore: ObservableObject {
         }
     }
 
+    // MARK: - Retry / Delete
+
+    /// Re-sends a thread's original request as a fresh message explicitly
+    /// joined to it (docs/THREADS.md §2 "explicit" membership): a new
+    /// messageId, routed fresh (a dead pin or an abandoned claim from the
+    /// first attempt has no say this time), same thread. This is what
+    /// Retry does everywhere it appears — a `queued` message nothing will
+    /// ever reclaim, or a `question.asked` thread that never got an answer
+    /// attached to it, both get a real second attempt instead of the only
+    /// prior recourse (asking again, which just roots yet another orphaned
+    /// thread — see docs/THREADS.md §2 and the 2026-09-21 Blackstreet
+    /// incident that motivated this).
+    @discardableResult
+    func retry(_ threadID: String) async -> Result<ControlPlaneClient.Message, ControlPlaneClient.Failure> {
+        var detail = details[threadID]
+        if detail == nil { detail = await loadDetail(threadID) }
+        guard let text = detail?.messages.first(where: { $0.messageId == threadID })?.text,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            Self.log.error("retry \(threadID.prefix(8), privacy: .public): no root text to resend")
+            return .failure(.http(422, "thread has no text to retry"))
+        }
+        let result = await ControlPlaneClient.sendMessage(
+            agent: agentName, text: text, messageID: ControlPlaneClient.newMessageID(),
+            context: .init(threadID: threadID)
+        )
+        switch result {
+        case .success:
+            Self.log.info("retried \(threadID.prefix(8), privacy: .public)")
+            await refresh()
+        case .failure(let failure):
+            Self.log.error("retry \(threadID.prefix(8), privacy: .public) failed: \(Self.describe(failure), privacy: .public)")
+        }
+        return result
+    }
+
+    /// Permanently drops a thread. Removed from the local list immediately —
+    /// not just left for the next poll — so the row is gone the moment the
+    /// server confirms it; falls back to the default selection if the
+    /// deleted thread was the one selected.
+    @discardableResult
+    func delete(_ threadID: String) async -> Result<Void, ControlPlaneClient.Failure> {
+        let result = await ControlPlaneClient.deleteThread(id: threadID)
+        switch result {
+        case .success:
+            threads.removeAll { $0.threadId == threadID }
+            details[threadID] = nil
+            Self.cache[agentName] = threads
+            Self.log.info("deleted \(threadID.prefix(8), privacy: .public)")
+            if selectedThreadID == threadID {
+                userChoseSelection = false
+                select(ThreadSelection.defaultThreadID(threads), byUser: false)
+            }
+        case .failure(let failure):
+            Self.log.error("delete \(threadID.prefix(8), privacy: .public) failed: \(Self.describe(failure), privacy: .public)")
+        }
+        return result
+    }
+
     /// The debug tail: raw events after `after`.
     func events(for threadID: String, after: Int = 0) async -> Result<[ThreadEvent], ControlPlaneClient.Failure> {
         let result = await ControlPlaneClient.threadEvents(id: threadID, after: after)

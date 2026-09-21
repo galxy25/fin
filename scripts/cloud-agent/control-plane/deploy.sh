@@ -731,6 +731,7 @@ POST /messages/{messageId}/register
 GET /threads
 GET /threads/{threadId}
 GET /threads/{threadId}/events
+DELETE /threads/{threadId}
 POST /sites/enroll-tokens
 GET /agents/{agent}/goals
 PUT /agents/{agent}/goals

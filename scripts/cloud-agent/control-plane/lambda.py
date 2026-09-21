@@ -5840,6 +5840,44 @@ def get_thread_events(event, thread_id):
     return _response(200, {"threadId": thread_id, "events": _thread_events_for(thread_id, after=after)})
 
 
+def delete_thread(event, thread_id):
+    """DELETE /threads/{threadId} — permanently drops a thread: every member
+    message row, and every thread-event row, wherever `_thread_timeline`
+    finds them (the thread key itself, plus any member's own key for events
+    written before implicit assignment moved it in). Not reachable with a
+    site token — `_require_site_scope` denies DELETE by omission, so only the
+    owner's own session/app can drop history, never a body acting for itself.
+
+    Exists because a thread the control plane can never auto-close (an
+    orphaned `question.asked` thread nobody replied to at that exact id, a
+    `queued` message whose claimant never came back) otherwise sits in the
+    list forever with no way off it. Best-effort like account deletion: one
+    row refusing to go must not abandon the rest."""
+    _root, members = _owned_thread(event, thread_id)
+    # `_owned_thread` already scanned every row for `userId = event["_userId"]`,
+    # so the deletes below need no ConditionExpression of their own — same
+    # trust model as `_delete_rows` (account deletion): ownership was proven
+    # by how these ids were found, not re-checked at delete time.
+    member_ids = sorted({m.get("messageId") for m in members if m.get("messageId")})
+    deleted_events = 0
+    for member_id in member_ids:
+        for evt in _thread_events_for(member_id):
+            try:
+                THREAD_EVENTS_TABLE.delete_item(Key={"threadId": evt["threadId"], "seq": evt["seq"]})
+                deleted_events += 1
+            except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
+                LOG.warning("thread delete: event %s#%s: %s", evt.get("threadId"), evt.get("seq"), _scrub(exc))
+    deleted_messages = 0
+    for message_id in member_ids:
+        try:
+            MESSAGES_TABLE.delete_item(Key={"messageId": message_id})
+            deleted_messages += 1
+        except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
+            LOG.warning("thread delete: message %s: %s", message_id, _scrub(exc))
+    LOG.info("thread deleted: %s (%d messages, %d events)", thread_id, deleted_messages, deleted_events)
+    return _response(200, {"threadId": thread_id, "deletedMessages": deleted_messages, "deletedEvents": deleted_events})
+
+
 FOLLOWUP_GOAL_PREFIX = "g-followup-"
 # A tmux target ("main:2.0", "agent:1") out of prose; ends on an alphanumeric
 # so a sentence's trailing period is not part of the pane.
@@ -6143,6 +6181,8 @@ def _route(event):
         return get_thread(event, parts[1])
     if method == "GET" and len(parts) == 3 and parts[0] == "threads" and parts[2] == "events":
         return get_thread_events(event, parts[1])
+    if method == "DELETE" and len(parts) == 2 and parts[0] == "threads":
+        return delete_thread(event, parts[1])
     if method == "POST" and parts == ["workers"]:
         return create_worker(event)
     if method == "GET" and parts == ["workers"]:
