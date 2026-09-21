@@ -154,6 +154,14 @@ shipped in 1.10.1. None of the changes below touch that path — but item 2 woul
 were built wrong, and that is called out.
 
 ### 1. Fix the context window. Not a notification change.
+**Done, fin-agentd 1.11.0 (2026-09-21, commit 0bfd982).** Shipped with a widened net beyond
+the original plan: the live refusal turned out to be a bare `"Context size has been
+exceeded."` with no digits at all, so `windowTokens(fromRefusal:)` alone never fired —
+added `ContextWindowProbe.isContextOverflow(_:)` plus an inference fallback (from what the
+turn actually sent, cushioned to 85%) for exactly that shape, and generalized the retry
+path to also read `AgentEndpointError.streamFailure`, which the original plan didn't name
+and which was silently unhandled. Persistence is `ContextWindowMarker`, keyed to
+`modelIdentifier` so a model swap can't inherit a stale ceiling.
 `AgentTurnEngine.swift:284` / `:292`. The endpoint reports 32768 and dies at ~23k, so the
 budget never bites and the transcript walks into a wall every ~100 minutes.
 Clamp `effectiveContextWindowTokens` to what the model *actually* accepts — learn the real
@@ -166,6 +174,12 @@ removes the noise by removing the fault.
 makes Fin work better rather than talk less.
 
 ### 2. A dwell window before the stall page.
+**Done, fin-agentd 1.11.0 (2026-09-21, commit 0bfd982).** Built as planned, with the
+flagged rate-test added: a single interleaved success does not clear `pendingSince` —
+`successesToClearPending = 2` consecutive successes are required, so a brain flapping
+between failing and succeeding can't dodge the page. `pendingSince` also now survives a
+page going out (`statePaged` carries it forward), so a persisting failure across a restart
+uses the existing exponential backoff rather than re-dwelling 30 minutes every time.
 `Daemon.swift:2077-2101`, with a `pendingSince` field added to `StallNotifyState`
 (`StallNotifyGate.swift:16-38`). At five failures, record `pendingSince` and keep retrying
 silently; page only if failures are still unbroken 30 minutes later; clear `pendingSince`
