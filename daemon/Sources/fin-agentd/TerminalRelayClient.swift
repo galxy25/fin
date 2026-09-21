@@ -31,7 +31,11 @@ public final class TerminalRelayClient {
     private let siteID: String
     private let siteToken: String
     private let controlPlaneURL: String?
-    private let urlSession: URLSession
+    private var urlSession: URLSession
+    /// Nil for the real, self-managed session (the normal case); set only when a
+    /// caller (a test) injected its own `URLSession` — self-healing must never
+    /// replace a session a test is asserting against.
+    private let injectedURLSession: URLSession?
     private let audit: (String) -> Void
 
     /// How many two-second dials the relay gets before this body gives up on a
@@ -40,6 +44,26 @@ public final class TerminalRelayClient {
     /// dialing an instance that is still installing python — a refused
     /// connection for the first minute is the normal path, not a failure.
     static let connectAttempts = 45
+
+    /// SELF-HEALING. Live incident (2026-09-21, the work laptop): the primary
+    /// heartbeat loop stayed healthy — the site was never stale — while EVERY
+    /// `terminal-open` for 45+ minutes across two relay instances failed to
+    /// pair, with no error anywhere to explain why. A `restart` site command
+    /// alone did not clear it; only a fresh process (via the `update` command)
+    /// did. `recoverUnreadyShell()` already exists for exactly this shape of
+    /// problem on the PRIMARY session — a long-lived resource silently wedging
+    /// on a machine that sleeps, roams networks, and changes IP, which the
+    /// always-on iMac never exercises — but it watches only that one session,
+    /// never this class's own long-lived `URLSession`. This is the same fix
+    /// applied here: after this many FULLY EXHAUSTED dial attempts in a row —
+    /// every attempt refused or timed out, none merely slow — tear down and
+    /// replace the `URLSession` rather than wait for a human to notice and
+    /// queue a restart. Two, not one: a single exhausted dial is what a relay
+    /// that is still booting looks like on its unluckiest possible timing, and
+    /// replacing the session on that alone would cost every ordinary "still
+    /// installing python" case a session it would otherwise have won.
+    static let dialFailuresBeforeSelfHeal = 2
+    private var consecutiveDialFailures = 0
 
     private final class RelaySession {
         let socket: URLSessionWebSocketTask
@@ -61,11 +85,38 @@ public final class TerminalRelayClient {
         self.siteID = siteID
         self.siteToken = siteToken
         self.controlPlaneURL = controlPlaneURL
+        self.injectedURLSession = urlSession
         // Pinned by default: the relay has no name worth checking, so its
         // certificate IS its identity (see RelayCertificatePin).
         self.urlSession = urlSession
-            ?? URLSession(configuration: .default, delegate: RelayPinningDelegate(), delegateQueue: nil)
+            ?? Self.freshURLSession()
         self.audit = audit
+    }
+
+    /// A new, pinned `URLSession` — the initial one, and every self-healing
+    /// replacement. A fresh instance rather than invalidating the old one in
+    /// place: `URLSession.invalidateAndCancel` tears down in-flight tasks
+    /// asynchronously and is documented as unsafe to immediately reuse the
+    /// session for, so a genuinely fresh object is the only way to be certain
+    /// nothing of the wedged state carries over.
+    private static func freshURLSession() -> URLSession {
+        URLSession(configuration: .default, delegate: RelayPinningDelegate(), delegateQueue: nil)
+    }
+
+    /// Replaces the `URLSession` backing every future dial. The old one is
+    /// invalidated (its in-flight tasks, if any survived this long, are
+    /// cancelled) rather than merely dropped, so it cannot keep holding a
+    /// socket or a delegate queue slot after this body has stopped trusting it.
+    private func selfHealURLSession(reason: String) {
+        guard injectedURLSession == nil else { return }
+        audit("[relay] \(consecutiveDialFailures) consecutive dial failures (\(reason)) — "
+            + "replacing the relay URLSession rather than waiting for a human to notice")
+        logClientEvent("relay_state", sessionId: "-", detail: [
+            "stage": "self_healed_url_session", "consecutiveDialFailures": consecutiveDialFailures,
+        ])
+        urlSession.invalidateAndCancel()
+        urlSession = Self.freshURLSession()
+        consecutiveDialFailures = 0
     }
 
     /// Best-effort breadcrumb to the same `/client-events` endpoint the app posts
@@ -161,6 +212,14 @@ public final class TerminalRelayClient {
                     self.logClientEvent("relay_ws_open_failed", sessionId: sessionId, detail: [
                         "reason": "relay_unreachable", "error": String(describing: error),
                     ])
+                    // Every one of `connectAttempts` was refused or timed out — not
+                    // "the relay was slow to boot", which a single retry clears, but
+                    // "nothing this body dials ever answers." See
+                    // `dialFailuresBeforeSelfHeal`'s doc for the incident this guards.
+                    self.consecutiveDialFailures += 1
+                    if self.consecutiveDialFailures >= Self.dialFailuresBeforeSelfHeal {
+                        self.selfHealURLSession(reason: "exhausted \(Self.connectAttempts) dial attempts")
+                    }
                     return
                 }
                 try? await Task.sleep(for: .seconds(2))
@@ -178,6 +237,9 @@ public final class TerminalRelayClient {
             socket.cancel(with: .goingAway, reason: nil)
             return
         }
+        // A dial that reaches here proves the URLSession is not wedged — the
+        // failure streak the self-heal counts is over, whatever caused it.
+        consecutiveDialFailures = 0
         let command = "exec tmux new-session -A -s \(Self.shellQuote(tmuxSession))"
         let terminal = LocalTerminalSession(configuration: LocalSessionConfiguration(connectCommand: command))
         let relay = RelaySession(socket: socket, terminal: terminal)

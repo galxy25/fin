@@ -183,7 +183,7 @@ final class DaemonDirectiveClient {
     /// ordinary WebSocket server on an on-demand instance. `terminal-open`
     /// therefore carries `relayHost`/`relayPort` and a command without them is
     /// ignored; `controlPlane.terminalRelayURL` is gone from the config.
-    static let daemonVersion = "1.11.1"
+    static let daemonVersion = "1.11.2"
     /// The ONE status that means "no such object" on a first-run read. S3 answers 404
     /// for a missing key when the signer may `s3:ListBucket` — the control plane's and
     /// the operator's signers hold it for exactly that reason (control-plane commit
