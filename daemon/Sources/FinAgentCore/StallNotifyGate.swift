@@ -17,24 +17,50 @@ public struct StallNotifyState: Codable, Equatable, Sendable {
     public var failureKey: String?
     public var pageCount: Int
     public var active: Bool
+    /// When the CURRENT give-up-worthy failure streak (>=5 consecutive) began, for the
+    /// failure named by `pendingFailureKey` — see the "Dwell before paging" section
+    /// below. Nil when nothing is pending. Persisted, and deliberately NOT reset by a
+    /// page going out (`statePaged` carries it forward) — only by real recovery.
+    public var pendingSince: Date?
+    /// The normalized failure text `pendingSince` was started for. A different failure
+    /// arriving restarts the dwell clock, same as `statePaged` treats a new failure as
+    /// news rather than a continuation.
+    public var pendingFailureKey: String?
+    /// Consecutive successful turns seen while a streak is pending, toward
+    /// `StallNotifyGate.successesToClearPending`. Reset to 0 by every failure.
+    public var pendingSuccessStreak: Int
 
-    public init(lastNotifiedAt: Date, failureKey: String? = nil, pageCount: Int = 1, active: Bool = true) {
+    public init(
+        lastNotifiedAt: Date, failureKey: String? = nil, pageCount: Int = 1, active: Bool = true,
+        pendingSince: Date? = nil, pendingFailureKey: String? = nil, pendingSuccessStreak: Int = 0
+    ) {
         self.lastNotifiedAt = lastNotifiedAt
         self.failureKey = failureKey
         self.pageCount = pageCount
         self.active = active
+        self.pendingSince = pendingSince
+        self.pendingFailureKey = pendingFailureKey
+        self.pendingSuccessStreak = pendingSuccessStreak
     }
 
-    enum CodingKeys: String, CodingKey { case lastNotifiedAt, failureKey, pageCount, active }
+    enum CodingKeys: String, CodingKey {
+        case lastNotifiedAt, failureKey, pageCount, active
+        case pendingSince, pendingFailureKey, pendingSuccessStreak
+    }
 
-    /// Tolerates the pre-backoff marker (`{"lastNotifiedAt": …}` only): a daemon
-    /// updating in place must read its own old file as "paged once, still active".
+    /// Tolerates the pre-backoff marker (`{"lastNotifiedAt": …}` only) and the
+    /// pre-dwell marker (no `pending*` fields at all): a daemon updating in place must
+    /// read its own old file as "paged once, still active, nothing pending" rather than
+    /// fail to decode.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         lastNotifiedAt = try c.decode(Date.self, forKey: .lastNotifiedAt)
         failureKey = try c.decodeIfPresent(String.self, forKey: .failureKey)
         pageCount = max(1, try c.decodeIfPresent(Int.self, forKey: .pageCount) ?? 1)
         active = try c.decodeIfPresent(Bool.self, forKey: .active) ?? true
+        pendingSince = try c.decodeIfPresent(Date.self, forKey: .pendingSince)
+        pendingFailureKey = try c.decodeIfPresent(String.self, forKey: .pendingFailureKey)
+        pendingSuccessStreak = try c.decodeIfPresent(Int.self, forKey: .pendingSuccessStreak) ?? 0
     }
 }
 
@@ -75,23 +101,102 @@ public enum StallNotifyGate {
         return elapsed >= repeatCooldown(pageCount: state.pageCount, base: cooldown, cap: maxCooldown)
     }
 
-    /// The state to persist after a page just went out for `failure`.
+    /// The state to persist after a page just went out for `failure`. Carries the
+    /// pending-dwell bookkeeping forward from `previous` unchanged — paging is not
+    /// recovery, so `pendingSince` must survive a page the same way it survives a
+    /// restart; only real recovery (`stateRecovered`/`statePendingSucceeded`) clears it.
     public static func statePaged(after previous: StallNotifyState?, failure: String, now: Date) -> StallNotifyState {
         let key = failureKey(failure)
+        var state: StallNotifyState
         if let previous, previous.active, sameFailure(previous.failureKey, key) {
-            return StallNotifyState(lastNotifiedAt: now, failureKey: key, pageCount: previous.pageCount + 1, active: true)
+            state = StallNotifyState(lastNotifiedAt: now, failureKey: key, pageCount: previous.pageCount + 1, active: true)
+        } else {
+            state = StallNotifyState(lastNotifiedAt: now, failureKey: key, pageCount: 1, active: true)
         }
-        return StallNotifyState(lastNotifiedAt: now, failureKey: key, pageCount: 1, active: true)
+        state.pendingSince = previous?.pendingSince
+        state.pendingFailureKey = previous?.pendingFailureKey
+        state.pendingSuccessStreak = previous?.pendingSuccessStreak ?? 0
+        return state
     }
 
     /// The state to persist once a turn succeeds again; nil when there is nothing to
     /// close out (no marker, or the incident was already closed) — so the recovery
     /// push goes out at most once per incident, and never on an ordinary good turn.
+    /// Also closes out any pending (not-yet-paged) dwell: a full recovery ends both.
     public static func stateRecovered(from previous: StallNotifyState?, now: Date) -> StallNotifyState? {
         guard let previous, previous.active else { return nil }
         var recovered = previous
         recovered.active = false
+        recovered.pendingSince = nil
+        recovered.pendingFailureKey = nil
+        recovered.pendingSuccessStreak = 0
         return recovered
+    }
+
+    // MARK: - Dwell before paging
+
+    /// How long a give-up-worthy failure streak (>=5 consecutive) must keep failing,
+    /// unresolved, before it is worth waking a human — see
+    /// docs/NOTIFICATION-NOISE-AUDIT.md item 2. The max observed page-to-recovery gap
+    /// in the audited week was 15.8 minutes, so this window silenced 26 of 27 pages
+    /// that self-healed before a human could have done anything with the page anyway.
+    public static let dwellBeforePaging: TimeInterval = 30 * 60
+
+    /// How many CONSECUTIVE successful turns, while a streak is pending, count as real
+    /// recovery rather than one lucky answer inside a mostly-failing run. Set above 1
+    /// on purpose: a brain that flaps (4 failures, 1 success, 4 failures, …) must not
+    /// cancel the dwell on every single interleaved success, or it can fail ~80% of its
+    /// turns forever without ever paging a human — the risk a reviewer flagged against
+    /// a naive "any success clears it" design.
+    public static let successesToClearPending = 2
+
+    /// The state to persist the moment a give-up-worthy streak is seen (every failed
+    /// turn once `consecutiveFailures >= 5`, not just the first). Starts `pendingSince`
+    /// the first time; a later call for the SAME failure text leaves the clock running
+    /// — it must survive every subsequent failed turn AND every process restart,
+    /// because `consecutiveFailures` is an in-memory local that a crash-loop restart
+    /// wipes. Without this persisted clock, a daemon restarting every ~90 seconds would
+    /// never accumulate an unbroken 30 minutes inside one process lifetime and would
+    /// never page — silencing exactly the 2026-09-09/10 crash-loop class this whole
+    /// mechanism exists for. A DIFFERENT failure text restarts the dwell, the same way
+    /// `statePaged` treats a new failure as news. Any failure — same text or not —
+    /// breaks a success streak that was building toward `successesToClearPending`.
+    public static func statePending(after previous: StallNotifyState?, failure: String, now: Date) -> StallNotifyState {
+        let key = failureKey(failure)
+        var state = previous ?? StallNotifyState(lastNotifiedAt: .distantPast, pageCount: 0, active: false)
+        if state.pendingFailureKey != key {
+            state.pendingSince = now
+            state.pendingFailureKey = key
+        }
+        state.pendingSuccessStreak = 0
+        return state
+    }
+
+    /// The state to persist after a turn SUCCEEDS, for a stall that may still be
+    /// pending (not yet paged). Nil when there is nothing pending to update. Recovery
+    /// only clears the dwell once `successesToClearPending` successes land in a row —
+    /// see that constant's doc. Independent of `stateRecovered`, which only fires once
+    /// a page has actually gone out; this is what lets a streak be cancelled BEFORE it
+    /// ever reaches a human.
+    public static func statePendingSucceeded(after previous: StallNotifyState?) -> StallNotifyState? {
+        guard var state = previous, state.pendingSince != nil else { return previous }
+        state.pendingSuccessStreak += 1
+        if state.pendingSuccessStreak >= successesToClearPending {
+            state.pendingSince = nil
+            state.pendingFailureKey = nil
+            state.pendingSuccessStreak = 0
+        }
+        return state
+    }
+
+    /// Whether a pending streak — still the SAME unresolved failure named by
+    /// `pendingFailureKey` — has dwelled long enough to be worth paging.
+    public static func pendingHasDwelled(
+        state: StallNotifyState?, failure: String, now: Date, dwell: TimeInterval = dwellBeforePaging
+    ) -> Bool {
+        guard let state, let pendingSince = state.pendingSince, state.pendingFailureKey == failureKey(failure)
+        else { return false }
+        return now.timeIntervalSince(pendingSince) >= dwell
     }
 
     /// The cooldown before page N+1 of the same failure: base × 2^(N−1), capped.

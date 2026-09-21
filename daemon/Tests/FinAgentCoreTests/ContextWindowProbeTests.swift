@@ -29,6 +29,24 @@ final class ContextWindowProbeTests: XCTestCase {
             fromRefusal: #"{"error":{"message":"model not found: gemma-99"}}"#))
     }
 
+    /// Verbatim from the iMac's live `audit.jsonl`, 218 occurrences over two days
+    /// (2026-09-20). No digits at all — `windowTokens` correctly returns nil for it, but
+    /// callers that stopped at `windowTokens != nil` never noticed this WAS a context
+    /// overflow and never fell back to inferring a number. `isContextOverflow` is what a
+    /// caller checks instead.
+    private let bareOverflow = #"{"code":500,"message":"Context size has been exceeded.","type":"server_error"}"#
+
+    func testTheBareOverflowIsRecognizedEvenWithNoNumber() {
+        XCTAssertTrue(ContextWindowProbe.isContextOverflow(bareOverflow))
+        XCTAssertNil(ContextWindowProbe.windowTokens(fromRefusal: bareOverflow),
+                     "no digits to parse — this is exactly the case isContextOverflow exists for")
+    }
+
+    func testIsContextOverflowAgreesWithWindowTokensOnEveryOtherCase() {
+        XCTAssertTrue(ContextWindowProbe.isContextOverflow(realRefusal))
+        XCTAssertFalse(ContextWindowProbe.isContextOverflow(#"{"error":{"message":"model not found: gemma-99"}}"#))
+    }
+
     func testOnlyClaimingMoreThanTheServerHasIsTheBug() {
         // The live mismatch.
         XCTAssertTrue(ContextWindowProbe.isOverstated(configured: 32768, serverWindow: 8192))

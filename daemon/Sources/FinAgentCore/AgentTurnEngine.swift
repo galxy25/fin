@@ -302,6 +302,23 @@ public final class AgentTurnEngine {
     /// number was observed or merely configured — `source` says which.
     public private(set) var contextWindow: ContextWindowReading?
 
+    /// Fires whenever `contextWindow` is set from a live signal — a refusal, an inferred
+    /// ceiling, or a probe — never from `.configured`. A host persists this across
+    /// restarts (the daemon writes it to a marker file keyed by model identifier) so a
+    /// ceiling learned the hard way is not re-forgotten and re-learned every process
+    /// lifetime; see `seedContextWindow` for the restore side.
+    public var onContextWindowLearned: ((ContextWindowReading) -> Void)?
+
+    /// Restores a ceiling learned in a previous process lifetime. Guarded to only apply
+    /// before anything else has set `contextWindow`: a live signal from THIS process —
+    /// even a `.configured` fallback the caller later upgrades — must never be clobbered
+    /// by a stale restore racing in late.
+    public func seedContextWindow(_ reading: ContextWindowReading) {
+        guard contextWindow == nil else { return }
+        contextWindow = reading
+        record("notice", "[context] restored \(reading.summary) from a previous run")
+    }
+
     private var observedContextWindowTokens: Int? { contextWindow?.loadedTokens }
 
     /// The reading as the rest of the system should see it: the observed one when we have
@@ -351,6 +368,7 @@ public final class AgentTurnEngine {
         } else {
             record("notice", "[context] endpoint serves \(reading.summary)")
         }
+        onContextWindowLearned?(reading)
         return reading
     }
 
@@ -652,25 +670,66 @@ public final class AgentTurnEngine {
                 let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 lastMessage = message
 
-                // THE SERVER JUST TOLD US ITS REAL WINDOW. Learn it, clamp every budget
-                // to it, and trim — so the retry that follows is one the server can
-                // actually answer, and so this process never again sizes a pane capture
-                // against a window four times larger than the one it has.
-                if case AgentEndpointError.http(_, let body) = error,
-                   let serverWindow = ContextWindowProbe.windowTokens(fromRefusal: body),
-                   ContextWindowProbe.isOverstated(
-                       configured: effectiveContextWindowTokens, serverWindow: serverWindow
-                   ) {
-                    let notice = ContextWindowProbe.mismatchMessage(
-                        configured: effectiveContextWindowTokens, serverWindow: serverWindow
-                    )
-                    contextWindow = ContextWindowReading(
-                        loadedTokens: serverWindow,
-                        maxTokens: contextWindow?.maxTokens,
-                        source: .refusal
-                    )
-                    record("notice", notice, isFailure: true)
-                    _ = transcript.compactIfNeeded(budget: contextBudget)
+                // THE SERVER JUST TOLD US ITS REAL WINDOW — or at least that we blew past
+                // it. Two error shapes carry that: `.http` for a rejected request, and
+                // `.streamFailure` for a refusal that arrives mid-SSE-stream instead of as
+                // a rejected request — both come from the same llama.cpp backend depending
+                // on how far a request got before the window bit, and only checking `.http`
+                // silently missed every one of the second shape. Learn it, clamp every
+                // budget to it, and trim — so the retry that follows is one the server can
+                // actually answer.
+                var refusalText: String?
+                if case AgentEndpointError.http(_, let body) = error {
+                    refusalText = body
+                } else if case AgentEndpointError.streamFailure(_, let message) = error {
+                    refusalText = message
+                }
+                if let refusalText, ContextWindowProbe.isContextOverflow(refusalText) {
+                    if let serverWindow = ContextWindowProbe.windowTokens(fromRefusal: refusalText),
+                       ContextWindowProbe.isOverstated(
+                           configured: effectiveContextWindowTokens, serverWindow: serverWindow
+                       ) {
+                        let notice = ContextWindowProbe.mismatchMessage(
+                            configured: effectiveContextWindowTokens, serverWindow: serverWindow
+                        )
+                        let reading = ContextWindowReading(
+                            loadedTokens: serverWindow,
+                            maxTokens: contextWindow?.maxTokens,
+                            source: .refusal
+                        )
+                        contextWindow = reading
+                        record("notice", notice, isFailure: true)
+                        _ = transcript.compactIfNeeded(budget: contextBudget)
+                        onContextWindowLearned?(reading)
+                    } else if ContextWindowProbe.windowTokens(fromRefusal: refusalText) == nil {
+                        // The server confirmed an overflow but named no number — llama.cpp's
+                        // bare "Context size has been exceeded." (LM Studio, 2026-09-20) is
+                        // exactly this, and it is the common case, not the rare one: 174 of
+                        // these in two days, every one of them a no-op under the old
+                        // number-only check. Infer a ceiling from what THIS request actually
+                        // sent — the transcript plus the output room reserved is a lower
+                        // bound on what the server just refused — cushioned down rather than
+                        // trusted exactly, and applied ONLY if it lowers the window: an
+                        // inferred number correcting itself upward would recreate the exact
+                        // overstatement bug this exists to fix.
+                        let sent = transcript.estimatedTokenCount + configuration.maxOutputTokens
+                        let inferred = Int(Double(sent) * 0.85)
+                        if inferred > 0, inferred < effectiveContextWindowTokens {
+                            let notice = "[context] endpoint refused with \"\(refusalText)\" and named "
+                                + "no number; inferring a window of ~\(inferred) tokens from what this "
+                                + "turn actually sent (\(sent) tokens), down from the configured "
+                                + "\(effectiveContextWindowTokens)."
+                            let reading = ContextWindowReading(
+                                loadedTokens: inferred,
+                                maxTokens: contextWindow?.maxTokens,
+                                source: .inferredFromOverflow
+                            )
+                            contextWindow = reading
+                            record("notice", notice, isFailure: true)
+                            _ = transcript.compactIfNeeded(budget: contextBudget)
+                            onContextWindowLearned?(reading)
+                        }
+                    }
                 }
 
                 // CLASSIFY BEFORE COUNTING. A revoked key or an empty balance is not a

@@ -1237,6 +1237,36 @@ final class Daemon {
             .path
     }
 
+    /// The learned context window ceiling (`ContextWindowMarker`), same sibling-file
+    /// directory. Without this, every restart forgets a ceiling learned from a real
+    /// refusal and goes back to the configured number the refusal just disproved — on
+    /// the crash-restart-recover pattern this daemon actually sees, that meant relearning
+    /// the same lesson, the expensive way, every cycle. See `ContextWindowMarker`.
+    private var contextWindowStatePath: String {
+        URL(fileURLWithPath: auditLogPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("fin-agentd-context-window.json")
+            .path
+    }
+
+    /// Restores a ceiling learned in a previous process lifetime, before the engine takes
+    /// its first turn — mirrors `restoreAwaitingUserInput`'s "read once at startup"
+    /// shape. `seedContextWindow` itself is guarded to a no-op past the engine's first
+    /// live reading, so calling this before that first turn is the only ordering that
+    /// matters.
+    private func restoreContextWindow(engine: AgentTurnEngine, modelIdentifier: String) {
+        guard let reading = ContextWindowMarker.state(at: contextWindowStatePath, forModel: modelIdentifier)
+        else { return }
+        engine.seedContextWindow(reading)
+    }
+
+    /// Wired to `engine.onContextWindowLearned` — persists every live reading so the next
+    /// restart can call `restoreContextWindow` instead of relearning it from a fresh
+    /// round of empty completions.
+    private func persistContextWindow(_ reading: ContextWindowReading, modelIdentifier: String) {
+        ContextWindowMarker.write(reading, modelIdentifier: modelIdentifier, at: contextWindowStatePath)
+    }
+
     /// Closes out a paged stall on the first turn that succeeds: one "is back" push per
     /// incident, so the owner who was paged about the outage also hears it ended, and the
     /// next stall starts a fresh backoff instead of inheriting this one's page count.
@@ -1251,6 +1281,19 @@ final class Daemon {
         log(line)
         record(AgentAuditEvent(kind: "notice", text: line))
         notify(event: "agent-recovered", message: "fin-agentd is answering again; the earlier stall is over.")
+    }
+
+    /// Turn succeeded — if a give-up-worthy failure streak was mid-dwell (five or more
+    /// consecutive failures, but not yet paged), count this toward the consecutive
+    /// successes that cancel it. Distinct from `noteStallRecovered`, which only fires
+    /// once a page has actually gone out; this is what lets a streak be cancelled
+    /// silently, the same way it would have been noticed silently by a human watching.
+    /// No-op, and writes nothing, when nothing is pending.
+    private func notePendingStreakSucceeded() {
+        guard let updated = StallNotifyGate.statePendingSucceeded(
+            after: StallNotifyMarker.state(at: stallNotifyStatePath)
+        ) else { return }
+        StallNotifyMarker.write(updated, at: stallNotifyStatePath)
     }
 
     /// A local cache of the shared cumulative profile (`/memory/profile`), same sibling-
@@ -1548,6 +1591,15 @@ final class Daemon {
             tmuxGuard: tmuxGuard,
             audit: { [weak self] event in self?.record(event) }
         )
+        // RESTORE BEFORE THE FIRST PROBE, not after — a ceiling learned in a previous
+        // process lifetime is real information, and `seedContextWindow` only takes effect
+        // while `contextWindow` is still nil, so this must run before anything else has a
+        // chance to set it.
+        restoreContextWindow(engine: engine, modelIdentifier: config.agent.modelIdentifier)
+        engine.onContextWindowLearned = { [weak self] reading in
+            guard let self else { return }
+            self.persistContextWindow(reading, modelIdentifier: self.config.agent.modelIdentifier)
+        }
         // ASK BEFORE THE FIRST TURN, not after a turn has already been damaged by the
         // answer. The refusal-derived clamp still exists as a backstop, but it can only
         // ever fire once a turn has already overrun the window; this makes the ordinary
@@ -1975,6 +2027,7 @@ final class Daemon {
                 lastAssistantPreview = String(text.prefix(200))
                 log("agent: \(text)")
                 noteStallRecovered()
+                notePendingStreakSucceeded()
                 // Kept past the ack so a task-complete push below can name the
                 // message it answers — the control plane pushes each message's
                 // reply once, whichever of the ack or this push gets there first.
@@ -2075,17 +2128,37 @@ final class Daemon {
                     continue
                 }
                 if consecutiveFailures >= 5 {
-                    // consecutiveFailures is a local var — it does NOT survive the
-                    // process restart `fail()` triggers below. Without this persisted
-                    // cooldown, a launchd `KeepAlive` loop hitting the same root cause
-                    // gets a fresh "free first strike" at 5 failures every restart,
-                    // paging a human every ~17 minutes for as long as the underlying
-                    // failure persists — exactly what happened live on 2026-09-09/10.
+                    // DWELL BEFORE PAGING. consecutiveFailures is a local var — it does
+                    // NOT survive the process restart `fail()` used to trigger
+                    // unconditionally here. The max observed page-to-recovery gap in a
+                    // week of live pages was under 16 minutes, so paging the instant the
+                    // 5th failure lands wakes a human for something that, most of the
+                    // time, was already healing itself. `pendingSince` is persisted
+                    // (`StallNotifyGate.statePending`) precisely so this dwell survives
+                    // a restart too — an in-memory dwell counter would page NEVER for a
+                    // daemon crash-looping every ~90 seconds, since no single process
+                    // lifetime would ever hold an unbroken 30 minutes; that would have
+                    // silenced exactly the 2026-09-09/10 crash-loop class this whole
+                    // mechanism exists for.
                     let now = Date()
-                    let stallState = StallNotifyMarker.state(at: stallNotifyStatePath)
+                    let stallState = StallNotifyGate.statePending(
+                        after: StallNotifyMarker.state(at: stallNotifyStatePath), failure: message, now: now
+                    )
+                    StallNotifyMarker.write(stallState, at: stallNotifyStatePath)
+
+                    guard StallNotifyGate.pendingHasDwelled(state: stallState, failure: message, now: now) else {
+                        let since = stallState.pendingSince ?? now
+                        let remainingMin = max(0, Int((StallNotifyGate.dwellBeforePaging - now.timeIntervalSince(since)) / 60) + 1)
+                        let line = "[stall] \(consecutiveFailures) consecutive failures, still inside the dwell "
+                            + "window — retrying silently, will page in ~\(remainingMin) min if still unresolved"
+                        log(line)
+                        record(AgentAuditEvent(kind: "notice", text: line))
+                        continue
+                    }
+
                     if StallNotifyGate.shouldNotify(state: stallState, failure: message, now: now) {
-                        let repeatNote = (stallState?.active == true && stallState?.failureKey == StallNotifyGate.failureKey(message))
-                            ? " (still the same failure; next page in \(Int(StallNotifyGate.repeatCooldown(pageCount: (stallState?.pageCount ?? 0) + 1) / 60)) min at the earliest)"
+                        let repeatNote = (stallState.active && stallState.failureKey == StallNotifyGate.failureKey(message))
+                            ? " (still the same failure; next page in \(Int(StallNotifyGate.repeatCooldown(pageCount: stallState.pageCount + 1) / 60)) min at the earliest)"
                             : ""
                         notify(
                             event: "agent-stalled",

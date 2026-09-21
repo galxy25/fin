@@ -259,6 +259,39 @@ final class AgentCoreLogicTests: XCTestCase {
         XCTAssertTrue(refusal?.text.contains("REFUSED") ?? false, "got: \(refusal?.text ?? "nil")")
         XCTAssertTrue(audited.contains { $0.kind == "error" && $0.isFailure }, "refusal must land in the audit trail")
     }
+
+    // MARK: - Context window seeding (restore-across-restart)
+
+    /// `seedContextWindow` is how a restored `ContextWindowMarker` reading gets back into
+    /// a fresh engine. It must actually take effect on a clean engine — the case a daemon
+    /// restart is in every time.
+    @MainActor
+    func testSeedContextWindowAppliesOnAFreshEngine() async {
+        let engine = AgentTurnEngine(
+            configuration: AgentEngineConfiguration(endpointURL: "http://127.0.0.1:1", modelIdentifier: "stub"),
+            session: RecordingStubSession(),
+            audit: { _ in }
+        )
+        XCTAssertNil(engine.contextWindow)
+        engine.seedContextWindow(ContextWindowReading(loadedTokens: 5_500, source: .inferredFromOverflow))
+        XCTAssertEqual(engine.contextWindow?.loadedTokens, 5_500)
+        XCTAssertEqual(engine.contextWindow?.source, .inferredFromOverflow)
+    }
+
+    /// A restore racing in AFTER a live reading must never win — the live signal from
+    /// THIS process is always more current than a marker written last time.
+    @MainActor
+    func testSeedContextWindowNeverOverwritesALiveReading() async {
+        let engine = AgentTurnEngine(
+            configuration: AgentEngineConfiguration(endpointURL: "http://127.0.0.1:1", modelIdentifier: "stub"),
+            session: RecordingStubSession(),
+            audit: { _ in }
+        )
+        engine.seedContextWindow(ContextWindowReading(loadedTokens: 32_768, source: .modelsAPI))
+        engine.seedContextWindow(ContextWindowReading(loadedTokens: 5_500, source: .inferredFromOverflow))
+        XCTAssertEqual(engine.contextWindow?.loadedTokens, 32_768, "the first (live) reading must win")
+        XCTAssertEqual(engine.contextWindow?.source, .modelsAPI)
+    }
 }
 
 /// Minimal in-memory conformer for engine tests that must not touch SSH.

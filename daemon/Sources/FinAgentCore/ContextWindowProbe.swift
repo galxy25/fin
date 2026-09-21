@@ -25,13 +25,28 @@ import FoundationNetworking
 /// protocol-shaped rather than vendor-shaped — the same discipline as naming the
 /// protocol and not the vendor in the endpoint labels.
 public enum ContextWindowProbe {
+    /// Whether a refusal or mid-stream failure names a context-size overflow AT ALL —
+    /// with or without a number attached. Split out from `windowTokens(fromRefusal:)`
+    /// because not every server that says this says a number too: llama.cpp's server
+    /// (the backend under LM Studio) answers an overflow with the bare
+    /// `"Context size has been exceeded."` — true, and useless to `windowTokens`, whose
+    /// three patterns all require digits nearby. A caller that only checks
+    /// `windowTokens(fromRefusal:) != nil` silently does nothing for that server; this
+    /// predicate is what tells it to fall back to inference instead
+    /// (`AgentTurnEngine.completeWithRetries`, 2026-09-20: 174 of these in two days, the
+    /// self-correction never engaged, and 53 stall pages followed from prompts the
+    /// endpoint had been failing on for hours).
+    public static func isContextOverflow(_ text: String) -> Bool {
+        text.localizedCaseInsensitiveContains("context size")
+            || text.contains("n_ctx")
+            || text.localizedCaseInsensitiveContains("exceed_context_size")
+    }
+
     /// The server's real window, parsed out of a refusal body. Nil when the body is not
-    /// a context-size refusal — every other 400 must keep its own meaning.
+    /// a context-size refusal, OR when it is one but names no number — see
+    /// `isContextOverflow`, which a caller needs for that second case.
     public static func windowTokens(fromRefusal body: String) -> Int? {
-        guard body.localizedCaseInsensitiveContains("context size")
-            || body.contains("n_ctx")
-            || body.localizedCaseInsensitiveContains("exceed_context_size")
-        else { return nil }
+        guard isContextOverflow(body) else { return nil }
 
         // `"n_ctx":8192` is the structured field; the prose form is the fallback.
         for pattern in [#""n_ctx"\s*:\s*([0-9]{3,7})"#,
@@ -95,6 +110,13 @@ public struct ContextWindowReading: Equatable, Sendable, Codable {
         /// Nothing reported anything; this is `contextWindowTokens` from the config and
         /// has not been checked against reality.
         case configured
+        /// The server confirmed an overflow (`ContextWindowProbe.isContextOverflow`) but
+        /// named no number — llama.cpp's `"Context size has been exceeded."` is exactly
+        /// this. Backed into from what the failing turn actually sent
+        /// (`transcript.estimatedTokenCount + maxOutputTokens`, cushioned down), so it is
+        /// weaker than `refusal`: a real ceiling, just not a measured one. Still strictly
+        /// better than trusting a `.configured` number the server just proved wrong.
+        case inferredFromOverflow = "inferred_from_overflow"
     }
 
     /// The window the model is serving right now — what every budget must respect.
