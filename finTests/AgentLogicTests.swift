@@ -1203,7 +1203,7 @@ final class AgentLogicTests: XCTestCase {
         )
     }
 
-    func testConsolidationDailyFloor() {
+    func testConsolidationFloor() {
         let now = Self.tickNow
         // Never succeeded and memories are waiting: due.
         XCTAssertTrue(AgentWatchdog.consolidationFloorDue(
@@ -1211,14 +1211,14 @@ final class AgentLogicTests: XCTestCase {
             hasUnconsolidatedMemories: { true }
         ))
         XCTAssertTrue(AgentWatchdog.consolidationFloorDue(
-            lastSuccessAt: now.addingTimeInterval(-25 * 60 * 60),
+            lastSuccessAt: now.addingTimeInterval(-90 * 60),
             lastAttemptAt: now.addingTimeInterval(-31 * 60),
             isBusy: false, now: now,
             hasUnconsolidatedMemories: { true }
         ))
         // Succeeded recently: the post-turn pacing path owns it.
         XCTAssertFalse(AgentWatchdog.consolidationFloorDue(
-            lastSuccessAt: now.addingTimeInterval(-23 * 60 * 60),
+            lastSuccessAt: now.addingTimeInterval(-45 * 60),
             lastAttemptAt: nil, isBusy: false, now: now,
             hasUnconsolidatedMemories: { true }
         ))
@@ -1244,13 +1244,13 @@ final class AgentLogicTests: XCTestCase {
 
     /// The memories check costs a SwiftData fetch, so the free checks must rule the
     /// tick out before it ever runs — the all-quiet 5s tick does zero I/O.
-    func testConsolidationDailyFloorConsultsMemoriesLazily() {
+    func testConsolidationFloorConsultsMemoriesLazily() {
         let now = Self.tickNow
         XCTAssertFalse(AgentWatchdog.consolidationFloorDue(
             lastSuccessAt: now.addingTimeInterval(-60), lastAttemptAt: nil,
             isBusy: false, now: now,
             hasUnconsolidatedMemories: {
-                XCTFail("a satisfied 24h stamp must skip the candidates fetch")
+                XCTFail("a satisfied floor stamp must skip the candidates fetch")
                 return true
             }
         ))

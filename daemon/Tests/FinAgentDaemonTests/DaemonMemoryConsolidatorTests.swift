@@ -98,8 +98,8 @@ final class DaemonMemoryConsolidatorTests: XCTestCase {
 
     func testRunDoesNotWriteCacheFileWhenRefreshCacheIsFalseAndConsolidationSkips() async {
         let (consolidator, _) = makeConsolidator { request in
-            // Recent updatedAt: the 24h floor isn't due, so nothing past the profile
-            // read should happen — including no cache write, since refreshCache is false.
+            // refreshCache is false, so nothing past the profile read should write
+            // the cache file regardless of whether consolidation itself runs.
             self.ok(self.profileBody(content: "x", updatedAt: ISO8601DateFormatter().string(from: Date())), for: request)
         }
         await consolidator.run(refreshCache: false, attemptConsolidation: true)
@@ -124,7 +124,7 @@ final class DaemonMemoryConsolidatorTests: XCTestCase {
             return self.ok(self.profileBody(content: "x", updatedAt: ISO8601DateFormatter().string(from: Date())), for: request)
         }
         await consolidator.run(refreshCache: false, attemptConsolidation: true)
-        XCTAssertFalse(lockClaimed, "the 24h floor isn't due yet — must never reach the lock")
+        XCTAssertFalse(lockClaimed, "the candidates fetch got the profile shape back, not entries — must never reach the lock")
     }
 
     func testRunSkipsConsolidationWhenThereAreNoNewCandidates() async {

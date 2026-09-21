@@ -1988,12 +1988,16 @@ def put_device_token(event):
 
 # The daemon's event vocabulary on POST /notify. Anything else (including an
 # absent field — every pre-Phase-1 daemon) is treated as a plain "notify".
-NOTIFY_EVENTS = ("request-input", "task-complete", "agent-stalled", "notify", "answered")
+# `operator-question` (2026-09-21): an operator Claude Code session — not Fin
+# itself — is blocked on Levi's answer and may not be watched; OperatorNotifyGate
+# (daemon-side) dwells before firing this, same "needs you" treatment as Fin's
+# own request-input, because the person is time-blocked either way.
+NOTIFY_EVENTS = ("request-input", "task-complete", "agent-stalled", "notify", "answered", "operator-question")
 # The events a human is being ASKED something by: they ride Announce's default
 # "Time Sensitive and Direct Messages" filter in the car, so they get the
 # time-sensitive interruption level (design §3.3 step 6). Nothing else does —
 # a chatty task-complete must not break through a Focus.
-NOTIFY_INPUT_EVENTS = ("request-input", "agent-stalled")
+NOTIFY_INPUT_EVENTS = ("request-input", "agent-stalled", "operator-question")
 # UNNotificationCategory identifiers the app registers (design §5.1): fin.input
 # for "needs you", fin.reply for everything the agent says back — both carry a
 # text-input reply action, the category only changes the wording around it.

@@ -263,6 +263,11 @@ final class DaemonNotifyClientTests: XCTestCase {
             DaemonNotifyClient.title(event: "someday-a-new-event", agentName: "Nimbus"),
             "Nimbus"
         )
+        XCTAssertEqual(
+            DaemonNotifyClient.title(event: "operator-question", agentName: "Nimbus"),
+            "Claude is waiting on you",
+            "not agent-name-shaped on purpose — this is about a Claude Code session, not the agent itself"
+        )
     }
 
     // MARK: - The message leaves the machine

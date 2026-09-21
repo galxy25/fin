@@ -1576,6 +1576,7 @@ class PushPayloadTests(unittest.TestCase):
         expected = {
             "request-input": ("fin.input", "time-sensitive"),
             "agent-stalled": ("fin.input", "time-sensitive"),
+            "operator-question": ("fin.input", "time-sensitive"),
             "task-complete": ("fin.reply", None),
             "notify": ("fin.reply", None),
             "answered": ("fin.reply", None),

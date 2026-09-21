@@ -678,6 +678,16 @@ final class Daemon {
     /// the one alert a non-resident daemon exists to deliver. Bounded by the client's
     /// own request timeout, so a dead control plane can't wedge a shutdown.
     private var lastNotifyTask: Task<Bool, Never>?
+    /// The most recent episodic-memory upsert, same reason as `lastNotifyTask`: fire-
+    /// and-forget with nothing awaiting it meant a turn that completed moments before a
+    /// restart (a crash loop, a `shutdown()`, the work laptop's own documented
+    /// instability) silently lost that turn's `recordTurnInEpisodicMemory` write — the
+    /// POST never got the chance to leave the process. Live evidence 2026-09-21: one
+    /// site (stable, low restart rate) has written episodic memory since 2026-09-10;
+    /// its sibling (a site with a documented crash-loop history) has never successfully
+    /// written one, ever, despite having the real conversations more recently. Awaited
+    /// on the same exit paths `lastNotifyTask` already is.
+    private var lastMemoryTask: Task<AgentRememberOutcome, Never>?
     /// The app-side Agent UUID from the config; validated at load, so nil here means
     /// "unset", never "malformed".
     private let agentID: UUID?
@@ -1224,6 +1234,17 @@ final class Daemon {
         URL(fileURLWithPath: auditLogPath)
             .deletingLastPathComponent()
             .appendingPathComponent("fin-agentd-awaiting-input.json")
+            .path
+    }
+
+    /// `OperatorNotifyGate`'s watch file — written by `scripts/dev/watch-for-
+    /// answer.sh` when a Claude Code session on THIS Mac blocks on Levi's answer,
+    /// read every heartbeat here. Same sibling-file directory, same "a body other
+    /// than the daemon may write this" precedent as the goals ledger.
+    private var operatorNotifyStatePath: String {
+        URL(fileURLWithPath: auditLogPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("operator-notify.json")
             .path
     }
 
@@ -2033,6 +2054,26 @@ final class Daemon {
                 // reply once, whichever of the ack or this push gets there first.
                 let answeredMessageID = inFlightSiteMessageID
                 let answeredThreadID = inFlightThreadID
+                // TELEMETRY FOR THE 2026-09-16 BLACKSTREET INCIDENT: a "neither, drop
+                // it" reply answered as "I don't see a message from you in our current
+                // turn" — the request was never registered, so Fin re-asked the same
+                // clarifying question twice, each as its own orphaned thread. This one
+                // guard doesn't change behavior; it turns the next occurrence into one
+                // grep instead of a manual transcript archaeology pass. The exact
+                // request text is logged here (not just its control-plane row) because
+                // that row can now be gone — Delete removes it — by the time anyone
+                // looks; `Self.userTurnPrompt` embeds it into the prompt verbatim, so if
+                // this fires with the request text plainly present below, that argues
+                // against a delivery bug and toward the model losing track of it in a
+                // saturated context (see the per-round-trip token telemetry above this
+                // turn's `notice` events for prompt/window size at the time).
+                if let id = inFlightSiteMessageID, let request = inFlightSiteMessageText,
+                   AgentTurnLogic.looksLikeMissingMessageConfusion(text) {
+                    let line = "[site] reply reads as a missing-message confusion for \(id.prefix(10)) — "
+                        + "request was: \(request)"
+                    log(line)
+                    record(AgentAuditEvent(kind: "notice", text: line, isFailure: true))
+                }
                 if let id = inFlightSiteMessageID {
                     let proposal = inFlightThreadProposal
                     clearInFlightMessage()
@@ -2276,6 +2317,7 @@ final class Daemon {
             log("heartbeat")
             inFlightDirectiveID = nil
             pendingUserMessageForDigest = nil
+            checkOperatorNotifyGate()
             // Belt and braces: a heartbeat never answers a claimed message. If an
             // id survived to here, settle it now rather than let the decision
             // JSON become someone's reply.
@@ -2307,8 +2349,8 @@ final class Daemon {
         let startedAt = conversationStartedAt
         let title = conversationTitle
         let content = conversationDigest
-        Task {
-            _ = await memoryClient.rememberConversation(
+        lastMemoryTask = Task {
+            await memoryClient.rememberConversation(
                 id: id, startedAt: startedAt, title: title, content: content, tags: "auto,conversation"
             )
         }
@@ -2729,6 +2771,7 @@ final class Daemon {
         Task { @MainActor in
             await transcript?.flush()
             await lastNotifyTask?.value
+            await lastMemoryTask?.value
             try? await Task.sleep(for: .milliseconds(300))
             self.terminateOnce(exitCode)
         }
@@ -2775,6 +2818,7 @@ final class Daemon {
         await transcript?.flush()
         // The giving-up push (5 consecutive failures) precedes some fail()s; let it land.
         await lastNotifyTask?.value
+        await lastMemoryTask?.value
         auditLog.close()
         session?.disconnect()
         terminate(1)
@@ -2799,6 +2843,29 @@ final class Daemon {
             }
         }
         runNotifyCommand(event: event, message: message)
+    }
+
+    /// Checked once per heartbeat tick, deterministically — before the model is
+    /// ever asked, so a weak local model's unreliable sense of time never gates a
+    /// time-sensitive push. Reads `scripts/dev/watch-for-answer.sh`'s file, fires
+    /// `operator-question` for anything past its own dwell and not yet fired, and
+    /// persists the result (notified + pruned of anything stale) in one write so a
+    /// restart mid-tick can't double-push. A missing or empty file is the common
+    /// case and costs one file read.
+    private func checkOperatorNotifyGate() {
+        let path = operatorNotifyStatePath
+        let now = Date()
+        let loaded = OperatorNotifyMarker.state(at: path)
+        var state = OperatorNotifyGate.prunedOfStale(loaded, now: now)
+        let due = OperatorNotifyGate.due(in: state, now: now)
+        for request in due {
+            notify(event: "operator-question", message: request.question, threadID: request.threadID)
+            state = OperatorNotifyGate.notified(state, id: request.id, at: now)
+            log("[operator-notify] fired \(request.id): \(request.question)")
+        }
+        if state != loaded {
+            OperatorNotifyMarker.write(state, at: path)
+        }
     }
 
     /// True when SOME push channel is wired — the control plane, the shell hook, or both.

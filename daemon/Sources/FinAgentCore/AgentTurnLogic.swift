@@ -153,6 +153,28 @@ public enum AgentTurnLogic {
         return head.contains("\"decision\"")
     }
 
+    /// A reply that claims it never saw the user's message — the 2026-09-16
+    /// Blackstreet incident's signature ("I don't see a message from you in
+    /// our current turn"): the model answered as though `runMessageTurn`'s
+    /// prompt had nothing in it, even though `Daemon.userTurnPrompt` embeds
+    /// the request verbatim every time. Not acted on (no retry, no behavior
+    /// change) — purely a telemetry marker so the daemon's own log names the
+    /// failure instead of leaving it to be reconstructed from the control
+    /// plane's event history after the fact. Best-effort phrase match: a
+    /// free-form model reply can't be matched exhaustively, so a miss here
+    /// just means this particular occurrence isn't flagged, not that the
+    /// detector is wrong to exist.
+    public static func looksLikeMissingMessageConfusion(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        let signals = [
+            "don't see a message", "do not see a message", "no message from you",
+            "didn't receive a message", "did not receive a message",
+            "haven't received a message", "have not received a message",
+            "what you'd like me to work on", "what you would like me to work on",
+        ]
+        return signals.contains { lowered.contains($0) }
+    }
+
     /// The one corrective turn a task turn gets when its answer was a decision
     /// blob: the request restated, JSON forbidden, tools optional.
     public static func decisionRetryPrompt(request: String) -> String {

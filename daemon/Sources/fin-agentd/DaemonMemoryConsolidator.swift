@@ -16,9 +16,9 @@ import FoundationNetworking
 ///   profile, write its content to `cacheFileURL` — cheap, keeps this daemon's own
 ///   prompt reasonably current with whatever anyone else last wrote, independent of
 ///   whether a rewrite is also due.
-/// - **Compaction** (`consolidationFloor`, 24h since the profile's OWN `updatedAt` —
-///   not a local stamp, so whichever client or daemon runs it first resets the clock
-///   for everyone, matching "S3 as source of truth"; `consolidationPacing`, ~30 min
+/// - **Compaction** (`consolidationFloor`, 1h since THIS daemon's own last successful
+///   rewrite — see `lastConsolidationAt`'s doc for why not `profile.updatedAt`;
+///   `consolidationPacing`, ~30 min
 ///   between local ATTEMPTS so a persistently failing backend doesn't retry every
 ///   tick): claim the cross-device lock, fetch episodic entries newer than the
 ///   profile's `updatedAt`, summarize with a raw (`tools: []`) completion call,
@@ -27,8 +27,8 @@ import FoundationNetworking
 final class DaemonMemoryConsolidator {
     /// Mirrors `AgentWatchdog.consolidationFloor` (app-only, not in `FinAgentCore`) —
     /// duplicated rather than shared for one call site's sake; keep the two numbers in
-    /// sync by hand if either changes.
-    static let consolidationFloor: TimeInterval = 24 * 60 * 60
+    /// sync by hand if either changes. Was 24h; see that constant's doc for why 1h.
+    static let consolidationFloor: TimeInterval = 60 * 60
     /// Mirrors `AgentWatchdog.consolidationPacing`.
     static let consolidationPacing: TimeInterval = 30 * 60
     static let cacheRefreshInterval: TimeInterval = 5 * 60

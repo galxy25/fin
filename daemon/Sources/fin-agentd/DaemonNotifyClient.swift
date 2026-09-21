@@ -77,6 +77,7 @@ final class DaemonNotifyClient {
         case "task-complete": return "\(agentName): task complete"
         case "agent-stalled": return "\(agentName) is stuck"
         case "agent-recovered": return "\(agentName) is back"
+        case "operator-question": return "Claude is waiting on you"
         default: return agentName
         }
     }

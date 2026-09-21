@@ -41,3 +41,16 @@ review notes, and feature priorities should reinforce it, not dilute it.
   merge continuously, you're the foreman of the software factory"): verify
   (build + evals), merge to main, push — don't sit on green branches. App
   Store / TestFlight **submissions** still need Levi's explicit word.
+- **Register a watch before asking Levi something blocking** (Levi, 2026-09-21):
+  when a question to him in a Claude Code session — any AskUserQuestion-shaped
+  moment, a plan-mode confirmation, anything you're waiting on his answer to
+  keep going — might go unnoticed because he's mid-task elsewhere, run
+  `scripts/dev/watch-for-answer.sh add <id> <minutes> "<question>"` right
+  alongside asking it. The resident Fin daemon on this Mac checks it every
+  heartbeat and pages him (time-sensitive) if it's still unanswered past the
+  deadline you pick — pick minutes to match how urgent the question actually
+  is, there's no fixed default. Call `watch-for-answer.sh clear <id>` the
+  moment he answers so he's never paged about something already resolved. See
+  `daemon/Sources/FinAgentCore/OperatorNotifyGate.swift` for why this is a
+  plain deterministic timer rather than something routed through Fin's own
+  heartbeat prompt/model judgment.

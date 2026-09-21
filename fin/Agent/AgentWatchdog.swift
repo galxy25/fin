@@ -40,8 +40,16 @@ enum AgentWatchdog {
     /// Continuous thinking beyond this earns a notice.
     static let thinkingWedgeThreshold: TimeInterval = 10 * 60
     /// Consolidation must succeed at least once per this window whenever
-    /// unconsolidated episodic memories exist.
-    static let consolidationFloor: TimeInterval = 24 * 60 * 60
+    /// unconsolidated episodic memories exist. Was 24h; live 2026-09-21 the profile's
+    /// `updatedAt` read "yesterday" while every dated fact in it was 6+ days stale —
+    /// a real rewrite (the empty-candidates guard in `DaemonMemoryConsolidator.run`/
+    /// `AgentRuntime.consolidateMemoriesIfDue` means a due-but-nothing-new tick never
+    /// writes) just hadn't had fresh episodic material to fold in for most of a day.
+    /// 1h keeps the floor from being the reason recent work takes until tomorrow to
+    /// show up, without changing when a write actually happens — that's still gated
+    /// on real new candidates existing, per `consolidationPacing` below and the
+    /// non-empty-hits guard.
+    static let consolidationFloor: TimeInterval = 60 * 60
     /// The consolidation machinery's own pacing between attempts (successful or
     /// not). The floor consults it too, so a due-but-paced tick doesn't audit-log
     /// and dispatch a guaranteed no-op every 5 seconds.
