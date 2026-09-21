@@ -102,7 +102,25 @@ public final class TerminalRelayClient {
     /// and taking it from the same control-plane call that told the app makes
     /// it impossible for the two sides to dial different relays.
     public func open(sessionId: String, tmuxSession: String, relayHost: String, relayPort: Int) {
-        guard sessions[sessionId] == nil else { return }
+        // ALWAYS the first thing this body does with the command, before any
+        // guard can return early — so "did the command even arrive here" is
+        // answered by the log/breadcrumb alone, never inferred from its
+        // absence. Live gap (2026-09-21): every stage past this point already
+        // logged on both success and failure, but nothing logged on ENTRY, so
+        // a run of failed connects from the work laptop looked identical —
+        // zero site-side events — whether `open` was never called at all, was
+        // called and silently deduped by the guard below, or was called and
+        // every dial attempt failed. `relay_state` is allow-listed
+        // server-side (`CLIENT_EVENT_KINDS`) but was never actually emitted
+        // by anything until now.
+        audit("[relay] terminal-open \(sessionId): received (tmux=\(tmuxSession), relay=\(relayHost):\(relayPort))")
+        logClientEvent("relay_state", sessionId: sessionId, detail: [
+            "stage": "received", "tmuxSession": tmuxSession, "relayHost": relayHost,
+        ])
+        guard sessions[sessionId] == nil else {
+            audit("[relay] terminal-open \(sessionId): ignored — already relaying (duplicate command)")
+            return
+        }
         guard let url = URL(string: "wss://\(relayHost):\(relayPort)/") else {
             audit("[relay] terminal-open \(sessionId): unusable relay address \(relayHost):\(relayPort)")
             logClientEvent("relay_ws_open_failed", sessionId: sessionId, detail: ["reason": "bad_relay_address"])
@@ -115,7 +133,13 @@ public final class TerminalRelayClient {
     /// `URLSessionWebSocketTask` has failed its connection there is nothing to
     /// retry ON — it has to be replaced, not resent.
     private func dial(sessionId: String, tmuxSession: String, url: URL, attemptsRemaining: Int) {
-        guard sessions[sessionId] == nil else { return }
+        guard sessions[sessionId] == nil else {
+            audit("[relay] terminal-open \(sessionId): dial abandoned — session already relaying")
+            return
+        }
+        if attemptsRemaining == Self.connectAttempts {
+            audit("[relay] terminal-open \(sessionId): dialing \(url.host ?? "?"):\(url.port ?? 0)")
+        }
         let socket = urlSession.webSocketTask(with: url)
         socket.resume()
         guard let attach = try? JSONSerialization.data(withJSONObject: [

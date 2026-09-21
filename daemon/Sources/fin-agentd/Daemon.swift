@@ -2536,7 +2536,17 @@ final class Daemon {
                 log("[relay] terminal-open command missing sessionId/tmuxSession/relay address — ignored")
                 return
             }
-            terminalRelayClient?.open(
+            // `terminalRelayClient` is only nil when `config.site` was nil at
+            // startup, which cannot be true here — this command only ever
+            // arrives ON a site's own heartbeat. Loud on purpose: the `?.`
+            // this replaced would have swallowed a `terminal-open` command
+            // completely silently in that impossible case, indistinguishable
+            // from every other kind of failure downstream of it.
+            guard let terminalRelayClient else {
+                log("[relay] terminal-open \(sessionId): no relay client (config.site was nil at startup) — dropped")
+                return
+            }
+            terminalRelayClient.open(
                 sessionId: sessionId, tmuxSession: tmuxSession,
                 relayHost: relayHost, relayPort: relayPort
             )
