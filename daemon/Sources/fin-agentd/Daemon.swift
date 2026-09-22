@@ -302,6 +302,15 @@ struct DaemonConfig: Decodable {
     var sessionActivity: SessionActivityConfig?
     /// Optional site block; see `SiteConfig`.
     var site: SiteConfig?
+    /// Whether this Mac is willing to proxy a GUI (VNC/RFB) session to the app —
+    /// docs/VNC.md. Deliberately NOT the shape `terminal_relay` has: that one is true
+    /// for any enrolled site, because a terminal is available the moment the relay code
+    /// is compiled in. A VNC session hands over the whole logged-in desktop — clipboard,
+    /// every other app, an unlocked password manager — not a shell bounded by one tmux
+    /// pane, so it stays a standing per-machine decision a human makes once, defaults
+    /// off, and is checked again locally before any session opens rather than trusted
+    /// from the advertised capability alone.
+    var vncProxyEnabled: Bool?
 
     static let defaultDeviceToken8 = "cloud001"
     static let defaultTranscriptFlushSeconds = 15
@@ -497,6 +506,21 @@ final class Daemon {
         config.agent.contextWindowTokens ?? Self.defaultContextWindowTokens
     }
 
+    /// Whether this site can serve a GUI session right now (docs/VNC.md §2): the human
+    /// opted this machine in AND something is actually listening on the RFB port.
+    ///
+    /// TWO independent booleans, both required, and deliberately not collapsed into one.
+    /// "Opted in" is a standing decision a person made once; "reachable" is a fact about
+    /// this minute that flips whenever Screen Sharing is toggled outside Fin's control.
+    /// Collapsing them would make the flag lie in both directions — a machine that opted
+    /// in but has Screen Sharing off would advertise a session it can't open, and the
+    /// opt-in itself would look like it had been withdrawn every time the service
+    /// blipped. Recomputed every heartbeat, so the capability self-corrects within one
+    /// beat either way.
+    private var vncProxyCapability: Bool {
+        config.vncProxyEnabled == true && VNCPortProbe.isReachable()
+    }
+
     /// Static facts plus the titled-pane inventory over the DEFAULT tmux socket, the
     /// same fixed-argv exec channel `read_session` uses. A machine without tmux
     /// reports no sessions; the heartbeat never fails for it.
@@ -512,6 +536,7 @@ final class Daemon {
                 "always_on": config.stayResident ?? false,
                 "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
                 "terminal_relay": config.site != nil,
+                "vnc_proxy": vncProxyCapability,
                 "launch_stage": launchStage,
             ]
             if let launchFailure { caps["launch_failure"] = launchFailure }
@@ -548,6 +573,7 @@ final class Daemon {
             // than an assumption so an older daemon (which has no relay code
             // at all) still reports false and stays out of the app's picker.
             "terminal_relay": config.site != nil,
+            "vnc_proxy": vncProxyCapability,
         ]
         // The rule, and the bug it encodes, live in `PaneScanPolicy` — a pure function,
         // because "not while a turn is running" quietly meant "never" on a site whose

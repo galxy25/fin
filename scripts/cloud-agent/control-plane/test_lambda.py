@@ -3735,6 +3735,38 @@ class TerminalOpenCommandKindTests(_SitesTestCase):
         )
         self.assertEqual([c["kind"] for c in json.loads(beat["body"])["commands"]], ["terminal-open"])
 
+    def test_vnc_open_is_a_recognized_relay_backed_kind(self):
+        self.assertIn("vnc-open", lam.SITE_COMMAND_KINDS)
+        self.assertIn("vnc-open", lam.RELAY_BACKED_COMMAND_KINDS)
+
+    def test_vnc_open_gets_the_same_relay_address_as_terminal_open(self):
+        """The whole point of ensuring the relay inside queue_site_command: both
+        sides are handed one address. A GUI session shares the user's existing relay
+        instance with any open terminal — the relay multiplexes on sessionId."""
+        response = lam.queue_site_command(
+            {"_userId": "user-1", "body": json.dumps({"kind": "vnc-open", "args": {"sessionId": "s-gui-1"}})},
+            self.site["siteId"],
+        )
+        body = json.loads(response["body"])
+        command = body["command"]
+        self.assertEqual(command["kind"], "vnc-open")
+        # No tmuxSession: the target is the fixed loopback RFB port, not a named session.
+        self.assertEqual(command["args"], {
+            "sessionId": "s-gui-1", "relayHost": "203.0.113.7", "relayPort": 443,
+        })
+        self.assertEqual((body["relayHost"], body["relayPort"]), ("203.0.113.7", 443))
+
+    def test_vnc_open_drains_on_the_next_heartbeat_like_any_other_kind(self):
+        lam.queue_site_command(
+            {"_userId": "user-1", "body": json.dumps({"kind": "vnc-open", "args": {"sessionId": "s-gui-1"}})},
+            self.site["siteId"],
+        )
+        beat = lam.site_heartbeat(
+            {"_userId": "user-1", "_siteId": self.site["siteId"], "body": json.dumps({})},
+            self.site["siteId"],
+        )
+        self.assertEqual([c["kind"] for c in json.loads(beat["body"])["commands"]], ["vnc-open"])
+
     def test_a_site_still_cannot_queue_its_own_terminal_open(self):
         # Same reasoning as every other command kind (SiteTokenScopeTests): a
         # body that can queue its own commands could tell itself to open a

@@ -34,6 +34,13 @@ struct FinSite: Decodable, Equatable, Identifiable {
         /// older daemon that predates the feature simply omits it — nil reads as
         /// unsupported, never as a crash or a false yes.
         let terminalRelay: Bool?
+        /// Whether this site can serve a GUI (VNC) session right now — docs/VNC.md.
+        /// Unlike `terminalRelay` (true for any enrolled site), this is true only when
+        /// the machine's owner opted it in AND an RFB server is actually listening
+        /// there, both re-checked every heartbeat: a GUI session hands over the whole
+        /// desktop, so it is never on by default and never assumed from the fact that
+        /// the daemon knows how. nil reads as unsupported, same rule as every field here.
+        let vncProxy: Bool?
         /// Where the daemon's launch stands (`starting`, `connecting`, `probing`,
         /// `ready`, `failed`) and what stopped it — reported while `state` is
         /// "unavailable", so a body that cannot attach its terminal says why.
@@ -73,6 +80,7 @@ struct FinSite: Decodable, Equatable, Identifiable {
             case alwaysOn = "always_on"
             case tmuxSessions = "tmux_sessions"
             case terminalRelay = "terminal_relay"
+            case vncProxy = "vnc_proxy"
             case launchStage = "launch_stage"
             case launchFailure = "launch_failure"
         }

@@ -3976,7 +3976,13 @@ SITE_STATES = ("idle", "working", "needs-input", "task-complete", "draining", "u
 # below. It is delivered and drained exactly like the others, on the site's
 # next heartbeat; there is nothing terminal-relay-specific about the queue
 # itself, only about what the daemon does once it sees the command.
-SITE_COMMAND_KINDS = ("restart", "update", "stop", "drain", "terminal-open")
+# "vnc-open" is terminal-open's sibling for a GUI session (docs/VNC.md): same
+# on-demand relay worker, same sessionId-as-capability model, no tmuxSession arg
+# (the target is the fixed loopback RFB port, not a named session).
+SITE_COMMAND_KINDS = ("restart", "update", "stop", "drain", "terminal-open", "vnc-open")
+# The kinds that need a relay worker ensured before the command is queued, so both
+# sides are handed the same address (see `queue_site_command`).
+RELAY_BACKED_COMMAND_KINDS = ("terminal-open", "vnc-open")
 
 # `enrollKey` is the operator's stable name for a physical place
 # ("levis-imac/deepspacenine"), and is what makes enrollment idempotent:
@@ -4288,14 +4294,16 @@ def queue_site_command(event, site_id):
     if not isinstance(args, dict):
         raise ApiError(400, "args must be an object")
 
-    # "terminal-open" is the one kind that needs somewhere for the two sides to
-    # MEET. Ensuring the relay here — rather than in a separate call the app
+    # "terminal-open" and "vnc-open" are the kinds that need somewhere for the two
+    # sides to MEET. Ensuring the relay here — rather than in a separate call the app
     # would have to make first — is what keeps the address consistent between
     # the two parties: the daemon reads it out of the command's args, the app
     # reads it out of this response, and neither can be pointed at a different
-    # relay than the other.
+    # relay than the other. Both kinds share one relay instance per user: the relay
+    # multiplexes on sessionId (relay.py), so a GUI session and an open terminal
+    # ride the same box for free.
     relay = None
-    if kind == "terminal-open":
+    if kind in RELAY_BACKED_COMMAND_KINDS:
         relay = _ensure_relay_worker(event["_userId"], _now())
         args = dict(args, **relay)
 
