@@ -1680,6 +1680,9 @@ CLIENT_EVENT_KINDS = frozenset({
     "relay_connect_blocked", "relay_command_queued", "relay_command_failed",
     "relay_ws_open", "relay_ws_open_failed", "relay_ws_receive_failed",
     "relay_ws_message", "relay_state", "relay_closed",
+    # Remote Browser / Remote Desktop (docs/REMOTE-BROWSER.md, docs/VNC.md) — see the
+    # matching cases in fin/Agent/ControlPlaneClient.swift.
+    "remote_screen_gate_failed", "remote_screen_opened", "remote_screen_closed",
 })
 MAX_CLIENT_EVENT_BYTES = 4096
 

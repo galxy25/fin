@@ -51,6 +51,11 @@ public final class DesktopRelayClient {
         var lastFrame: Data?
         var warnedViewOnly = false
         var droppedFrames = 0
+        // Telemetry (Levi, 2026-09-23): shape only — no captured pixels, no played-back
+        // text, ever logged. See BrowserRelayClient.Session for the matching fields.
+        let openedAt = Date()
+        var framesSent = 0
+        var inputCounts: [String: Int] = [:]
         init(socket: URLSessionWebSocketTask) { self.socket = socket }
     }
 
@@ -188,11 +193,23 @@ public final class DesktopRelayClient {
             audit("[desktop] \(sessionId): frame over budget — capture width now \(Int(session.widthCap))")
             return
         }
+        session.framesSent += 1
         let frame = RemoteBrowserProtocol.Frame(
             jpegBase64: encoded, width: bounds.width, height: bounds.height,
             url: nil, title: Host.current().localizedName
         )
         send(sessionId: sessionId, frame: frame.relayFrame(sessionId: sessionId))
+    }
+
+    private static func inputTypeName(_ input: RemoteBrowserProtocol.Input) -> String {
+        switch input {
+        case .tap: return "tap"
+        case .scroll: return "scroll"
+        case .text: return "text"
+        case .key: return "key"
+        case .navigate: return "navigate"
+        case .selectTab: return "selectTab"
+        }
     }
 
     private static func jpeg(_ image: CGImage, quality: Double) -> Data? {
@@ -235,10 +252,26 @@ public final class DesktopRelayClient {
                     key.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
                     key.post(tap: .cghidEventTap)
                 }
-            case .key(let code):
+            case .key(let code, let modifiers):
+                let flags = cgEventFlags(modifiers)
                 for keyDown in [true, false] {
-                    CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: keyDown)?.post(tap: .cghidEventTap)
+                    guard let keyEvent = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: keyDown) else { continue }
+                    if !flags.isEmpty { keyEvent.flags = flags }
+                    keyEvent.post(tap: .cghidEventTap)
                 }
+            }
+        }
+    }
+
+    /// RemoteBrowserProtocol.Modifier -> CGEventFlags, for the carousel toolbar's
+    /// Ctrl/Opt/Cmd/Shift latches.
+    private func cgEventFlags(_ modifiers: [RemoteBrowserProtocol.Modifier]) -> CGEventFlags {
+        modifiers.reduce(into: CGEventFlags()) { flags, modifier in
+            switch modifier {
+            case .shift: flags.insert(.maskShift)
+            case .control: flags.insert(.maskControl)
+            case .option: flags.insert(.maskAlternate)
+            case .command: flags.insert(.maskCommand)
             }
         }
     }
@@ -278,6 +311,7 @@ public final class DesktopRelayClient {
         }
         guard action == "input", let input = RemoteBrowserProtocol.input(fromRelayFrame: object) else { return }
         armIdleTimeout(sessionId: sessionId)
+        session.inputCounts[Self.inputTypeName(input), default: 0] += 1
         play(input, session: session, sessionId: sessionId)
     }
 
@@ -310,7 +344,10 @@ public final class DesktopRelayClient {
             session.socket.send(.data(data)) { _ in }
         }
         session.socket.cancel(with: .normalClosure, reason: nil)
-        audit("[desktop] \(sessionId): closed")
+        let duration = Int(Date().timeIntervalSince(session.openedAt))
+        audit("[desktop] \(sessionId): closed — \(duration)s, \(session.framesSent) frames"
+            + (session.droppedFrames > 0 ? " (\(session.droppedFrames) dropped)" : "")
+            + ", input=\(session.inputCounts)")
     }
 }
 #endif

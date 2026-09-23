@@ -20,6 +20,11 @@ struct RemoteBrowserView: View {
     @State private var address = ""
     @State private var gateFailed: String?
     @State private var lastDrag: CGSize = .zero
+    /// The carousel's sticky modifiers (Levi, 2026-09-23: a toolbar "everywhere," not
+    /// only iOS/iPadOS like the terminal's UIKit accessory row — built in SwiftUI here
+    /// so macOS and Vision Pro get it for free). Tapping one arms it; it applies to the
+    /// NEXT key send and then clears, mirroring the terminal's Ctrl latch.
+    @State private var armedModifiers: Set<RemoteBrowserProtocol.Modifier> = []
 
     /// Set for the tab presentation: the session belongs to `SessionManager`, so the
     /// view must neither close it on disappear (switching tabs) nor dismiss itself
@@ -201,23 +206,83 @@ struct RemoteBrowserView: View {
                 Button("Send", action: sendTyped)
                     .disabled(typed.isEmpty)
             }
-            HStack(spacing: 14) {
-                keyButton("return", .enter)
-                keyButton("arrow.right.to.line", .tab)
-                keyButton("delete.left", .backspace)
-                keyButton("escape", .escape)
-                Spacer()
-            }
-            .buttonStyle(.bordered)
+            keyCarousel
         }
         .padding()
         .background(.bar)
         .disabled(session.state != .connected)
     }
 
+    /// A horizontally scrollable row, so it holds every key worth having (modifiers,
+    /// navigation, arrows) without crowding a phone-width screen — a real carousel,
+    /// unlike the fixed four-button row it replaces. Same content on every platform:
+    /// this is SwiftUI, not the terminal's UIKit-only `KeyboardAccessoryRow`.
+    private var keyCarousel: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(RemoteBrowserProtocol.Modifier.allCases, id: \.self) { modifier in
+                    modifierButton(modifier)
+                }
+                Divider().frame(height: 20)
+                keyButton("delete.left", .backspace)
+                keyButton("arrow.right.to.line", .tab)
+                keyButton("return", .enter)
+                keyButton("escape", .escape)
+                keyButton("delete.forward", .forwardDelete)
+                Divider().frame(height: 20)
+                keyButton("arrow.left", .arrowLeft)
+                keyButton("arrow.up", .arrowUp)
+                keyButton("arrow.down", .arrowDown)
+                keyButton("arrow.right", .arrowRight)
+                Divider().frame(height: 20)
+                textKeyButton("Home", .home)
+                textKeyButton("End", .end)
+                textKeyButton("PgUp", .pageUp)
+                textKeyButton("PgDn", .pageDown)
+            }
+            .buttonStyle(.bordered)
+            .padding(.horizontal, 2)
+        }
+    }
+
+    private func modifierButton(_ modifier: RemoteBrowserProtocol.Modifier) -> some View {
+        let armed = armedModifiers.contains(modifier)
+        return Button {
+            if armed { armedModifiers.remove(modifier) } else { armedModifiers.insert(modifier) }
+        } label: {
+            Text(modifierLabel(modifier))
+        }
+        .tint(armed ? Color.accentColor : nil)
+        .accessibilityLabel("\(modifier.rawValue) \(armed ? "armed" : "")")
+    }
+
+    private func modifierLabel(_ modifier: RemoteBrowserProtocol.Modifier) -> String {
+        switch modifier {
+        case .shift: return "\u{21e7}"
+        case .control: return "\u{2303}"
+        case .option: return "\u{2325}"
+        case .command: return "\u{2318}"
+        }
+    }
+
     private func keyButton(_ symbol: String, _ key: RemoteBrowserProtocol.SpecialKey) -> some View {
-        Button { session.send(.key(key)) } label: { Image(systemName: symbol) }
+        Button(action: { sendKey(key) }) { Image(systemName: symbol) }
             .accessibilityLabel(key.rawValue)
+    }
+
+    /// A few keys have no crisp glyph worth guessing at — a label reads better than a
+    /// wrong or missing SF Symbol.
+    private func textKeyButton(_ title: String, _ key: RemoteBrowserProtocol.SpecialKey) -> some View {
+        Button(title, action: { sendKey(key) })
+            .font(.caption)
+            .accessibilityLabel(key.rawValue)
+    }
+
+    /// Sends the key with whatever modifiers are armed, then clears them — a chord is
+    /// one shot, not a mode you forget you left on.
+    private func sendKey(_ key: RemoteBrowserProtocol.SpecialKey) {
+        session.send(.key(key, modifiers: Array(armedModifiers)))
+        armedModifiers.removeAll()
     }
 
     private func sendTyped() {
@@ -257,6 +322,7 @@ struct RemoteBrowserView: View {
         // so a device without (or with a failed) Face ID still opens after a real check.
         guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
             gateFailed = "This device has no passcode set, so the browser can\u{2019}t be unlocked here."
+            ControlPlaneClient.logClientEvent(.remoteScreenGateFailed, detail: ["mode": session.mode.rawValue, "reason": "no_passcode"])
             return
         }
         do {
@@ -264,9 +330,14 @@ struct RemoteBrowserView: View {
                 .deviceOwnerAuthentication,
                 localizedReason: "Open \(siteName)\u{2019}s \(session.mode == .desktop ? "desktop" : "browser")"
             )
-            guard ok else { gateFailed = "Authentication failed."; return }
+            guard ok else {
+                gateFailed = "Authentication failed."
+                ControlPlaneClient.logClientEvent(.remoteScreenGateFailed, detail: ["mode": session.mode.rawValue, "reason": "not_ok"])
+                return
+            }
         } catch {
             gateFailed = "Authentication was cancelled."
+            ControlPlaneClient.logClientEvent(.remoteScreenGateFailed, detail: ["mode": session.mode.rawValue, "reason": "cancelled"])
             return
         }
         #endif

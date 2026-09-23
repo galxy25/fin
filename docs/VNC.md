@@ -19,8 +19,17 @@
 > - **Auth (§4's blocking question):** the same answer as Remote Browser — Face ID /
 >   Touch ID / Optic ID (or passcode) in the app on every open, plus the per-site
 >   opt-in enforced locally by the daemon.
-> - **Not yet:** multiple displays (main only), right-click / drag / modifier keys,
->   clipboard.
+> - **Not yet:** multiple displays (main only), right-click / drag, clipboard.
+>   Modifier keys (Ctrl/Opt/Cmd/Shift) shipped 2026-09-23 as sticky carousel latches
+>   (see docs/REMOTE-BROWSER.md's "Where it opens" section, which now also covers the
+>   carousel toolbar and telemetry, shared with Remote Browser).
+>
+> **Root-caused live, 2026-09-23 (Levi):** a Remote Browser session that streamed once
+> then went stale/stuck — Chrome throttles a tab's CDP screencast when its OS window
+> isn't frontmost. Fixed with `Page.bringToFront` on every tab attach and every 3s tab
+> refresh (`BrowserRelayClient`) — a CDP command built for exactly this, which also
+> resolves the multi-window edge case since it targets the specific tab, not "the"
+> Chrome window.
 
 > **STATUS 2026-09-23: Phase 0 shipped. Phase 1 as written below is dead, but the
 > feature is NOT — a different Phase 1 is viable. Read this before building.**

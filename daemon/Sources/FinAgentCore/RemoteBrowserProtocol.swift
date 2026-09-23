@@ -110,6 +110,16 @@ public enum RemoteBrowserProtocol {
 
     public enum SpecialKey: String, CaseIterable, Sendable {
         case enter, tab, backspace, escape, arrowUp, arrowDown, arrowLeft, arrowRight
+        case home, end, pageUp, pageDown, forwardDelete
+    }
+
+    /// A modifier held while a key is sent — the carousel toolbar's Ctrl/Opt/Cmd/Shift
+    /// latches (docs/VNC.md): tap one to arm it, then the next key press carries it,
+    /// mirroring the terminal's existing Ctrl-latch (`FinTerminalView.ctrlArmed`) so the
+    /// gesture is one Levi already knows. Meaningful in both modes: Cmd+A/C/V in a
+    /// browser field, Cmd+Tab or Ctrl+click on a desktop.
+    public enum Modifier: String, CaseIterable, Sendable {
+        case shift, control, option, command
     }
 
     public enum Input: Equatable, Sendable {
@@ -122,7 +132,7 @@ public enum RemoteBrowserProtocol {
         /// events: a password pasted from a manager arrives whole and exactly, with none
         /// of the keymap guessing synthetic keystrokes need.
         case text(String)
-        case key(SpecialKey)
+        case key(SpecialKey, modifiers: [Modifier] = [])
         case navigate(String)
         case selectTab(String)
     }
@@ -136,7 +146,10 @@ public enum RemoteBrowserProtocol {
         case .tap(let x, let y): return ["type": "tap", "x": x, "y": y]
         case .scroll(let x, let y, let dx, let dy): return ["type": "scroll", "x": x, "y": y, "dx": dx, "dy": dy]
         case .text(let text): return ["type": "text", "text": text]
-        case .key(let key): return ["type": "key", "key": key.rawValue]
+        case .key(let key, let modifiers):
+            var event: [String: Any] = ["type": "key", "key": key.rawValue]
+            if !modifiers.isEmpty { event["modifiers"] = modifiers.map(\.rawValue) }
+            return event
         case .navigate(let url): return ["type": "navigate", "url": url]
         case .selectTab(let id): return ["type": "selectTab", "id": id]
         }
@@ -158,7 +171,8 @@ public enum RemoteBrowserProtocol {
             return .text(text)
         case "key":
             guard let raw = event["key"] as? String, let key = SpecialKey(rawValue: raw) else { return nil }
-            return .key(key)
+            let modifiers = (event["modifiers"] as? [String] ?? []).compactMap(Modifier.init(rawValue:))
+            return .key(key, modifiers: modifiers)
         case "navigate":
             guard let url = event["url"] as? String, !url.isEmpty else { return nil }
             return .navigate(url)
@@ -208,22 +222,24 @@ public enum RemoteBrowserProtocol {
             ])]
         case .text(let text):
             return [CDPCommand("Input.insertText", ["text": text])]
-        case .key(let key):
+        case .key(let key, let modifiers):
             let spec = keySpec(key)
+            let mask = cdpModifierMask(modifiers)
             var down: [String: AnyHashable] = [
                 "type": "keyDown", "key": spec.key, "code": spec.code,
                 "windowsVirtualKeyCode": spec.keyCode, "nativeVirtualKeyCode": spec.keyCode,
             ]
             // Enter needs `text` on keyDown or Chrome treats it as a bare key with no
-            // character — the field sees the key but the form never submits.
-            if let text = spec.text { down["text"] = text }
-            return [
-                CDPCommand("Input.dispatchKeyEvent", down),
-                CDPCommand("Input.dispatchKeyEvent", [
-                    "type": "keyUp", "key": spec.key, "code": spec.code,
-                    "windowsVirtualKeyCode": spec.keyCode, "nativeVirtualKeyCode": spec.keyCode,
-                ]),
+            // character — the field sees the key but the form never submits. A modified
+            // Enter (rare) skips it: Chrome would otherwise also submit a form on Cmd+Enter.
+            if let text = spec.text, modifiers.isEmpty { down["text"] = text }
+            if mask != 0 { down["modifiers"] = mask }
+            var up: [String: AnyHashable] = [
+                "type": "keyUp", "key": spec.key, "code": spec.code,
+                "windowsVirtualKeyCode": spec.keyCode, "nativeVirtualKeyCode": spec.keyCode,
             ]
+            if mask != 0 { up["modifiers"] = mask }
+            return [CDPCommand("Input.dispatchKeyEvent", down), CDPCommand("Input.dispatchKeyEvent", up)]
         case .navigate(let url):
             return [CDPCommand("Page.navigate", ["url": normalizedURL(url)])]
         case .selectTab:
@@ -241,6 +257,23 @@ public enum RemoteBrowserProtocol {
         case .arrowDown: return ("ArrowDown", "ArrowDown", 40, nil)
         case .arrowLeft: return ("ArrowLeft", "ArrowLeft", 37, nil)
         case .arrowRight: return ("ArrowRight", "ArrowRight", 39, nil)
+        case .home: return ("Home", "Home", 36, nil)
+        case .end: return ("End", "End", 35, nil)
+        case .pageUp: return ("PageUp", "PageUp", 33, nil)
+        case .pageDown: return ("PageDown", "PageDown", 34, nil)
+        case .forwardDelete: return ("Delete", "Delete", 46, nil)
+        }
+    }
+
+    /// CDP's `Input.dispatchKeyEvent` modifier bitmask: Alt 1, Ctrl 2, Meta/Cmd 4, Shift 8.
+    static func cdpModifierMask(_ modifiers: [Modifier]) -> Int {
+        modifiers.reduce(0) { mask, modifier in
+            switch modifier {
+            case .shift: return mask | 8
+            case .control: return mask | 2
+            case .option: return mask | 1
+            case .command: return mask | 4
+            }
         }
     }
 

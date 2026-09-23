@@ -49,6 +49,22 @@ final class RemoteBrowserSession: ObservableObject {
     /// Same patience as the terminal: an on-demand relay needs about a minute to boot.
     private let connectAttempts = 45
 
+    // MARK: - Telemetry (Levi, 2026-09-23: "thorough telemetry... to monitor and replay
+    // usage for both debugging and evaling"). None of this is page content, keystrokes
+    // or screenshots — those stay off the wire to any logging system by design (a
+    // password typed here must never be more durable than the browser it was typed
+    // into). What's captured is a session's SHAPE: when it opened and for how long, how
+    // many frames it streamed, and a count of each input TYPE sent — enough to
+    // reconstruct a timeline (a "replay" of what happened, not what was shown) and to
+    // eval things like "how often does a session end in under 5 frames" without ever
+    // holding anything sensitive. Emitted once at close via the existing client-events
+    // channel (`ControlPlaneClient.logClientEvent`, CloudWatch-backed, the same one
+    // TerminalSession uses) rather than a new store — see docs/REMOTE-BROWSER.md.
+    private var openedAt: Date?
+    private var connectedLogged = false
+    private var frameCount = 0
+    private var inputCounts: [String: Int] = [:]
+
     init(siteID: String, mode: Mode = .browser) {
         self.siteID = siteID
         self.mode = mode
@@ -59,6 +75,10 @@ final class RemoteBrowserSession: ObservableObject {
         let sessionId = (mode == .desktop ? "d-" : "b-") + UUID().uuidString.lowercased()
         self.sessionId = sessionId
         state = .waking
+        openedAt = Date()
+        frameCount = 0
+        inputCounts = [:]
+        connectedLogged = false
         runTask = Task { [weak self] in
             await self?.run(sessionId: sessionId)
         }
@@ -72,6 +92,7 @@ final class RemoteBrowserSession: ObservableObject {
         runTask?.cancel()
         runTask = nil
         socket = nil
+        logClosed(reason: nil)
         if case .closed = state {} else { state = .closed(nil) }
     }
 
@@ -80,7 +101,35 @@ final class RemoteBrowserSession: ObservableObject {
               let data = try? JSONSerialization.data(withJSONObject: RemoteBrowserProtocol.inputFrame(sessionId: sessionId, input: input))
         else { return }
         if case .selectTab(let id) = input { selectedTab = id }
+        inputCounts[Self.inputTypeName(input), default: 0] += 1
         Task { try? await socket.send(data) }
+    }
+
+    /// Fires once, whichever path closes the session first (`close()` or a relay-side
+    /// "close"/socket-failure landing in `handle`) — never twice, so a duration or
+    /// count is never double-reported for one session.
+    private func logClosed(reason: String?) {
+        guard let openedAt else { return }
+        self.openedAt = nil
+        var detail: [String: Any] = [
+            "mode": mode.rawValue, "siteId": siteID,
+            "durationSeconds": Int(Date().timeIntervalSince(openedAt)),
+            "frameCount": frameCount, "connected": connectedLogged,
+        ]
+        if let reason { detail["reason"] = reason }
+        if !inputCounts.isEmpty { detail["inputCounts"] = inputCounts }
+        ControlPlaneClient.logClientEvent(.remoteScreenClosed, detail: detail)
+    }
+
+    private static func inputTypeName(_ input: RemoteBrowserProtocol.Input) -> String {
+        switch input {
+        case .tap: return "tap"
+        case .scroll: return "scroll"
+        case .text: return "text"
+        case .key: return "key"
+        case .navigate: return "navigate"
+        case .selectTab: return "selectTab"
+        }
     }
 
     // MARK: - Connection
@@ -114,7 +163,11 @@ final class RemoteBrowserSession: ObservableObject {
             } catch {
                 candidate.cancel()
                 if attempt == connectAttempts {
+                    ControlPlaneClient.logClientEvent(.relayWSOpenFailed, detail: [
+                        "mode": mode.rawValue, "siteId": siteID, "error": error.localizedDescription,
+                    ])
                     state = .closed("The relay never came up.")
+                    logClosed(reason: "relay never came up")
                     return
                 }
                 try? await Task.sleep(for: .seconds(2))
@@ -122,13 +175,18 @@ final class RemoteBrowserSession: ObservableObject {
         }
         guard let socket = connected else { return }
         self.socket = socket
+        ControlPlaneClient.logClientEvent(.relayWSOpen, detail: ["mode": mode.rawValue, "siteId": siteID, "sessionId": sessionId])
 
         while !Task.isCancelled {
             let data: Data
             do {
                 data = try await socket.receive()
             } catch {
+                ControlPlaneClient.logClientEvent(.relayWSReceiveFailed, detail: [
+                    "mode": mode.rawValue, "siteId": siteID, "error": error.localizedDescription,
+                ])
                 if case .closed = state {} else { state = .closed("Disconnected.") }
+                logClosed(reason: "socket receive failed")
                 return
             }
             await handle(data)
@@ -142,9 +200,11 @@ final class RemoteBrowserSession: ObservableObject {
         case "attached":
             if state == .waking { state = .connected }
         case "close":
-            state = .closed(object["reason"] as? String)
+            let reason = object["reason"] as? String
+            state = .closed(reason)
             socket?.cancel()
             socket = nil
+            logClosed(reason: reason ?? "closed by site")
         case "output":
             if let decoded = RemoteBrowserProtocol.Frame(relayFrame: object) {
                 // JPEG decode off the main actor — at screencast rates it is the one
@@ -154,10 +214,15 @@ final class RemoteBrowserSession: ObservableObject {
                 }.value
                 guard let image else { return }
                 frame = image
+                frameCount += 1
                 viewport = CGSize(width: decoded.width, height: decoded.height)
                 url = decoded.url ?? url
                 title = decoded.title ?? title
                 if state != .connected { state = .connected }
+                if !connectedLogged {
+                    connectedLogged = true
+                    ControlPlaneClient.logClientEvent(.remoteScreenOpened, detail: ["mode": mode.rawValue, "siteId": siteID])
+                }
             } else if let list = RemoteBrowserProtocol.tabs(fromRelayFrame: object) {
                 tabs = list.tabs
                 selectedTab = list.selected ?? selectedTab

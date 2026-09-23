@@ -24,7 +24,7 @@ public enum RemoteDesktopProtocol {
         /// Typed text, delivered as unicode strings rather than key codes so any
         /// keyboard layout, emoji or password character arrives as typed.
         case text(String)
-        case key(virtualKeyCode: UInt16)
+        case key(virtualKeyCode: UInt16, modifiers: [RemoteBrowserProtocol.Modifier])
     }
 
     /// CGEvent's unicode payload is per event and silently truncated past 20 UTF-16
@@ -42,6 +42,11 @@ public enum RemoteDesktopProtocol {
         case .arrowRight: return 124
         case .arrowDown: return 125
         case .arrowUp: return 126
+        case .home: return 115
+        case .end: return 119
+        case .pageUp: return 116
+        case .pageDown: return 121
+        case .forwardDelete: return 117
         }
     }
 
@@ -62,8 +67,8 @@ public enum RemoteDesktopProtocol {
             return [.mouseMove(x: px, y: py), .scroll(dx: wheel(-deltaX), dy: wheel(-deltaY))]
         case .text(let text):
             return unicodeChunks(text).map(Event.text)
-        case .key(let key):
-            return [.key(virtualKeyCode: virtualKeyCode(for: key))]
+        case .key(let key, let modifiers):
+            return [.key(virtualKeyCode: virtualKeyCode(for: key), modifiers: modifiers)]
         case .navigate, .selectTab:
             return []
         }

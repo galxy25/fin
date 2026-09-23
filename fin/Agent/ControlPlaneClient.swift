@@ -174,6 +174,16 @@ enum ControlPlaneClient {
         case relayWSMessage = "relay_ws_message"
         case relayState = "relay_state"
         case relayClosed = "relay_closed"
+        // Remote Browser / Remote Desktop (docs/REMOTE-BROWSER.md, docs/VNC.md): the
+        // parts of a session that have no terminal-relay equivalent — the Face ID gate,
+        // and a durable open/close pair to reconstruct a session's span (when it opened,
+        // how long it ran, why it ended) even though frame/input traffic itself rides
+        // the same relay* kinds above. `detail` always carries `mode` (browser|desktop)
+        // and `siteId8` so the two features' events sort out from each other and from
+        // the terminal's.
+        case remoteScreenGateFailed = "remote_screen_gate_failed"
+        case remoteScreenOpened = "remote_screen_opened"
+        case remoteScreenClosed = "remote_screen_closed"
     }
 
     static func logClientEvent(_ kind: ClientEventKind, detail: [String: Any] = [:]) {

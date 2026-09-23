@@ -88,6 +88,41 @@ terminal and back keeps the live page with no second Face ID. iPad could get win
 later: that needs `UIApplicationSupportsMultipleScenes`, which also lets the MAIN
 window be opened twice, so it was left out of the first rollout.
 
+## The carousel toolbar
+
+A horizontally scrollable key bar (Levi, 2026-09-23: "we want it everywhere," unlike
+the terminal's `KeyboardAccessoryRow`, which is UIKit-only and exists on iOS/iPadOS —
+this one is plain SwiftUI, so macOS and Vision Pro get it for free): Ctrl/Opt/Cmd/Shift
+as sticky latches (tap to arm, consumed by the next key and then cleared — the same
+gesture as the terminal's Ctrl latch), backspace/tab/enter/escape/forward-delete,
+arrows, and Home/End/PgUp/PgDn. `RemoteBrowserProtocol.Modifier` rides on `.key` and
+reaches both backends: a CDP modifier bitmask in the browser, `CGEventFlags` on the
+desktop.
+
+## Telemetry
+
+Levi, 2026-09-23: "thorough telemetry... to monitor and replay usage for both
+debugging and evaling." What's captured is a session's SHAPE, never its content — no
+page text, no typed characters, no frame pixels reach any logging system, because a
+password typed here must never be more durable than the browser it was typed into.
+
+- **App → control plane** (`ControlPlaneClient.logClientEvent`, CloudWatch-backed,
+  the channel `TerminalSession` already used): `remote_screen_gate_failed` (Face ID
+  reason), `remote_screen_opened` (first real frame), `remote_screen_closed`
+  (duration, frame count, input counts BY TYPE, close reason) — plus the existing
+  `relay_ws_open`/`relay_ws_open_failed`/`relay_ws_receive_failed`, now also emitted
+  by `RemoteBrowserSession`. `aws logs tail /aws/lambda/fin-control-plane | grep
+  client-event`.
+- **Daemon → its own audit trail** (`BrowserRelayClient`/`DesktopRelayClient`, the
+  same `record(AgentAuditEvent...)` path every other daemon breadcrumb uses, so it's
+  durable and shows up in the site's own Logs/Traces): one structured line per
+  session close — duration, frames sent, dropped frames, tab switches, input counts
+  by type.
+- **Not built (scope call, noted for later):** a queryable per-session store for true
+  frame-by-frame replay. What exists today reconstructs a session's timeline (when,
+  how long, how much, why it ended) from two independent trails that already existed
+  for the terminal; it does not let anyone scrub through what was actually shown.
+
 ## Delivery
 
 1. **Done:** protocol + tests, daemon client, `browser-open` command, `remote_browser`

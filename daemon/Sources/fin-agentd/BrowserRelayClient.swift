@@ -63,6 +63,13 @@ public final class BrowserRelayClient {
         var idleTask: Task<Void, Never>?
         var tabTask: Task<Void, Never>?
         var droppedFrames = 0
+        // Telemetry (Levi, 2026-09-23): a session's SHAPE, never its content — no page
+        // text, no typed characters, no JPEG bytes leave this struct. `inputCounts` is
+        // by TYPE only.
+        let openedAt = Date()
+        var framesSent = 0
+        var inputCounts: [String: Int] = [:]
+        var tabSwitches = 0
         init(socket: URLSessionWebSocketTask) { self.socket = socket }
     }
 
@@ -228,6 +235,14 @@ public final class BrowserRelayClient {
             self?.forward(sessionId: sessionId, jpegBase64: data, width: width, height: height)
         }
         page.start()
+        // THE fix for "stuck on the same page" / "won't navigate anywhere I type": Chrome
+        // throttles (and eventually stops) a screencast on a tab whose window isn't
+        // frontmost — confirmed live, 2026-09-23, by Levi ("if it isn't the active window
+        // it doesn't work"). Page.bringToFront targets THIS target specifically, so it
+        // also resolves the multi-window edge case without knowing which OS window a tab
+        // lives in. Sent on every attach — a fresh session, a tab switch, and Claude
+        // opening a new tab all attach again.
+        page.bringToFront()
         sendTabs(sessionId: sessionId, targets: targets)
     }
 
@@ -241,6 +256,11 @@ public final class BrowserRelayClient {
             await attachToTab(sessionId: sessionId, preferring: nil)
             return
         }
+        // Re-asserted on this same 3s tick, not just on attach: Levi using the laptop
+        // himself, Claude opening an unrelated app, or macOS's own window-cycling can all
+        // steal front-most status from Chrome mid-session, and each one silently stalls
+        // the screencast until this brings it back.
+        session.page?.bringToFront()
         sendTabs(sessionId: sessionId, targets: targets)
     }
 
@@ -266,8 +286,20 @@ public final class BrowserRelayClient {
             return
         }
         let tab = session.lastTabs.first { $0.id == session.targetID }
+        session.framesSent += 1
         let frame = RemoteBrowserProtocol.Frame(jpegBase64: jpegBase64, width: width, height: height, url: tab?.url, title: tab?.title)
         send(sessionId: sessionId, frame: frame.relayFrame(sessionId: sessionId))
+    }
+
+    private static func inputTypeName(_ input: RemoteBrowserProtocol.Input) -> String {
+        switch input {
+        case .tap: return "tap"
+        case .scroll: return "scroll"
+        case .text: return "text"
+        case .key: return "key"
+        case .navigate: return "navigate"
+        case .selectTab: return "selectTab"
+        }
     }
 
     // MARK: - Relay socket
@@ -305,7 +337,9 @@ public final class BrowserRelayClient {
         }
         guard action == "input", let input = RemoteBrowserProtocol.input(fromRelayFrame: object) else { return }
         armIdleTimeout(sessionId: sessionId)
+        session.inputCounts[Self.inputTypeName(input), default: 0] += 1
         if case .selectTab(let id) = input {
+            session.tabSwitches += 1
             await attachToTab(sessionId: sessionId, preferring: id)
             return
         }
@@ -349,7 +383,14 @@ public final class BrowserRelayClient {
             session.socket.send(.data(data)) { _ in }
         }
         session.socket.cancel(with: .normalClosure, reason: nil)
-        audit("[browser] \(sessionId): closed")
+        // One structured line per session (monitor/replay, Levi 2026-09-23): duration,
+        // frames sent, dropped, tab switches, and input counts BY TYPE — the same shape
+        // the app logs its half of, `record`ed into the site's own durable audit trail
+        // (Logs/Traces), not just this process's stdout.
+        let duration = Int(Date().timeIntervalSince(session.openedAt))
+        audit("[browser] \(sessionId): closed — \(duration)s, \(session.framesSent) frames"
+            + (session.droppedFrames > 0 ? " (\(session.droppedFrames) dropped)" : "")
+            + ", \(session.tabSwitches) tab switches, input=\(session.inputCounts)")
     }
 }
 
@@ -384,6 +425,13 @@ final class CDPPage {
         receive()
         send(.init("Page.enable"))
         send(.init("Page.startScreencast", Self.screencastParams))
+    }
+
+    /// See the call site in `attachToTab`: without this, Chrome throttles (and then
+    /// stops) the screencast on any tab whose window isn't the frontmost one — the
+    /// confirmed root cause of a session that streamed once and then went stale.
+    func bringToFront() {
+        send(.init("Page.bringToFront"))
     }
 
     func stop() {

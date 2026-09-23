@@ -14,7 +14,7 @@ final class RemoteBrowserProtocolTests: XCTestCase {
             .tap(x: 0.25, y: 0.75),
             .scroll(x: 0.5, y: 0.5, deltaX: 0, deltaY: 400),
             .text("hunter2 with spaces & symbols !@#"),
-            .key(.enter),
+            .key(.enter, modifiers: []),
             .navigate("github.com/login"),
             .selectTab("TAB-1"),
         ]
@@ -79,16 +79,25 @@ final class RemoteBrowserProtocolTests: XCTestCase {
     }
 
     func testEnterCarriesTextSoFormsActuallySubmit() {
-        let commands = P.cdpCommands(for: .key(.enter), viewportWidth: 1, viewportHeight: 1)
+        let commands = P.cdpCommands(for: .key(.enter, modifiers: []), viewportWidth: 1, viewportHeight: 1)
         XCTAssertEqual(commands.map { $0.params["type"] }, ["keyDown", "keyUp"])
         XCTAssertEqual(commands[0].params["text"], "\r")
         XCTAssertEqual(commands[0].params["windowsVirtualKeyCode"], 13)
     }
 
     func testNonCharacterKeysCarryNoText() {
-        let commands = P.cdpCommands(for: .key(.backspace), viewportWidth: 1, viewportHeight: 1)
+        let commands = P.cdpCommands(for: .key(.backspace, modifiers: []), viewportWidth: 1, viewportHeight: 1)
         XCTAssertNil(commands[0].params["text"])
         XCTAssertEqual(commands[0].params["key"], "Backspace")
+    }
+
+    func testModifiersRideAsACDPBitmaskAndSuppressEntersText() {
+        let commands = P.cdpCommands(for: .key(.enter, modifiers: [.command]), viewportWidth: 1, viewportHeight: 1)
+        // Cmd+Enter must not ALSO carry "\r" — Chrome would submit the form twice over.
+        XCTAssertNil(commands[0].params["text"])
+        XCTAssertEqual(commands[0].params["modifiers"], 4)
+        XCTAssertEqual(commands[1].params["modifiers"], 4)
+        XCTAssertEqual(P.cdpModifierMask([.shift, .control, .option, .command]), 15)
     }
 
     func testSelectingATabIsNotAPageCommand() {

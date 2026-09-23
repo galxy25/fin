@@ -36,8 +36,15 @@ final class RemoteDesktopProtocolTests: XCTestCase {
     }
 
     func testSpecialKeysUseLayoutIndependentKeyCodes() {
-        XCTAssertEqual(RemoteDesktopProtocol.events(for: .key(.enter), display: laptop), [.key(virtualKeyCode: 36)])
-        XCTAssertEqual(RemoteDesktopProtocol.events(for: .key(.backspace), display: laptop), [.key(virtualKeyCode: 51)])
+        XCTAssertEqual(RemoteDesktopProtocol.events(for: .key(.enter), display: laptop), [.key(virtualKeyCode: 36, modifiers: [])])
+        XCTAssertEqual(RemoteDesktopProtocol.events(for: .key(.backspace), display: laptop), [.key(virtualKeyCode: 51, modifiers: [])])
+        XCTAssertEqual(
+            RemoteDesktopProtocol.events(for: .key(.tab, modifiers: [.command]), display: laptop),
+            [.key(virtualKeyCode: 48, modifiers: [.command])]
+        )
+        // The four new navigation keys carry codes distinct from the originals.
+        XCTAssertEqual(RemoteDesktopProtocol.virtualKeyCode(for: .home), 115)
+        XCTAssertEqual(RemoteDesktopProtocol.virtualKeyCode(for: .pageDown), 121)
         // Every key has a code — a new SpecialKey case can't silently map to nothing.
         let codes = Set(RemoteBrowserProtocol.SpecialKey.allCases.map(RemoteDesktopProtocol.virtualKeyCode(for:)))
         XCTAssertEqual(codes.count, RemoteBrowserProtocol.SpecialKey.allCases.count)
