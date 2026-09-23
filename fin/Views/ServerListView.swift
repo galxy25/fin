@@ -17,6 +17,8 @@ struct ServerListView: View {
     @ObservedObject private var sites = SiteDirectory.shared
     @State private var siteActionError: String?
     @State private var expandedSiteID: String?
+    /// Remote Browser (docs/REMOTE-BROWSER.md) — the site whose browser is open, if any.
+    @State private var browsingSite: FinSite?
 
     private var visibleSites: [FinSite] { sites.sites.filter { $0.state != "retired" } }
 
@@ -110,6 +112,9 @@ struct ServerListView: View {
         .sheet(isPresented: $showingCloudStatus) {
             CloudSyncStatusView()
         }
+        .sheet(item: $browsingSite) { site in
+            RemoteBrowserView(site: site)
+        }
     }
 
     private var serverRows: some View {
@@ -157,6 +162,20 @@ struct ServerListView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
+                // Only for a site that opted in AND is live: a globe that opens onto a
+                // minute of "waking" and then nothing is worse than no globe.
+                if site.capabilities.remoteBrowser == true, site.live {
+                    Button {
+                        browsingSite = site
+                    } label: {
+                        Image(systemName: "globe")
+                            .font(.title3)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Open \(site.displayName)\u{2019}s browser")
+                    .accessibilityIdentifier("siteBrowser_\(site.siteId8)")
+                }
                 Menu {
                     ForEach(ControlPlaneClient.SiteCommand.allCases, id: \.rawValue) { command in
                         Button(command.rawValue.capitalized) { run(command, on: site) }

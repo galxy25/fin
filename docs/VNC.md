@@ -26,7 +26,7 @@
 >   every other capability here already follows.
 >
 > Phase 0 (capability plumbing, no data path) is implemented and merged: the
-> `vncProxyEnabled` daemon config field, the `VNCPortProbe` loopback check, the
+> `vncProxyEnabled` daemon config field, the loopback probe (now `LoopbackPortProbe`, shared with Remote Browser), the
 > `vnc_proxy` capability at both `Daemon.siteCapabilities` call sites, `vnc-open`
 > in `SITE_COMMAND_KINDS`/`RELAY_BACKED_COMMAND_KINDS`, and
 > `FinSite.Capabilities.vncProxy` on the app side.

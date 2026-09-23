@@ -311,6 +311,30 @@ struct DaemonConfig: Decodable {
     /// off, and is checked again locally before any session opens rather than trusted
     /// from the advertised capability alone.
     var vncProxyEnabled: Bool?
+    /// Remote Browser (docs/REMOTE-BROWSER.md): let the app view and drive the Chrome
+    /// this Mac's Claude sessions use, so Levi can sign in to GitHub/Gmail there himself.
+    /// Opt-in and off by default for the same reason `vncProxyEnabled` is: that browser
+    /// carries signed-in sessions, so exposing it is a per-machine decision, not a
+    /// side effect of enrolling the site.
+    var remoteBrowser: RemoteBrowserConfig?
+
+    struct RemoteBrowserConfig: Decodable {
+        var enabled: Bool?
+        /// Chrome's DevTools port. Claude's Playwright MCP on this Mac attaches to the
+        /// same browser with `--cdp-endpoint http://127.0.0.1:<port>`.
+        var port: Int?
+        var chromePath: String?
+        /// Persistent profile, so a sign-in survives across sessions and restarts.
+        var profileDirectory: String?
+
+        static let defaultPort = 9222
+
+        /// `chromePath` if set, else the best browser installed here —
+        /// `RemoteBrowserProtocol.findBrowser`.
+        var resolvedBrowserPath: String? {
+            RemoteBrowserProtocol.findBrowser(configured: chromePath, home: NSHomeDirectory())
+        }
+    }
 
     static let defaultDeviceToken8 = "cloud001"
     static let defaultTranscriptFlushSeconds = 15
@@ -393,6 +417,8 @@ final class Daemon {
     /// The site heartbeat + claim protocol; nil without `config.site`.
     private var siteClient: DaemonSiteClient?
     private var terminalRelayClient: TerminalRelayClient?
+    /// Remote Browser; nil unless this site opted in (`config.remoteBrowser.enabled`).
+    private var browserRelayClient: BrowserRelayClient?
     /// False until the shell inside the terminal has answered a readiness probe. While
     /// false the site heartbeat says "unavailable" — visible to the operator, inert to
     /// the control plane — and carries `launchStage`/`launchFailure`, so a body that
@@ -518,7 +544,19 @@ final class Daemon {
     /// blipped. Recomputed every heartbeat, so the capability self-corrects within one
     /// beat either way.
     private var vncProxyCapability: Bool {
-        config.vncProxyEnabled == true && VNCPortProbe.isReachable()
+        config.vncProxyEnabled == true && LoopbackPortProbe.isReachable()
+    }
+
+    /// Remote Browser's capability (docs/REMOTE-BROWSER.md): opted in, AND there is a
+    /// browser to serve — one already listening on the DevTools port, or a Chrome the
+    /// daemon can launch on demand. Not gated on "running right now" the way VNC is:
+    /// the daemon starts the browser itself when a session opens, so an installed one is
+    /// as good as a running one.
+    private var remoteBrowserCapability: Bool {
+        guard let browser = config.remoteBrowser, browser.enabled == true else { return false }
+        let port = UInt16(browser.port ?? DaemonConfig.RemoteBrowserConfig.defaultPort)
+        return LoopbackPortProbe.isReachable(port: port)
+            || browser.resolvedBrowserPath != nil
     }
 
     /// Static facts plus the titled-pane inventory over the DEFAULT tmux socket, the
@@ -537,6 +575,7 @@ final class Daemon {
                 "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
                 "terminal_relay": config.site != nil,
                 "vnc_proxy": vncProxyCapability,
+            "remote_browser": remoteBrowserCapability,
                 "launch_stage": launchStage,
             ]
             if let launchFailure { caps["launch_failure"] = launchFailure }
@@ -574,6 +613,7 @@ final class Daemon {
             // at all) still reports false and stays out of the app's picker.
             "terminal_relay": config.site != nil,
             "vnc_proxy": vncProxyCapability,
+            "remote_browser": remoteBrowserCapability,
         ]
         // The rule, and the bug it encodes, live in `PaneScanPolicy` — a pure function,
         // because "not while a turn is running" quietly meant "never" on a site whose
@@ -1955,6 +1995,22 @@ final class Daemon {
             // No endpoint to configure any more: the relay is launched per
             // demand and its address rides in with each `terminal-open`, so
             // every enrolled site can serve a relayed terminal.
+            if let site = config.site, let browser = config.remoteBrowser, browser.enabled == true {
+                let home = (auditLogPath as NSString).deletingLastPathComponent
+                browserRelayClient = BrowserRelayClient(
+                    siteID: site.id, siteToken: site.token,
+                    controlPlaneURL: config.controlPlane?.endpointURL,
+                    configuration: .init(
+                        port: browser.port ?? DaemonConfig.RemoteBrowserConfig.defaultPort,
+                        chromePath: browser.chromePath,
+                        profileDirectory: browser.profileDirectory ?? home + "/browser-profile"
+                    ),
+                    audit: { [weak self] line in
+                        self?.log(line)
+                        self?.record(AgentAuditEvent(kind: "notice", text: line))
+                    }
+                )
+            }
             if let site = config.site {
                 terminalRelayClient = TerminalRelayClient(
                     siteID: site.id, siteToken: site.token,
@@ -2618,6 +2674,22 @@ final class Daemon {
                 sessionId: sessionId, tmuxSession: tmuxSession,
                 relayHost: relayHost, relayPort: relayPort
             )
+        case "browser-open":
+            guard let sessionId = command.args["sessionId"],
+                  let relayHost = command.args["relayHost"],
+                  let relayPort = command.args["relayPort"].flatMap(Int.init)
+            else {
+                log("[browser] browser-open command missing sessionId/relay address — ignored")
+                return
+            }
+            // The LOCAL enforcement point, not just the advertised capability: a stale
+            // capability cache in the app, or a hand-queued command, must never open the
+            // browser on a site whose owner never opted it in.
+            guard let browserRelayClient else {
+                log("[browser] browser-open \(sessionId): refused — Remote Browser is not enabled on this site")
+                return
+            }
+            browserRelayClient.open(sessionId: sessionId, relayHost: relayHost, relayPort: relayPort)
         default:
             break // drain is handled inside the client
         }

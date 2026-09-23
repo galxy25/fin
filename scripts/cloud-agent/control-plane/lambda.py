@@ -3979,10 +3979,12 @@ SITE_STATES = ("idle", "working", "needs-input", "task-complete", "draining", "u
 # "vnc-open" is terminal-open's sibling for a GUI session (docs/VNC.md): same
 # on-demand relay worker, same sessionId-as-capability model, no tmuxSession arg
 # (the target is the fixed loopback RFB port, not a named session).
-SITE_COMMAND_KINDS = ("restart", "update", "stop", "drain", "terminal-open", "vnc-open")
+# "browser-open" is Remote Browser (docs/REMOTE-BROWSER.md): the app views and drives
+# the Chrome a site's Claude sessions use. Same relay, same sessionId model.
+SITE_COMMAND_KINDS = ("restart", "update", "stop", "drain", "terminal-open", "vnc-open", "browser-open")
 # The kinds that need a relay worker ensured before the command is queued, so both
 # sides are handed the same address (see `queue_site_command`).
-RELAY_BACKED_COMMAND_KINDS = ("terminal-open", "vnc-open")
+RELAY_BACKED_COMMAND_KINDS = ("terminal-open", "vnc-open", "browser-open")
 
 # `enrollKey` is the operator's stable name for a physical place
 # ("levis-imac/deepspacenine"), and is what makes enrollment idempotent:

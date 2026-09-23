@@ -1,11 +1,11 @@
 import XCTest
 @testable import FinAgentCore
 
-/// `VNCPortProbe` — the loopback connect-and-close that decides half of the
+/// `LoopbackPortProbe` — the loopback connect-and-close that decides half of the
 /// `vnc_proxy` capability (docs/VNC.md §2). The other half is the config opt-in,
 /// which is a plain boolean and needs no test of its own; this is the half that
 /// talks to the world and therefore the half that can be wrong.
-final class VNCPortProbeTests: XCTestCase {
+final class LoopbackPortProbeTests: XCTestCase {
     /// Binds an ephemeral loopback port and starts listening, returning the port and a
     /// close handle. Real sockets on purpose: the whole value of this probe is that it
     /// answers with a TCP fact rather than a service-state reading, so a test that
@@ -41,7 +41,7 @@ final class VNCPortProbeTests: XCTestCase {
     func testReachableWhenSomethingIsListening() throws {
         let listener = try listeningPort()
         defer { listener.close() }
-        XCTAssertTrue(VNCPortProbe.isReachable(port: listener.port))
+        XCTAssertTrue(LoopbackPortProbe.isReachable(port: listener.port))
     }
 
     func testNotReachableOnceTheListenerGoesAway() throws {
@@ -50,17 +50,17 @@ final class VNCPortProbeTests: XCTestCase {
         listener.close()
         // The capability has to self-correct within one heartbeat when Screen Sharing is
         // switched off outside Fin's control — that is this assertion, in miniature.
-        XCTAssertFalse(VNCPortProbe.isReachable(port: port))
+        XCTAssertFalse(LoopbackPortProbe.isReachable(port: port))
     }
 
     func testAMalformedHostIsNotReachableRatherThanAnError() {
         // "not reachable" and "not there" are the same answer to the only question the
         // capability asks, so every failure mode collapses to false rather than throwing
         // into the heartbeat's path.
-        XCTAssertFalse(VNCPortProbe.isReachable(host: "not-an-address", port: 5900))
+        XCTAssertFalse(LoopbackPortProbe.isReachable(host: "not-an-address", port: 5900))
     }
 
     func testTheDefaultPortIsScreenSharings() {
-        XCTAssertEqual(VNCPortProbe.port, 5900)
+        XCTAssertEqual(LoopbackPortProbe.vncPort, 5900)
     }
 }

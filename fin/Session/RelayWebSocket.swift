@@ -79,6 +79,12 @@ final class RelayWebSocket: @unchecked Sendable {
 
         let websocket = NWProtocolWebSocket.Options()
         websocket.autoReplyPing = true
+        // Explicit, not the platform default: Remote Browser frames are JPEGs up to
+        // ~200 KiB (RemoteBrowserProtocol.maxFrameBase64Bytes), far larger than any PTY
+        // chunk this socket carried before, and a default nobody has exercised at that
+        // size is not something to find out about from a phone. Twice the relay's own
+        // 256 KiB ceiling, so the relay — not this socket — is always the limit.
+        websocket.maximumMessageSize = 512 * 1024
 
         let parameters = NWParameters(tls: tls)
         parameters.defaultProtocolStack.applicationProtocols.insert(websocket, at: 0)

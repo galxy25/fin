@@ -3735,6 +3735,16 @@ class TerminalOpenCommandKindTests(_SitesTestCase):
         )
         self.assertEqual([c["kind"] for c in json.loads(beat["body"])["commands"]], ["terminal-open"])
 
+    def test_browser_open_gets_a_relay_like_terminal_open(self):
+        self.assertIn("browser-open", lam.RELAY_BACKED_COMMAND_KINDS)
+        response = lam.queue_site_command(
+            {"_userId": "user-1", "body": json.dumps({"kind": "browser-open", "args": {"sessionId": "s-web-1"}})},
+            self.site["siteId"],
+        )
+        body = json.loads(response["body"])
+        self.assertEqual(body["command"]["args"], {"sessionId": "s-web-1", "relayHost": "203.0.113.7", "relayPort": 443})
+        self.assertEqual((body["relayHost"], body["relayPort"]), ("203.0.113.7", 443))
+
     def test_vnc_open_is_a_recognized_relay_backed_kind(self):
         self.assertIn("vnc-open", lam.SITE_COMMAND_KINDS)
         self.assertIn("vnc-open", lam.RELAY_BACKED_COMMAND_KINDS)

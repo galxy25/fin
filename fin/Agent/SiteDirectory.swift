@@ -41,6 +41,9 @@ struct FinSite: Decodable, Equatable, Identifiable {
         /// desktop, so it is never on by default and never assumed from the fact that
         /// the daemon knows how. nil reads as unsupported, same rule as every field here.
         let vncProxy: Bool?
+        /// Whether this site serves Remote Browser — its Claude sessions' Chrome, viewable
+        /// and drivable from here (docs/REMOTE-BROWSER.md). Opt-in on the site, nil = no.
+        let remoteBrowser: Bool?
         /// Where the daemon's launch stands (`starting`, `connecting`, `probing`,
         /// `ready`, `failed`) and what stopped it — reported while `state` is
         /// "unavailable", so a body that cannot attach its terminal says why.
@@ -81,6 +84,7 @@ struct FinSite: Decodable, Equatable, Identifiable {
             case tmuxSessions = "tmux_sessions"
             case terminalRelay = "terminal_relay"
             case vncProxy = "vnc_proxy"
+            case remoteBrowser = "remote_browser"
             case launchStage = "launch_stage"
             case launchFailure = "launch_failure"
         }

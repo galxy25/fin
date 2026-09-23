@@ -126,6 +126,17 @@ enum ControlPlaneClient {
         .flatMap { decode(RelayAddress.self, status: $0.0, body: $0.1) }
     }
 
+    /// Remote Browser (docs/REMOTE-BROWSER.md): the `terminal-open` shape with no tmux
+    /// session — asks the site's daemon to stream its Chrome over a relay the control
+    /// plane launched or reused, and returns that relay's address to dial.
+    static func openBrowserRelay(_ siteID: String, sessionId: String) async -> Result<RelayAddress, Failure> {
+        await perform(request("POST", path: "/sites/\(siteID)/commands", body: [
+            "kind": "browser-open",
+            "args": ["sessionId": sessionId],
+        ]))
+        .flatMap { decode(RelayAddress.self, status: $0.0, body: $0.1) }
+    }
+
     static func deleteSite(_ siteID: String) async -> Result<Void, Failure> {
         await perform(request("DELETE", path: "/sites/\(siteID)"))
             .flatMap { status, body in
