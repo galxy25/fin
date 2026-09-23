@@ -41,6 +41,17 @@ review notes, and feature priorities should reinforce it, not dilute it.
   merge continuously, you're the foreman of the software factory"): verify
   (build + evals), merge to main, push — don't sit on green branches. App
   Store / TestFlight **submissions** still need Levi's explicit word.
+- **Record what the session did into Fin's memory before you finish** (Levi,
+  2026-09-23): run `scripts/dev/remember-session.sh <session-id> "<title>"
+  "<what happened>"` — the session id is the one in the `Claude-Session` URL
+  in your commit footer. Fin writes episodic memory from its OWN turns only,
+  so everything done in a Claude Code session is invisible to it: live on
+  2026-09-21 the cumulative profile's newest fact was six days old, not
+  because consolidation was broken but because it had nothing to consolidate.
+  Upsert by session id, so calling it repeatedly through a long session
+  refines one entry — pass the fullest summary you have each time. Say what
+  shipped AND what is still open; the profile is what the next session and
+  Fin itself read to know where things stand.
 - **Register a watch before asking Levi something blocking** (Levi, 2026-09-21):
   when a question to him in a Claude Code session — any AskUserQuestion-shaped
   moment, a plan-mode confirmation, anything you're waiting on his answer to

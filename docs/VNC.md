@@ -1,7 +1,29 @@
 # VNC (GUI remote-control) support for Fin — recommended architecture
 
-> **STATUS 2026-09-22: Phase 0 shipped. Phase 1 is BLOCKED and its central
-> assumption is disproven — read this before building anything below.**
+> **STATUS 2026-09-23: Phase 0 shipped. Phase 1 as written below is dead, but the
+> feature is NOT — a different Phase 1 is viable. Read this before building.**
+>
+> **Update, 2026-09-23.** The follow-up question — is TCC blocked the same way the
+> Screen Sharing service is? — is answered: **no. Screen Recording is available on
+> the work laptop.** The two gates are different (a service toggle is admin/MDM
+> territory; TCC is per-app and usually user-grantable), so the userspace path is
+> open where the proxy path is shut. What that costs, plainly:
+>
+> - The design below is cheap *because it writes no RFB code*. A userspace server
+>   means implementing the RFB **server** side — handshake, security type,
+>   framebuffer updates, an encoding — plus ScreenCaptureKit capture and (for
+>   anything beyond view-only) CGEvent input injection behind a **second, separate**
+>   TCC permission, Accessibility.
+> - **It deletes the free second factor.** §4 leans on Apple's own Screen Sharing
+>   login as the wall an attacker holding only a stolen relay `sessionId` still hits.
+>   A userspace server has no such wall. The auth question §4 defers to Phase 3 is
+>   therefore **blocking for a userspace Phase 1**, not deferred — a full-desktop
+>   takeover behind nothing but a relay capability is not a posture this design ever
+>   argued for.
+> - View-only (Screen Recording alone) and controllable (Screen Recording +
+>   Accessibility) are a natural phase boundary, and the capability should degrade
+>   per-permission rather than all-or-nothing, matching the nil-is-unsupported rule
+>   every other capability here already follows.
 >
 > Phase 0 (capability plumbing, no data path) is implemented and merged: the
 > `vncProxyEnabled` daemon config field, the `VNCPortProbe` loopback check, the
@@ -19,14 +41,12 @@
 > at all. On the one machine that motivated this whole feature, that server cannot
 > be turned on. Phase 1 as written would deliver zero value for the actual use case.
 >
-> **The rethink has to start from a different question than the one this document
-> answered.** The obvious alternative — fin-agentd shipping its own userspace RFB
-> server rather than proxying Apple's — trades away the free-auth property in §4 AND
-> is likely to hit the same class of wall one layer down: a userspace screen-capture
-> and input-injection server needs Screen Recording and Accessibility (TCC)
-> permissions, and those are themselves commonly MDM-managed via PPPC profiles on a
-> corporate-managed Mac. That needs checking *first*, the same way this question
-> should have been, before any more design work is spent on it.
+> **The rethink starts from a different question than the one this document
+> answered** — not "how do we tunnel to Apple's server" but "what do we serve, and
+> what stands in front of it." The TCC-blocked-too worry that was flagged here on
+> 09-22 has been checked and did not materialize (see the 09-23 update above); what
+> remains is the auth question, which is now the real blocker rather than the
+> permissions one.
 >
 > Everything below this line is the original, unamended proposal. It remains a
 > correct and useful design **for a Mac whose owner controls it** (Levi's iMac, a
