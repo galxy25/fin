@@ -18,7 +18,9 @@ struct ServerListView: View {
     @State private var siteActionError: String?
     @State private var expandedSiteID: String?
     /// Remote Browser (docs/REMOTE-BROWSER.md) — the site whose browser is open, if any.
-    @State private var browsingSite: FinSite?
+    #if os(macOS) || os(visionOS)
+    @Environment(\.openWindow) private var openWindow
+    #endif
 
     private var visibleSites: [FinSite] { sites.sites.filter { $0.state != "retired" } }
 
@@ -112,9 +114,6 @@ struct ServerListView: View {
         .sheet(isPresented: $showingCloudStatus) {
             CloudSyncStatusView()
         }
-        .sheet(item: $browsingSite) { site in
-            RemoteBrowserView(site: site)
-        }
     }
 
     private var serverRows: some View {
@@ -166,7 +165,14 @@ struct ServerListView: View {
                 // minute of "waking" and then nothing is worse than no globe.
                 if site.capabilities.remoteBrowser == true, site.live {
                     Button {
-                        browsingSite = site
+                        // A window on Mac and Vision Pro, a tab on iPhone and iPad (Levi,
+                        // 2026-09-23 — iPad may get windows later).
+                        #if os(macOS) || os(visionOS)
+                        openWindow(id: FinScene.remoteBrowser, value: site.siteId)
+                        #else
+                        sessionManager.openBrowserTab(siteID: site.siteId, displayName: site.displayName)
+                        dismiss()
+                        #endif
                     } label: {
                         Image(systemName: "globe")
                             .font(.title3)

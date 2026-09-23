@@ -357,6 +357,7 @@ final class SessionManager: ObservableObject {
     /// that tab is the explicit gesture that revives it.
     func selectTab(offset: Int) {
         guard tabOrder.count > 1 else { return }
+        activeBrowserSiteID = nil
         let current = activeServerID.flatMap { tabOrder.firstIndex(of: $0) } ?? 0
         let count = tabOrder.count
         activeServerID = tabOrder[((current + offset) % count + count) % count]
@@ -366,11 +367,13 @@ final class SessionManager: ObservableObject {
     /// Safari convention for ⌘9.
     func selectTab(at index: Int) {
         guard !tabOrder.isEmpty, index >= 0 else { return }
+        activeBrowserSiteID = nil
         activeServerID = tabOrder[index >= 8 ? tabOrder.count - 1 : min(index, tabOrder.count - 1)]
     }
 
     @discardableResult
     func open(_ server: Server) -> TerminalSession {
+        activeBrowserSiteID = nil
         activeServerID = server.id
         let session = session(for: server)
         guard session.state == .disconnected else {
@@ -642,5 +645,53 @@ final class SessionManager: ObservableObject {
         remaining.remove(at: index)
         guard !remaining.isEmpty else { return nil }
         return remaining[min(index, remaining.count - 1)]
+    }
+
+    // MARK: - Browser tabs (iPhone / iPad)
+
+    /// A Remote Browser (docs/REMOTE-BROWSER.md) open as a TAB, the iPhone/iPad
+    /// presentation (Levi, 2026-09-23: "on iOS it should be a tab"); Mac and Vision Pro
+    /// open a window instead. The session lives here, not in the view, so switching to
+    /// a terminal and back keeps the same live page instead of re-waking the relay and
+    /// asking for Face ID again. Not persisted across launches: a relaunch has no live
+    /// session to restore, and a dormant browser tab would just be a Face ID prompt
+    /// waiting to happen.
+    struct BrowserTab: Identifiable {
+        var id: String { siteID }
+        let siteID: String
+        let displayName: String
+        let session: RemoteBrowserSession
+    }
+
+    @Published private(set) var browserTabs: [BrowserTab] = []
+    /// The browser tab in front, which wins over `activeServerID` for routing. Cleared
+    /// by every explicit terminal-tab gesture (`open`, `selectTab`), so the terminal
+    /// the user reaches for is the one they get.
+    @Published private(set) var activeBrowserSiteID: String?
+
+    var activeBrowserTab: BrowserTab? {
+        activeBrowserSiteID.flatMap { id in browserTabs.first(where: { $0.siteID == id }) }
+    }
+
+    /// Opens (or brings forward) the site's browser tab. One per site: tapping the
+    /// globe again returns to the live page rather than starting a second session.
+    func openBrowserTab(siteID: String, displayName: String) {
+        if !browserTabs.contains(where: { $0.siteID == siteID }) {
+            browserTabs.append(BrowserTab(siteID: siteID, displayName: displayName, session: RemoteBrowserSession(siteID: siteID)))
+        }
+        activeBrowserSiteID = siteID
+    }
+
+    func selectBrowserTab(_ siteID: String) {
+        guard browserTabs.contains(where: { $0.siteID == siteID }) else { return }
+        activeBrowserSiteID = siteID
+    }
+
+    /// Ends the session and drops the tab; focus falls back to whichever terminal was
+    /// active underneath (or home), since `activeServerID` was never touched.
+    func closeBrowserTab(_ siteID: String) {
+        browserTabs.first(where: { $0.siteID == siteID })?.session.close()
+        browserTabs.removeAll { $0.siteID == siteID }
+        if activeBrowserSiteID == siteID { activeBrowserSiteID = nil }
     }
 }

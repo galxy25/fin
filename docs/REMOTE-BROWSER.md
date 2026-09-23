@@ -79,6 +79,15 @@ Fin app  ──(relay: output/input frames)──  fin-agentd  ──CDP (loopba
    ```
 3. Restart the daemon. The site's row under *Fin's Computers* shows a globe.
 
+## Where it opens
+
+A **window** on Mac and Vision Pro, beside the terminal (`FinScene.remoteBrowser`,
+keyed by siteId). A **tab** on iPhone and iPad (`SessionManager.BrowserTab`), in the
+same tab bar as the terminals; the session lives in SessionManager, so switching to a
+terminal and back keeps the live page with no second Face ID. iPad could get windows
+later: that needs `UIApplicationSupportsMultipleScenes`, which also lets the MAIN
+window be opened twice, so it was left out of the first rollout.
+
 ## Delivery
 
 1. **Done:** protocol + tests, daemon client, `browser-open` command, `remote_browser`

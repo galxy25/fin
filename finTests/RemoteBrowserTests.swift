@@ -77,4 +77,29 @@ final class RemoteBrowserTests: XCTestCase {
         let older = try JSONDecoder().decode(FinSite.Capabilities.self, from: Data(#"{"daemon_version": "1.11.3"}"#.utf8))
         XCTAssertNil(older.remoteBrowser, "a daemon that predates the feature omits it — nil, never a false yes")
     }
+
+    // MARK: - Browser tabs (iPhone / iPad)
+
+    @MainActor
+    func testOpeningTheSameSiteTwiceBringsItsTabForwardInsteadOfASecondSession() {
+        let manager = SessionManager()
+        manager.openBrowserTab(siteID: "s1", displayName: "Work laptop")
+        let first = manager.browserTabs.first?.session
+        manager.openBrowserTab(siteID: "s1", displayName: "Work laptop")
+        XCTAssertEqual(manager.browserTabs.count, 1)
+        XCTAssertTrue(manager.browserTabs.first?.session === first, "the live session survives — no re-wake, no second Face ID")
+        XCTAssertEqual(manager.activeBrowserTab?.siteID, "s1")
+    }
+
+    @MainActor
+    func testClosingTheBrowserTabHandsFocusBackToTheTerminals() {
+        // (Terminal-tab gestures clearing browser focus isn't asserted here: a
+        // SessionManager restores the HOST's saved terminal tabs, so what `selectTab`
+        // lands on depends on the machine running the test.)
+        let manager = SessionManager()
+        manager.openBrowserTab(siteID: "s1", displayName: "Work laptop")
+        manager.closeBrowserTab("s1")
+        XCTAssertNil(manager.activeBrowserSiteID)
+        XCTAssertTrue(manager.browserTabs.isEmpty)
+    }
 }

@@ -14,7 +14,6 @@ import LocalAuthentication
 /// the target Mac because that one can't be answered when Levi is away from it — which
 /// is exactly when he'd reach for this.
 struct RemoteBrowserView: View {
-    let site: FinSite
     @Environment(\.dismiss) private var dismiss
     @StateObject private var session: RemoteBrowserSession
     @State private var typed = ""
@@ -22,9 +21,24 @@ struct RemoteBrowserView: View {
     @State private var gateFailed: String?
     @State private var lastDrag: CGSize = .zero
 
+    /// Set for the tab presentation: the session belongs to `SessionManager`, so the
+    /// view must neither close it on disappear (switching tabs) nor dismiss itself
+    /// on Done (there is nothing to dismiss — Done closes the tab).
+    private let onDone: (() -> Void)?
+    private let siteName: String
+
+    /// Window / sheet: the view owns a fresh session and ends it when it goes away.
     init(site: FinSite) {
-        self.site = site
+        self.siteName = site.displayName
+        self.onDone = nil
         _session = StateObject(wrappedValue: RemoteBrowserSession(siteID: site.siteId))
+    }
+
+    /// Tab: the session outlives this view (see `SessionManager.BrowserTab`).
+    init(tab: SessionManager.BrowserTab, onDone: @escaping () -> Void) {
+        self.siteName = tab.displayName
+        self.onDone = onDone
+        _session = StateObject(wrappedValue: tab.session)
     }
 
     var body: some View {
@@ -34,20 +48,22 @@ struct RemoteBrowserView: View {
                 Divider()
                 inputBar
             }
-            .navigationTitle(session.title?.isEmpty == false ? session.title! : site.displayName)
+            .navigationTitle(session.title?.isEmpty == false ? session.title! : siteName)
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { session.close(); dismiss() }
+                    Button("Done") {
+                        if let onDone { onDone() } else { session.close(); dismiss() }
+                    }
                 }
                 ToolbarItem(placement: .primaryAction) { tabMenu }
             }
             .safeAreaInset(edge: .top) { addressBar }
         }
         .task { await gateThenOpen() }
-        .onDisappear { session.close() }
+        .onDisappear { if onDone == nil { session.close() } }
         #if os(macOS)
         .frame(minWidth: 720, minHeight: 560)
         #endif
@@ -87,7 +103,7 @@ struct RemoteBrowserView: View {
                 if session.frame == nil {
                     VStack(spacing: 10) {
                         ProgressView()
-                        Text("Waking \(site.displayName)\u{2019}s browser\u{2026}")
+                        Text("Waking \(siteName)\u{2019}s browser\u{2026}")
                             .font(.callout).foregroundStyle(.secondary)
                         Text("The first session after a quiet spell takes about a minute.")
                             .font(.caption).foregroundStyle(.tertiary)
@@ -212,6 +228,9 @@ struct RemoteBrowserView: View {
     // MARK: - Gate
 
     private func gateThenOpen() async {
+        // A tab coming back to front already has its session: no second Face ID
+        // prompt for switching away to a terminal and back.
+        guard session.state == .idle else { return }
         #if canImport(LocalAuthentication) && !os(tvOS)
         let context = LAContext()
         var error: NSError?
@@ -224,7 +243,7 @@ struct RemoteBrowserView: View {
         do {
             let ok = try await context.evaluatePolicy(
                 .deviceOwnerAuthentication,
-                localizedReason: "Open \(site.displayName)\u{2019}s browser"
+                localizedReason: "Open \(siteName)\u{2019}s browser"
             )
             guard ok else { gateFailed = "Authentication failed."; return }
         } catch {
@@ -233,5 +252,36 @@ struct RemoteBrowserView: View {
         }
         #endif
         session.open()
+    }
+}
+
+/// Remote Browser as its own window (`FinScene.remoteBrowser`, keyed by siteId). The
+/// window gets only the id across the `openWindow` boundary, so it resolves the site
+/// from the shared directory — and says so plainly if the site has gone away (a window
+/// restored at launch for a site since retired or turned off).
+struct RemoteBrowserWindowView: View {
+    let siteID: String?
+    @ObservedObject private var directory = SiteDirectory.shared
+    @State private var looked = false
+
+    var body: some View {
+        if let site = directory.sites.first(where: { $0.siteId == siteID }) {
+            RemoteBrowserView(site: site)
+        } else {
+            Group {
+                if looked {
+                    ContentUnavailableView(
+                        "Browser unavailable", systemImage: "globe",
+                        description: Text("That computer isn\u{2019}t reporting a browser any more.")
+                    )
+                } else {
+                    ProgressView()
+                }
+            }
+            .task {
+                await directory.refresh()
+                looked = true
+            }
+        }
     }
 }

@@ -9,6 +9,8 @@ struct RootView: View {
     private enum Route {
         case terminal(Server)
         case markdown(MarkdownDocument)
+        /// A Remote Browser tab (iPhone/iPad; Mac and Vision Pro use a window).
+        case browser(SessionManager.BrowserTab)
         case home
     }
 
@@ -193,6 +195,11 @@ struct RootView: View {
                 MarkdownReaderView(document: document, isRoot: true)
             }
             #endif
+        case .browser(let tab):
+            RemoteBrowserView(tab: tab) { sessionManager.closeBrowserTab(tab.siteID) }
+                // One view identity per site, so switching between two sites' tabs
+                // gives each its own @StateObject rather than reusing the first.
+                .id(tab.siteID)
         case .home:
             HomeView()
         }
@@ -279,6 +286,9 @@ struct RootView: View {
     }
 
     private var route: Route {
+        // A browser tab in front wins: it only becomes active by an explicit tap, and
+        // every terminal-tab gesture clears it (SessionManager.activeBrowserSiteID).
+        if let tab = sessionManager.activeBrowserTab { return .browser(tab) }
         let terminalTarget = sessionManager.activeServerID.flatMap { id in
             servers.first(where: { $0.id == id })
         }
