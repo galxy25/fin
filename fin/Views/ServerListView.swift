@@ -161,26 +161,13 @@ struct ServerListView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
-                // Only for a site that opted in AND is live: a globe that opens onto a
-                // minute of "waking" and then nothing is worse than no globe.
+                // Only for a site that opted in AND is live: a button that opens onto a
+                // minute of "waking" and then nothing is worse than no button.
+                if site.capabilities.vncProxy == true, site.live {
+                    remoteScreenButton(site, mode: .desktop)
+                }
                 if site.capabilities.remoteBrowser == true, site.live {
-                    Button {
-                        // A window on Mac and Vision Pro, a tab on iPhone and iPad (Levi,
-                        // 2026-09-23 — iPad may get windows later).
-                        #if os(macOS) || os(visionOS)
-                        openWindow(id: FinScene.remoteBrowser, value: site.siteId)
-                        #else
-                        sessionManager.openBrowserTab(siteID: site.siteId, displayName: site.displayName)
-                        dismiss()
-                        #endif
-                    } label: {
-                        Image(systemName: "globe")
-                            .font(.title3)
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.borderless)
-                    .accessibilityLabel("Open \(site.displayName)\u{2019}s browser")
-                    .accessibilityIdentifier("siteBrowser_\(site.siteId8)")
+                    remoteScreenButton(site, mode: .browser)
                 }
                 Menu {
                     ForEach(ControlPlaneClient.SiteCommand.allCases, id: \.rawValue) { command in
@@ -294,6 +281,29 @@ struct ServerListView: View {
         return Circle()
             .fill(connected ? Color.green : Color.gray)
             .frame(width: 8, height: 8)
+    }
+
+    /// Opens a site's browser or desktop: a window on Mac and Vision Pro, a tab on
+    /// iPhone and iPad (Levi, 2026-09-23 — iPad may get windows later).
+    private func remoteScreenButton(_ site: FinSite, mode: RemoteBrowserSession.Mode) -> some View {
+        Button {
+            #if os(macOS) || os(visionOS)
+            openWindow(id: FinScene.remoteBrowser, value: RemoteScreenTarget(siteID: site.siteId, mode: mode))
+            #else
+            sessionManager.openBrowserTab(
+                siteID: site.siteId, displayName: site.displayName, mode: mode,
+                inputAvailable: mode == .desktop ? site.capabilities.guiPermissions?.accessibility : true
+            )
+            dismiss()
+            #endif
+        } label: {
+            Image(systemName: mode == .desktop ? "display" : "globe")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel("Open \(site.displayName)\u{2019}s \(mode == .desktop ? "desktop" : "browser")")
+        .accessibilityIdentifier("site\(mode == .desktop ? "Desktop" : "Browser")_\(site.siteId8)")
     }
 
     private func connect(to server: Server) {

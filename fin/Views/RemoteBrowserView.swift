@@ -27,17 +27,23 @@ struct RemoteBrowserView: View {
     private let onDone: (() -> Void)?
     private let siteName: String
 
-    /// Window / sheet: the view owns a fresh session and ends it when it goes away.
-    init(site: FinSite) {
+    /// Whether typing and taps will do anything: false when the site's daemon lacks the
+    /// Accessibility grant (desktop only — the browser needs no grant). nil = unknown.
+    private let inputAvailable: Bool?
+
+    /// Window: the view owns a fresh session and ends it when it goes away.
+    init(site: FinSite, mode: RemoteBrowserSession.Mode = .browser) {
         self.siteName = site.displayName
         self.onDone = nil
-        _session = StateObject(wrappedValue: RemoteBrowserSession(siteID: site.siteId))
+        self.inputAvailable = mode == .desktop ? site.capabilities.guiPermissions?.accessibility : true
+        _session = StateObject(wrappedValue: RemoteBrowserSession(siteID: site.siteId, mode: mode))
     }
 
     /// Tab: the session outlives this view (see `SessionManager.BrowserTab`).
     init(tab: SessionManager.BrowserTab, onDone: @escaping () -> Void) {
         self.siteName = tab.displayName
         self.onDone = onDone
+        self.inputAvailable = tab.inputAvailable
         _session = StateObject(wrappedValue: tab.session)
     }
 
@@ -58,9 +64,21 @@ struct RemoteBrowserView: View {
                         if let onDone { onDone() } else { session.close(); dismiss() }
                     }
                 }
-                ToolbarItem(placement: .primaryAction) { tabMenu }
+                if session.mode == .browser {
+                    ToolbarItem(placement: .primaryAction) { tabMenu }
+                }
             }
-            .safeAreaInset(edge: .top) { addressBar }
+            .safeAreaInset(edge: .top) {
+                // A desktop has no address or tabs; what it may have is no input.
+                if session.mode == .browser {
+                    addressBar
+                } else if inputAvailable == false {
+                    Label("View only \u{2014} fin-agentd on \(siteName) has no Accessibility permission",
+                          systemImage: "eye")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity).padding(6).background(.bar)
+                }
+            }
         }
         .task { await gateThenOpen() }
         .onDisappear { if onDone == nil { session.close() } }
@@ -103,7 +121,7 @@ struct RemoteBrowserView: View {
                 if session.frame == nil {
                     VStack(spacing: 10) {
                         ProgressView()
-                        Text("Waking \(siteName)\u{2019}s browser\u{2026}")
+                        Text("Waking \(siteName)\u{2019}s \(session.mode == .desktop ? "desktop" : "browser")\u{2026}")
                             .font(.callout).foregroundStyle(.secondary)
                         Text("The first session after a quiet spell takes about a minute.")
                             .font(.caption).foregroundStyle(.tertiary)
@@ -114,7 +132,8 @@ struct RemoteBrowserView: View {
                 EmptyView()
             case .closed(let reason):
                 ContentUnavailableView(
-                    "Browser closed", systemImage: "globe.badge.chevron.backward",
+                    session.mode == .desktop ? "Desktop closed" : "Browser closed",
+                    systemImage: session.mode == .desktop ? "display" : "globe.badge.chevron.backward",
                     description: Text(reason ?? "The session ended.")
                 )
             }
@@ -243,7 +262,7 @@ struct RemoteBrowserView: View {
         do {
             let ok = try await context.evaluatePolicy(
                 .deviceOwnerAuthentication,
-                localizedReason: "Open \(siteName)\u{2019}s browser"
+                localizedReason: "Open \(siteName)\u{2019}s \(session.mode == .desktop ? "desktop" : "browser")"
             )
             guard ok else { gateFailed = "Authentication failed."; return }
         } catch {
@@ -255,24 +274,34 @@ struct RemoteBrowserView: View {
     }
 }
 
-/// Remote Browser as its own window (`FinScene.remoteBrowser`, keyed by siteId). The
-/// window gets only the id across the `openWindow` boundary, so it resolves the site
-/// from the shared directory — and says so plainly if the site has gone away (a window
-/// restored at launch for a site since retired or turned off).
+/// Which remote screen a window or tab shows: a site's browser or its whole desktop.
+/// Codable + Hashable because it is the `openWindow(value:)` payload.
+struct RemoteScreenTarget: Codable, Hashable {
+    let siteID: String
+    let mode: RemoteBrowserSession.Mode
+
+    /// The tab identity (`SessionManager.BrowserTab.id`).
+    var tabID: String { "\(mode.rawValue):\(siteID)" }
+}
+
+/// A remote screen as its own window (`FinScene.remoteBrowser`). The window gets only
+/// the target across the `openWindow` boundary, so it resolves the site from the shared
+/// directory — and says so plainly if the site has gone away (a window restored at
+/// launch for a site since retired or turned off).
 struct RemoteBrowserWindowView: View {
-    let siteID: String?
+    let target: RemoteScreenTarget?
     @ObservedObject private var directory = SiteDirectory.shared
     @State private var looked = false
 
     var body: some View {
-        if let site = directory.sites.first(where: { $0.siteId == siteID }) {
-            RemoteBrowserView(site: site)
+        if let target, let site = directory.sites.first(where: { $0.siteId == target.siteID }) {
+            RemoteBrowserView(site: site, mode: target.mode)
         } else {
             Group {
                 if looked {
                     ContentUnavailableView(
-                        "Browser unavailable", systemImage: "globe",
-                        description: Text("That computer isn\u{2019}t reporting a browser any more.")
+                        "Unavailable", systemImage: target?.mode == .desktop ? "display" : "globe",
+                        description: Text("That computer isn\u{2019}t offering this any more.")
                     )
                 } else {
                     ProgressView()

@@ -137,6 +137,17 @@ enum ControlPlaneClient {
         .flatMap { decode(RelayAddress.self, status: $0.0, body: $0.1) }
     }
 
+    /// Remote Desktop (docs/VNC.md): the same shape as `openBrowserRelay`, for the whole
+    /// screen. `vnc-open` keeps its Phase-0 name on the wire — the control plane has
+    /// carried it since then, so the desktop needed no Lambda change.
+    static func openDesktopRelay(_ siteID: String, sessionId: String) async -> Result<RelayAddress, Failure> {
+        await perform(request("POST", path: "/sites/\(siteID)/commands", body: [
+            "kind": "vnc-open",
+            "args": ["sessionId": sessionId],
+        ]))
+        .flatMap { decode(RelayAddress.self, status: $0.0, body: $0.1) }
+    }
+
     static func deleteSite(_ siteID: String) async -> Result<Void, Failure> {
         await perform(request("DELETE", path: "/sites/\(siteID)"))
             .flatMap { status, body in

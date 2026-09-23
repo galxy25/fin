@@ -357,7 +357,7 @@ final class SessionManager: ObservableObject {
     /// that tab is the explicit gesture that revives it.
     func selectTab(offset: Int) {
         guard tabOrder.count > 1 else { return }
-        activeBrowserSiteID = nil
+        activeBrowserTabID = nil
         let current = activeServerID.flatMap { tabOrder.firstIndex(of: $0) } ?? 0
         let count = tabOrder.count
         activeServerID = tabOrder[((current + offset) % count + count) % count]
@@ -367,13 +367,13 @@ final class SessionManager: ObservableObject {
     /// Safari convention for ⌘9.
     func selectTab(at index: Int) {
         guard !tabOrder.isEmpty, index >= 0 else { return }
-        activeBrowserSiteID = nil
+        activeBrowserTabID = nil
         activeServerID = tabOrder[index >= 8 ? tabOrder.count - 1 : min(index, tabOrder.count - 1)]
     }
 
     @discardableResult
     func open(_ server: Server) -> TerminalSession {
-        activeBrowserSiteID = nil
+        activeBrowserTabID = nil
         activeServerID = server.id
         let session = session(for: server)
         guard session.state == .disconnected else {
@@ -657,41 +657,51 @@ final class SessionManager: ObservableObject {
     /// session to restore, and a dormant browser tab would just be a Face ID prompt
     /// waiting to happen.
     struct BrowserTab: Identifiable {
-        var id: String { siteID }
+        /// One tab per site AND mode: a site's browser and its desktop can both be open.
+        var id: String { RemoteScreenTarget(siteID: siteID, mode: mode).tabID }
         let siteID: String
         let displayName: String
         let session: RemoteBrowserSession
+        /// From the site's `gui_permissions` when the tab opened; false = view-only.
+        var inputAvailable: Bool? = nil
+        var mode: RemoteBrowserSession.Mode { session.mode }
     }
 
     @Published private(set) var browserTabs: [BrowserTab] = []
     /// The browser tab in front, which wins over `activeServerID` for routing. Cleared
     /// by every explicit terminal-tab gesture (`open`, `selectTab`), so the terminal
     /// the user reaches for is the one they get.
-    @Published private(set) var activeBrowserSiteID: String?
+    @Published private(set) var activeBrowserTabID: String?
 
     var activeBrowserTab: BrowserTab? {
-        activeBrowserSiteID.flatMap { id in browserTabs.first(where: { $0.siteID == id }) }
+        activeBrowserTabID.flatMap { id in browserTabs.first(where: { $0.id == id }) }
     }
 
     /// Opens (or brings forward) the site's browser tab. One per site: tapping the
     /// globe again returns to the live page rather than starting a second session.
-    func openBrowserTab(siteID: String, displayName: String) {
-        if !browserTabs.contains(where: { $0.siteID == siteID }) {
-            browserTabs.append(BrowserTab(siteID: siteID, displayName: displayName, session: RemoteBrowserSession(siteID: siteID)))
+    func openBrowserTab(
+        siteID: String, displayName: String, mode: RemoteBrowserSession.Mode = .browser, inputAvailable: Bool? = nil
+    ) {
+        let id = RemoteScreenTarget(siteID: siteID, mode: mode).tabID
+        if !browserTabs.contains(where: { $0.id == id }) {
+            browserTabs.append(BrowserTab(
+                siteID: siteID, displayName: displayName, session: RemoteBrowserSession(siteID: siteID, mode: mode),
+                inputAvailable: inputAvailable
+            ))
         }
-        activeBrowserSiteID = siteID
+        activeBrowserTabID = id
     }
 
-    func selectBrowserTab(_ siteID: String) {
-        guard browserTabs.contains(where: { $0.siteID == siteID }) else { return }
-        activeBrowserSiteID = siteID
+    func selectBrowserTab(_ id: String) {
+        guard browserTabs.contains(where: { $0.id == id }) else { return }
+        activeBrowserTabID = id
     }
 
     /// Ends the session and drops the tab; focus falls back to whichever terminal was
     /// active underneath (or home), since `activeServerID` was never touched.
-    func closeBrowserTab(_ siteID: String) {
-        browserTabs.first(where: { $0.siteID == siteID })?.session.close()
-        browserTabs.removeAll { $0.siteID == siteID }
-        if activeBrowserSiteID == siteID { activeBrowserSiteID = nil }
+    func closeBrowserTab(_ id: String) {
+        browserTabs.first(where: { $0.id == id })?.session.close()
+        browserTabs.removeAll { $0.id == id }
+        if activeBrowserTabID == id { activeBrowserTabID = nil }
     }
 }

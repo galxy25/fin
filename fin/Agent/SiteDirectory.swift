@@ -34,21 +34,34 @@ struct FinSite: Decodable, Equatable, Identifiable {
         /// older daemon that predates the feature simply omits it — nil reads as
         /// unsupported, never as a crash or a false yes.
         let terminalRelay: Bool?
-        /// Whether this site can serve a GUI (VNC) session right now — docs/VNC.md.
+        /// Whether this site can serve a Remote Desktop session right now — docs/VNC.md.
         /// Unlike `terminalRelay` (true for any enrolled site), this is true only when
-        /// the machine's owner opted it in AND an RFB server is actually listening
-        /// there, both re-checked every heartbeat: a GUI session hands over the whole
-        /// desktop, so it is never on by default and never assumed from the fact that
+        /// the machine's owner opted it in AND its daemon holds the Screen Recording
+        /// grant, both re-checked every heartbeat: a desktop session hands over the whole
+        /// screen, so it is never on by default and never assumed from the fact that
         /// the daemon knows how. nil reads as unsupported, same rule as every field here.
         let vncProxy: Bool?
         /// Whether this site serves Remote Browser — its Claude sessions' Chrome, viewable
         /// and drivable from here (docs/REMOTE-BROWSER.md). Opt-in on the site, nil = no.
         let remoteBrowser: Bool?
+        /// The daemon's own macOS privacy grants (docs/VNC.md): Screen Recording to
+        /// show the desktop, Accessibility to drive it. Accessibility false = the
+        /// desktop opens view-only.
+        let guiPermissions: GUIPermissions?
         /// Where the daemon's launch stands (`starting`, `connecting`, `probing`,
         /// `ready`, `failed`) and what stopped it — reported while `state` is
         /// "unavailable", so a body that cannot attach its terminal says why.
         let launchStage: String?
         let launchFailure: String?
+
+        struct GUIPermissions: Decodable, Equatable {
+            let accessibility: Bool?
+            let screenRecording: Bool?
+            enum CodingKeys: String, CodingKey {
+                case accessibility
+                case screenRecording = "screen_recording"
+            }
+        }
 
         struct Brain: Decodable, Equatable {
             let kind: String?
@@ -85,6 +98,7 @@ struct FinSite: Decodable, Equatable, Identifiable {
             case terminalRelay = "terminal_relay"
             case vncProxy = "vnc_proxy"
             case remoteBrowser = "remote_browser"
+            case guiPermissions = "gui_permissions"
             case launchStage = "launch_stage"
             case launchFailure = "launch_failure"
         }

@@ -1,5 +1,27 @@
 # VNC (GUI remote-control) support for Fin — recommended architecture
 
+> **STATUS 2026-09-23 (later): Phase 1 BUILT — as "Remote Desktop", not RFB.**
+> fin-agentd 1.12.0 `DesktopRelayClient` captures the main display with
+> ScreenCaptureKit (`SCScreenshotManager`, ~4 fps, points not pixels, capped 1600 wide,
+> unchanged frames skipped, JPEG quality stepped down to fit the relay's frame budget)
+> and plays input back as CGEvents (`RemoteDesktopProtocol.events`, tested). It speaks
+> Remote Browser's wire protocol (docs/REMOTE-BROWSER.md) unchanged, so the app reuses
+> `RemoteBrowserSession`/`RemoteBrowserView` in `.desktop` mode — a window on Mac and
+> Vision Pro, a tab on iPhone/iPad — with no VNC client and no relay or Lambda change
+> (`vnc-open` has been relay-backed since Phase 0).
+>
+> - **Opt-in:** `"vncProxyEnabled": true` in the site's config.json (name kept from
+>   Phase 0). Capability `vnc_proxy` = opted in AND Screen Recording granted.
+> - **Grants:** Screen Recording (view) + Accessibility (input), reported per
+>   heartbeat as `gui_permissions`; without Accessibility the app shows a view-only
+>   banner. Grants survive updates because the binary is now signed with a stable
+>   identity (publish-binary.sh, fin-agentd 1.11.6).
+> - **Auth (§4's blocking question):** the same answer as Remote Browser — Face ID /
+>   Touch ID / Optic ID (or passcode) in the app on every open, plus the per-site
+>   opt-in enforced locally by the daemon.
+> - **Not yet:** multiple displays (main only), right-click / drag / modifier keys,
+>   clipboard.
+
 > **STATUS 2026-09-23: Phase 0 shipped. Phase 1 as written below is dead, but the
 > feature is NOT — a different Phase 1 is viable. Read this before building.**
 >

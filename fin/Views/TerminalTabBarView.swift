@@ -22,7 +22,7 @@ struct TerminalTabBarView: View {
                             TerminalTabChip(
                                 server: server,
                                 session: session,
-                                isActive: sessionManager.activeBrowserSiteID == nil
+                                isActive: sessionManager.activeBrowserTabID == nil
                                     && sessionManager.activeServerID == server.id,
                                 // A click is the explicit gesture, so it goes through
                                 // `open` — which reconnects a dropped tab — where the
@@ -36,9 +36,9 @@ struct TerminalTabBarView: View {
                         BrowserTabChip(
                             tab: tab,
                             session: tab.session,
-                            isActive: sessionManager.activeBrowserSiteID == tab.siteID,
-                            select: { sessionManager.selectBrowserTab(tab.siteID) },
-                            close: { sessionManager.closeBrowserTab(tab.siteID) }
+                            isActive: sessionManager.activeBrowserTabID == tab.id,
+                            select: { sessionManager.selectBrowserTab(tab.id) },
+                            close: { sessionManager.closeBrowserTab(tab.id) }
                         )
                     }
                     Button {
@@ -128,7 +128,7 @@ private struct BrowserTabChip: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "globe")
+            Image(systemName: tab.mode == .desktop ? "display" : "globe")
                 .font(.system(size: 10))
                 .foregroundStyle(session.state == .connected ? Color.green : Color.yellow)
             Text(session.title?.isEmpty == false ? session.title! : tab.displayName)
@@ -141,7 +141,7 @@ private struct BrowserTabChip: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.white.opacity(0.5))
-            .accessibilityLabel("Close browser")
+            .accessibilityLabel(tab.mode == .desktop ? "Close desktop" : "Close browser")
         }
         .padding(.horizontal, 12)
         .frame(maxWidth: 220, maxHeight: .infinity)
@@ -149,6 +149,6 @@ private struct BrowserTabChip: View {
         .foregroundStyle(isActive ? Color.white : Color.white.opacity(0.65))
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
-        .accessibilityIdentifier("tabBar_browser_\(tab.siteID)")
+        .accessibilityIdentifier("tabBar_\(tab.id)")
     }
 }

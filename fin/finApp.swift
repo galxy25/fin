@@ -485,11 +485,12 @@ struct FinApp: App {
         #if os(macOS) || os(visionOS)
         // Remote Browser (docs/REMOTE-BROWSER.md) gets a window of its own on Mac and
         // Vision Pro, so the page Levi is signing in to sits beside the terminal
-        // instead of covering it (Levi, 2026-09-23). Keyed by siteId: opening the same
-        // site twice brings its window forward rather than starting a second session.
+        // instead of covering it (Levi, 2026-09-23) — and so does Remote Desktop. Keyed
+        // by site + mode: opening the same one twice brings its window forward rather
+        // than starting a second session.
         // iPhone and iPad open it as a tab instead (SessionManager.BrowserTab).
-        WindowGroup(id: FinScene.remoteBrowser, for: String.self) { $siteID in
-            RemoteBrowserWindowView(siteID: siteID)
+        WindowGroup(id: FinScene.remoteBrowser, for: RemoteScreenTarget.self) { $target in
+            RemoteBrowserWindowView(target: target)
                 .preferredColorScheme(.dark)
         }
         .defaultSize(width: 1000, height: 760)

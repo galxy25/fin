@@ -11,8 +11,18 @@ import ImageIO
 /// control-plane call both launches (or reuses) the relay and tells both ends its address.
 /// What differs is only the payload, and that is `RemoteBrowserProtocol`, which the
 /// daemon compiles too.
+///
+/// Also Remote Desktop's session (docs/VNC.md): the daemon streams the whole screen in
+/// this same protocol, so only the command that opens it differs (`Mode`).
 @MainActor
 final class RemoteBrowserSession: ObservableObject {
+    /// What the site streams. Codable/Hashable because it rides `openWindow(value:)`
+    /// inside `RemoteScreenTarget`.
+    enum Mode: String, Codable, Hashable {
+        case browser
+        case desktop
+    }
+
     enum State: Equatable {
         case idle
         /// Relay launching / daemon dialing in / Chrome starting — the first session
@@ -32,19 +42,21 @@ final class RemoteBrowserSession: ObservableObject {
     @Published private(set) var selectedTab: String?
 
     let siteID: String
+    let mode: Mode
     private var socket: RelayWebSocket?
     private var sessionId: String?
     private var runTask: Task<Void, Never>?
     /// Same patience as the terminal: an on-demand relay needs about a minute to boot.
     private let connectAttempts = 45
 
-    init(siteID: String) {
+    init(siteID: String, mode: Mode = .browser) {
         self.siteID = siteID
+        self.mode = mode
     }
 
     func open() {
         guard runTask == nil else { return }
-        let sessionId = "b-" + UUID().uuidString.lowercased()
+        let sessionId = (mode == .desktop ? "d-" : "b-") + UUID().uuidString.lowercased()
         self.sessionId = sessionId
         state = .waking
         runTask = Task { [weak self] in
@@ -75,7 +87,10 @@ final class RemoteBrowserSession: ObservableObject {
 
     private func run(sessionId: String) async {
         let relay: ControlPlaneClient.RelayAddress
-        switch await ControlPlaneClient.openBrowserRelay(siteID, sessionId: sessionId) {
+        let opened = mode == .desktop
+            ? await ControlPlaneClient.openDesktopRelay(siteID, sessionId: sessionId)
+            : await ControlPlaneClient.openBrowserRelay(siteID, sessionId: sessionId)
+        switch opened {
         case .failure(let failure):
             state = .closed("Could not reach the control plane: \(failure)")
             return

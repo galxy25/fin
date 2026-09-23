@@ -422,6 +422,10 @@ final class Daemon {
     private var terminalRelayClient: TerminalRelayClient?
     /// Remote Browser; nil unless this site opted in (`config.remoteBrowser.enabled`).
     private var browserRelayClient: BrowserRelayClient?
+    #if os(macOS)
+    /// Remote Desktop — nil unless this site opted in (`vncProxyEnabled`).
+    private var desktopRelayClient: DesktopRelayClient?
+    #endif
     /// False until the shell inside the terminal has answered a readiness probe. While
     /// false the site heartbeat says "unavailable" — visible to the operator, inert to
     /// the control plane — and carries `launchStage`/`launchFailure`, so a body that
@@ -535,19 +539,21 @@ final class Daemon {
         config.agent.contextWindowTokens ?? Self.defaultContextWindowTokens
     }
 
-    /// Whether this site can serve a GUI session right now (docs/VNC.md §2): the human
-    /// opted this machine in AND something is actually listening on the RFB port.
-    ///
-    /// TWO independent booleans, both required, and deliberately not collapsed into one.
-    /// "Opted in" is a standing decision a person made once; "reachable" is a fact about
-    /// this minute that flips whenever Screen Sharing is toggled outside Fin's control.
-    /// Collapsing them would make the flag lie in both directions — a machine that opted
-    /// in but has Screen Sharing off would advertise a session it can't open, and the
-    /// opt-in itself would look like it had been withdrawn every time the service
-    /// blipped. Recomputed every heartbeat, so the capability self-corrects within one
-    /// beat either way.
+    /// Whether this site can serve a Remote Desktop session right now (docs/VNC.md,
+    /// "Phase 1, as built"): the human opted this machine in AND the daemon holds the
+    /// Screen Recording grant it captures with. Two independent facts, deliberately not
+    /// collapsed: the opt-in is a standing decision, the grant can be revoked in System
+    /// Settings at any time — recomputed every heartbeat, so the flag self-corrects
+    /// within one beat. Accessibility (input) is NOT required here: without it a session
+    /// is view-only, and `gui_permissions` tells the app which it will get. (Phase 0
+    /// probed for macOS Screen Sharing on :5900 instead; MDM keeps that off on the work
+    /// laptop, which is why the server is now our own.)
     private var vncProxyCapability: Bool {
-        config.vncProxyEnabled == true && LoopbackPortProbe.isReachable()
+        #if os(macOS)
+        return config.vncProxyEnabled == true && CGPreflightScreenCaptureAccess()
+        #else
+        return false
+        #endif
     }
 
     /// Whether THIS process holds the two macOS privacy grants a userspace GUI session
@@ -2031,6 +2037,18 @@ final class Daemon {
                     }
                 )
             }
+            #if os(macOS)
+            if let site = config.site, config.vncProxyEnabled == true {
+                desktopRelayClient = DesktopRelayClient(
+                    siteID: site.id, siteToken: site.token,
+                    controlPlaneURL: config.controlPlane?.endpointURL,
+                    audit: { [weak self] line in
+                        self?.log(line)
+                        self?.record(AgentAuditEvent(kind: "notice", text: line))
+                    }
+                )
+            }
+            #endif
             if let site = config.site {
                 terminalRelayClient = TerminalRelayClient(
                     siteID: site.id, siteToken: site.token,
@@ -2710,6 +2728,25 @@ final class Daemon {
                 return
             }
             browserRelayClient.open(sessionId: sessionId, relayHost: relayHost, relayPort: relayPort)
+        case "vnc-open":
+            guard let sessionId = command.args["sessionId"],
+                  let relayHost = command.args["relayHost"],
+                  let relayPort = command.args["relayPort"].flatMap(Int.init)
+            else {
+                log("[desktop] vnc-open command missing sessionId/relay address — ignored")
+                return
+            }
+            // Local enforcement, same rule as browser-open: nothing opens the desktop on
+            // a site whose owner didn't opt in, whatever the capability cache says.
+            #if os(macOS)
+            guard let desktopRelayClient else {
+                log("[desktop] vnc-open \(sessionId): refused — Remote Desktop is not enabled on this site")
+                return
+            }
+            desktopRelayClient.open(sessionId: sessionId, relayHost: relayHost, relayPort: relayPort)
+            #else
+            log("[desktop] vnc-open \(sessionId): refused — Remote Desktop needs macOS")
+            #endif
         default:
             break // drain is handled inside the client
         }

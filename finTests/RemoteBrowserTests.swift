@@ -89,6 +89,10 @@ final class RemoteBrowserTests: XCTestCase {
         XCTAssertEqual(manager.browserTabs.count, 1)
         XCTAssertTrue(manager.browserTabs.first?.session === first, "the live session survives — no re-wake, no second Face ID")
         XCTAssertEqual(manager.activeBrowserTab?.siteID, "s1")
+        // The same site's DESKTOP is a separate tab, not the browser tab again.
+        manager.openBrowserTab(siteID: "s1", displayName: "Work laptop", mode: .desktop)
+        XCTAssertEqual(manager.browserTabs.count, 2)
+        XCTAssertEqual(manager.activeBrowserTab?.mode, .desktop)
     }
 
     @MainActor
@@ -98,8 +102,8 @@ final class RemoteBrowserTests: XCTestCase {
         // lands on depends on the machine running the test.)
         let manager = SessionManager()
         manager.openBrowserTab(siteID: "s1", displayName: "Work laptop")
-        manager.closeBrowserTab("s1")
-        XCTAssertNil(manager.activeBrowserSiteID)
+        manager.closeBrowserTab("browser:s1")
+        XCTAssertNil(manager.activeBrowserTabID)
         XCTAssertTrue(manager.browserTabs.isEmpty)
     }
 }
