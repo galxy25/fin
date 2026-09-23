@@ -7,6 +7,9 @@ import FoundationNetworking
 #if canImport(Glibc)
 import Glibc
 #endif
+#if os(macOS)
+import ApplicationServices
+#endif
 
 /// fin-agentd — a headless, always-on agent runner.
 ///
@@ -547,6 +550,21 @@ final class Daemon {
         config.vncProxyEnabled == true && LoopbackPortProbe.isReachable()
     }
 
+    /// Whether THIS process holds the two macOS privacy grants a userspace GUI session
+    /// needs (docs/VNC.md): Screen Recording to capture the display, Accessibility to
+    /// post mouse and keyboard events. Reported, not requested — both are granted by
+    /// hand in System Settings, and a grant made while the daemon runs only takes
+    /// effect after a restart, so "granted but still false" means restart the daemon.
+    /// Stable across updates only because the binary is signed with a real identity
+    /// (publish-binary.sh); an ad-hoc binary lost both on every update.
+    private var guiPermissions: [String: Bool] {
+        #if os(macOS)
+        return ["accessibility": AXIsProcessTrusted(), "screen_recording": CGPreflightScreenCaptureAccess()]
+        #else
+        return [:]
+        #endif
+    }
+
     /// Remote Browser's capability (docs/REMOTE-BROWSER.md): opted in, AND there is a
     /// browser to serve — one already listening on the DevTools port, or a Chrome the
     /// daemon can launch on demand. Not gated on "running right now" the way VNC is:
@@ -575,7 +593,8 @@ final class Daemon {
                 "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
                 "terminal_relay": config.site != nil,
                 "vnc_proxy": vncProxyCapability,
-            "remote_browser": remoteBrowserCapability,
+                "remote_browser": remoteBrowserCapability,
+                "gui_permissions": guiPermissions,
                 "launch_stage": launchStage,
             ]
             if let launchFailure { caps["launch_failure"] = launchFailure }
@@ -614,6 +633,7 @@ final class Daemon {
             "terminal_relay": config.site != nil,
             "vnc_proxy": vncProxyCapability,
             "remote_browser": remoteBrowserCapability,
+            "gui_permissions": guiPermissions,
         ]
         // The rule, and the bug it encodes, live in `PaneScanPolicy` — a pure function,
         // because "not while a turn is running" quietly meant "never" on a site whose
