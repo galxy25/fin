@@ -299,6 +299,7 @@ public final class BrowserRelayClient {
         case .key: return "key"
         case .navigate: return "navigate"
         case .selectTab: return "selectTab"
+        case .selectDisplay: return "selectDisplay"
         }
     }
 

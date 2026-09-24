@@ -47,6 +47,9 @@ public enum RemoteDesktopProtocol {
         case .pageUp: return 116
         case .pageDown: return 121
         case .forwardDelete: return 117
+        case .space: return 49
+        case .f11: return 103   // kVK_F11
+        case .digit5: return 23 // kVK_ANSI_5
         }
     }
 
@@ -69,7 +72,9 @@ public enum RemoteDesktopProtocol {
             return unicodeChunks(text).map(Event.text)
         case .key(let key, let modifiers):
             return [.key(virtualKeyCode: virtualKeyCode(for: key), modifiers: modifiers)]
-        case .navigate, .selectTab:
+        // selectDisplay is consumed upstream by DesktopRelayClient before it reaches
+        // here — see its `handle`, the same shape as BrowserRelayClient's selectTab.
+        case .navigate, .selectTab, .selectDisplay:
             return []
         }
     }
@@ -90,6 +95,13 @@ public enum RemoteDesktopProtocol {
         }
         if !current.isEmpty { chunks.append(current) }
         return chunks
+    }
+
+    /// "Display 1 (2560x1440)" / "Display 2 \u2014 secondary (1920x1080)": no AppKit
+    /// dependency for a friendlier name (`NSScreen.localizedName` would need one), so
+    /// the resolution is what tells two displays apart in the picker.
+    public static func displayLabel(index: Int, width: Int, height: Int, isMain: Bool) -> String {
+        "Display \(index)\(isMain ? "" : " \u{2014} secondary") (\(width)x\(height))"
     }
 
     /// The captured frame's size: the display's size in points, scaled down to fit

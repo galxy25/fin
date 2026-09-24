@@ -40,6 +40,10 @@ final class RemoteBrowserSession: ObservableObject {
     @Published private(set) var title: String?
     @Published private(set) var tabs: [RemoteBrowserProtocol.Tab] = []
     @Published private(set) var selectedTab: String?
+    /// Desktop mode only ("choose displays" — Levi, 2026-09-23): every display the site
+    /// can capture, and which one is showing.
+    @Published private(set) var displays: [RemoteBrowserProtocol.Display] = []
+    @Published private(set) var selectedDisplay: String?
 
     let siteID: String
     let mode: Mode
@@ -101,6 +105,7 @@ final class RemoteBrowserSession: ObservableObject {
               let data = try? JSONSerialization.data(withJSONObject: RemoteBrowserProtocol.inputFrame(sessionId: sessionId, input: input))
         else { return }
         if case .selectTab(let id) = input { selectedTab = id }
+        if case .selectDisplay(let id) = input { selectedDisplay = id }
         inputCounts[Self.inputTypeName(input), default: 0] += 1
         Task { try? await socket.send(data) }
     }
@@ -129,6 +134,7 @@ final class RemoteBrowserSession: ObservableObject {
         case .key: return "key"
         case .navigate: return "navigate"
         case .selectTab: return "selectTab"
+        case .selectDisplay: return "selectDisplay"
         }
     }
 
@@ -226,6 +232,9 @@ final class RemoteBrowserSession: ObservableObject {
             } else if let list = RemoteBrowserProtocol.tabs(fromRelayFrame: object) {
                 tabs = list.tabs
                 selectedTab = list.selected ?? selectedTab
+            } else if let list = RemoteBrowserProtocol.displays(fromRelayFrame: object) {
+                displays = list.displays
+                selectedDisplay = list.selected ?? selectedDisplay
             }
         default:
             break

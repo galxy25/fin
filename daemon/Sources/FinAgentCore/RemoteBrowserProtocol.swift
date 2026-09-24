@@ -21,6 +21,9 @@ public enum RemoteBrowserProtocol {
     public static let frameKind = "browser-frame"
     /// Site → app: the open tabs, and which one is being shown.
     public static let tabsKind = "browser-tabs"
+    /// Remote Desktop's sibling of `tabsKind` (docs/VNC.md, "choose displays"): which
+    /// physical display is being captured, and what else is available.
+    public static let displaysKind = "desktop-displays"
     /// App → site: one input event.
     public static let inputKind = "browser-input"
 
@@ -106,11 +109,46 @@ public enum RemoteBrowserProtocol {
         return (tabs, object["selected"] as? String)
     }
 
+    /// One physical display a Remote Desktop site can capture — the desktop mode
+    /// sibling of `Tab`. `id` is the display's `CGDirectDisplayID` as a string (opaque
+    /// to the app; only the daemon interprets it).
+    public struct Display: Equatable, Sendable {
+        public var id: String
+        public var label: String
+        public init(id: String, label: String) {
+            self.id = id
+            self.label = label
+        }
+    }
+
+    public static func displaysFrame(sessionId: String, displays: [Display], selected: String?) -> [String: Any] {
+        var frame: [String: Any] = [
+            "action": "output", "sessionId": sessionId, "kind": displaysKind,
+            "displays": displays.map { ["id": $0.id, "label": $0.label] },
+        ]
+        if let selected { frame["selected"] = selected }
+        return frame
+    }
+
+    public static func displays(fromRelayFrame object: [String: Any]) -> (displays: [Display], selected: String?)? {
+        guard object["kind"] as? String == displaysKind, let raw = object["displays"] as? [[String: Any]] else { return nil }
+        let displays = raw.compactMap { entry -> Display? in
+            guard let id = entry["id"] as? String else { return nil }
+            return Display(id: id, label: entry["label"] as? String ?? "Display")
+        }
+        return (displays, object["selected"] as? String)
+    }
+
     // MARK: - Input (app → site)
 
     public enum SpecialKey: String, CaseIterable, Sendable {
         case enter, tab, backspace, escape, arrowUp, arrowDown, arrowLeft, arrowRight
-        case home, end, pageUp, pageDown, forwardDelete
+        case home, end, pageUp, pageDown, forwardDelete, space
+        /// Show Desktop's own shortcut (macOS default: bare F11 — no modifier).
+        case f11
+        /// Only ever meant to ride WITH modifiers (Cmd+Shift+5 for Screenshot); not a
+        /// general "type a 5" key — that goes through `.text`.
+        case digit5
     }
 
     /// A modifier held while a key is sent — the carousel toolbar's Ctrl/Opt/Cmd/Shift
@@ -135,6 +173,9 @@ public enum RemoteBrowserProtocol {
         case key(SpecialKey, modifiers: [Modifier] = [])
         case navigate(String)
         case selectTab(String)
+        /// Remote Desktop only (docs/VNC.md, "choose displays"): capture a different
+        /// physical display. Meaningless to a browser session — `Display.id`.
+        case selectDisplay(String)
     }
 
     public static func inputFrame(sessionId: String, input: Input) -> [String: Any] {
@@ -152,6 +193,7 @@ public enum RemoteBrowserProtocol {
             return event
         case .navigate(let url): return ["type": "navigate", "url": url]
         case .selectTab(let id): return ["type": "selectTab", "id": id]
+        case .selectDisplay(let id): return ["type": "selectDisplay", "id": id]
         }
     }
 
@@ -179,6 +221,9 @@ public enum RemoteBrowserProtocol {
         case "selectTab":
             guard let id = event["id"] as? String, !id.isEmpty else { return nil }
             return .selectTab(id)
+        case "selectDisplay":
+            guard let id = event["id"] as? String, !id.isEmpty else { return nil }
+            return .selectDisplay(id)
         default:
             return nil
         }
@@ -242,7 +287,7 @@ public enum RemoteBrowserProtocol {
             return [CDPCommand("Input.dispatchKeyEvent", down), CDPCommand("Input.dispatchKeyEvent", up)]
         case .navigate(let url):
             return [CDPCommand("Page.navigate", ["url": normalizedURL(url)])]
-        case .selectTab:
+        case .selectTab, .selectDisplay:
             return []
         }
     }
@@ -262,6 +307,9 @@ public enum RemoteBrowserProtocol {
         case .pageUp: return ("PageUp", "PageUp", 33, nil)
         case .pageDown: return ("PageDown", "PageDown", 34, nil)
         case .forwardDelete: return ("Delete", "Delete", 46, nil)
+        case .space: return (" ", "Space", 32, " ")
+        case .f11: return ("F11", "F11", 122, nil)
+        case .digit5: return ("5", "Digit5", 53, nil)
         }
     }
 

@@ -51,6 +51,11 @@ public final class DesktopRelayClient {
         var lastFrame: Data?
         var warnedViewOnly = false
         var droppedFrames = 0
+        /// nil = main display. Set by `.selectDisplay` ("choose displays" — Levi,
+        /// 2026-09-23). Falls back to main if the targeted display disappears.
+        var targetDisplayID: CGDirectDisplayID?
+        var lastDisplays: [RemoteBrowserProtocol.Display] = []
+        var lastSentSelectedDisplay: String?
         // Telemetry (Levi, 2026-09-23): shape only — no captured pixels, no played-back
         // text, ever logged. See BrowserRelayClient.Session for the matching fields.
         let openedAt = Date()
@@ -155,9 +160,20 @@ public final class DesktopRelayClient {
             close(sessionId: sessionId, sendCloseFrame: true)
             return
         }
-        guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else { return }
+        // An unplugged targeted display falls back to main on the very next frame
+        // rather than freezing on its last picture forever.
+        if let targetID = session.targetDisplayID, !content.displays.contains(where: { $0.displayID == targetID }) {
+            session.targetDisplayID = nil
+            audit("[desktop] \(sessionId): targeted display disappeared — back to the main display")
+        }
+        guard let display = content.displays.first(where: { $0.displayID == (session.targetDisplayID ?? CGMainDisplayID()) })
+            ?? content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first
+        else { return }
         let bounds = CGDisplayBounds(display.displayID)
         session.displayRect = CGRectLike(x: bounds.origin.x, y: bounds.origin.y, width: bounds.width, height: bounds.height)
+        // "Choose displays" (Levi, 2026-09-23): resent only when the set or the
+        // selection changes, the same throttling `sendTabs` uses for browser tabs.
+        sendDisplaysIfChanged(sessionId: sessionId, session: session, allDisplays: content.displays, selected: display.displayID)
 
         let size = RemoteDesktopProtocol.captureSize(
             displayWidth: bounds.width, displayHeight: bounds.height, maxWidth: session.widthCap
@@ -209,7 +225,28 @@ public final class DesktopRelayClient {
         case .key: return "key"
         case .navigate: return "navigate"
         case .selectTab: return "selectTab"
+        case .selectDisplay: return "selectDisplay"
         }
+    }
+
+    /// Rebuilds the list from the CURRENT enumeration each call — cheap, and it means a
+    /// monitor plugged in or unplugged mid-session shows up within one capture tick.
+    /// Sent only when the set or the selection actually changed, like `sendTabs`.
+    private func sendDisplaysIfChanged(sessionId: String, session: Session, allDisplays: [SCDisplay], selected: CGDirectDisplayID) {
+        let sorted = allDisplays.sorted { $0.displayID < $1.displayID }
+        let list = sorted.enumerated().map { index, display -> RemoteBrowserProtocol.Display in
+            let bounds = CGDisplayBounds(display.displayID)
+            let label = RemoteDesktopProtocol.displayLabel(
+                index: index + 1, width: Int(bounds.width), height: Int(bounds.height),
+                isMain: display.displayID == CGMainDisplayID()
+            )
+            return RemoteBrowserProtocol.Display(id: String(display.displayID), label: label)
+        }
+        let selectedID = String(selected)
+        guard list != session.lastDisplays || selectedID != session.lastSentSelectedDisplay else { return }
+        session.lastDisplays = list
+        session.lastSentSelectedDisplay = selectedID
+        send(sessionId: sessionId, frame: RemoteBrowserProtocol.displaysFrame(sessionId: sessionId, displays: list, selected: selectedID))
     }
 
     private static func jpeg(_ image: CGImage, quality: Double) -> Data? {
@@ -312,6 +349,12 @@ public final class DesktopRelayClient {
         guard action == "input", let input = RemoteBrowserProtocol.input(fromRelayFrame: object) else { return }
         armIdleTimeout(sessionId: sessionId)
         session.inputCounts[Self.inputTypeName(input), default: 0] += 1
+        // "Choose displays": consumed here, never reaches CGEvent playback — the same
+        // shape as BrowserRelayClient's selectTab.
+        if case .selectDisplay(let id) = input {
+            session.targetDisplayID = CGDirectDisplayID(id)
+            return
+        }
         play(input, session: session, sessionId: sessionId)
     }
 

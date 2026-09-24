@@ -53,6 +53,30 @@ final class RemoteDesktopProtocolTests: XCTestCase {
     func testBrowserOnlyInputsDoNothingOnADesktop() {
         XCTAssertTrue(RemoteDesktopProtocol.events(for: .navigate("https://github.com"), display: laptop).isEmpty)
         XCTAssertTrue(RemoteDesktopProtocol.events(for: .selectTab("t1"), display: laptop).isEmpty)
+        XCTAssertTrue(RemoteDesktopProtocol.events(for: .selectDisplay("1"), display: laptop).isEmpty)
+    }
+
+    /// Mission Control (Ctrl+↑), Spaces (Ctrl+←/→) and Spotlight (Cmd+Space) are
+    /// all just chords over primitives this file already maps — no protocol change
+    /// needed for the carousel's system-shortcut buttons, only for `.space` itself.
+    func testShowDesktopAndScreenshotHaveTheirOwnKeyCodes() {
+        // Show Desktop: bare F11, no modifier. Screenshot: Cmd+Shift+5.
+        XCTAssertEqual(RemoteDesktopProtocol.virtualKeyCode(for: .f11), 103)
+        XCTAssertEqual(
+            RemoteDesktopProtocol.events(for: .key(.digit5, modifiers: [.command, .shift]), display: laptop),
+            [.key(virtualKeyCode: 23, modifiers: [.command, .shift])]
+        )
+    }
+
+    func testSystemShortcutsAreOrdinaryChordsOverExistingPrimitives() {
+        XCTAssertEqual(
+            RemoteDesktopProtocol.events(for: .key(.space, modifiers: [.command]), display: laptop),
+            [.key(virtualKeyCode: 49, modifiers: [.command])]
+        )
+        XCTAssertEqual(
+            RemoteDesktopProtocol.events(for: .key(.arrowUp, modifiers: [.control]), display: laptop),
+            [.key(virtualKeyCode: 126, modifiers: [.control])]
+        )
     }
 
     func testCaptureIsInPointsAndCappedToTheMaxWidth() {

@@ -99,6 +99,31 @@ arrows, and Home/End/PgUp/PgDn. `RemoteBrowserProtocol.Modifier` rides on `.key`
 reaches both backends: a CDP modifier bitmask in the browser, `CGEventFlags` on the
 desktop.
 
+Desktop mode also gets system-shortcut buttons (Levi, 2026-09-23, from a screenshot of
+macOS's own Spaces/Mission Control menu — Mission Control, Application Windows, Show
+Desktop, Move Left/Right a Space, Screenshot — plus Spotlight): each is an ordinary
+chord over the same primitives (`.key(_, modifiers:)`), sent directly rather than
+through the armed-modifier latch since these are one-tap, not two-step.
+
+| Button | Chord |
+|---|---|
+| Mission Control | Ctrl+↑ |
+| Space ← / Space → | Ctrl+← / Ctrl+→ (unverified against a real chord — depends on the target's own Keyboard Shortcuts settings, not provable from here) |
+| App Windows | Ctrl+↓ |
+| Desktop (Show Desktop) | F11, no modifier |
+| Screenshot | Cmd+Shift+5 |
+| Spotlight | Cmd+Space |
+
+## Choose displays (Remote Desktop only)
+
+A second display connected to the site shows up as a **Displays** menu in the
+toolbar (mirroring the browser's Tabs menu) once there is more than one. Switching
+sends `.selectDisplay(id)`, consumed by `DesktopRelayClient` before it ever reaches
+CGEvent playback — the same shape as the browser's `selectTab`. Labels are
+resolution-based ("Display 2 — secondary (1920x1080)"); there is no AppKit
+dependency in the daemon for a friendlier name. An unplugged targeted display falls
+back to the main display on the next capture, automatically.
+
 ## Telemetry
 
 Levi, 2026-09-23: "thorough telemetry... to monitor and replay usage for both

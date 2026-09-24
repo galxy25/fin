@@ -71,6 +71,8 @@ struct RemoteBrowserView: View {
                 }
                 if session.mode == .browser {
                     ToolbarItem(placement: .primaryAction) { tabMenu }
+                } else {
+                    ToolbarItem(placement: .primaryAction) { displaysMenu }
                 }
             }
             .safeAreaInset(edge: .top) {
@@ -239,6 +241,10 @@ struct RemoteBrowserView: View {
                 textKeyButton("End", .end)
                 textKeyButton("PgUp", .pageUp)
                 textKeyButton("PgDn", .pageDown)
+                if session.mode == .desktop {
+                    Divider().frame(height: 20)
+                    systemShortcutButtons
+                }
             }
             .buttonStyle(.bordered)
             .padding(.horizontal, 2)
@@ -289,6 +295,55 @@ struct RemoteBrowserView: View {
         guard !typed.isEmpty else { return }
         session.send(.text(typed))
         typed = ""
+    }
+
+    /// The desktop's system-level chords (Levi, 2026-09-23) — all ordinary modifier+key
+    /// combinations `RemoteDesktopProtocol` already maps, sent directly rather than
+    /// through the armed-modifier latch (a one-tap shortcut, not a two-step chord).
+    /// Meaningless to a browser (macOS system UI, not page content), so desktop-only.
+    private var systemShortcutButtons: some View {
+        Group {
+            // Default shortcut: Control+↑. A real button because it's the one command
+            // Levi is likeliest to reach for on a screen he can't otherwise see the Dock of.
+            shortcutButton("Mission Ctrl", .arrowUp, modifiers: [.control])
+            // Default shortcuts: Control+←/→. Genuinely uncertain this reaches a
+            // Space the way a physical key does — depends on the target's own Keyboard
+            // Shortcuts settings and isn't provable from here; try it and see (Levi
+            // flagged the same doubt, 2026-09-23).
+            shortcutButton("Space ←", .arrowLeft, modifiers: [.control])
+            shortcutButton("Space →", .arrowRight, modifiers: [.control])
+            // Default shortcut: Control+↓.
+            shortcutButton("App Windows", .arrowDown, modifiers: [.control])
+            // Default shortcut: bare F11, no modifier.
+            shortcutButton("Desktop", .f11, modifiers: [])
+            // Default shortcut: Cmd+Shift+5 — opens the screenshot/recording toolbar,
+            // the same one Screenshot.app's own on-screen button opens.
+            shortcutButton("Screenshot", .digit5, modifiers: [.command, .shift])
+            // Default shortcut: Cmd+Space.
+            shortcutButton("Spotlight", .space, modifiers: [.command])
+        }
+    }
+
+    private func shortcutButton(_ title: String, _ key: RemoteBrowserProtocol.SpecialKey, modifiers: [RemoteBrowserProtocol.Modifier]) -> some View {
+        Button(title) { session.send(.key(key, modifiers: modifiers)) }
+            .font(.caption)
+    }
+
+    @ViewBuilder
+    private var displaysMenu: some View {
+        if session.displays.count > 1 {
+            Menu {
+                ForEach(session.displays, id: \.id) { display in
+                    Button {
+                        session.send(.selectDisplay(display.id))
+                    } label: {
+                        Label(display.label, systemImage: display.id == session.selectedDisplay ? "checkmark" : "display")
+                    }
+                }
+            } label: {
+                Label("Displays", systemImage: "rectangle.on.rectangle")
+            }
+        }
     }
 
     @ViewBuilder
