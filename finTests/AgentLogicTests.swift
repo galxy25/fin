@@ -2149,14 +2149,16 @@ final class AgentLogicTests: XCTestCase {
         })
     }
 
-    /// The monitor tool's interval clamp floors at 15s — a model-chosen 1s cadence
-    /// is a turn storm — while 0 still means "unset" and takes the 60s default.
+    /// The monitor tool's interval clamp floors at 30s (raised from 15s
+    /// 2026-09-27, to match the UI stepper's floor) — a model-chosen cadence
+    /// tighter than a human could dial in is a turn storm — while 0 still means
+    /// "unset" and takes the 60s default.
     @MainActor
     func testMonitorToolIntervalClampFloor() {
         let (runtime, agent) = makeArmableRuntime(heartbeatSeconds: 0, history: [])
 
         _ = runtime.executeMonitor(action: "start", intervalSeconds: 1, rawArguments: "{}")
-        XCTAssertEqual(agent.heartbeatSeconds, 15)
+        XCTAssertEqual(agent.heartbeatSeconds, 30)
         _ = runtime.executeMonitor(action: "stop", intervalSeconds: 0, rawArguments: "{}")
 
         _ = runtime.executeMonitor(action: "start", intervalSeconds: 30, rawArguments: "{}")

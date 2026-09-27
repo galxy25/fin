@@ -199,13 +199,19 @@ final class CloudTraceStore: ObservableObject {
     @Published private(set) var records: [AgentMirrorRecord] = []
     private var loop: Task<Void, Never>?
 
+    /// 30s (lowered from 15s on 2026-09-27): the accepted UX latency ceiling
+    /// for background freshness, and this is a historical log view, not a live
+    /// feed — one instance per open `AgentLogView` window, undeduplicated, made
+    /// it a top contributor to fin-control-plane's invocation volume.
+    static let pollSeconds: TimeInterval = 30
+
     func start(agentName: String) {
         guard loop == nil, CloudControlPlaneConfig.isConfigured, !TestHost.isUnitTest else { return }
         loop = Task { [weak self] in
             while let self, !Task.isCancelled {
                 let page = await CloudAgentChannel.fetchTranscriptChunks(agentName: agentName)
                 if !page.records.isEmpty { self.records = page.records }
-                try? await Task.sleep(for: .seconds(15))
+                try? await Task.sleep(for: .seconds(Self.pollSeconds))
             }
         }
     }

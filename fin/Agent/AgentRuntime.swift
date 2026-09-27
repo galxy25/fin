@@ -1961,11 +1961,14 @@ final class AgentRuntime: ObservableObject {
                        toolArguments: rawArguments, isFailure: true)
                 return message
             }
-            // Floor 15: a model-chosen 1s cadence is a turn storm, not supervision;
-            // 0 means "unset" and defers to the AGENT's configured heartbeat — the
-            // user's stepper is the authoritative knob when the model doesn't choose.
+            // Floor 30 (raised from 15 on 2026-09-27): matches the UI stepper's
+            // floor — a model-chosen cadence tighter than a human could dial in
+            // is a turn storm, not supervision, and was one un-hardened path
+            // driving fin-control-plane's invocation volume. 0 means "unset" and
+            // defers to the AGENT's configured heartbeat — the user's stepper is
+            // the authoritative knob when the model doesn't choose.
             if intervalSeconds > 0 {
-                agent.heartbeatSeconds = min(max(intervalSeconds, 15), 600)
+                agent.heartbeatSeconds = min(max(intervalSeconds, 30), 600)
             }
             if agent.heartbeatSeconds <= 0 {
                 // No interval configured anywhere — pick the stock default rather
