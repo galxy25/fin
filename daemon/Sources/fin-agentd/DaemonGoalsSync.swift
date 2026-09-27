@@ -16,7 +16,10 @@ import FoundationNetworking
 /// real base instead of a two-way union.
 actor DaemonGoalsSync {
     static let requestTimeout: TimeInterval = 10
-    static let tickInterval: TimeInterval = 60
+    /// 120s (raised from 60s 2026-09-27): purely a fallback safety net — every
+    /// real mutation already pushes immediately via the debounced path above,
+    /// so slowing the tick only delays a freshly launched body's first pull.
+    static let tickInterval: TimeInterval = 120
     static let debounce: TimeInterval = 2
     static let failureAuditWindow: TimeInterval = 5 * 60
 
