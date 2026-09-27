@@ -2,15 +2,18 @@ import Foundation
 import os
 
 /// docs/THREADS.md §4: the app's view of threads for one agent — `GET /threads`
-/// polled on the console cadence (10 s), cached per agent across instances so a
-/// freshly opened screen shows the last list instantly, thread details fetched
-/// on demand, and the current selection (`nil` = All activity). Every fetch,
-/// merge and selection change is logged with counts only — never a title, a
-/// message, or an id beyond its 8-char prefix.
+/// polled on the console cadence (30 s; lowered from 10s on 2026-09-27 — one
+/// instance per open window/console, uncapped and undeduplicated, was the
+/// second-largest source of fin-control-plane's ~1M Lambda invocations/month),
+/// cached per agent across instances so a freshly opened screen shows the last
+/// list instantly, thread details fetched on demand, and the current selection
+/// (`nil` = All activity). Every fetch, merge and selection change is logged
+/// with counts only — never a title, a message, or an id beyond its 8-char
+/// prefix.
 @MainActor
 final class ThreadStore: ObservableObject {
     static let log = Logger(subsystem: "dev.levischoen.fin", category: "threads")
-    static let pollSeconds: UInt64 = 10
+    static let pollSeconds: UInt64 = 30
 
     /// Last successful list per agent, shared by every store instance.
     private static var cache: [String: [ThreadSummary]] = [:]
