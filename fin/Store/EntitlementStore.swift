@@ -15,6 +15,7 @@ final class EntitlementStore: ObservableObject {
     @Published private(set) var products: [Product] = []
     @Published private(set) var isSubscribed = false
     @Published private(set) var ownsLifetime = false
+    @Published private(set) var isLoadingProducts = false
     @Published var purchaseErrorMessage: String?
 
     @AppStorage("trialStartedAt") private var trialStartedAtRaw: Double = 0
@@ -56,8 +57,19 @@ final class EntitlementStore: ObservableObject {
     var lifetimeProduct: Product? { products.first(where: { $0.id == Self.lifetimeProductID }) }
 
     func loadProducts() async {
+        isLoadingProducts = true
+        defer { isLoadingProducts = false }
         do {
             products = try await Product.products(for: [Self.yearlyProductID, Self.lifetimeProductID])
+            // StoreKit returns an empty array rather than throwing when it can't resolve
+            // any product ID (unrecognized ID, not yet cleared for this environment, no
+            // network) — without this, the paywall showed a spinner forever with no
+            // way to tell a real outage from App Review not being able to find the IAP.
+            if products.isEmpty {
+                purchaseErrorMessage = "Fin Pro isn't available right now. Check your connection and try again."
+            } else {
+                purchaseErrorMessage = nil
+            }
         } catch {
             purchaseErrorMessage = error.localizedDescription
         }

@@ -35,7 +35,14 @@ struct PaywallView: View {
                     purchaseButton(title: "Buy Lifetime", subtitle: "\(lifetime.displayPrice) once", product: lifetime)
                 }
                 if entitlementStore.yearlyProduct == nil && entitlementStore.lifetimeProduct == nil {
-                    ProgressView()
+                    if entitlementStore.isLoadingProducts {
+                        ProgressView()
+                    } else {
+                        Button("Try Again") {
+                            Task { await entitlementStore.loadProducts() }
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
             }
             .padding(.horizontal)
@@ -56,6 +63,7 @@ struct PaywallView: View {
                 Text(message)
                     .font(.caption)
                     .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
                     .padding(.horizontal)
             }
 
