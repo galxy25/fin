@@ -370,6 +370,8 @@ struct RemoteBrowserView: View {
         // A tab coming back to front already has its session: no second Face ID
         // prompt for switching away to a terminal and back.
         guard session.state == .idle else { return }
+        // A capture has nobody to touch a sensor.
+        if ScreenshotFixtures.isEnabled { session.open(); return }
         #if canImport(LocalAuthentication) && !os(tvOS)
         let context = LAContext()
         var error: NSError?
@@ -422,6 +424,7 @@ struct RemoteBrowserWindowView: View {
     var body: some View {
         if let target, let site = directory.sites.first(where: { $0.siteId == target.siteID }) {
             RemoteBrowserView(site: site, mode: target.mode)
+                .onAppear { ScreenshotFixtures.sizeWindowForCapture(width: 1440, height: 900) }
         } else {
             Group {
                 if looked {

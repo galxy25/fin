@@ -245,10 +245,18 @@ final class TerminalSession: ObservableObject, Identifiable {
             ControlPlaneClient.logClientEvent(.relayConnectBlocked, detail: ["reason": "not_disconnected", "state": String(describing: state)])
             return
         }
-        state = state == .reconnecting ? .reconnecting : .waking
-        lastError = nil
         lastServer = server
         lastRelaySiteID = siteID
+        // Capture mode with no live site to dial: print a canned session through the
+        // real terminal engine rather than waking a relay.
+        if ScreenshotFixtures.isEnabled, ScreenshotFixtures.liveSiteID == nil {
+            state = .connected
+            lastError = nil
+            terminalView.feed(byteArray: ScreenshotDemoScreens.relayTerminalScript()[...])
+            return
+        }
+        state = state == .reconnecting ? .reconnecting : .waking
+        lastError = nil
 
         generation += 1
         let myGeneration = generation
@@ -427,6 +435,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             ]) else { return }
             Task { try? await relaySocket.send(payload) }
         }
+    }
+
+    private func sendCurrentSizeToRelay() {
+        let terminal = terminalView.getTerminal()
+        resize(cols: terminal.cols, rows: terminal.rows)
     }
 
     private func run(server: Server, credentials: ServerCredentials, environment: [String: String], generation myGeneration: Int) async {
@@ -615,6 +628,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         ])
         relaySocket = socket
         relaySessionId = sessionId
+        // The view was laid out before this socket existed, so SwiftTerm's size-changed
+        // callback has already come and gone — and the `open` frame carries no size. Without
+        // this the remote PTY keeps its default until the window is next resized (a relay
+        // session drawn in the corner of a field of tmux dots).
+        sendCurrentSizeToRelay()
 
         while myGeneration == generation {
             let frame: Data
@@ -648,6 +666,8 @@ final class TerminalSession: ObservableObject, Identifiable {
             if state != .connected {
                 state = .connected
             }
+            // The daemon may not have had a PTY yet when the size went out on connect.
+            sendCurrentSizeToRelay()
         case "output":
             guard let encoded = object["data"] as? String, let bytes = Data(base64Encoded: encoded) else { return }
             if state != .connected {

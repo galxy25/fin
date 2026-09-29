@@ -76,6 +76,25 @@ final class RemoteBrowserSession: ObservableObject {
 
     func open() {
         guard runTask == nil else { return }
+        #if !os(tvOS)
+        // Capture mode with no live site to dial: show the curated demo screen instead.
+        // A whole-desktop stream is always the demo scene, even with a live site — a real
+        // desktop carries every window, tab title and profile label of whoever owns the
+        // machine, and the capture cannot curate those.
+        if ScreenshotFixtures.isEnabled, ScreenshotFixtures.liveSiteID == nil || mode == .desktop,
+           let demo = ScreenshotDemoScreens.screen(mode: mode) {
+            frame = demo.image
+            viewport = demo.viewport
+            url = demo.url
+            title = demo.title
+            tabs = demo.tabs
+            selectedTab = demo.selectedTab
+            displays = demo.displays
+            selectedDisplay = demo.selectedDisplay
+            state = .connected
+            return
+        }
+        #endif
         let sessionId = (mode == .desktop ? "d-" : "b-") + UUID().uuidString.lowercased()
         self.sessionId = sessionId
         state = .waking

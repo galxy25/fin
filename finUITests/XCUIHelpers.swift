@@ -221,6 +221,12 @@ extension XCUIElement {
     /// `.tap()` on a small `.buttonStyle(.plain)` control can resolve as hittable yet
     /// never fire the action — a coordinate tap on the same point reliably does.
     func tapCenter() {
+        #if os(visionOS)
+        // Coordinate taps land nowhere in the visionOS simulator's scene; a plain tap
+        // (which targets the element through the accessibility tree) does fire.
+        tap()
+        #else
         coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        #endif
     }
 }
