@@ -13,6 +13,17 @@ enum ControlPlaneClient {
     nonisolated(unsafe) static var transport: Transport = { try await URLSession.shared.data(for: $0) }
 
     static let requestTimeout: TimeInterval = 10
+    /// The three calls that ask the control plane for a relay (terminal, browser, desktop).
+    /// Unlike every other route they can LAUNCH an EC2 instance and wait for its address —
+    /// the Lambda's own comment puts that at about ten seconds — so on the first open after
+    /// a quiet spell a 10-second client timeout gave up exactly as the relay came up: the
+    /// user saw "could not reach the control plane" (error: network), the instance booted
+    /// anyway, and a second try worked. API Gateway's ceiling is 30 s; this stays just above.
+    static let relayOpenTimeout: TimeInterval = 35
+
+    /// The last transport-level failure `perform` swallowed into `.network`, for telemetry:
+    /// the domain, code and elapsed time that "error: network" used to throw away.
+    nonisolated(unsafe) static var lastTransportError: String?
 
     enum Failure: Equatable, Error {
         case notConfigured
@@ -33,11 +44,12 @@ enum ControlPlaneClient {
         return components.url
     }
 
-    static func request(_ method: String, path: String, query: [String: String] = [:], body: [String: Any]? = nil) -> URLRequest? {
+    static func request(_ method: String, path: String, query: [String: String] = [:], body: [String: Any]? = nil,
+                        timeout: TimeInterval = requestTimeout) -> URLRequest? {
         guard let url = url(path: path, query: query) else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = requestTimeout
+        request.timeoutInterval = timeout
         request.setValue("Bearer \(CloudControlPlaneConfig.token)", forHTTPHeaderField: "authorization")
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -50,10 +62,19 @@ enum ControlPlaneClient {
     /// the caller's decoder, since 404 and 409 mean different things per route.
     static func perform(_ request: URLRequest?) async -> Result<(Int, Data), Failure> {
         guard let request else { return .failure(.notConfigured) }
-        guard let (data, response) = try? await transport(request),
-              let status = (response as? HTTPURLResponse)?.statusCode
-        else { return .failure(.network) }
-        return .success((status, data))
+        let started = Date()
+        do {
+            let (data, response) = try await transport(request)
+            guard let status = (response as? HTTPURLResponse)?.statusCode else {
+                lastTransportError = "non-HTTP response after \(Int(Date().timeIntervalSince(started) * 1000)) ms"
+                return .failure(.network)
+            }
+            return .success((status, data))
+        } catch {
+            let ns = error as NSError
+            lastTransportError = "\(ns.domain) \(ns.code) after \(Int(Date().timeIntervalSince(started) * 1000)) ms: \(ns.localizedDescription)"
+            return .failure(.network)
+        }
     }
 
     static func errorMessage(status: Int, body: Data) -> String {
@@ -122,7 +143,7 @@ enum ControlPlaneClient {
         await perform(request("POST", path: "/sites/\(siteID)/commands", body: [
             "kind": "terminal-open",
             "args": ["sessionId": sessionId, "tmuxSession": tmuxSession],
-        ]))
+        ], timeout: relayOpenTimeout))
         .flatMap { decode(RelayAddress.self, status: $0.0, body: $0.1) }
     }
 
@@ -133,7 +154,7 @@ enum ControlPlaneClient {
         await perform(request("POST", path: "/sites/\(siteID)/commands", body: [
             "kind": "browser-open",
             "args": ["sessionId": sessionId],
-        ]))
+        ], timeout: relayOpenTimeout))
         .flatMap { decode(RelayAddress.self, status: $0.0, body: $0.1) }
     }
 
@@ -144,7 +165,7 @@ enum ControlPlaneClient {
         await perform(request("POST", path: "/sites/\(siteID)/commands", body: [
             "kind": "vnc-open",
             "args": ["sessionId": sessionId],
-        ]))
+        ], timeout: relayOpenTimeout))
         .flatMap { decode(RelayAddress.self, status: $0.0, body: $0.1) }
     }
 

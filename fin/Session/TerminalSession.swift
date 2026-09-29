@@ -539,7 +539,10 @@ final class TerminalSession: ObservableObject, Identifiable {
             siteID, sessionId: sessionId, tmuxSession: server.tmuxSessionName
         ) {
         case .failure(let failure):
-            ControlPlaneClient.logClientEvent(.relayCommandFailed, detail: ["siteId": siteID, "error": String(describing: failure)])
+            ControlPlaneClient.logClientEvent(.relayCommandFailed, detail: [
+                "siteId": siteID, "error": String(describing: failure),
+                "transport": ControlPlaneClient.lastTransportError ?? "",
+            ])
             if myGeneration == generation {
                 lastError = "Could not reach the control plane: \(failure)"
             }

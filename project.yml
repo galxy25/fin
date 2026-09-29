@@ -285,6 +285,11 @@ targets:
         includes:
           - ScreenshotFixtures.swift
       - path: fin/Persistence/KeychainStore.swift
+      # The relay's pinned WebSocket: SSH tunnelled over HTTPS for `.siteRelay` servers.
+      - path: fin/Session
+        includes:
+          - RelayWebSocket.swift
+          - RelayCertificatePin.swift
       # The key vault (how SSH keys reach a device without iCloud Keychain) and
       # the Sign in with Apple exchange that earns the TV its own session token.
       - path: fin/Vault

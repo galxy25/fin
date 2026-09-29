@@ -166,6 +166,10 @@ final class RemoteBrowserSession: ObservableObject {
             : await ControlPlaneClient.openBrowserRelay(siteID, sessionId: sessionId)
         switch opened {
         case .failure(let failure):
+            ControlPlaneClient.logClientEvent(.relayCommandFailed, detail: [
+                "siteId": siteID, "mode": mode.rawValue, "error": String(describing: failure),
+                "transport": ControlPlaneClient.lastTransportError ?? "",
+            ])
             state = .closed("Could not reach the control plane: \(failure)")
             return
         case .success(let address):
