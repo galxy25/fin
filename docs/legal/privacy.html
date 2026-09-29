@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fin — Privacy Policy</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 720px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; line-height: 1.6; color: #1c1c1e; background: #fff; }
+  @media (prefers-color-scheme: dark) { body { color: #f2f2f7; background: #000; } a { color: #0a84ff; } }
+  h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
+  .updated { color: #8e8e93; font-size: 0.9rem; margin-bottom: 2rem; }
+  h2 { font-size: 1.2rem; margin-top: 2.25rem; }
+  a { color: #007aff; }
+  code { background: rgba(127,127,127,0.15); padding: 0.1em 0.4em; border-radius: 4px; font-size: 0.9em; }
+  ul { padding-left: 1.3rem; }
+  .summary { background: rgba(127,127,127,0.1); border-radius: 12px; padding: 1rem 1.25rem; margin: 1.5rem 0; }
+</style>
+</head>
+<body>
+<h1>Privacy Policy for Fin</h1>
+<p class="updated">Last updated September 29, 2026</p>
+
+<div class="summary">
+<strong>In short:</strong> Fin's terminal works without any account: it connects directly from your device to the SSH servers you configure, and what it stores stays on your device or in your own private iCloud. Fin also has <em>optional</em> cloud features — an account you create with Sign in with Apple, Fin's relay (SSH over HTTPS, Remote Desktop, Remote Browser), the agent's messages and notifications, and cloud agent computers — that run on a small service operated by Fin's developer on Amazon Web Services. This policy says exactly what that service handles, for how long, and how to delete it. There are no advertising or analytics SDKs, and we never sell or share your data.
+</div>
+
+<h2>Who this policy covers</h2>
+<p>Fin is developed by Levi Schoen. This policy applies to the Fin app on iOS, iPadOS, macOS, tvOS, and visionOS, and to Fin's background service (<code>fin-agentd</code>) that you may install on your own computers. Questions can be sent to <a href="mailto:levismschoen@gmail.com">levismschoen@gmail.com</a>.</p>
+
+<h2>Part 1 — Without a Fin account</h2>
+<p>If you never sign in, none of the following leaves your devices and Apple's infrastructure.</p>
+<ul>
+  <li><strong>SSH private keys and passphrases</strong> are stored in your device's Keychain, protected by your passcode or biometrics. If you're signed in to iCloud, Keychain items sync to your other Apple devices through Apple's end-to-end encrypted iCloud Keychain; Fin's developer has no access to them.</li>
+  <li><strong>Server records</strong> (name, hostname, port, username, connection settings), <strong>SSH key metadata</strong> (a key's name and type, not the key), and agent settings are stored in Apple's CloudKit, in the private database tied to your own iCloud account. Fin's developer cannot read it.</li>
+  <li><strong>Clipboard clippings</strong> and <strong>markdown file references</strong> stay on your device only.</li>
+  <li><strong>Terminal content over a direct SSH connection</strong> — anything you type or see — travels directly between your device and the server you connected to. It does not pass through any server operated by Fin's developer.</li>
+  <li><strong>On-device AI.</strong> When an agent uses Apple's on-device model, its prompts and replies are processed on your device by Apple's framework.</li>
+</ul>
+
+<h2>Part 2 — With a Fin account and Fin's cloud service</h2>
+<p>Some features need a service that can reach your computers when they are behind a firewall or asleep, and can reach your devices when the app is closed. They require you to sign in with Apple. The service runs on AWS in the US (Oregon region) and handles the following. Nothing in this section applies unless you sign in and use the feature named.</p>
+<ul>
+  <li><strong>Your account.</strong> Sign in with Apple gives us Apple's stable, app-specific identifier for you, which we map to a Fin user ID. We ask Apple for no name and no email address, and we keep no Apple credentials or refresh tokens. A session token (valid for up to a year) keeps your devices signed in.</li>
+  <li><strong>Fin's relay — SSH over HTTPS.</strong> For a computer you have enrolled with Fin's background service, a terminal can be tunnelled through Fin's relay instead of connecting directly. The relay is a small on-demand server that starts when you open a session and shuts itself down when idle. It passes your keystrokes and the computer's terminal output between your device and the enrolled computer <em>in memory</em>; it does not write that content to disk or to logs (its logs hold only connection events and session IDs). The connection to the relay is encrypted with TLS, but the relay itself handles the traffic in the clear while forwarding it — so, unlike a direct SSH connection, the relay is a party in the path. Fin's developer does not read or keep this traffic.</li>
+  <li><strong>Remote Desktop and Remote Browser.</strong> These stream images of an enrolled computer's screen (or of the one browser the agent is using) to your device, and carry your taps and typing back, over the same relay and on the same terms: in memory, not stored. Each session opens only after Face ID, Touch ID, Optic ID, or your device passcode, and only on a computer whose owner has opted in and granted macOS Screen Recording (and, for input, Accessibility).</li>
+  <li><strong>Agent messages and notifications.</strong> The requests you send to your agent (by text, dictation, or Siri) and its replies are stored so they reach the right device and can be answered from a notification; they are deleted automatically after 14 days. The threads that group them keep event records for 30 days. Your devices' push-notification tokens are stored so Apple's push service can alert you.</li>
+  <li><strong>The agent's workspace.</strong> To work across devices, the agent's run history is stored under your account: its transcript (what it decided, the commands it typed, and the text it read from your terminals — which can include anything visible in a terminal), its memory and goals, artifacts it produced, and device status. It stays until you delete it or your account.</li>
+  <li><strong>Enrolled computers.</strong> For each computer you enroll we store its name and role, when it last checked in, its Fin version, what it can do, the name of its local user and host, the names of its tmux sessions and pane titles, and which model its agent is configured to use.</li>
+  <li><strong>SSH key vault (Apple TV).</strong> So an Apple TV can use your SSH keys, your other devices seal each key with a vault key that exists only in your private CloudKit database and upload the sealed ciphertext. The service stores ciphertext it cannot open.</li>
+  <li><strong>Connected-service credentials</strong> you choose to add are stored encrypted in AWS Secrets Manager.</li>
+  <li><strong>Cloud agent computers.</strong> If you launch one, we run a small AWS instance for you and store its configuration and transcripts as above; it is shut down when idle or when you delete your account.</li>
+  <li><strong>Diagnostics.</strong> When a relay or remote-screen connection is made, fails, or ends, the app and your computers send a small diagnostic record — your user ID, a computer ID, a session ID, a timestamp, and an error description or duration. These records never contain terminal content, keystrokes, or screen images, and are kept in AWS logs for troubleshooting.</li>
+  <li><strong>"Help improve Fin" (off by default).</strong> If you switch it on, ratings you give, comments you write (with secret-shaped text redacted before they leave your device), and metadata-only summaries of agent runs are sent to us to improve Fin's models and prompts. Switching it off stops sending and discards anything still queued on your device.</li>
+</ul>
+
+<h2>AI models</h2>
+<p>Fin does not send your data to any AI provider of its own. An agent uses either Apple's on-device model or an endpoint <em>you</em> configure — a model server on your own network, or a hosted service you choose. If you point an agent at a hosted endpoint, its prompts (which can include terminal text) go to that provider under the provider's own terms.</p>
+
+<h2>Who else handles data</h2>
+<ul>
+  <li><strong>Amazon Web Services</strong> hosts Fin's service (API Gateway, Lambda, DynamoDB, S3, EC2, Secrets Manager, CloudWatch) as our processor.</li>
+  <li><strong>Apple</strong> provides iCloud and CloudKit, Keychain, Sign in with Apple, the Apple Push Notification service, and purchases through the App Store; Apple's own terms and privacy policy govern those.</li>
+</ul>
+<p>There are no advertising or analytics SDKs in Fin, no crash-reporting SDKs, and we do not sell, rent, or share your data with anyone for their own purposes.</p>
+
+<h2>Markdown and file access</h2>
+<p>When you open a markdown or text file, Fin uses the standard file picker and a security-scoped bookmark to remember its location, and reads or writes only the files you explicitly open.</p>
+
+<h2>Deleting your data</h2>
+<ul>
+  <li><strong>Delete your Fin account from inside the app</strong> (Settings → iCloud Sync → Fin Account → Delete Fin Account; on Apple TV, the Fin Account section of the server list). This shuts down your cloud computers, unlinks every computer, and erases your messages, transcripts, memory, goals, artifacts, vault ciphertext, stored credentials, device tokens, sessions, and the link between your Apple ID and Fin. It cannot be undone. Your own iCloud data — servers, keys, and settings — belongs to your Apple Account and is untouched by it.</li>
+  <li>Answered message records expire on their own after 14 days and thread events after 30 days; a session token expires after a year. Transcripts and memory stay until you delete them or your account.</li>
+  <li>Deleting a server, key, or clipping in Fin removes it from Keychain, CloudKit, or local storage. Deleting the app removes locally stored data, and CloudKit data can be removed from your device's iCloud settings.</li>
+  <li>To ask about anything else we may hold, write to <a href="mailto:levismschoen@gmail.com">levismschoen@gmail.com</a>.</li>
+</ul>
+
+<h2>Children's privacy</h2>
+<p>Fin is a developer tool and is not directed at children. It does not knowingly collect data from children.</p>
+
+<h2>Changes to this policy</h2>
+<p>If this policy changes, the "Last updated" date above will change and material changes will be noted in the app's release notes.</p>
+
+<h2>Contact</h2>
+<p><a href="mailto:levismschoen@gmail.com">levismschoen@gmail.com</a></p>
+</body>
+</html>
