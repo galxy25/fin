@@ -85,6 +85,13 @@ struct FinTVApp: App {
             )
         }
 
+        // Created here (not inline below) so the session manager can read the sign-in it earns.
+        let cloudAccount = TVCloudAccount(context: context)
+        manager.relayLogin = { [weak cloudAccount] in
+            guard let cloudAccount, cloudAccount.isSignedIn, !cloudAccount.endpoint.isEmpty else { return nil }
+            return (cloudAccount.endpoint, cloudAccount.sessionToken)
+        }
+
         let keyboard = TVKeyboardMonitor()
         keyboard.sendBytes = { [weak manager] bytes in
             manager?.activeSession?.send(bytes: bytes)
@@ -97,7 +104,7 @@ struct FinTVApp: App {
 
         _sessionManager = StateObject(wrappedValue: manager)
         _keyboardMonitor = StateObject(wrappedValue: keyboard)
-        _account = StateObject(wrappedValue: TVCloudAccount(context: context))
+        _account = StateObject(wrappedValue: cloudAccount)
     }
 
     var body: some Scene {

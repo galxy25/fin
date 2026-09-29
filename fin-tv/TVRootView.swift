@@ -84,13 +84,20 @@ struct TVServerListView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(server.name)
                     .font(.headline)
-                Text("\(server.username)@\(server.host):\(String(server.port))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospaced()
+                if server.transport == .siteRelay {
+                    Label("via Fin relay", systemImage: "point.3.connected.trianglepath.dotted")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(server.username)@\(server.host):\(String(server.port))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospaced()
+                }
             }
             Spacer()
-            if !ScreenshotFixtures.isEnabled,
+            // A relay server has no key by design; only a direct SSH row can lack one.
+            if !ScreenshotFixtures.isEnabled, server.transport == .direct,
                server.keyID == nil || KeychainStore.loadPrivateKey(for: server.keyID ?? UUID()) == nil {
                 Label("Key needed", systemImage: "key.slash")
                     .font(.caption)

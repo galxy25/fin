@@ -34,6 +34,22 @@ final class TVTerminalSession: ObservableObject, Identifiable {
 
     private var client: SSHClient?
     private var stdinWriter: TTYStdinWriter?
+    /// Live only on the `.siteRelay` path (SSH tunnelled over HTTPS through Fin's relay):
+    /// the pinned WebSocket and the session id both ends of the relay pair on. Mutually
+    /// exclusive with `client`/`stdinWriter` — one server, one transport.
+    private var relaySocket: RelayWebSocket?
+    private var relaySessionId: String?
+    private var lastRelay: RelayTarget?
+    /// How long the relay gets to come up: it is on-demand, and the first open after a
+    /// quiet spell pays an EC2 boot (about a minute). 45 tries, two seconds apart.
+    private let relayConnectAttempts = 45
+
+    struct RelayTarget {
+        let server: Server
+        let siteID: String
+        let endpoint: String
+        let token: String
+    }
     private var runTask: Task<Void, Never>?
     private var writeChain: Task<Void, Never>?
     private var lastServer: Server?
@@ -48,7 +64,10 @@ final class TVTerminalSession: ObservableObject, Identifiable {
         delegateProxy.owner = self
     }
 
-    var isConnected: Bool { client?.isConnected ?? false }
+    var isConnected: Bool {
+        if let client { return client.isConnected }
+        return relaySocket != nil && state == .connected
+    }
 
     func connect(server: Server, credentials: ServerCredentials) {
         guard state == .disconnected || state == .reconnecting else { return }
@@ -74,6 +93,42 @@ final class TVTerminalSession: ObservableObject, Identifiable {
         }
     }
 
+    /// The `.siteRelay` counterpart to `connect(server:credentials:)`: no SSH dial and no key —
+    /// the control plane wakes the named computer's daemon to attach a PTY to the tmux
+    /// session and both ends meet at the relay. Needs only the Sign in with Apple session.
+    func connectSiteRelay(_ target: RelayTarget) {
+        guard state == .disconnected || state == .reconnecting else { return }
+        state = state == .reconnecting ? .reconnecting : .connecting
+        lastError = nil
+        lastServer = target.server
+        lastRelay = target
+        lastCredentials = nil
+
+        generation += 1
+        let myGeneration = generation
+        runTask?.cancel()
+
+        if let staleClient = client {
+            Task { try? await staleClient.close() }
+        }
+        client = nil
+        stdinWriter = nil
+        relaySocket?.cancel()
+        relaySocket = nil
+        relaySessionId = nil
+        writeChain?.cancel()
+        writeChain = nil
+
+        let sessionId = UUID().uuidString
+        runTask = Task { [weak self] in
+            await self?.runSiteRelay(target, sessionId: sessionId, generation: myGeneration)
+        }
+    }
+
+    func reportRelayUnavailable(_ message: String) {
+        lastError = message
+    }
+
     func markNeedsReconnect() {
         guard state == .connected else { return }
         state = .reconnecting
@@ -91,20 +146,46 @@ final class TVTerminalSession: ObservableObject, Identifiable {
         let closingClient = client
         client = nil
         stdinWriter = nil
+        let closingSocket = relaySocket
+        let closingSessionId = relaySessionId
+        relaySocket = nil
+        relaySessionId = nil
+        lastRelay = nil
         state = .disconnected
         Task { try? await closingClient?.close() }
+        if let closingSocket {
+            Task {
+                // Tell the relay (and through it the daemon) to end the PTY, then drop the socket.
+                if let closingSessionId,
+                   let payload = try? JSONSerialization.data(withJSONObject: ["action": "close", "sessionId": closingSessionId]) {
+                    try? await closingSocket.send(payload)
+                }
+                closingSocket.cancel()
+            }
+        }
     }
 
     /// Transport-level write; every producer (Bluetooth keyboard, iPhone companion,
     /// the fallback text field, engine auto-replies) funnels through here, chained
     /// so multi-byte sequences can never interleave out of order.
     func send(bytes: [UInt8]) {
-        guard let stdinWriter else { return }
-        eventLog.recordInput(bytes)
-        let previousWrite = writeChain
-        writeChain = Task {
-            await previousWrite?.value
-            try? await stdinWriter.write(ByteBuffer(bytes: bytes))
+        if let stdinWriter {
+            eventLog.recordInput(bytes)
+            let previousWrite = writeChain
+            writeChain = Task {
+                await previousWrite?.value
+                try? await stdinWriter.write(ByteBuffer(bytes: bytes))
+            }
+        } else if let relaySocket, let relaySessionId,
+                  let payload = try? JSONSerialization.data(withJSONObject: [
+                      "action": "input", "sessionId": relaySessionId, "data": Data(bytes).base64EncodedString(),
+                  ]) {
+            eventLog.recordInput(bytes)
+            let previousWrite = writeChain
+            writeChain = Task {
+                await previousWrite?.value
+                try? await relaySocket.send(payload)
+            }
         }
     }
 
@@ -124,9 +205,152 @@ final class TVTerminalSession: ObservableObject, Identifiable {
             terminal.resize(cols: cols, rows: rows)
             onScreenUpdate()
         }
-        guard let stdinWriter else { return }
-        Task {
-            try? await stdinWriter.changeSize(cols: cols, rows: rows, pixelWidth: 0, pixelHeight: 0)
+        if let stdinWriter {
+            Task {
+                try? await stdinWriter.changeSize(cols: cols, rows: rows, pixelWidth: 0, pixelHeight: 0)
+            }
+        } else {
+            sendCurrentSizeToRelay()
+        }
+    }
+
+    private func sendCurrentSizeToRelay() {
+        guard let relaySocket, let relaySessionId,
+              let payload = try? JSONSerialization.data(withJSONObject: [
+                  "action": "resize", "sessionId": relaySessionId, "cols": terminal.cols, "rows": terminal.rows,
+              ]) else { return }
+        Task { try? await relaySocket.send(payload) }
+    }
+
+    // MARK: - Relay transport
+
+    /// Asks the control plane to wake the site and returns the relay's address. The call can
+    /// LAUNCH the relay (about ten seconds), so it gets a long timeout — the same lesson as
+    /// ControlPlaneClient.relayOpenTimeout on the other platforms.
+    private static func openRelay(_ target: RelayTarget, sessionId: String) async -> Result<(host: String, port: Int), RelayOpenFailure> {
+        let base = KeyVaultClient.normalizedBase(target.endpoint)
+        guard !base.isEmpty, let url = URL(string: base + "/sites/\(target.siteID)/commands") else {
+            return .failure(.message("Fin's control plane isn't set up on this Apple TV yet. Open Fin on your iPhone or Mac once so iCloud can deliver it."))
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 35
+        request.setValue("Bearer \(target.token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "kind": "terminal-open",
+            "args": ["sessionId": sessionId, "tmuxSession": target.server.tmuxSessionName],
+        ])
+        let started = Date()
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200...299).contains(status) else {
+                switch status {
+                case 401, 403: return .failure(.message("This Apple TV's Fin sign-in has expired. Sign in with Apple again from the server list."))
+                case 404: return .failure(.message("That computer is no longer enrolled with Fin."))
+                default: return .failure(.message("Fin's control plane answered \(status)."))
+                }
+            }
+            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let host = object["relayHost"] as? String, let port = object["relayPort"] as? Int else {
+                return .failure(.message("Fin's control plane answered without a relay address."))
+            }
+            return .success((host, port))
+        } catch {
+            let ns = error as NSError
+            return .failure(.message("Could not reach Fin's control plane (\(ns.domain) \(ns.code) after \(Int(Date().timeIntervalSince(started) * 1000)) ms)."))
+        }
+    }
+
+    private enum RelayOpenFailure: Error { case message(String) }
+
+    private func runSiteRelay(_ target: RelayTarget, sessionId: String, generation myGeneration: Int) async {
+        switch await Self.openRelay(target, sessionId: sessionId) {
+        case .failure(.message(let message)):
+            if myGeneration == generation { lastError = message }
+        case .success(let address):
+            await pumpRelay(target, sessionId: sessionId, address: address, generation: myGeneration)
+        }
+
+        guard myGeneration == generation else { return }
+        // Only a session that reached `.connected` and then dropped retries itself: a wake
+        // that never produced a frame is left for the user rather than spinning against a
+        // computer that may not be reachable at all.
+        let shouldAutoReconnect = state == .connected
+        relaySocket = nil
+        relaySessionId = nil
+        if state != .disconnected {
+            state = .disconnected
+        }
+        if shouldAutoReconnect, let target = lastRelay {
+            state = .reconnecting
+            connectSiteRelay(target)
+        }
+    }
+
+    private func pumpRelay(_ target: RelayTarget, sessionId: String, address: (host: String, port: Int),
+                           generation myGeneration: Int) async {
+        guard let openFrame = try? JSONSerialization.data(withJSONObject: [
+            "action": "open", "sessionId": sessionId, "siteId": target.siteID, "tmuxSession": target.server.tmuxSessionName,
+        ]) else { return }
+
+        var socket: RelayWebSocket?
+        var attemptsRemaining = relayConnectAttempts
+        while myGeneration == generation, attemptsRemaining > 0 {
+            attemptsRemaining -= 1
+            let candidate = RelayWebSocket(host: address.host, port: address.port)
+            do {
+                try await candidate.connect()
+                try await candidate.send(openFrame)
+                socket = candidate
+                break
+            } catch {
+                candidate.cancel()
+                if attemptsRemaining == 0 {
+                    if myGeneration == generation { lastError = "The terminal relay did not come up in time." }
+                    return
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        guard let socket, myGeneration == generation else {
+            socket?.cancel()
+            return
+        }
+        relaySocket = socket
+        relaySessionId = sessionId
+        // The canvas sized the terminal before this socket existed, so its resize call found
+        // nothing to tell; without this the remote PTY keeps its default size.
+        sendCurrentSizeToRelay()
+
+        while myGeneration == generation {
+            let frame: Data
+            do {
+                frame = try await socket.receive()
+            } catch {
+                if myGeneration == generation { lastError = String(describing: error) }
+                return
+            }
+            guard myGeneration == generation,
+                  let object = (try? JSONSerialization.jsonObject(with: frame)) as? [String: Any],
+                  let action = object["action"] as? String else { continue }
+            switch action {
+            case "attached":
+                if state != .connected { state = .connected }
+                sendCurrentSizeToRelay()
+            case "output":
+                guard let encoded = object["data"] as? String, let bytes = Data(base64Encoded: encoded) else { continue }
+                if state != .connected { state = .connected }
+                let byteArray = [UInt8](bytes)
+                eventLog.recordOutput(byteArray)
+                terminal.feed(byteArray: byteArray)
+                onScreenUpdate()
+            case "close":
+                socket.cancel()
+            default:
+                break
+            }
         }
     }
 

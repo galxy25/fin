@@ -38,7 +38,8 @@ def main():
             "keywords": listing["keywords"],
             "promotionalText": listing["promotional"][platform],
         }
-        if listing.get("whatsNew"):
+        # A version that has never shipped (macOS 1.x, tvOS 1.x) refuses whatsNew.
+        if listing.get("whatsNew") and platform not in listing.get("noWhatsNew", []):
             attrs["whatsNew"] = listing["whatsNew"]
         s, r = u.call("PATCH", f"/appStoreVersionLocalizations/{loc['id']}", {
             "data": {"type": "appStoreVersionLocalizations", "id": loc["id"], "attributes": attrs}}, tok=tok)
