@@ -54,7 +54,9 @@ struct TVServerListView: View {
                 }
             } else {
                 List {
-                    TVAccountSection()
+                    // A capture has no iCloud to wait on; the "waiting for your account"
+                    // banner would headline the store shot.
+                    if !ScreenshotFixtures.isEnabled { TVAccountSection() }
                     Section {
                         ForEach(servers) { server in
                             NavigationLink {
@@ -88,7 +90,8 @@ struct TVServerListView: View {
                     .monospaced()
             }
             Spacer()
-            if server.keyID == nil || KeychainStore.loadPrivateKey(for: server.keyID ?? UUID()) == nil {
+            if !ScreenshotFixtures.isEnabled,
+               server.keyID == nil || KeychainStore.loadPrivateKey(for: server.keyID ?? UUID()) == nil {
                 Label("Key needed", systemImage: "key.slash")
                     .font(.caption)
                     .foregroundStyle(.orange)

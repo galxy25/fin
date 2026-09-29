@@ -1,4 +1,7 @@
 import XCTest
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Drives the app through the screens that belong on the App Store product page
 /// and attaches a full-screen capture of each, so a capture run is reproducible
@@ -20,12 +23,50 @@ final class ScreenshotCaptureUITests: XCTestCase {
     private func app() -> XCUIApplication {
         launchFinApp { app in
             app.launchEnvironment["FIN_SCREENSHOT_MODE"] = "1"
+            #if os(macOS)
+            // Opt into the REAL relay for the terminal/desktop/browser shots by naming
+            // the site to dial (one line, a site id from the fleet). Absent, those
+            // screens are the synthetic ones from ScreenshotDemoScreens.
+            let live = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/fin-screenshots/live-site-id")
+            if let id = try? String(contentsOf: live, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
+                app.launchEnvironment["FIN_SCREENSHOT_LIVE_SITE_ID"] = id
+            }
+            #else
+            // Simulators run on the host and can read its files: the throwaway loopback
+            // key (a real ssh to this Mac) and the real browser frame the Mac run saved.
+            let dir = "/Users/deepspacenine/Library/Application Support/fin-screenshots"
+            app.launchEnvironment["FIN_SCREENSHOT_KEY_PATH"] = dir + "/id_ed25519"
+            app.launchEnvironment["FIN_SCREENSHOT_SSH_USER"] = "deepspacenine"
+            app.launchEnvironment["FIN_SCREENSHOT_FRAMES_DIR"] = dir + "/frames"
+            #endif
         }
     }
 
-    private func shoot(_ app: XCUIApplication, _ name: String) {
-        // Screenshot the APP, not XCUIScreen.main: on a multi-display Mac "main"
-        // is a physical display that may not be the one the window is on.
+    private var isVision: Bool {
+        #if os(visionOS)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    private func shoot(_ app: XCUIApplication, _ name: String, viaHost: Bool = false) {
+        #if !os(macOS)
+        // Host-side capture (see vision-watch.sh) for visionOS, where XCTest screenshots are
+        // 1x1, and for a rotated phone, where they come back clipped.
+        if viaHost || isVision {
+        // The host takes the picture (`xcrun simctl io <sim> screenshot`, watched for by
+        // scripts/screenshots/vision-watch.sh): drop a marker, wait for its .done.
+        let dir = "/Users/deepspacenine/Library/Application Support/fin-screenshots/vision-ready"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(atPath: "\(dir)/\(name).done")   // a previous run's
+        FileManager.default.createFile(atPath: "\(dir)/\(name).ready", contents: Data())
+        for _ in 0..<40 where !FileManager.default.fileExists(atPath: "\(dir)/\(name).done") { sleep(1) }
+        return
+        }
+        #endif
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
@@ -55,6 +96,135 @@ final class ScreenshotCaptureUITests: XCTestCase {
         app.descendants(matching: .any)
             .matching(NSPredicate(format: "identifier BEGINSWITH %@", prefix))
             .firstMatch
+    }
+
+    // MARK: - Phone / pad / headset story
+    //
+    // One test per screen, each a fresh launch: a screen reached by navigating back from
+    // the last one is at the mercy of that platform's back affordance, and a launch is
+    // cheap next to a run that fails halfway.
+
+    private func waitForServers(_ app: XCUIApplication) {
+        XCTAssertTrue(element(app, id: "homeMode_Terminal").waitForExistence(timeout: 30), "home never appeared")
+        _ = firstStartingWith(app, "siteRow_").waitForExistence(timeout: 5)
+        sleep(3)
+    }
+
+    private func label(_ app: XCUIApplication, beginsWith prefix: String) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
+    }
+
+    /// A streamed desktop or browser is landscape; on a phone in portrait it is a thin
+    /// strip between two black bars. Rotate the phone for those two shots (an iPad's
+    /// canvas is wide enough as it is, and visionOS has no orientation).
+    private func rotatePhoneToLandscape() {
+        #if os(iOS)
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            XCUIDevice.shared.orientation = .landscapeLeft
+            sleep(3)
+        }
+        #endif
+    }
+
+    private func restorePortrait() {
+        #if os(iOS)
+        XCUIDevice.shared.orientation = .portrait
+        #endif
+    }
+
+    func testMobile01Servers() throws {
+        let app = app()
+        waitForServers(app)
+        shoot(app, "m-01-servers")
+    }
+
+    func testMobile02Desktop() throws {
+        let app = app()
+        waitForServers(app)
+        let open = label(app, beginsWith: "Open Studio iMac")
+        let desktop = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", "Open Studio iMac\u{2019}s desktop")).firstMatch
+        XCTAssertTrue(desktop.waitForExistence(timeout: 10), "desktop button missing (\(open.exists))")
+        desktop.tapCenter()
+        sleep(4)
+        rotatePhoneToLandscape()
+        sleep(3)
+        shoot(app, "m-02-desktop", viaHost: true)
+        restorePortrait()
+    }
+
+    func testMobile03Browser() throws {
+        let app = app()
+        waitForServers(app)
+        let browser = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", "Open Build Box\u{2019}s browser")).firstMatch
+        XCTAssertTrue(browser.waitForExistence(timeout: 10), "browser button missing")
+        browser.tapCenter()
+        sleep(4)
+        rotatePhoneToLandscape()
+        sleep(3)
+        shoot(app, "m-03-browser", viaHost: true)
+        restorePortrait()
+    }
+
+    func testMobile04RelayTerminal() throws {
+        let app = app()
+        waitForServers(app)
+        let row = label(app, beginsWith: "Build Box, via")
+        XCTAssertTrue(row.waitForExistence(timeout: 10), "relay server row missing")
+        row.tapCenter()
+        sleep(8)
+        shoot(app, "m-04-relay-terminal")
+    }
+
+    func testMobile05DirectTerminal() throws {
+        let app = app()
+        waitForServers(app)
+        let row = label(app, beginsWith: "This Mac")
+        XCTAssertTrue(row.waitForExistence(timeout: 10), "loopback server row missing")
+        row.tapCenter()
+        sleep(14)
+        shoot(app, "m-05-direct-terminal")
+    }
+
+    func testMobile06Voice() throws {
+        let app = app()
+        waitForServers(app)
+        let voice = app.buttons["Set up voice button"].firstMatch
+        XCTAssertTrue(voice.waitForExistence(timeout: 10), "voice setup button missing")
+        voice.tapCenter()
+        sleep(3)
+        shoot(app, "m-06-voice")
+    }
+
+    func testMobile07Agents() throws {
+        let app = app()
+        waitForServers(app)
+        element(app, id: "homeMode_Agents").tapCenter()
+        _ = firstStartingWith(app, "agentRow_").waitForExistence(timeout: 10)
+        sleep(2)
+        shoot(app, "m-07-agents")
+        let row = firstStartingWith(app, "agentRow_")
+        if row.exists {
+            row.tapCenter()
+            sleep(4)
+            shoot(app, "m-08-agent-hub")
+        }
+    }
+
+    func testMobile09Console() throws {
+        let app = app()
+        waitForServers(app)
+        let row = label(app, beginsWith: "Build Box, via")
+        XCTAssertTrue(row.waitForExistence(timeout: 10), "relay server row missing")
+        row.tapCenter()
+        let strip = element(app, id: "controlStrip_agent")
+        XCTAssertTrue(strip.waitForExistence(timeout: 30), "control strip missing")
+        sleep(3)
+        strip.tapCenter()
+        sleep(4)
+        shoot(app, "m-09-console")
     }
 
     func testCaptureProductPageScreens() throws {
@@ -302,6 +472,105 @@ final class ScreenshotCaptureUITests: XCTestCase {
                 shootWindow(mainAgain, "story-08-paywall")
                 break
             }
+        }
+    }
+
+    /// The features the product page leads with besides the local terminal: a terminal
+    /// reached through Fin's relay (SSH tunnelled over HTTPS), Remote Desktop, Remote
+    /// Browser, and the Siri setup. Runs from the servers list; each remote window is
+    /// closed after its shot because a macOS window capture is a screen-region grab —
+    /// two windows at one frame photograph whichever is on top.
+    func testCaptureMacRemote() throws {
+        let app = app()
+
+        var terminalTab = element(app, id: "homeMode_Terminal")
+        if !terminalTab.waitForExistence(timeout: 10) {
+            let servers = element(app, id: "controlStrip_servers")
+            XCTAssertTrue(servers.waitForExistence(timeout: 10), "no way into the tabs")
+            servers.tapCenter()
+            terminalTab = element(app, id: "homeMode_Terminal")
+        }
+        XCTAssertTrue(terminalTab.waitForExistence(timeout: 15))
+        _ = firstStartingWith(app, "siteRow_").waitForExistence(timeout: 10)
+        let main = app.windows.matching(identifier: "main-AppWindow-1").firstMatch
+
+        // Remote Desktop and Remote Browser on the Build Box site.
+        for (kind, name) in [("desktop", "remote-01-desktop"), ("browser", "remote-02-browser")] {
+            // By label: the button's own identifier does not surface under the row's
+            // container identifier, its accessibility label ("Open Build Box's desktop")
+            // does.
+            let button = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Open Build Box' AND label ENDSWITH %@", kind)).firstMatch
+            XCTAssertTrue(button.waitForExistence(timeout: 15), "\(kind) button missing")
+            button.tapCenter()
+            // The stream's Image is not in the accessibility tree; the window is. SwiftUI
+            // names a WindowGroup's windows "<id>-AppWindow-N".
+            let window = app.windows.matching(NSPredicate(format: "identifier BEGINSWITH 'remote-browser'")).firstMatch
+            XCTAssertTrue(window.waitForExistence(timeout: 30), "\(name): the remote window never opened")
+            // Relay wake + first frames + a settled page.
+            sleep(25)
+            if kind == "browser" {
+                // The shared browser may be parked on anything (last time: a third
+                // party's staging admin console). Point it at the developer's own site so the
+                // shot shows the feature, not whatever was open.
+                let address = window.textFields.firstMatch
+                if address.waitForExistence(timeout: 10) {
+                    address.tapCenter()
+                    address.typeText("https://africanintellect.club/\n")
+                }
+                sleep(15)
+                // The daemon reports a tab's URL and title one navigation late; a second
+                // visit to the same page brings the address bar and title level with it.
+                if address.exists {
+                    address.tapCenter()
+                    address.typeText("https://africanintellect.club/\n")
+                }
+                sleep(25)
+            }
+            shootWindow(window, name)
+            window.buttons[XCUIIdentifierCloseWindow].firstMatch.click()
+            sleep(3)
+            XCTAssertFalse(window.exists, "\(name): window still open — the next shot would photograph it")
+        }
+
+        // The relay terminal: the Build Box server row, which has no address at all.
+        let buildBox = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'serverRow_' AND label CONTAINS 'Build Box'"))
+            .firstMatch
+        XCTAssertTrue(buildBox.waitForExistence(timeout: 10), "Build Box row missing")
+        shootWindow(main, "remote-00-servers")
+        buildBox.tapCenter()
+        XCTAssertTrue(element(app, id: "controlStrip_agent").waitForExistence(timeout: 120), "relay terminal never opened")
+        // A brand-new tmux session on a real, in-use laptop takes a while to draw.
+        sleep(30)
+        // A shell on a real machine that has been in use: clear its greeting and ask
+        // for things that say what it is without naming anything private.
+        main.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.5)).click()
+        // The owner's fish prompt prints a banner on every prompt; a plain bash with a
+        // neutral prompt (as the loopback session does) and no tmux status bar.
+        app.typeText("tmux set status off; exec env PS1='fin % ' bash --norc --noprofile\n")
+        sleep(4)
+        app.typeText("clear; sw_vers; echo; uptime; echo; df -h / | tail -1\n")
+        sleep(10)
+        shootWindow(main, "remote-03-relay-terminal")
+    }
+
+    /// Drives the INSTALLED, signed-in app (real servers, real synced keys, real
+    /// Keychain session) instead of the throwaway-store build, for the shots that
+    /// must go over the live relay to a real machine. Attaches by path because the
+    /// test-hosted build shares its bundle id. Exploratory first: dumps the tree.
+    func testExploreRealApp() throws {
+        let app = XCUIApplication(url: URL(fileURLWithPath: "/Applications/fin.app"))
+        app.launch()
+        app.activate()
+        sleep(6)
+        let servers = element(app, id: "controlStrip_servers")
+        if servers.waitForExistence(timeout: 10) { servers.tapCenter(); sleep(3) }
+        let dump = XCTAttachment(string: app.debugDescription)
+        dump.name = "real-tree"
+        dump.lifetime = .keepAlways
+        add(dump)
+        for index in 0..<app.windows.count {
+            shootWindow(app.windows.element(boundBy: index), "real-window-\(index)")
         }
     }
 

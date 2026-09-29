@@ -30,6 +30,19 @@ enum ScreenshotFixtures {
         ProcessInfo.processInfo.environment["FIN_SCREENSHOT_MODE"] == "1"
     }
 
+    /// When set (a site id from the real fleet), the demo "Build Box" is that site: its
+    /// name and pane titles stay invented, but a terminal, desktop or browser opened on
+    /// it goes over the REAL relay to the REAL machine. Unset, those three screens are
+    /// fed by `ScreenshotDemoScreens` instead. Live frames are reviewed by hand before
+    /// they ship — a real desktop is not curated the way the demo rows are.
+    static var liveSiteID: String? {
+        let id = ProcessInfo.processInfo.environment["FIN_SCREENSHOT_LIVE_SITE_ID"]
+        return (id?.isEmpty == false) ? id : nil
+    }
+
+    /// The demo Build Box's site id (the server row's relay target and the site's id).
+    static var buildBoxSiteID: String { liveSiteID ?? "5c2ee1a0-0000-4000-8000-000000000002" }
+
     /// Kept for the pre-isolated-store era: a capture that once ran against the
     /// real container may have left these named rows behind, and relaunching with
     /// `FIN_SCREENSHOT_CLEANUP=1` still removes exactly them.
@@ -152,7 +165,12 @@ enum ScreenshotFixtures {
         }
         let servers = [
             Server(name: "Studio iMac", host: "studio.example.com", username: "levi", tmuxSessionName: "fin"),
-            Server(name: "Build Box", host: "build.example.com", username: "ci", tmuxSessionName: "ci"),
+            // Reached through Fin's relay — SSH's PTY carried over HTTPS, no inbound port,
+            // no VPN — which is the row that shows the second transport.
+            Server(name: "Build Box", host: "build.example.com", username: "ci", transport: .siteRelay,
+                   relaySiteId: buildBoxSiteID, // A fresh tmux session per run: reusing one keeps an old client's smaller size,
+                   // which tmux paints as a field of dots around the new one.
+                   tmuxSessionName: "fin-demo-\(Int(Date().timeIntervalSince1970) % 100_000)"),
             Server(name: "Cloud Worker", host: "worker.example.com", username: "ubuntu", tmuxSessionName: "agent"),
         ]
         for server in servers {
@@ -404,7 +422,8 @@ enum ScreenshotFixtures {
           {"siteId":"5c2ee1a0-0000-4000-8000-000000000001","siteId8":"5c2ee1a0","agent":"Fin","kind":"resident",
            "displayName":"Studio iMac","priority":100,"state":"working","live":true,
            "enrolledAt":"\(at(-36 * 86400))","lastHeartbeatAt":"\(at(-8))","leaseUntil":"\(at(52))",
-           "capabilities":{"daemon_version":"1.10.1","always_on":true,"terminal_relay":true,
+           "capabilities":{"daemon_version":"1.12.3","always_on":true,"terminal_relay":true,
+             "vnc_proxy":true,"remote_browser":true,"gui_permissions":{"accessibility":true,"screen_recording":true},
              "brain":{"kind":"apple-on-device","model":"Apple on-device"},
              "tmux_sessions":[
                {"session":"fin","registered":true,"tasks":["fin app","release 1.0.2"],
@@ -413,10 +432,11 @@ enum ScreenshotFixtures {
                {"session":"docs","registered":false,"tasks":[],
                 "panes":[{"target":"docs:0.0","title":"vim runbook.md","command":"vim","cwd":"docs"}]}]},
            "runId":null,"workerId":null},
-          {"siteId":"5c2ee1a0-0000-4000-8000-000000000002","siteId8":"7d41b2c9","agent":"Fin","kind":"byo",
+          {"siteId":"\(buildBoxSiteID)","siteId8":"7d41b2c9","agent":"Fin","kind":"byo",
            "displayName":"Build Box","priority":80,"state":"idle","live":true,
            "enrolledAt":"\(at(-20 * 86400))","lastHeartbeatAt":"\(at(-14))","leaseUntil":"\(at(46))",
-           "capabilities":{"daemon_version":"1.10.1","always_on":true,"terminal_relay":true,
+           "capabilities":{"daemon_version":"1.12.3","always_on":true,"terminal_relay":true,
+             "vnc_proxy":true,"remote_browser":true,"gui_permissions":{"accessibility":true,"screen_recording":true},
              "brain":{"kind":"openai-compatible","model":"qwen3.6-27b"},
              "tmux_sessions":[
                {"session":"ci","registered":true,"tasks":["nightly tests","eval run"],

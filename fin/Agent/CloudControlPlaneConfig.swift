@@ -29,7 +29,28 @@ enum CloudControlPlaneConfig {
     /// Local-cache read; `SyncedDeviceConfig` keeps the cache current with the
     /// account (setter push, launch pull, external-change pull).
     static var endpointURL: String {
-        UserDefaults.standard.string(forKey: endpointURLKey) ?? ""
+        if let capture = captureCredentials { return capture.endpointURL }
+        return UserDefaults.standard.string(forKey: endpointURLKey) ?? ""
+    }
+
+    /// A screenshot capture that dials a REAL relay (`ScreenshotFixtures.liveSiteID`)
+    /// needs a control-plane login, and the throwaway-store test build has no Keychain
+    /// session of its own. It is handed one through a 0600 file next to the capture
+    /// key — the same arrangement as `loopbackKeyPEM` — never through the store, and
+    /// only when capture mode is on AND a live site was named.
+    private static var captureCredentials: (endpointURL: String, token: String)? {
+        guard ScreenshotFixtures.isEnabled, ScreenshotFixtures.liveSiteID != nil else { return nil }
+        #if os(macOS)
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/fin-screenshots/control-plane.json")
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+              let endpoint = object["endpointURL"], let token = object["token"], !endpoint.isEmpty, !token.isEmpty
+        else { return nil }
+        return (endpoint, token)
+        #else
+        return nil
+        #endif
     }
 
     /// Synced keychain first. A legacy plaintext UserDefaults value (pre-sync
@@ -43,6 +64,7 @@ enum CloudControlPlaneConfig {
     /// iCloud-less CI) the value simply stays in UserDefaults — local-only,
     /// degraded, silent.
     static var token: String {
+        if let capture = captureCredentials { return capture.token }
         if let synced = KeychainStore.loadDeviceSecret(forKey: tokenKey) {
             // A pre-sync plaintext copy can survive here when keychain sync
             // delivered the item from another device before this one's first
