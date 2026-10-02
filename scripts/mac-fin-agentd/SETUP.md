@@ -20,9 +20,12 @@ it.
 ## 1. Unpack
 
 ```sh
-cd ~/Downloads
-tar -xpzf fin-agentd-site-*.tar.gz     # -p matters: it keeps site.env owner-only
-cd fin-agentd-site
+# Unpack into a scratch directory, NOT ~/Downloads: this folder is only an installer, and
+# step 5 deletes it. The tarball itself stays wherever it landed until then.
+BUNDLE=$(ls -t ~/Downloads/fin-agentd-site-*.tar.gz ~/Library/Mobile\ Documents/com~apple~CloudDocs/From\ Claude/fin-agentd-site-*.tar.gz 2>/dev/null | head -1)
+WORK=$(mktemp -d)
+tar -xpzf "$BUNDLE" -C "$WORK"         # -p matters: it keeps site.env owner-only
+cd "$WORK/fin-agentd-site"
 xattr -dr com.apple.quarantine .       # it arrived via iCloud; macOS flags that
 chmod 600 site.env                     # belt and braces — install.sh refuses a loose one
 ./fin-agentd --version                 # => fin-agentd 1.6.6
@@ -69,6 +72,20 @@ If it refuses to start, the reason is one line in `agentd.err.log` and it is one
 things: the config did not parse, the brain did not answer, or `tmux` is not on `PATH`
 (remember that launchd's `PATH` is the plist's, not your shell's). A refusal sleeps and
 retries — it never crash-loops, and it never consumes a message it cannot answer.
+
+## 5. Clean up
+
+Once step 4 looks healthy, nothing in the unpacked folder is needed any more — the binary,
+scripts, config and LaunchAgents all live under `~/Library/Application Support/fin-agentd/`
+and `~/Library/LaunchAgents/`. The folder and the tarball both carry `site.env` (which can
+hold the brain bearer), so remove them:
+
+```sh
+cd ~ && rm -rf "$WORK" "$BUNDLE"
+```
+
+Also delete the tarball from iCloud Drive → From Claude if it was shared that way, and
+check that `~/Downloads` holds no `fin-agentd-site*` leftovers.
 
 ## The two transports
 
