@@ -94,6 +94,7 @@ other_build_pids() {
 # Whether WE booted the daemon out, so restore only ever undoes our own doing: a
 # machine where Fin was already stopped must be left stopped.
 QUIESCED=0
+RESIDENT_MODELS=""
 
 agentd_loaded() { launchctl print "$AGENTD_DOMAIN/$AGENTD_LABEL" >/dev/null 2>&1; }
 
@@ -110,6 +111,18 @@ quiesce_agentd() {
   # with its process rather than racing the unload.
   sleep 2
   command -v lms >/dev/null 2>&1 || return 0
+  # Remember what was loaded, AT WHAT CONTEXT, so restore can put it back exactly.
+  # Left to JIT, the daemon's first request reloads the model at LM Studio's global
+  # default context (8192 here), not the 42k it was loaded with — and the daemon then
+  # learns and persists that smaller window (2026-10-07, qwen3.8-27b after a TestFlight
+  # round).
+  RESIDENT_MODELS="$(lms ps --json 2>/dev/null | /usr/bin/python3 -c 'import json, sys
+try:
+    for m in json.load(sys.stdin):
+        if m.get("modelKey") and m.get("contextLength"):
+            print(m["modelKey"], m["contextLength"])
+except Exception:
+    pass' 2>/dev/null)"
   lms unload --all >/dev/null 2>&1 || true
   # AND WAIT FOR IT. `lms unload` returns before LM Studio has released the memory,
   # so the resident-model check that follows was measuring the machine as it had
@@ -128,12 +141,22 @@ quiesce_agentd() {
 
 # Always paired with quiesce_agentd, on every exit path including Ctrl-C, because
 # the failure mode of forgetting is a Mac whose agent is simply gone with nothing
-# to say so. The model is deliberately NOT reloaded here: JIT brings it back on the
-# daemon's first request, at the context length its per-model default specifies,
-# which is the path we actually want exercised.
+# to say so. The models quiesce_agentd unloaded are reloaded FIRST, at the context
+# they had, so the daemon's first request (and any other site sharing this LM
+# Studio) finds them as they were rather than JIT-loaded at the global default.
 restore_agentd() {
   [ "$QUIESCED" = "1" ] || return 0
   QUIESCED=0
+  if [ -n "${RESIDENT_MODELS:-}" ] && command -v lms >/dev/null 2>&1; then
+    printf '%s\n' "$RESIDENT_MODELS" | while read -r _key _ctx; do
+      [ -n "$_key" ] || continue
+      if lms load "$_key" --context-length "$_ctx" -y >/dev/null 2>&1; then
+        log "reloaded $_key at context $_ctx"
+      else
+        log "WARNING: could not reload $_key — the daemon will JIT-load it at the default context"
+      fi
+    done
+  fi
   if [ -f "$AGENTD_PLIST" ]; then
     launchctl enable "$AGENTD_DOMAIN/$AGENTD_LABEL" 2>/dev/null || true
     if launchctl bootstrap "$AGENTD_DOMAIN" "$AGENTD_PLIST" 2>/dev/null; then
