@@ -95,6 +95,7 @@ other_build_pids() {
 # machine where Fin was already stopped must be left stopped.
 QUIESCED=0
 RESIDENT_MODELS=""
+LMS_SERVER_STOPPED=0
 
 agentd_loaded() { launchctl print "$AGENTD_DOMAIN/$AGENTD_LABEL" >/dev/null 2>&1; }
 
@@ -124,6 +125,13 @@ try:
 except Exception:
     pass' 2>/dev/null)"
   lms unload --all >/dev/null 2>&1 || true
+  # AND STOP THE SERVER, when this build is the one taking it down. Another Mac's
+  # daemon can use this LM Studio over Funnel (the MacBook Neo, since 2026-10-07), and
+  # its next request JIT-loads the model straight back mid-build — which also made the
+  # restore's reload fail on a model already loaded at the default context.
+  if [ -n "${RESIDENT_MODELS:-}" ] && lms server status 2>&1 | grep -qi "running"; then
+    lms server stop >/dev/null 2>&1 && LMS_SERVER_STOPPED=1
+  fi
   # AND WAIT FOR IT. `lms unload` returns before LM Studio has released the memory,
   # so the resident-model check that follows was measuring the machine as it had
   # been a second earlier and refusing a build that was already fine. Poll the same
@@ -147,9 +155,15 @@ except Exception:
 restore_agentd() {
   [ "$QUIESCED" = "1" ] || return 0
   QUIESCED=0
+  if [ "${LMS_SERVER_STOPPED:-0}" = "1" ]; then
+    lms server start >/dev/null 2>&1 || log "WARNING: could not restart the LM Studio server"
+    LMS_SERVER_STOPPED=0
+  fi
   if [ -n "${RESIDENT_MODELS:-}" ] && command -v lms >/dev/null 2>&1; then
     printf '%s\n' "$RESIDENT_MODELS" | while read -r _key _ctx; do
       [ -n "$_key" ] || continue
+      # Unload first: anything that slipped in meanwhile came in at the default context.
+      lms unload "$_key" >/dev/null 2>&1 || true
       if lms load "$_key" --context-length "$_ctx" -y >/dev/null 2>&1; then
         log "reloaded $_key at context $_ctx"
       else

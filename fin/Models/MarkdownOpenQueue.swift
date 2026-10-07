@@ -11,11 +11,12 @@ extension UTType {
 }
 
 /// Files handed to Fin by Finder (double-click with Fin as the default app, Open With,
-/// drag onto the Dock icon). `FinAppDelegate.application(_:open:)` receives them with
-/// no SwiftUI environment to open a window from, so it parks them here and whichever
-/// Fin window is on screen drains the queue (`drainsMarkdownOpens()`): each file joins
-/// the Files list as a normal `MarkdownDocument` and opens in the same reader window
-/// the Files tab uses.
+/// drag onto the Dock icon). They arrive at the main window's `.onOpenURL`, which parks
+/// them here, and whichever Fin window is on screen drains the queue
+/// (`drainsMarkdownOpens()`): each file joins the Files list as a normal
+/// `MarkdownDocument` and opens in the same reader window the Files tab uses.
+/// (An `NSApplicationDelegate.application(_:open:)` is never called under the SwiftUI
+/// lifecycle — SwiftUI routes the open to a scene itself; verified 2026-10-07.)
 @MainActor
 final class MarkdownOpenQueue: ObservableObject {
     static let shared = MarkdownOpenQueue()

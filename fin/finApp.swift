@@ -51,25 +51,6 @@ extension FinAppDelegate: NSApplicationDelegate {
     func application(_ application: NSApplication, handlerFor intent: INIntent) -> Any? {
         handler(for: intent)
     }
-
-    /// Finder handing Fin files (Fin as the default Markdown app, Open With, a drop on
-    /// the Dock icon) and `fin://` links both land here once this method exists —
-    /// SwiftUI stops routing either to `.onOpenURL` on macOS. Files go to the reader
-    /// (`MarkdownOpenQueue`); links are re-posted for `FinApp` to handle as before.
-    func application(_ application: NSApplication, open urls: [URL]) {
-        let files = urls.filter(\.isFileURL)
-        if !files.isEmpty {
-            MarkdownOpenQueue.shared.enqueue(files)
-        }
-        for url in urls where !url.isFileURL {
-            NotificationCenter.default.post(name: .finOpenExternalURL, object: url)
-        }
-    }
-}
-
-extension Notification.Name {
-    /// A non-file URL (`fin://…`) received by `FinAppDelegate.application(_:open:)`.
-    static let finOpenExternalURL = Notification.Name("dev.levischoen.fin.openExternalURL")
 }
 #else
 extension FinAppDelegate: UIApplicationDelegate {
@@ -465,11 +446,22 @@ struct FinApp: App {
                 .environmentObject(sessionManager)
                 .environmentObject(entitlementStore)
                 .preferredColorScheme(.dark)
-                .onOpenURL { url in openActivityLink(url) }
-                #if os(macOS)
-                .onReceive(NotificationCenter.default.publisher(for: .finOpenExternalURL)) { note in
-                    if let url = note.object as? URL { openActivityLink(url) }
+                .onOpenURL { url in
+                    #if os(macOS)
+                    // A file from Finder (Fin as the default Markdown app, Open With, a
+                    // drop on the Dock icon) goes to the reader, not the terminal.
+                    if url.isFileURL {
+                        MarkdownOpenQueue.shared.enqueue([url])
+                        return
+                    }
+                    #endif
+                    openActivityLink(url)
                 }
+                #if os(macOS)
+                // Without this SwiftUI answers every opened URL — a Finder file
+                // included — with a NEW main window (2026-10-07: a blank terminal
+                // window). An open main window takes the event instead.
+                .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
                 .drainsMarkdownOpens()
                 #endif
         }
@@ -500,6 +492,9 @@ struct FinApp: App {
         }
         .modelContainer(modelContainer)
         .defaultSize(width: 920, height: 640)
+        // Opened only by openWindow(id:value:), never for an external URL or file —
+        // an empty match keeps SwiftUI from picking this scene for one.
+        .handlesExternalEvents(matching: [])
         // A file opens as its own resizable window too — see
         // MarkdownReaderWindowView — for the same reason: worth reading next to a
         // terminal session, an agent's settings, or another file.
@@ -511,6 +506,9 @@ struct FinApp: App {
         }
         .modelContainer(modelContainer)
         .defaultSize(width: 720, height: 640)
+        // Opened only by openWindow(id:value:), never for an external URL or file —
+        // an empty match keeps SwiftUI from picking this scene for one.
+        .handlesExternalEvents(matching: [])
         #endif
         #if os(macOS) || os(visionOS)
         // Remote Browser (docs/REMOTE-BROWSER.md) gets a window of its own on Mac and
@@ -524,6 +522,9 @@ struct FinApp: App {
                 .preferredColorScheme(.dark)
         }
         .defaultSize(width: 1000, height: 760)
+        // Opened only by openWindow(id:value:), never for an external URL or file —
+        // an empty match keeps SwiftUI from picking this scene for one.
+        .handlesExternalEvents(matching: [])
         #endif
     }
 }
