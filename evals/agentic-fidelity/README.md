@@ -35,6 +35,34 @@ task-mode prompt → hidden goal tools + role text out of the launch task → st
 records the follow-up goal itself (`GoalsTick.followUpGoal`), because a model
 that is not offered the goal tools cannot be asked to remember the hand-off.
 
+## S2 — a read-only task handed in by another Claude session (2026-10-07)
+
+**Machine:** iMac resident daemon, tmux `main` with `main:1.0 fin` (a Claude Code
+session whose screen shows the very request below, pasted by the owner).
+
+**Message (via the app, from a Claude session on the Neo):** "...Please do this
+on the iMac and reply with what you find. 1) Check whether this folder exists in
+iCloud Drive: `~/Library/Mobile Documents/com~apple~CloudDocs/From Claude/hire-me
+shared/` ... Report the file list with modified times ... say plainly if it is
+missing. 2) If it is there, treat those three files as shared state ... Do not
+edit, move or delete anything now; this is a read-only check."
+
+**Pass:**
+1. `send_input` an `ls` (e.g. `ls -laO "<folder>"`) — no forced `read_terminal` first.
+2. reply: the file list with modified times (or plainly "missing").
+3. **No** `read_session` of `main:1.0` to find out "who is handling it"; no waiting.
+
+**Observed fail (gemma-4-12b-qat, 04:28Z):** the message matched the
+`read_terminal` question pattern (`what ... say`), so the daemon forced
+`read_terminal`; the model then listed sessions, read `main:1.0`, saw the pasted
+request, and answered that "another agent ... is currently processing the
+request", never running `ls`. **Fixes:** `AgentIntentClassifier` only forces
+`read_terminal` on short single-line questions (≤200 chars;
+`testLongTaskMessageIsNotForcedToReadTerminal`), and `read_session`'s tool
+description says task-doing is `send_input`'s and a pane echoing the request is
+a transcript, not a worker. The model-behaviour half still needs a live re-run
+of S2 after the daemon update.
+
 Failure modes to keep pinning, from `~/.claude/.../fin-agentic-fidelity-failure-modes`:
 repetition of the launch reply, recency confusion, ledger override of a live
 user request.

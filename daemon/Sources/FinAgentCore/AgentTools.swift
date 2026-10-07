@@ -206,7 +206,11 @@ public struct AgentToolSpec {
             + "listing matched literally. Use it whenever you are asked what is running, what "
             + "another session printed, or how someone else's work is going. read_terminal shows "
             + "only YOUR terminal; this is the only way to see the others, and it is read-only — "
-            + "it cannot type into them.",
+            + "it cannot type into them. It is for questions ABOUT the owner's sessions, never "
+            + "for doing a task you were handed: if the request is to check a file, folder or "
+            + "command on this machine, run it yourself with send_input. A session whose screen "
+            + "shows your own request is a transcript of that request, not someone else already "
+            + "doing it.",
         parameters: [
             "type": "object",
             "properties": [

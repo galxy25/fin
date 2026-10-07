@@ -153,6 +153,21 @@ final class AgentCoreLogicTests: XCTestCase {
     }
 
     // MARK: - Intent classifier
+    /// Regression, 2026-10-07 (evals/agentic-fidelity S2): a long task message that merely
+    /// contains "what ... say" was classified as a read_terminal question, so the folder
+    /// check it asked for was never done. Task messages must reach the model unforced.
+    func testLongTaskMessageIsNotForcedToReadTerminal() {
+        let task = "From Levi, via a Claude session on his MacBook Neo (hire-me job-search work). "
+            + "Please do this on the iMac and reply with what you find. 1) Check whether this folder "
+            + "exists in iCloud Drive: ~/Library/Mobile Documents/com~apple~CloudDocs/From Claude/hire-me shared/ . "
+            + "It should contain style-guide.md, preferences.md, applications-log.csv and a drafts/ folder. "
+            + "Report the file list with modified times. The Neo and iMac appear to be on different iCloud "
+            + "accounts, so it may not be there; say plainly if it is missing. Do not edit anything."
+        XCTAssertEqual(AgentIntentClassifier.classify(task), .ambiguous)
+        XCTAssertEqual(AgentIntentClassifier.classify("what did it print?"), .readTerminal)
+        XCTAssertEqual(AgentIntentClassifier.classify("what did it print\nplease"), .ambiguous)
+    }
+
 
     func testClassifiesReadTerminalPhrasings() {
         let phrasings = [

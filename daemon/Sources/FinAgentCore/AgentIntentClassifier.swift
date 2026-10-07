@@ -38,6 +38,8 @@ enum AgentIntentClassifier {
         #"(?i)\bwhat (does|did) the (terminal|screen) (say|show)\b"#,
     ]
 
+    static let maxReadTerminalQuestionLength = 200
+
     static func classify(_ message: String) -> Intent {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .ambiguous }
@@ -50,6 +52,16 @@ enum AgentIntentClassifier {
             // object is one of the agent's own tools, defer to the model instead.
             if referencesOwnToolAsImperative(command) { return .ambiguous }
             return .sendInput(command: command)
+        }
+
+        // A "what did it print" question is short. A long message that merely CONTAINS
+        // those words ("...reply with what you find... say plainly if it is missing") is
+        // a task, and forcing read_terminal on it sent the model hunting through panes
+        // instead of doing the work (2026-10-07: a read-only iCloud folder check from
+        // another Claude session was never performed). Only short, single-line messages
+        // can be the terminal-state question the patterns below describe.
+        guard trimmed.count <= Self.maxReadTerminalQuestionLength, !trimmed.contains("\n") else {
+            return .ambiguous
         }
 
         for pattern in readTerminalPatterns {
