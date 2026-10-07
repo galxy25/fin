@@ -60,8 +60,12 @@ request", never running `ls`. **Fixes:** `AgentIntentClassifier` only forces
 `read_terminal` on short single-line questions (≤200 chars;
 `testLongTaskMessageIsNotForcedToReadTerminal`), and `read_session`'s tool
 description says task-doing is `send_input`'s and a pane echoing the request is
-a transcript, not a worker. The model-behaviour half still needs a live re-run
-of S2 after the daemon update.
+a transcript, not a worker. **Live re-run, qwen/qwen3.8-27b on fin-agentd 1.13.2 (04:35-05:13Z):** no forced
+`read_terminal`; the model went straight to `send_input` and found the folder (all
+four items), then hit the 8-call ceiling before replying. Calls were lost to one
+empty `send_input` and to fish keeping a rejected bash line in its editor, which the
+next command was typed onto. 1.13.3 clears the input line (Ctrl-E Ctrl-U) before
+every send.
 
 Failure modes to keep pinning, from `~/.claude/.../fin-agentic-fidelity-failure-modes`:
 repetition of the launch reply, recency confusion, ledger override of a live
