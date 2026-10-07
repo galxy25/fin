@@ -77,6 +77,10 @@ final class DaemonTranscriptUplink {
 
     let endpointURL: String
     private let token: String
+    /// Set when this daemon's control-plane bearer IS its site token (an enrolled
+    /// site's config): the Lambda only checks a bearer as a site token when
+    /// `X-Fin-Site` names the site, so without it every call is a 401.
+    var siteID: String?
     let flushSeconds: Int
     /// Per-hour-chunk line cap (not a global ring anymore — each hour is its own
     /// document, so this only bounds one hour's worth of lines).
@@ -364,6 +368,7 @@ final class DaemonTranscriptUplink {
         request.timeoutInterval = Self.requestTimeout
         request.httpMethod = "PUT"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        if let siteID { request.setValue(siteID, forHTTPHeaderField: "X-Fin-Site") }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
         do {

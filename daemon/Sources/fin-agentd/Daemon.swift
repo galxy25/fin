@@ -1254,6 +1254,7 @@ final class Daemon {
                     writer.append(AgentAuditEvent(kind: "notice", text: line))
                 }
             )
+            self.transcript?.siteID = Self.controlPlaneSiteHeader(config)
         }
     }
 
@@ -1281,6 +1282,14 @@ final class Daemon {
     /// directive ledger rather than two more keys inside it: the two files have
     /// different writers on different tasks, and one atomic write per owner is
     /// simpler than a shared file with a lock.
+    /// The `X-Fin-Site` value for control-plane clients that present `controlPlane.token`:
+    /// the site id when that token is the site's own (an enrolled site), nil when it is
+    /// the operator token. Sending a site id with an operator token is itself a 401.
+    static func controlPlaneSiteHeader(_ config: DaemonConfig) -> String? {
+        guard let site = config.site, let block = config.controlPlane, site.token == block.token else { return nil }
+        return site.id.lowercased()
+    }
+
     var siteLedgerPath: String {
         (auditLogPath as NSString).deletingLastPathComponent + "/fin-agentd-site.json"
     }
@@ -1867,6 +1876,7 @@ final class Daemon {
                     self?.record(AgentAuditEvent(kind: "notice", text: line))
                 }
             )
+            notifyClient?.siteID = Self.controlPlaneSiteHeader(config)
             log("push notifications enabled: control plane /notify as \"\(notifyClient?.agentName ?? "Agent")\"")
 
             // The model's remember/recall tools: both agent and app read/write the SAME
@@ -1884,6 +1894,7 @@ final class Daemon {
                     self?.record(AgentAuditEvent(kind: "notice", text: line))
                 }
             )
+            memory.siteID = Self.controlPlaneSiteHeader(config)
             memoryClient = memory
             engine.onRemember = { title, content, tags in
                 await memory.remember(title: title, content: content, tags: tags)
@@ -1962,6 +1973,7 @@ final class Daemon {
                     self?.record(AgentAuditEvent(kind: "notice", text: line))
                 }
             )
+            deviceStatusClient?.siteID = Self.controlPlaneSiteHeader(config)
             let ownDeviceID8 = config.deviceToken8 ?? DaemonConfig.defaultDeviceToken8
             memoryConsolidator?.crossDeviceStatusProvider = { [weak self] in
                 guard let deviceStatusClient = self?.deviceStatusClient else { return [] }

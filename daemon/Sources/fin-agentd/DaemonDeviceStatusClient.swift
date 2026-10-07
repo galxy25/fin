@@ -15,6 +15,10 @@ final class DaemonDeviceStatusClient {
 
     private let endpointURL: String
     private let token: String
+    /// Set when this daemon's control-plane bearer IS its site token (an enrolled
+    /// site's config): the Lambda only checks a bearer as a site token when
+    /// `X-Fin-Site` names the site, so without it every call is a 401.
+    var siteID: String?
     var transport: (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) }
     let audit: (String) -> Void
     private var lastFailureAuditAt: Date?
@@ -42,6 +46,7 @@ final class DaemonDeviceStatusClient {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        if let siteID { req.setValue(siteID, forHTTPHeaderField: "X-Fin-Site") }
         req.timeoutInterval = Self.requestTimeout
         return req
     }

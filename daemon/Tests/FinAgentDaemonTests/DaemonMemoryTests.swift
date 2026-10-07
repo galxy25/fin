@@ -384,4 +384,19 @@ final class DaemonMemoryClientTests: XCTestCase {
         XCTAssertEqual(captured?.url?.absoluteString, "https://cp.example/memory/profile/lock")
         XCTAssertEqual(captured?.httpMethod, "DELETE")
     }
+
+    /// An enrolled site's control-plane bearer is its SITE token, which the Lambda only
+    /// accepts alongside `X-Fin-Site` (2026-10-07: the Neo's profile reads were 906
+    /// consecutive 401s). With no site id, no header: the operator token must not send one.
+    func testSiteHeaderIsSentOnlyWhenSet() async {
+        var headers: [String?] = []
+        let client = makeClient(transport: { request in
+            headers.append(request.value(forHTTPHeaderField: "X-Fin-Site"))
+            return (Data("{}".utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        })
+        _ = await client.readProfile()
+        client.siteID = "c38c0f86-0000-4000-8000-000000000000"
+        _ = await client.readProfile()
+        XCTAssertEqual(headers, [nil, "c38c0f86-0000-4000-8000-000000000000"])
+    }
 }

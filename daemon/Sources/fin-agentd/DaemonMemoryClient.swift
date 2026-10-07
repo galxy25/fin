@@ -26,6 +26,10 @@ final class DaemonMemoryClient {
 
     let endpointURL: String
     private let token: String
+    /// Set when this daemon's control-plane bearer IS its site token (an enrolled
+    /// site's config): the Lambda only checks a bearer as a site token when
+    /// `X-Fin-Site` names the site, so without it every call is a 401.
+    var siteID: String?
     let agentName: String
     let agentID: UUID?
     let originDeviceID8: String
@@ -63,6 +67,7 @@ final class DaemonMemoryClient {
         request.timeoutInterval = Self.requestTimeout
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        if let siteID { request.setValue(siteID, forHTTPHeaderField: "X-Fin-Site") }
         return request
     }
 

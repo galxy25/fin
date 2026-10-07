@@ -30,6 +30,10 @@ final class DaemonNotifyClient {
 
     let endpointURL: String
     private let token: String
+    /// Set when this daemon's control-plane bearer IS its site token (an enrolled
+    /// site's config): the Lambda only checks a bearer as a site token when
+    /// `X-Fin-Site` names the site, so without it every call is a 401.
+    var siteID: String?
     let agentName: String
     /// The Agent record this push is about, when the daemon has been paired to
     /// one (`config.agentID`) — lets a tap deep-link straight to the
@@ -183,6 +187,7 @@ final class DaemonNotifyClient {
         request.timeoutInterval = Self.requestTimeout
         request.httpMethod = "POST"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        if let siteID { request.setValue(siteID, forHTTPHeaderField: "X-Fin-Site") }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = Self.requestBody(
             title: title,
