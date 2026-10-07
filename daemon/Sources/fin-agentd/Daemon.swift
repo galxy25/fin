@@ -2332,16 +2332,19 @@ final class Daemon {
                     )
                     StallNotifyMarker.write(stallState, at: stallNotifyStatePath)
 
-                    guard StallNotifyGate.pendingHasDwelled(state: stallState, failure: message, now: now) else {
+                    if !StallNotifyGate.pendingHasDwelled(state: stallState, failure: message, now: now) {
                         let since = stallState.pendingSince ?? now
                         let remainingMin = max(0, Int((StallNotifyGate.dwellBeforePaging - now.timeIntervalSince(since)) / 60) + 1)
                         let line = "[stall] \(consecutiveFailures) consecutive failures, still inside the dwell "
                             + "window — retrying silently, will page in ~\(remainingMin) min if still unresolved"
                         log(line)
                         record(AgentAuditEvent(kind: "notice", text: line))
-                        continue
-                    }
-
+                        // NO `continue` HERE. It skipped the wait for the next trigger at
+                        // the bottom of this loop, so a turn that fails instantly was
+                        // retried instantly: 2026-10-07 19:50-20:20 the iMac logged 3.08
+                        // million "[stall]" lines (736 MB of audit) at ~1,600/s. "Retrying
+                        // silently" means on the next heartbeat, like any other turn.
+                    } else {
                     if StallNotifyGate.shouldNotify(state: stallState, failure: message, now: now) {
                         let repeatNote = (stallState.active && stallState.failureKey == StallNotifyGate.failureKey(message))
                             ? " (still the same failure; next page in \(Int(StallNotifyGate.repeatCooldown(pageCount: stallState.pageCount + 1) / 60)) min at the earliest)"
@@ -2359,6 +2362,7 @@ final class Daemon {
                         log("[stall] not paging again yet — same failure as the last page")
                     }
                     await fail("5 consecutive turn failures; last: \(message)")
+                    }
                 }
             case .toolBudgetExhausted:
                 consecutiveFailures = 0
