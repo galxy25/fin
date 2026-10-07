@@ -241,20 +241,31 @@ struct AgentTranscript {
         var dropped = 0
 
         while estimatedTokenCount > target {
+            // Belt and braces on top of `protectingLast`: the newest real user message is
+            // never dropped, whatever the caller counted. A request with no user message
+            // is one Qwen's chat template refuses outright ("No user query found in
+            // messages") — every heartbeat on the iMac failed that way after the first
+            // trim, 2026-10-07 19:44, and the path that lost it was never pinned down.
+            var protectedStart = min(
+                messages.count - protectingLast,
+                messages.lastIndex { $0.role == .user && !$0.isLocalOnly } ?? messages.count
+            )
             var dropIndex = preservedPrefix
             // Skip past an existing compaction note so it is updated, never re-dropped.
             if dropIndex < messages.count, isCompactionNote(messages[dropIndex]) {
                 dropIndex += 1
             }
-            guard dropIndex < messages.count, dropIndex < messages.count - protectingLast else { break }
+            guard dropIndex < messages.count, dropIndex < protectedStart else { break }
 
             messages.remove(at: dropIndex)
             dropped += 1
+            protectedStart -= 1
 
             // Orphaned tool results left at the head would reference a call that is gone.
-            while dropIndex < messages.count, messages[dropIndex].role == .tool {
+            while dropIndex < messages.count, dropIndex < protectedStart, messages[dropIndex].role == .tool {
                 messages.remove(at: dropIndex)
                 dropped += 1
+                protectedStart -= 1
             }
 
             // Nothing left worth trimming — the remaining messages are the live turn.

@@ -144,6 +144,23 @@ final class AgentCoreLogicTests: XCTestCase {
         XCTAssertFalse(live.messages.contains { $0.text == "old question" })
     }
 
+    /// Even when the caller protects nothing, the newest user message survives a trim —
+    /// a request without one is refused by Qwen's template (2026-10-07).
+    func testCompactionNeverDropsTheNewestUserMessage() {
+        var transcript = AgentTranscript()
+        transcript.reset(systemPrompt: String(repeating: "s", count: 4_000))
+        for index in 0..<10 {
+            transcript.append(AgentMessage(role: .user, text: "q\(index) " + String(repeating: "x", count: 400)))
+            transcript.append(AgentMessage(role: .assistant, text: String(repeating: "y", count: 400)))
+        }
+        transcript.append(AgentMessage(role: .user, text: "the question now"))
+        transcript.append(AgentMessage(role: .assistant, text: "", toolCalls: [AgentToolCall(id: "c1", name: "read_terminal", arguments: "{}")]))
+        transcript.append(AgentMessage(role: .tool, text: String(repeating: "t", count: 2_000), toolCallID: "c1"))
+        XCTAssertTrue(transcript.compactIfNeeded(budget: 1_000, target: 600, protectingLast: 0))
+        XCTAssertTrue(transcript.wireMessages.contains { $0.role == .user && $0.text == "the question now" })
+        XCTAssertEqual(transcript.wireMessages.last?.role, .tool, "the live turn's tool result stays")
+    }
+
     func testCompactionRecordsASingleRunningNote() {
         var transcript = AgentTranscript()
         transcript.reset(systemPrompt: "SYSTEM")
