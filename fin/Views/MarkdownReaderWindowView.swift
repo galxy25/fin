@@ -25,6 +25,10 @@ struct MarkdownReaderWindowView: View {
             NavigationStack {
                 MarkdownReaderView(document: document)
             }
+            #if os(macOS)
+            .joinsMarkdownReaderTabs()
+            .drainsMarkdownOpens()
+            #endif
         } else {
             // Reachable if the file was deleted (on this or another synced
             // device) while this window was still open.

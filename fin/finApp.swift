@@ -51,6 +51,25 @@ extension FinAppDelegate: NSApplicationDelegate {
     func application(_ application: NSApplication, handlerFor intent: INIntent) -> Any? {
         handler(for: intent)
     }
+
+    /// Finder handing Fin files (Fin as the default Markdown app, Open With, a drop on
+    /// the Dock icon) and `fin://` links both land here once this method exists —
+    /// SwiftUI stops routing either to `.onOpenURL` on macOS. Files go to the reader
+    /// (`MarkdownOpenQueue`); links are re-posted for `FinApp` to handle as before.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let files = urls.filter(\.isFileURL)
+        if !files.isEmpty {
+            MarkdownOpenQueue.shared.enqueue(files)
+        }
+        for url in urls where !url.isFileURL {
+            NotificationCenter.default.post(name: .finOpenExternalURL, object: url)
+        }
+    }
+}
+
+extension Notification.Name {
+    /// A non-file URL (`fin://…`) received by `FinAppDelegate.application(_:open:)`.
+    static let finOpenExternalURL = Notification.Name("dev.levischoen.fin.openExternalURL")
 }
 #else
 extension FinAppDelegate: UIApplicationDelegate {
@@ -447,12 +466,23 @@ struct FinApp: App {
                 .environmentObject(entitlementStore)
                 .preferredColorScheme(.dark)
                 .onOpenURL { url in openActivityLink(url) }
+                #if os(macOS)
+                .onReceive(NotificationCenter.default.publisher(for: .finOpenExternalURL)) { note in
+                    if let url = note.object as? URL { openActivityLink(url) }
+                }
+                .drainsMarkdownOpens()
+                #endif
         }
         .modelContainer(modelContainer)
         // The menu bar (⌘T and tab cycling). Attached to the main window group
         // because that is the scene the terminal tabs live in; see FinCommands for
         // why these are menu commands rather than SwiftUI key handling.
-        .commands { FinCommands(sessionManager: sessionManager) }
+        .commands {
+            FinCommands(sessionManager: sessionManager)
+            #if os(macOS)
+            MarkdownDefaultAppCommands()
+            #endif
+        }
         #if os(macOS) || os(visionOS)
         // The agent hub (settings, logs/traces, memory, remote, artifacts, key) opens
         // as its own resizable window on macOS/visionOS instead of pushing over the
