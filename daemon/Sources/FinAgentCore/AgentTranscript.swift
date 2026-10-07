@@ -261,8 +261,15 @@ struct AgentTranscript {
             dropped += 1
             protectedStart -= 1
 
-            // Orphaned tool results left at the head would reference a call that is gone.
-            while dropIndex < messages.count, dropIndex < protectedStart, messages[dropIndex].role == .tool {
+            // Drop whole exchanges: keep going until the history starts at a USER message
+            // again. Orphaned tool results would reference a call that is gone, and an
+            // assistant reply with its question dropped is just as bad — Qwen's template
+            // (via LM Studio) refuses ANY request whose history opens with an assistant or
+            // tool message after the system prompt, with the misleading "No user query
+            // found in messages" (2026-10-07: replayed against LM Studio — [system,
+            // assistant, user] fails, [system, user, assistant, user] works). That was
+            // the heartbeat failure after every trim.
+            while dropIndex < messages.count, dropIndex < protectedStart, messages[dropIndex].role != .user {
                 messages.remove(at: dropIndex)
                 dropped += 1
                 protectedStart -= 1

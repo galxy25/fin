@@ -161,6 +161,25 @@ final class AgentCoreLogicTests: XCTestCase {
         XCTAssertEqual(transcript.wireMessages.last?.role, .tool, "the live turn's tool result stays")
     }
 
+    /// After a trim the history must open with a user message: Qwen's template refuses
+    /// [system, assistant, …] outright (2026-10-07).
+    func testCompactionLeavesHistoryStartingAtAUserMessage() {
+        var transcript = AgentTranscript()
+        transcript.reset(systemPrompt: "SYSTEM")
+        for index in 0..<12 {
+            transcript.append(AgentMessage(role: .user, text: "q\(index) " + String(repeating: "x", count: 200)))
+            transcript.append(AgentMessage(role: .assistant, text: "", toolCalls: [AgentToolCall(id: "c\(index)", name: "read_terminal", arguments: "{}")]))
+            transcript.append(AgentMessage(role: .tool, text: String(repeating: "t", count: 300), toolCallID: "c\(index)"))
+            transcript.append(AgentMessage(role: .assistant, text: String(repeating: "y", count: 500)))
+        }
+        for budget in stride(from: 400, through: 2_400, by: 137) {
+            var copy = transcript
+            _ = copy.compactIfNeeded(budget: budget, target: budget * 6 / 10)
+            let firstNonSystem = copy.wireMessages.first { $0.role != .system }
+            XCTAssertEqual(firstNonSystem?.role, .user, "budget \(budget): history opens with \(String(describing: firstNonSystem?.role))")
+        }
+    }
+
     func testCompactionRecordsASingleRunningNote() {
         var transcript = AgentTranscript()
         transcript.reset(systemPrompt: "SYSTEM")
