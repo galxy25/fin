@@ -226,21 +226,27 @@ struct AgentTranscript {
     /// still in the payload — so trimming always resumes at a non-`tool` message rather
     /// than slicing a call/result pair down the middle.
     @discardableResult
-    mutating func compactIfNeeded(budget: Int) -> Bool {
+    ///
+    /// `target` (default `budget`) is where to trim down to once over budget, and the last
+    /// `protectingLast` messages — the turn in progress — are never dropped: trimming the
+    /// user's own question out from under a long turn would leave the model answering
+    /// nothing.
+    mutating func compactIfNeeded(budget: Int, target: Int? = nil, protectingLast: Int = 0) -> Bool {
         guard budget > 0, estimatedTokenCount > budget else { return false }
+        let target = min(budget, max(1, target ?? budget))
 
         // Anything before this index is preserved verbatim: the system prompt, plus the
         // compaction note itself once one exists.
         let preservedPrefix = messages.first?.role == .system && !(messages.first?.isLocalOnly ?? false) ? 1 : 0
         var dropped = 0
 
-        while estimatedTokenCount > budget {
+        while estimatedTokenCount > target {
             var dropIndex = preservedPrefix
             // Skip past an existing compaction note so it is updated, never re-dropped.
             if dropIndex < messages.count, isCompactionNote(messages[dropIndex]) {
                 dropIndex += 1
             }
-            guard dropIndex < messages.count else { break }
+            guard dropIndex < messages.count, dropIndex < messages.count - protectingLast else { break }
 
             messages.remove(at: dropIndex)
             dropped += 1

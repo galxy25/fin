@@ -39,6 +39,12 @@ public struct AgentEngineConfiguration {
     public var temperature: Double
     public var systemPrompt: String
     public var terminalContextLines: Int
+    /// Cap on the conversation history carried into each request, in estimated tokens,
+    /// independent of the window. nil = fill the window (the app's behaviour). A slow
+    /// local model pays for every carried token on every call: qwen3.8-27b reads ~80
+    /// tokens/s on the iMac, so a history grown to 22k tokens cost ~4.5 minutes of
+    /// prefill before each step of a one-line question (2026-10-07).
+    public var historyTokenBudget: Int?
 
     public init(
         endpointURL: String,
@@ -48,7 +54,8 @@ public struct AgentEngineConfiguration {
         maxOutputTokens: Int = 640,
         temperature: Double = 0.2,
         systemPrompt: String = "",
-        terminalContextLines: Int = 160
+        terminalContextLines: Int = 160,
+        historyTokenBudget: Int? = nil
     ) {
         self.endpointURL = endpointURL
         self.modelIdentifier = modelIdentifier
@@ -58,6 +65,7 @@ public struct AgentEngineConfiguration {
         self.temperature = temperature
         self.systemPrompt = systemPrompt
         self.terminalContextLines = terminalContextLines
+        self.historyTokenBudget = historyTokenBudget
     }
 }
 
@@ -282,8 +290,23 @@ public final class AgentTurnEngine {
     /// Rough budget headroom for the tool schemas and the model's own reply, which are
     /// part of the window but never part of the transcript we measure.
     private var contextBudget: Int {
-        max(512, effectiveContextWindowTokens - configuration.maxOutputTokens - 512)
+        let window = max(512, effectiveContextWindowTokens - configuration.maxOutputTokens - 512)
+        guard let history = configuration.historyTokenBudget, history > 0 else { return window }
+        return min(window, history)
     }
+
+    /// Where a compaction trims DOWN to. With a history budget, well below it: dropping
+    /// the oldest exchange shifts every message after the system prompt, which throws
+    /// away the server's cached prefix, so trimming a little every call would re-read the
+    /// whole history each time. Trimming to 60% means it happens once every few turns.
+    private var compactionTarget: Int {
+        guard let history = configuration.historyTokenBudget, history > 0 else { return contextBudget }
+        return contextBudget * 6 / 10
+    }
+
+    /// `transcript.messages.count` when the current turn's user message was appended,
+    /// so compaction can protect everything from there on (see `compactIfNeeded`).
+    private var turnStartMessageCount = 0
 
     /// The window every budget is derived from: what the config claims, clamped to what
     /// the server has actually told us it has. See `ContextWindowProbe` — a configured
@@ -471,6 +494,7 @@ public final class AgentTurnEngine {
         sessionReads.reset()
         pendingPrefill = nil
 
+        turnStartMessageCount = transcript.messages.count
         transcript.append(AgentMessage(role: .user, text: trimmed))
         record("userMessage", displayText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? trimmed)
         // Turn-visibility signal (item 6 of the message-delivery-reliability work): the
@@ -540,7 +564,10 @@ public final class AgentTurnEngine {
         for _ in 0..<Self.maxToolRoundTrips {
             if Task.isCancelled { return .failed("Cancelled.") }
 
-            if transcript.compactIfNeeded(budget: contextBudget) {
+            let before = transcript.messages.count
+            let protected = max(0, before - turnStartMessageCount)
+            if transcript.compactIfNeeded(budget: contextBudget, target: compactionTarget, protectingLast: protected) {
+                turnStartMessageCount = transcript.messages.count - protected
                 transcript.appendLocalNotice("Trimmed older turns to fit the context window.")
                 record("notice", "Trimmed older turns to fit the context window.")
             }

@@ -121,6 +121,29 @@ final class AgentCoreLogicTests: XCTestCase {
         XCTAssertEqual(transcript.messages.last?.role, .assistant)
     }
 
+    /// History budget (2026-10-07): once over budget, trim down to the lower target, and
+    /// never drop the turn in progress — even when that alone is over the target.
+    func testCompactionTrimsToTargetAndProtectsTheLiveTurn() {
+        var transcript = AgentTranscript()
+        transcript.reset(systemPrompt: "SYSTEM")
+        for index in 0..<40 {
+            transcript.append(AgentMessage(role: .user, text: String(repeating: "x", count: 400) + "\(index)"))
+            transcript.append(AgentMessage(role: .assistant, text: String(repeating: "y", count: 400)))
+        }
+        XCTAssertTrue(transcript.compactIfNeeded(budget: 2_000, target: 1_200))
+        XCTAssertLessThanOrEqual(transcript.estimatedTokenCount, 1_200)
+
+        var live = AgentTranscript()
+        live.reset(systemPrompt: "SYSTEM")
+        live.append(AgentMessage(role: .user, text: "old question"))
+        live.append(AgentMessage(role: .assistant, text: "old answer"))
+        live.append(AgentMessage(role: .user, text: "the question now"))
+        live.append(AgentMessage(role: .assistant, text: String(repeating: "z", count: 8_000)))
+        XCTAssertTrue(live.compactIfNeeded(budget: 500, target: 300, protectingLast: 2))
+        XCTAssertTrue(live.messages.contains { $0.text == "the question now" })
+        XCTAssertFalse(live.messages.contains { $0.text == "old question" })
+    }
+
     func testCompactionRecordsASingleRunningNote() {
         var transcript = AgentTranscript()
         transcript.reset(systemPrompt: "SYSTEM")

@@ -184,6 +184,10 @@ struct DaemonConfig: Decodable {
         /// Seconds one model completion may take before the turn fails. Default
         /// 300: a local model under build load needs more than the app's 120.
         var requestTimeoutSeconds: Int?
+        /// Estimated-token cap on carried conversation history (see
+        /// `AgentEngineConfiguration.historyTokenBudget`). Absent = the daemon default;
+        /// 0 = no cap, fill the window.
+        var historyTokenBudget: Int?
 
         /// `apiKey` in the file still decodes into `rawAPIKey`; everything else keeps
         /// its own name.
@@ -192,6 +196,7 @@ struct DaemonConfig: Decodable {
             case rawAPIKey = "apiKey"
             case contextWindowTokens, maxOutputTokens, temperature, systemPrompt
             case terminalContextLines, heartbeatSeconds, requestTimeoutSeconds
+            case historyTokenBudget
         }
     }
 
@@ -911,6 +916,11 @@ final class Daemon {
     }
 
     /// routing-only callers stay unchanged.
+    /// 10k estimated tokens of transcript (system prompt included; the tool schemas ride
+    /// on top): room for a few full pane reads and their answers, versus the 22k+ a 42k
+    /// window accumulated when history was only trimmed at the window's edge.
+    static let defaultHistoryTokenBudget = 10_000
+
     nonisolated static func composedSystemPrompt(
         base: String,
         registryFileURL: URL,
@@ -1709,7 +1719,8 @@ final class Daemon {
                 maxOutputTokens: config.agent.maxOutputTokens ?? Self.defaultMaxOutputTokens,
                 temperature: config.agent.temperature ?? 0.2,
                 systemPrompt: systemPrompt,
-                terminalContextLines: config.agent.terminalContextLines ?? 160
+                terminalContextLines: config.agent.terminalContextLines ?? 160,
+                historyTokenBudget: config.agent.historyTokenBudget ?? Self.defaultHistoryTokenBudget
             ),
             session: session,
             tmuxGuard: tmuxGuard,
