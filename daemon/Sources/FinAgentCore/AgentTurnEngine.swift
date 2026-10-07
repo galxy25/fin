@@ -1542,12 +1542,23 @@ public final class AgentTurnEngine {
         // both calls are awaited below for their REAL outcome before anything downstream
         // (including `awaitOutput`, which would otherwise wait out its full timeout for
         // output that a dropped write can never produce) trusts that the bytes landed.
+        // CLEAR THE LINE FIRST. A command the shell refused to run — fish keeps a line
+        // with a syntax error in its editor instead of executing it — stays on the input
+        // line, and the next send was typed onto the end of it (2026-10-07: a bash-style
+        // `D=...` line rejected by fish got glued to the fish retry, mangling both).
+        // Ctrl-E then Ctrl-U empties the line in fish, bash/zsh line editors, and TUI
+        // inputs like Claude Code's; for a cooked-mode program Ctrl-U is the tty KILL
+        // character, erasing whatever pending text it has. Its own write, a beat ahead,
+        // for the same paste-detection reason the Return below is separate.
+        let clearSend = session.sendAgentInput(AgentTurnLogic.clearInputLine)
+        try? await Task.sleep(for: .milliseconds(100))
         let bodySend = session.sendAgentInput(AgentTurnLogic.typedBody(input))
         try? await Task.sleep(for: .milliseconds(250))
         let returnSend = session.sendAgentInput("\r")
+        let clearSent = await clearSend?.value ?? true
         let bodySent = await bodySend?.value ?? true
         let returnSent = await returnSend?.value ?? true
-        guard bodySent, returnSent else {
+        guard clearSent, bodySent, returnSent else {
             let reason = session.lastError.map { " (\($0))" } ?? ""
             let message = "Error: sending input to the terminal failed\(reason). The command may be "
                 + "partially typed or not sent at all — verify with read_terminal before retrying, "

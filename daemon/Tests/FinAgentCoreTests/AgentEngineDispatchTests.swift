@@ -62,8 +62,8 @@ final class AgentEngineDispatchTests: XCTestCase {
             #"{"input": "echo hi\n", "await_output_seconds": 1}"#
         ))
 
-        XCTAssertEqual(session.sentInputs, ["echo hi", "\r"],
-                       "expected the typed body and a lone \\r, in that order")
+        XCTAssertEqual(session.sentInputs, [AgentTurnLogic.clearInputLine, "echo hi", "\r"],
+                       "expected a line clear, the typed body and a lone \\r, in that order")
     }
 
     /// Item 4's daemon-side half: a dropped write (the SSH channel goes away between the
@@ -673,10 +673,10 @@ final class AgentEngineDispatchTests: XCTestCase {
             #"{"input": "tmux -L fin new-session -d -s fin-build", "await_output_seconds": 1}"#
         ))
 
-        XCTAssertEqual(session.sentInputs.count, 6, "three sends, each body + Return")
-        XCTAssertTrue(session.sentInputs[0].contains("capture-pane"))
-        XCTAssertTrue(session.sentInputs[2].contains("send-keys -t fin"))
-        XCTAssertTrue(session.sentInputs[4].contains("-L fin new-session"))
+        XCTAssertEqual(session.sentInputs.count, 9, "three sends, each line clear + body + Return")
+        XCTAssertTrue(session.sentInputs[1].contains("capture-pane"))
+        XCTAssertTrue(session.sentInputs[4].contains("send-keys -t fin"))
+        XCTAssertTrue(session.sentInputs[7].contains("-L fin new-session"))
     }
 
     /// NOTHING IS TYPED INTO THE TERMINAL TO DECIDE A REFUSAL. The engine used to probe the
@@ -709,7 +709,7 @@ final class AgentEngineDispatchTests: XCTestCase {
             ))
         }
 
-        XCTAssertEqual(session.sentInputs.count, 10, "five sends, each body + Return")
+        XCTAssertEqual(session.sentInputs.count, 15, "five sends, each line clear + body + Return")
         XCTAssertTrue(session.environmentProbes.isEmpty,
                       "no send may type a probe into the pane — got \(session.environmentProbes)")
         XCTAssertFalse(
@@ -742,7 +742,7 @@ final class AgentEngineDispatchTests: XCTestCase {
                 AgentToolSpec.sendInput.name,
                 #"{"input": "tmux -L fin ls", "await_output_seconds": 1}"#
             ))
-            XCTAssertEqual(session.sentInputs.count, 2, "the agent's own server is its own")
+            XCTAssertEqual(session.sentInputs.count, 3, "the agent's own server is its own")
             XCTAssertTrue(session.environmentProbes.isEmpty)
         }
     }
@@ -759,8 +759,8 @@ final class AgentEngineDispatchTests: XCTestCase {
             #"{"input": "tmux send-keys -t main 'echo hi' Enter", "await_output_seconds": 1}"#
         ))
 
-        XCTAssertEqual(session.sentInputs.count, 2)
-        XCTAssertTrue(session.sentInputs[0].contains("send-keys -t main"))
+        XCTAssertEqual(session.sentInputs.count, 3)
+        XCTAssertTrue(session.sentInputs[1].contains("send-keys -t main"))
     }
 
     // MARK: - read_session

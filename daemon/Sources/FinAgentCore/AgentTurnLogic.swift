@@ -66,6 +66,10 @@ public enum AgentTurnLogic {
         typedBody(input) + "\r"
     }
 
+    /// Sent ahead of every `send_input` body: Ctrl-E (end of line) then Ctrl-U (kill to
+    /// line start), so text a shell refused to run can't be glued onto the next command.
+    static let clearInputLine = "\u{05}\u{15}"
+
     /// The command text as it should be typed, before the separately-sent Return: trailing
     /// newlines stripped (models add them inconsistently, and a `\n` is not a Return
     /// keypress anyway), interior newlines preserved as the command's own content.
