@@ -86,6 +86,8 @@ The Lambda renews the site lease, runs primary election (§6.1), extends `leaseU
 | health | `GET /sites?agent=` joins `fin-sites` with `fin-cloud-workers` (instanceType, launchedAt, cost) | `fin-sites` only | `fin-sites` only |
 | sweep | idle rule unchanged; **never** terminates the current primary while `queued` rows exist for its agent | `lastHeartbeatAt` older than 3 leases → `stale` + `/notify` "Fin lost contact with Levi's iMac"; never terminated | stale only |
 
+**`run-shell` (operator-only).** A fifth daemon command: `args {command, timeoutSeconds?}` runs `command` under `/bin/sh -c` (home directory, Homebrew on `PATH`, default 300 s timeout, max 1800 s), merges stdout/stderr, and writes `[site] run-shell <id>: exit N` plus the output to the audit log (so it lands in the site's transcript) and to `run-shell/<id>.log` beside the site ledger. It is deliberately **not** in the Lambda's `SITE_COMMAND_KINDS`: an app user's token can never queue one. The only way in is a direct `fin-sites` write with AWS admin credentials: `queue-site-command.py <siteId> run-shell --command '...'`. That means whoever holds those credentials has a shell as the daemon's user on every enrolled Mac; guard them accordingly, and never queue a command that prints secrets (its output is uplinked).
+
 ## 4. Single pane of glass
 
 **The Fin conversation** (`AgentRemoteConsoleView`, cloud branch): one merged transcript across every site and the on-device mirrors; a plain composer; a one-line header from a `FinPresence` fold computed client-side over `GET /sites`:

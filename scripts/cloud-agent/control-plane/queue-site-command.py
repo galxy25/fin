@@ -12,6 +12,7 @@ case that endpoint can't help with: an operator at a terminal, not the app.
     queue-site-command.py <siteId> update
     queue-site-command.py <siteId> stop
     queue-site-command.py <siteId> drain
+    queue-site-command.py <siteId> run-shell --command 'uname -a' [--timeout 300]
     queue-site-command.py --list                 # show every site's id, name, state
 """
 import argparse
@@ -24,7 +25,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 TABLE = "fin-sites"
-VALID_KINDS = ("restart", "update", "stop", "drain")
+VALID_KINDS = ("restart", "update", "stop", "drain", "run-shell")
 
 
 def _now_iso():
@@ -91,6 +92,8 @@ def main():
     parser.add_argument("site_id", nargs="?", help="the site's siteId (see --list)")
     parser.add_argument("kind", nargs="?", choices=VALID_KINDS, help="command to queue")
     parser.add_argument("--args", help="JSON object of extra args for the command", default=None)
+    parser.add_argument("--command", help="shell command for run-shell (runs under /bin/sh -c on the site)")
+    parser.add_argument("--timeout", type=int, help="run-shell timeout in seconds (default 300, max 1800)")
     parser.add_argument("--profile", default="levi", help="AWS profile (default: levi)")
     parser.add_argument("--list", action="store_true", help="list every site instead of queuing a command")
     parsed = parser.parse_args()
@@ -102,7 +105,15 @@ def main():
         return
     if not parsed.site_id or not parsed.kind:
         parser.error("site_id and kind are required unless --list is given")
-    queue_command(ddb, parsed.site_id, parsed.kind, parsed.args)
+    args_json = parsed.args
+    if parsed.kind == "run-shell":
+        if not parsed.command:
+            parser.error("run-shell needs --command")
+        payload = {"command": parsed.command}
+        if parsed.timeout:
+            payload["timeoutSeconds"] = parsed.timeout
+        args_json = json.dumps(payload)
+    queue_command(ddb, parsed.site_id, parsed.kind, args_json)
 
 
 if __name__ == "__main__":

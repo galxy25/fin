@@ -594,6 +594,7 @@ final class Daemon {
             // where the launch is and what stopped it.
             var caps: [String: Any] = [
                 "daemon_version": DaemonDirectiveClient.daemonVersion,
+                "last_run_shell": lastRunShell as Any,
                 "daemon_build": Self.runningBuildIdentity,
                 "always_on": config.stayResident ?? false,
                 "hosts": [["host": config.server.describedHost, "username": config.server.describedUsername]],
@@ -627,6 +628,7 @@ final class Daemon {
         }
         var caps: [String: Any] = [
             "daemon_version": DaemonDirectiveClient.daemonVersion,
+            "last_run_shell": lastRunShell as Any,
             "daemon_build": Self.runningBuildIdentity,
             "always_on": config.stayResident ?? false,
             "brain": brainCapability(),
@@ -2669,6 +2671,11 @@ final class Daemon {
             + "(\(client.siteID8)) reports \"unavailable\" until the shell answers")
     }
 
+    /// The latest `run-shell` result, reported in the heartbeat capabilities so the
+    /// operator can read it from the site row (the only return path a site has).
+    /// `[:]` until one has run; output is the tail, capped for the 16 KB capabilities limit.
+    var lastRunShell: [String: Any] = [:]
+
     private func handleSiteCommand(_ command: DaemonSiteClient.Command) {
         switch command.kind {
         case "restart", "stop":
@@ -2688,6 +2695,30 @@ final class Daemon {
                 if await client.performUpdate(binaryPath: binary) != nil {
                     self.shutdown(exitCode: 0)
                 }
+            }
+        case "run-shell":
+            // Operator-only (never in the control plane's SITE_COMMAND_KINDS, so only a
+            // direct fin-sites write with AWS admin credentials can queue it). Runs off
+            // the heartbeat path; the result goes to the audit log (-> transcript) and
+            // to a per-command file beside the ledger.
+            guard let shell = command.args["command"], !shell.isEmpty else {
+                log("[site] run-shell \(command.id): missing `command` arg — ignored")
+                return
+            }
+            let timeout = SiteShellRunner.timeout(from: command.args["timeoutSeconds"])
+            let directory = (siteLedgerPath as NSString).deletingLastPathComponent + "/run-shell"
+            log("[site] run-shell \(command.id): starting (timeout \(timeout)s)")
+            Task { [weak self] in
+                let outcome = await SiteShellRunner.run(command: shell, timeoutSeconds: timeout)
+                let report = SiteShellRunner.report(id: command.id, command: shell, outcome: outcome)
+                try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+                try? Data(report.utf8).write(to: URL(fileURLWithPath: directory + "/\(command.id).log"), options: .atomic)
+                self?.lastRunShell = [
+                    "id": command.id, "exit": Int(outcome.exitCode), "timed_out": outcome.timedOut,
+                    "output": String(outcome.output.suffix(6000)),
+                ]
+                self?.log(report)
+                self?.record(AgentAuditEvent(kind: "notice", text: report))
             }
         case "terminal-open":
             guard let sessionId = command.args["sessionId"],

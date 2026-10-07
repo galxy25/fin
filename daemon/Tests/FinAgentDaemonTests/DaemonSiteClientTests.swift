@@ -210,3 +210,30 @@ final class DaemonSiteClientTests: XCTestCase {
         XCTAssertEqual(claims.value, 1, "the offer in the SAME beat as the drain was still claimed; later ones are not")
     }
 }
+
+final class SiteShellRunnerTests: XCTestCase {
+    func testRunCapturesOutputAndExitCode() async {
+        let outcome = await SiteShellRunner.run(command: "echo out; echo err 1>&2; exit 3", timeoutSeconds: 10)
+        XCTAssertEqual(outcome.exitCode, 3)
+        XCTAssertFalse(outcome.timedOut)
+        XCTAssertTrue(outcome.output.contains("out") && outcome.output.contains("err"))
+    }
+
+    func testRunKillsAtTimeout() async {
+        let outcome = await SiteShellRunner.run(command: "sleep 30", timeoutSeconds: 1)
+        XCTAssertTrue(outcome.timedOut)
+    }
+
+    func testTimeoutClamping() {
+        XCTAssertEqual(SiteShellRunner.timeout(from: nil), 300)
+        XCTAssertEqual(SiteShellRunner.timeout(from: "abc"), 300)
+        XCTAssertEqual(SiteShellRunner.timeout(from: "99999"), 1800)
+        XCTAssertEqual(SiteShellRunner.timeout(from: "20"), 20)
+    }
+
+    func testEnvironmentAddsHomebrewToPath() {
+        let path = SiteShellRunner.environment(base: ["PATH": "/usr/bin:/bin"])["PATH"] ?? ""
+        XCTAssertTrue(path.hasPrefix("/opt/homebrew/bin"))
+        XCTAssertTrue(path.hasSuffix("/usr/bin:/bin"))
+    }
+}
