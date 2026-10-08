@@ -431,12 +431,17 @@ struct FinApp: App {
     @MainActor
     private func openActivityLink(_ url: URL) {
         guard let target = FinActivityLink.target(of: url) else { return }
-        let name = target.agentName
-        var descriptor = FetchDescriptor<Agent>(predicate: #Predicate<Agent> { $0.name == name })
-        descriptor.fetchLimit = 1
-        guard let agent = try? modelContainer.mainContext.fetch(descriptor).first else { return }
+        // The name comes from a site heartbeat, not the synced record, so match
+        // loosely — and with a single agent, any tap is for it. An exact-match miss
+        // used to drop the tap silently.
+        let agents = (try? modelContainer.mainContext.fetch(FetchDescriptor<Agent>())) ?? []
+        let name = target.agentName.trimmingCharacters(in: .whitespaces)
+        let match = agents.first { $0.name == name }
+            ?? agents.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+            ?? (agents.count == 1 ? agents.first : nil)
+        guard let agent = match else { return }
         sessionManager.pendingAgentOpen = SessionManager.PendingAgentOpen(
-            agentID: agent.id, originDeviceID8: nil, threadID: target.threadID
+            agentID: agent.id, originDeviceID8: nil, threadID: target.threadID, forcesRemote: true
         )
     }
 

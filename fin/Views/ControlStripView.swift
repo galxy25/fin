@@ -161,6 +161,7 @@ struct ControlStripView: View {
         // mutually exclusive by construction on the same decision, so the two
         // never race for the same tap.
         guard let pending = sessionManager.pendingAgentOpen,
+              !pending.forcesRemote,
               let agent = agents.first, agent.id == pending.agentID,
               // Cloud-hosted: never a local claim — RootView's remote half
               // takes every tap for an agent no device hosts.

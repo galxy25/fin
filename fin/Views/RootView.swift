@@ -276,7 +276,8 @@ struct RootView: View {
               // half declines them outright, so the fork's residence fallback
               // (which could briefly say local off a stranded armed flag mid
               // hosting-switch) must not strand the tap unclaimed here.
-              !agent.hostsLocally
+              pending.forcesRemote
+                  || !agent.hostsLocally
                   || sessionManager.notificationTapRoute(
                       for: agent, originDeviceID8: pending.originDeviceID8
                   ) == .remoteConsole else { return }

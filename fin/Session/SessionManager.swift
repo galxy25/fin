@@ -60,6 +60,13 @@ final class SessionManager: ObservableObject {
         /// `fin.threadId` from the push (docs/THREADS.md §2): the remote
         /// console opens with this thread selected. nil = the default rule.
         var threadID: String? = nil
+        /// A Live Activity tap: the tile reports a SITE's question (control-plane
+        /// presence), never this device's local conversation, so it always opens
+        /// the remote console — whose thread view and relay compose bar are where
+        /// the answer goes. Without this the origin-less tap fell to the residence
+        /// rule, and an iPhone with its auto-resumed terminal runtime opened its
+        /// own empty local console instead (Levi, 2026-10-07).
+        var forcesRemote: Bool = false
     }
 
     /// Set when a notification tap asks for an agent's console; the terminal screen's
