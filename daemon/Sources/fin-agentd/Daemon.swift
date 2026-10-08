@@ -1926,6 +1926,7 @@ final class Daemon {
                     self?.record(AgentAuditEvent(kind: "notice", text: line))
                 }
             )
+            artifacts.siteID = Self.controlPlaneSiteHeader(config)
             artifactClient = artifacts
             engine.onWriteArtifact = { path, content in
                 await artifacts.write(path: path, content: content)
@@ -1952,6 +1953,7 @@ final class Daemon {
                     self?.record(AgentAuditEvent(kind: "notice", text: line))
                 }
             )
+            inboxLockClient?.siteID = Self.controlPlaneSiteHeader(config)
             log("inbox cooperation enabled: control plane /inbox/\(config.supervision?.agentName ?? "Agent")/lock")
 
             // Periodic compaction of episodic memory into the shared cumulative

@@ -6142,6 +6142,14 @@ def _require_site_scope(event, method, parts):
         return
     if method == "GET" and parts in (["devices", "status"], ["secrets"]):
         return
+    # The artifacts filesystem (the owner's shared files, user-scoped like memory) and
+    # the per-agent inbox lock (claimed and released around a turn). A resident site
+    # enrolled with only a site token — the MacBook Neo, 2026-10-07 — otherwise got a
+    # 403 on every artifact call and every inbox-lock claim.
+    if parts[:1] == ["artifacts"] and method in ("GET", "PUT", "DELETE"):
+        return
+    if method in ("PUT", "DELETE") and len(parts) == 3 and parts[0] == "inbox" and parts[2] == "lock":
+        return
     if method == "POST" and parts == ["feedback"]:
         return
     if method == "POST" and parts == ["client-events"]:

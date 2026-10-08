@@ -17,6 +17,10 @@ final class DaemonArtifactClient {
 
     let endpointURL: String
     private let token: String
+    /// Set when this daemon's control-plane bearer IS its site token (an enrolled
+    /// site's config): the Lambda only checks a bearer as a site token when
+    /// `X-Fin-Site` names the site, so without it every call is a 401.
+    var siteID: String?
 
     var transport: (URLRequest) async throws -> (Data, URLResponse)
     let audit: (String) -> Void
@@ -48,6 +52,7 @@ final class DaemonArtifactClient {
         request.timeoutInterval = Self.requestTimeout
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        if let siteID { request.setValue(siteID, forHTTPHeaderField: "X-Fin-Site") }
         return request
     }
 

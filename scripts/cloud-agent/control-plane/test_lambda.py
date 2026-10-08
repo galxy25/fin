@@ -1168,6 +1168,14 @@ class SiteTokenScopeTests(_SitesTestCase):
         self._assert_denied("DELETE", "/secrets/github")
         self._assert_denied("POST", "/sites/enroll-tokens")
 
+    def test_a_site_may_use_artifacts_and_its_inbox_lock(self):
+        for method, path in (("GET", "/artifacts"), ("GET", "/artifacts/notes/a.md"),
+                             ("PUT", "/artifacts/notes/a.md"), ("DELETE", "/artifacts/notes/a.md"),
+                             ("PUT", "/inbox/Fin/lock"), ("DELETE", "/inbox/Fin/lock")):
+            lam._require_site_scope({"_siteId": "site-a"}, method, self._parts(path))
+        self._assert_denied("GET", "/inbox/Fin/lock/extra")
+        self._assert_denied("POST", "/artifacts/notes/a.md")
+
     def test_a_site_may_re_sign_its_own_urls_and_notify_its_owner(self):
         lam._require_site_scope({"_siteId": "site-a"}, "POST", self._parts("/presign"))
         lam._require_site_scope({"_siteId": "site-a"}, "POST", self._parts("/notify"))
