@@ -10,7 +10,7 @@
 # ever hands out presigned GETs for these two keys.
 set -euo pipefail
 PROFILE=${FIN_AWS_PROFILE:-levi}
-BUCKET=fin-agent-directives-011183829623
+BUCKET="${FIN_BUCKET:-fin-agent-directives-$(aws --profile "$PROFILE" sts get-caller-identity --query Account --output text)}"
 KEY=fin/agentd/fin-agentd-macos-arm64
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${1:-$REPO_ROOT/daemon/.build/release/fin-agentd}"

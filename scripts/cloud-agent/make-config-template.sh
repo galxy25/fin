@@ -24,12 +24,12 @@
 #   {{TRANSCRIPT_PUT_URL}}  presigned PUT  fin/transcripts/<slug>.jsonl
 set -euo pipefail
 
-PROFILE=levi
-BUCKET=fin-agent-directives-011183829623
+PROFILE="${FIN_AWS_PROFILE:-levi}"
 TEMPLATE_KEY=fin/agentd/_template.json
 SOURCE=${1:-nimbus}
 
 aws() { command aws --profile "$PROFILE" "$@"; }
+BUCKET="${FIN_BUCKET:-fin-agent-directives-$(aws sts get-caller-identity --query Account --output text)}"
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 

@@ -4,6 +4,12 @@
 #
 #   deploy.sh
 #
+# Account-agnostic: FIN_AWS_PROFILE picks the account (default levi, the
+# original stack); bucket names derive from its account id. A stack being
+# stood up alongside a live one (docs/aws-migration-plan.md) should export
+# FIN_SCHEDULES_STATE=DISABLED so its sweep/wake rules are born off and it
+# never launches workers for messages the live stack is still answering.
+#
 # Idempotent — every create is guarded by an exists-check, so re-running only
 # ships new code and re-puts the inline policy. The bearer token is generated
 # once and reused from ~/.fin-control-plane-token on later runs; rotating it on
@@ -15,7 +21,7 @@
 # only POST /notify is dark (503).
 set -euo pipefail
 
-PROFILE=levi
+PROFILE="${FIN_AWS_PROFILE:-levi}"
 REGION=us-west-2
 FUNCTION=fin-control-plane
 ROLE=fin-control-plane
@@ -33,8 +39,6 @@ RELAY_SECURITY_GROUP=fin-relay-ingress
 API_NAME=fin-control-plane
 RULE=fin-worker-sweep
 WAKE_RULE=fin-worker-wake
-BUCKET=fin-agent-directives-011183829623
-FACTORY_BUCKET=fin-model-factory-011183829623
 AGENT_ROLE=fin-agent-ssm
 TOKEN_FILE="$HOME/.fin-control-plane-token"
 # The one real account today, before Sign in with Apple's first real user
@@ -61,6 +65,47 @@ trap 'rm -rf "$BUILD"' EXIT
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 LAMBDA_ARN="arn:aws:lambda:$REGION:$ACCOUNT:function:$FUNCTION"
 ROLE_ARN="arn:aws:iam::$ACCOUNT:role/$ROLE"
+BUCKET="${FIN_BUCKET:-fin-agent-directives-$ACCOUNT}"
+FACTORY_BUCKET="${FIN_FACTORY_BUCKET:-fin-model-factory-$ACCOUNT}"
+SCHEDULES_STATE="${FIN_SCHEDULES_STATE:-ENABLED}"
+
+# --- agent-channel bucket ----------------------------------------------------
+# Private; every capability anything outside the Lambda holds on it is a
+# presigned URL. Created here so a fresh account needs nothing done by hand.
+if ! aws s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
+  aws s3api create-bucket --bucket "$BUCKET" \
+    --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
+  echo "==> Created S3 bucket $BUCKET"
+fi
+aws s3api put-public-access-block --bucket "$BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+# --- worker prerequisites ----------------------------------------------------
+# What POST /workers launches into, by name (lambda.py SECURITY_GROUP_NAME,
+# INSTANCE_PROFILE_NAME). ../launch.sh creates the same two on demand; they
+# live here too so a fresh account's control plane can launch on its first call.
+if ! aws ec2 describe-security-groups --group-names fin-agent-egress >/dev/null 2>&1; then
+  VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
+    --query 'Vpcs[0].VpcId' --output text)
+  aws ec2 create-security-group --group-name fin-agent-egress \
+    --description "fin cloud agents: egress only, no ingress" \
+    --vpc-id "$VPC_ID" >/dev/null
+  echo "==> Created security group fin-agent-egress (egress-only)"
+fi
+if ! aws iam get-instance-profile --instance-profile-name "$AGENT_ROLE" >/dev/null 2>&1; then
+  aws iam create-role --role-name "$AGENT_ROLE" \
+    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
+  aws iam attach-role-policy --role-name "$AGENT_ROLE" \
+    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  aws iam create-instance-profile --instance-profile-name "$AGENT_ROLE" >/dev/null
+  aws iam add-role-to-instance-profile --instance-profile-name "$AGENT_ROLE" \
+    --role-name "$AGENT_ROLE"
+  echo "==> Created IAM role/profile $AGENT_ROLE (SSM only)"
+fi
+# Same grant ../launch.sh puts: workers read service creds, never write them.
+aws iam put-role-policy --role-name "$AGENT_ROLE" --policy-name fin-agent-service-creds \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"ServiceCredsRead\",\"Effect\":\"Allow\",\"Action\":\"secretsmanager:GetSecretValue\",\"Resource\":\"arn:aws:secretsmanager:$REGION:$ACCOUNT:secret:fin/service-creds/*\"}]}"
 
 # --- DynamoDB ----------------------------------------------------------------
 if ! aws dynamodb describe-table --table-name "$TABLE" >/dev/null 2>&1; then
@@ -607,6 +652,7 @@ fi
 # The token and the .p8 content go to the CLI through a file inside the 0700
 # build dir, never on a command line where ps would show them.
 FIN_CP_TOKEN_VALUE="$TOKEN" LEGACY_USER_ID_VALUE="$LEGACY_USER_ID" \
+  BUCKET_VALUE="$BUCKET" FACTORY_BUCKET_VALUE="$FACTORY_BUCKET" \
   APNS_KEY_FILE="$APNS_KEY_FILE" APNS_KEY_ID="$APNS_KEY_ID" \
   APNS_TEAM_ID="$APNS_TEAM_ID" APNS_TOPIC="$APNS_TOPIC" \
   python3 - "$BUILD/env.json" <<'PY'
@@ -615,6 +661,8 @@ import json, os, sys
 variables = {
     "FIN_CP_TOKEN": os.environ["FIN_CP_TOKEN_VALUE"],
     "FIN_CP_LEGACY_USER_ID": os.environ["LEGACY_USER_ID_VALUE"],
+    "FIN_CP_BUCKET": os.environ["BUCKET_VALUE"],
+    "FIN_CP_FACTORY_BUCKET": os.environ["FACTORY_BUCKET_VALUE"],
 }
 key_file = os.environ.get("APNS_KEY_FILE")
 if key_file:
@@ -790,8 +838,8 @@ fi
 # --- sweep schedule ----------------------------------------------------------
 if ! aws events describe-rule --name "$RULE" >/dev/null 2>&1; then
   aws events put-rule --name "$RULE" --schedule-expression 'rate(10 minutes)' \
-    --description "terminate idle fin cloud workers" >/dev/null
-  echo "==> Created EventBridge rule $RULE"
+    --state "$SCHEDULES_STATE" --description "terminate idle fin cloud workers" >/dev/null
+  echo "==> Created EventBridge rule $RULE ($SCHEDULES_STATE)"
 fi
 
 cat > "$BUILD/target.json" <<JSON
@@ -806,8 +854,8 @@ aws events put-targets --rule "$RULE" --targets "file://$BUILD/target.json" >/de
 # and wake() only ever launches one when nothing else already covers the agent.
 if ! aws events describe-rule --name "$WAKE_RULE" >/dev/null 2>&1; then
   aws events put-rule --name "$WAKE_RULE" --schedule-expression 'rate(1 minute)' \
-    --description "launch a fin cloud worker for an unanswered inbox message" >/dev/null
-  echo "==> Created EventBridge rule $WAKE_RULE"
+    --state "$SCHEDULES_STATE" --description "launch a fin cloud worker for an unanswered inbox message" >/dev/null
+  echo "==> Created EventBridge rule $WAKE_RULE ($SCHEDULES_STATE)"
 fi
 
 cat > "$BUILD/wake-target.json" <<JSON

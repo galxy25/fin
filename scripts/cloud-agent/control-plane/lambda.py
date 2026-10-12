@@ -66,7 +66,9 @@ LOG = logging.getLogger()
 LOG.setLevel(logging.INFO)
 
 REGION = "us-west-2"
-BUCKET = "fin-agent-directives-011183829623"
+# deploy.sh sets both from the account it deploys into; the literals are the
+# original account's names, kept as defaults so an old deploy's env still works.
+BUCKET = os.environ.get("FIN_CP_BUCKET", "fin-agent-directives-011183829623")
 # Every per-user object lives under users/{user}/... — {user} is always our
 # own userId (fin-users' uuid4), never Apple's `sub` or anything client-
 # supplied; every route resolves it from event["_userId"] (set by
@@ -1657,7 +1659,7 @@ def presign(event):
 # purpose: training telemetry and supervision traffic never share a key space
 # or a lifecycle. raw/ objects expire after 180 days (bucket lifecycle rule,
 # set by deploy.sh); datasets/, models/, and evals/ persist.
-FACTORY_BUCKET = "fin-model-factory-011183829623"
+FACTORY_BUCKET = os.environ.get("FIN_CP_FACTORY_BUCKET", "fin-model-factory-011183829623")
 
 # kind -> key template. The date partition is the SERVER receive date (client
 # clocks lie); the client's own createdAt stays inside the document.

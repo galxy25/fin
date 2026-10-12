@@ -21,9 +21,8 @@
 # presigned URL with an expiry.
 set -euo pipefail
 
-PROFILE=levi
+PROFILE="${FIN_AWS_PROFILE:-levi}"
 REGION=us-west-2
-BUCKET=fin-agent-directives-011183829623
 AGENT_NAME="${1:?usage: launch.sh <agent-name> <config-s3-key> [instance-type] [browser]}"
 CONFIG_KEY="${2:?usage: launch.sh <agent-name> <config-s3-key> [instance-type] [browser]}"
 INSTANCE_TYPE="${3:-t4g.micro}"
@@ -44,6 +43,7 @@ if [ "$(printf '%s' "$AGENT_NAME" | tr '[:upper:]' '[:lower:]')" = "shared" ]; t
 fi
 
 aws() { command aws --profile "$PROFILE" --region "$REGION" "$@"; }
+BUCKET="${FIN_BUCKET:-fin-agent-directives-$(aws sts get-caller-identity --query Account --output text)}"
 
 # --- security group (egress-only) -------------------------------------------
 SG_ID=$(aws ec2 describe-security-groups \
