@@ -3434,6 +3434,62 @@ class LiveActivityTokenRegistrationTests(DeviceTokenRegistrationTests):
         self.assertEqual(caught.exception.status, 400)
 
 
+
+class ForwardTests(unittest.TestCase):
+    """The old stack's relay to the new one at an account move."""
+
+    def setUp(self):
+        self.seen = {}
+        test = self
+
+        class FakeAnswer:
+            status = 201
+            headers = {"Content-Type": "application/json", "X-Amzn-RequestId": "r"}
+            def read(self):
+                return b'{"ok": true}'
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                test.seen.update(url=request.full_url, method=request.get_method(), body=request.data,
+                                 headers={k.lower(): v for k, v in request.header_items()})
+                return FakeAnswer()
+
+        self._orig = lam.urllib.request.build_opener
+        lam.urllib.request.build_opener = lambda *a: FakeOpener()
+        self._forward_to = lam.FORWARD_TO
+        lam.FORWARD_TO = "https://green.example"
+
+    def tearDown(self):
+        lam.urllib.request.build_opener = self._orig
+        lam.FORWARD_TO = self._forward_to
+
+    def test_relays_method_path_query_body_and_auth(self):
+        out = lam.lambda_handler({
+            "rawPath": "/messages/m-1/claim", "rawQueryString": "agent=Fin",
+            "requestContext": {"http": {"method": "POST"}},
+            "headers": {"authorization": "Bearer t", "host": "blue.example", "content-length": "2",
+                        "x-amzn-trace-id": "x", "content-type": "application/json"},
+            "body": base64.b64encode(b"{}").decode(), "isBase64Encoded": True,
+        })
+        self.assertEqual(self.seen["url"], "https://green.example/messages/m-1/claim?agent=Fin")
+        self.assertEqual(self.seen["method"], "POST")
+        self.assertEqual(self.seen["body"], b"{}")
+        self.assertEqual(self.seen["headers"]["authorization"], "Bearer t")
+        self.assertNotIn("host", self.seen["headers"])
+        self.assertNotIn("x-amzn-trace-id", self.seen["headers"])
+        self.assertEqual(out["statusCode"], 201)
+        self.assertEqual(out["body"], '{"ok": true}')
+        self.assertEqual(out["headers"], {"content-type": "application/json"})
+
+    def test_schedules_do_nothing_while_forwarding(self):
+        out = lam.lambda_handler({"source": "wake-schedule"})
+        self.assertFalse(out["forwarded"])
+        self.assertEqual(self.seen, {})
+
 if __name__ == "__main__":
     unittest.main()
 

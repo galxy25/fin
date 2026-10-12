@@ -664,6 +664,11 @@ variables = {
     "FIN_CP_BUCKET": os.environ["BUCKET_VALUE"],
     "FIN_CP_FACTORY_BUCKET": os.environ["FACTORY_BUCKET_VALUE"],
 }
+# Account move only (docs/aws-migration-plan.md): the OLD stack relays every
+# request to the new one. Must be re-passed on any redeploy of the old stack —
+# this file writes the whole environment, so omitting it IS the rollback.
+if os.environ.get("FIN_CP_FORWARD_TO"):
+    variables["FIN_CP_FORWARD_TO"] = os.environ["FIN_CP_FORWARD_TO"]
 key_file = os.environ.get("APNS_KEY_FILE")
 if key_file:
     with open(key_file) as handle:

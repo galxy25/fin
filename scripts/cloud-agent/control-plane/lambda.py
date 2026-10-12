@@ -54,6 +54,8 @@ import re
 import secrets
 import socket
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -6281,8 +6283,63 @@ def _route(event):
     raise ApiError(404, "no route for {} {}".format(method or "?", path))
 
 
+# --- account move: forward everything to the new stack -------------------------
+# docs/aws-migration-plan.md. Set on the OLD stack's Lambda at cutover, after the
+# final data copy: every HTTP request is relayed verbatim to the new control plane,
+# so a client still holding the old endpoint (a device whose synced config hasn't
+# arrived, a site not yet re-pointed) keeps working against the new stack's data
+# instead of writing into a copy nobody reads. Its schedules no-op too. Rollback is
+# redeploying without it. Unset on every stack that owns its data.
+FORWARD_TO = os.environ.get("FIN_CP_FORWARD_TO", "").rstrip("/")
+FORWARD_TIMEOUT_SECONDS = 28  # API Gateway's own integration ceiling is 30s
+# Hop-by-hop or per-gateway headers: the new gateway sets its own.
+_FORWARD_DROP_HEADERS = {"host", "content-length", "connection", "accept-encoding", "x-forwarded-for",
+                         "x-forwarded-proto", "x-forwarded-port", "forwarded", "via"}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _forward(event, base):
+    """One request relayed to `base`, its answer returned as this function's own."""
+    http = (event.get("requestContext") or {}).get("http") or {}
+    method = str(http.get("method") or "GET").upper()
+    url = base + (event.get("rawPath") or "/")
+    if event.get("rawQueryString"):
+        url += "?" + event["rawQueryString"]
+    headers = {k: v for k, v in (event.get("headers") or {}).items()
+               if k.lower() not in _FORWARD_DROP_HEADERS and not k.lower().startswith("x-amzn-")}
+    body = event.get("body")
+    if body is not None:
+        body = base64.b64decode(body) if event.get("isBase64Encoded") else body.encode("utf-8")
+    request = urllib.request.Request(url, data=body, method=method, headers=headers)
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(request, timeout=FORWARD_TIMEOUT_SECONDS) as answer:
+            status, answer_headers, payload = answer.status, answer.headers, answer.read()
+    except urllib.error.HTTPError as error:
+        status, answer_headers, payload = error.code, error.headers, error.read()
+    except (urllib.error.URLError, socket.timeout) as error:
+        LOG.warning("forward to new stack failed: %s", type(error).__name__)
+        return _response(502, {"error": "control plane is moving; retry shortly"})
+    out_headers = {k.lower(): v for k, v in answer_headers.items()
+                   if k.lower() in ("content-type", "cache-control", "location", "retry-after")}
+    try:
+        return {"statusCode": status, "headers": out_headers, "body": payload.decode("utf-8")}
+    except UnicodeDecodeError:
+        return {"statusCode": status, "headers": out_headers,
+                "body": base64.b64encode(payload).decode("ascii"), "isBase64Encoded": True}
+
+
 def lambda_handler(event, _context=None):
     event = event if isinstance(event, dict) else {}
+
+    if FORWARD_TO:
+        if event.get("source") in ("sweep-schedule", "wake-schedule"):
+            return {"forwarded": False, "reason": "this stack forwards to " + FORWARD_TO}
+        return _forward(event, FORWARD_TO)
 
     # EventBridge invokes the function directly, so there is no HTTP envelope to
     # authorize; the schedule's invoke permission is the authorization.
