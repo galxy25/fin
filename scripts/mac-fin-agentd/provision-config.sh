@@ -29,7 +29,8 @@ set -euo pipefail
 FIN_AGENTD_HOME="${FIN_AGENTD_HOME:-$HOME/Library/Application Support/fin-agentd}"
 PROFILE="${FIN_AWS_PROFILE:-levi}"
 REGION="${FIN_AWS_REGION:-us-west-2}"
-BUCKET="${FIN_BUCKET:-fin-agent-directives-011183829623}"
+# Empty = fin-agent-directives-<account id of PROFILE>, as control-plane/deploy.sh names it.
+BUCKET="${FIN_BUCKET:-}"
 EXPIRES="${FIN_PRESIGN_SECONDS:-604800}"
 TOKEN_FILE="${FIN_CONTROL_PLANE_TOKEN_FILE:-$HOME/.fin-control-plane-token}"
 # Multi-tenancy: every S3 key this site reads/writes now lives under
@@ -236,6 +237,7 @@ if not user_id:
 
 # --- presign ------------------------------------------------------------------------
 session = boto3.session.Session(profile_name=profile, region_name=region)
+bucket = bucket or "fin-agent-directives-" + session.client("sts").get_caller_identity()["Account"]
 credentials = session.get_credentials()
 if credentials is None:
     sys.exit("error: AWS profile %r has no credentials" % profile)
