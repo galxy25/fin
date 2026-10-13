@@ -240,7 +240,7 @@ public final class TerminalRelayClient {
         // A dial that reaches here proves the URLSession is not wedged — the
         // failure streak the self-heal counts is over, whatever caused it.
         consecutiveDialFailures = 0
-        let command = "exec tmux new-session -A -s \(Self.shellQuote(tmuxSession))"
+        let command = Self.attachCommand(tmuxSession: tmuxSession)
         let terminal = LocalTerminalSession(configuration: LocalSessionConfiguration(connectCommand: command))
         let relay = RelaySession(socket: socket, terminal: terminal)
         sessions[sessionId] = relay
@@ -353,7 +353,21 @@ public final class TerminalRelayClient {
 
     /// Single-quotes a tmux session name for `sh -c`, the same defensive posture
     /// `LocalTerminalSession`'s own connect commands are built with elsewhere in the daemon.
-    private static func shellQuote(_ value: String) -> String {
+    /// The shell line that puts the relay's PTY on `tmuxSession`. A named session that
+    /// exists is attached; one that doesn't is created — EXCEPT the app's default name
+    /// `main`, which nobody chose: live on the iMac (2026-10-13) every relay open minted a
+    /// fresh, empty `main` beside the four per-project sessions actually in use. A missing
+    /// `main` attaches the most recently used session instead (bare `tmux attach`), and
+    /// only an empty server falls through to creating it. `=` makes `has-session` match
+    /// the name exactly rather than as a prefix. Run by `/bin/sh -c`, never the login shell.
+    nonisolated static func attachCommand(tmuxSession: String) -> String {
+        let quoted = shellQuote(tmuxSession)
+        guard tmuxSession == "main" else { return "exec tmux new-session -A -s \(quoted)" }
+        return "if ! tmux has-session -t '=main' 2>/dev/null && tmux has-session 2>/dev/null;"
+            + " then exec tmux attach-session; fi; exec tmux new-session -A -s \(quoted)"
+    }
+
+    nonisolated private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
