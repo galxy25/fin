@@ -666,7 +666,7 @@ a missing or malformed `agent`, is a 400.
 ## Model-factory ingest
 
 `POST /feedback` is the app's one door into the model-factory data lake
-(`fin-model-factory-011183829623` — a separate bucket from the agent channel,
+(`fin-model-factory-623170744161` — a separate bucket from the agent channel,
 with a 180-day expiry on `raw/`). The body contract is **frozen** and specified
 in `scripts/model-factory/README.md`; the Lambda validates it, wraps it with a
 server `receivedAt` and an id, and writes one JSON object to

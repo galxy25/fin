@@ -110,7 +110,7 @@ enum FinPresence { case needsInput(site: FinSite, preview: String), working(site
 
 ## 5. S3 key scheme and ownership
 
-Rule: every object has exactly one writer type. Bucket `fin-agent-directives-011183829623`.
+Rule: every object has exactly one writer type. Bucket `fin-agent-directives-623170744161`.
 
 | key | writer | reader | status |
 |---|---|---|---|

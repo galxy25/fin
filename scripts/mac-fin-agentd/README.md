@@ -87,7 +87,7 @@ scripts/mac-fin-agentd/install.sh --start  # …and bootstraps into gui/$UID
 ```
 
 Requirements: Remote Login on (sshd on `127.0.0.1:22`), `tmux` on `PATH`, a
-`/usr/bin/python3` (or Xcode's) with `boto3`, AWS profile `levi` with **long-lived**
+`/usr/bin/python3` (or Xcode's) with `boto3`, AWS profile `llc` with **long-lived**
 operator credentials (temporary creds make the presigned URLs die with the session,
 not at day 7 — the script warns), `~/.fin-control-plane-token`, and LM Studio serving
 the configured model on `127.0.0.1:1234` before `--start`.

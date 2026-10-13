@@ -6,9 +6,8 @@
 #
 # Account-agnostic: FIN_AWS_PROFILE picks the account (default llc, the LLC
 # account 623170744161 Fin moved to on 2026-10-12); bucket names derive from
-# its account id. The old stack (profile levi) now only forwards to this one —
-# redeploy it ONLY with FIN_AWS_PROFILE=levi FIN_CP_FORWARD_TO=<new endpoint>,
-# or it stops forwarding and starts answering from its stale copy. A stack being
+# its account id. FIN_CP_FORWARD_TO=<endpoint> turns a stack into a pure
+# forwarder to another one (how the old account bridged the 2026-10 move). A stack being
 # stood up alongside a live one (docs/aws-migration-plan.md) should export
 # FIN_SCHEDULES_STATE=DISABLED so its sweep/wake rules are born off and it
 # never launches workers for messages the live stack is still answering.

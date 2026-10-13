@@ -1,6 +1,6 @@
 # Fin: AWS migration out of the nonprofit account
 
-Status: **cut over to green 2026-10-12 23:59Z; the one-week watch was dropped, and blue is torn down 2026-10-14 (see Teardown).** Fin now
+Status: **done.** Cut over to green 2026-10-12 23:59Z. Levi dropped the one-week watch, and every Fin resource in 011183829623 was deleted 2026-10-13 17:48–17:52Z. There is no rollback any more. Fin now
 runs from the LLC account 623170744161 (profile `llc`); the old account only
 forwards. See "Cutover state" at the bottom for exactly what is where and how to
 roll back.
@@ -141,24 +141,11 @@ Traps hit (fixed in code):
   every deploy until the account is upgraded to a paid plan; a Free-plan account
   is closed when its credits run out). The EC2 on-demand vCPU quota is 5.
 
-Deploying now:
-- green: `control-plane/deploy.sh` (the account was upgraded to a paid plan on 2026-10-13: t4g.nano is accepted again, the vCPU quota is 16, and the t4g.micro overrides are gone)
-- blue (only ever like this during the watch):
-  `FIN_AWS_PROFILE=levi FIN_CP_FORWARD_TO=https://evnlvth1ih.execute-api.us-west-2.amazonaws.com control-plane/deploy.sh`
-
-Rollback to blue:
-1. `FIN_SRC_PROFILE=llc FIN_DST_PROFILE=levi scripts/cloud-agent/migrate-account.py all --delete`
-   (green's writes since cutover go back to blue).
-2. `FIN_AWS_PROFILE=levi control-plane/deploy.sh` with no `FIN_CP_FORWARD_TO`,
-   which stops the forwarding. Enable blue's two rules and disable green's.
-3. iMac: restore `config.json.bak-pre-llc`, run `FIN_AWS_PROFILE=levi provision-config.sh --refresh`,
-   `launchctl kickstart -k gui/$UID/dev.levischoen.fin.agentd`, restart wake with
-   `FIN_WAKE_PROFILE=levi`. Neo: queue the reverse endpoint edit.
-4. Legal pages (only if needed; green's distribution can keep serving them): remove the alias from E1HBK154BB5YYF, add it back on E2XD8RL8PK64SX, and point the Hover `fin` CNAME back to `d1neu32b2sn1ez.cloudfront.net`.
+Deploying now: `control-plane/deploy.sh` (profile `llc` by default).
 
 After the week, with Levi's explicit OK: delete Fin's resources in 011183829623.
 
-## Teardown of blue (2026-10-14)
+## Teardown of blue (done 2026-10-13, at Levi's "NOW")
 
 Levi dropped the one-week watch: switch over hard, then remove every Fin
 resource from 011183829623 so the nonprofit can redeem its TechSoup credit.
@@ -198,3 +185,17 @@ Delete (profile `levi`, us-west-2 unless noted). This is the full inventory take
 
 After the teardown, rollback is no longer possible. Remove the blue
 `FIN_CP_FORWARD_TO` instructions above and drop `levi` as a fallback profile in the scripts.
+
+Result, 2026-10-13:
+- The gate held. After Levi pasted the endpoint on the iPhone and then on this iMac,
+  the old account had no requests from 17:30Z on. iCloud never delivered the
+  iPhone's change to this iMac's KVS (not even after restarting `syncdefaultsd`
+  and relaunching), so the value had to be entered on the Mac as well.
+- Green check: a message round trip was answered `pong (teardown check)`; a relay
+  launched on t4g.nano, served the pinned cert, and the iMac daemon attached tmux
+  `main`; the legal pages returned 200; every live site had a fresh heartbeat.
+- A read-only diff instead of a `--missing-only` copy, because that copy would
+  bring back items green had deleted since cutover. Every bucket and table had
+  0 keys that existed only in blue.
+- Deleted every item on the list above, then verified an empty inventory. The
+  PocketDJ AMI/snapshot/key pair stays.

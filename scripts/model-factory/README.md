@@ -1,6 +1,6 @@
 # Fin model factory
 
-An LLM factory in AWS (profile `levi`, us-west-2, account 011183829623) that
+An LLM factory in AWS (profile `llc`, us-west-2, account 623170744161; moved from 011183829623 on 2026-10-12) that
 builds the small, fast, fine-tuned model that runs fin as the **foreman** of a
 software factory of agents — local Apple Silicon boxes and the cloud workers
 `scripts/cloud-agent/` launches. Base: a 4–12B open Gemma. Fine-tune targets,
@@ -54,7 +54,7 @@ mapping and the full account are in
 
 - [x] Architecture + frozen `POST /feedback` ingest contract (this doc)
 - [x] Ingest deployed and verified live — bucket
-      `fin-model-factory-011183829623` created (public access blocked,
+      `fin-model-factory-623170744161` created (public access blocked,
       `raw/` 180-day lifecycle), Lambda write policy `raw/*` only, 201/400/401
       paths exercised end-to-end
 - [x] Dataset builder — `build_dataset.py` (routing corpus + synced `raw/`
@@ -98,7 +98,7 @@ One private S3 bucket, separate from the agent supervision channel on purpose
 lifecycle, or an IAM statement):
 
 ```
-s3://fin-model-factory-011183829623/          (us-west-2, all public access blocked)
+s3://fin-model-factory-623170744161/          (us-west-2, all public access blocked)
   raw/                                        # EXPIRES 180 days after write
     feedback/YYYY/MM/DD/<uuid>.json           # user_feedback documents
     trajectories/YYYY/MM/DD/<uuid>.json       # trajectory documents
