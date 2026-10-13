@@ -1,6 +1,6 @@
 # Fin: AWS migration out of the nonprofit account
 
-Status: **cut over to green 2026-10-12 23:59Z; one-week watch running.** Fin now
+Status: **cut over to green 2026-10-12 23:59Z; the one-week watch was dropped, and blue is torn down 2026-10-14 (see Teardown).** Fin now
 runs from the LLC account 623170744161 (profile `llc`); the old account only
 forwards. See "Cutover state" at the bottom for exactly what is where and how to
 roll back.
@@ -142,7 +142,7 @@ Traps hit (fixed in code):
   is closed when its credits run out). The EC2 on-demand vCPU quota is 5.
 
 Deploying now:
-- green: `FIN_CP_RELAY_INSTANCE_TYPE=t4g.micro FIN_CP_DEFAULT_INSTANCE_TYPE=t4g.micro control-plane/deploy.sh`
+- green: `control-plane/deploy.sh` (the account was upgraded to a paid plan on 2026-10-13: t4g.nano is accepted again, the vCPU quota is 16, and the t4g.micro overrides are gone)
 - blue (only ever like this during the watch):
   `FIN_AWS_PROFILE=levi FIN_CP_FORWARD_TO=https://evnlvth1ih.execute-api.us-west-2.amazonaws.com control-plane/deploy.sh`
 
@@ -157,3 +157,44 @@ Rollback to blue:
 4. Legal pages (only if needed; green's distribution can keep serving them): remove the alias from E1HBK154BB5YYF, add it back on E2XD8RL8PK64SX, and point the Hover `fin` CNAME back to `d1neu32b2sn1ez.cloudfront.net`.
 
 After the week, with Levi's explicit OK: delete Fin's resources in 011183829623.
+
+## Teardown of blue (2026-10-14)
+
+Levi dropped the one-week watch: switch over hard, then remove every Fin
+resource from 011183829623 so the nonprofit can redeem its TechSoup credit.
+Message the `non-profit` session when it's done.
+
+Gate: nothing must still be calling blue. A temporary access log on blue's
+API stage (`/fin/blue-access-temp`, 1-day retention) records the caller,
+path and user agent. On 2026-10-13 everything still reaching blue came from
+the Fin apps, through the iCloud KVS endpoint; the daemons have already moved.
+1. Levi sets the control-plane endpoint in one device's Fin settings to
+   `https://evnlvth1ih.execute-api.us-west-2.amazonaws.com`, and every device's
+   app picks it up. Then `/fin/blue-access-temp` shows no new requests for
+   30+ minutes.
+2. Verify green end to end: run a message round trip, launch a relay, check
+   that /privacy, /terms and /support return 200, and check that every live
+   site has a fresh `lastHeartbeatAt` in green `fin-sites`.
+3. Final safety copy: `FIN_SRC_PROFILE=levi FIN_DST_PROFILE=llc migrate-account.py all --missing-only`
+   should add nothing.
+
+Delete (profile `levi`, us-west-2 unless noted). This is the full inventory taken
+2026-10-13. The only AMI/snapshot/key pair in the account is PocketDJ's, so leave it:
+- EventBridge `fin-worker-sweep`, `fin-worker-wake` (remove targets first)
+- Lambda `fin-control-plane`, plus log groups `/aws/lambda/fin-control-plane` and `/fin/blue-access-temp`
+- API Gateway `vzrf1bf59g`
+- DynamoDB: the 10 `fin-*` tables (no deletion protection, no backups)
+- S3 `fin-agent-directives-011183829623`, `fin-model-factory-011183829623`,
+  and `fin-africanintellect-legal` (us-east-1). None are versioned.
+- Secrets `fin/service-creds/shared/fin-agent-ssh-key` and
+  `users/6aa33866-…/fin/service-creds/shared/fin-agent-ssh-key`. Delete with
+  `--force-delete-without-recovery` so nothing lingers.
+- IAM: role `fin-control-plane` (inline policy); role and instance profile
+  `fin-agent-ssm` (AmazonSSMManagedInstanceCore + inline `fin-agent-service-creds`)
+- Security groups `fin-relay-ingress`, `fin-agent-egress`
+- CloudFront `E2XD8RL8PK64SX` (disable, wait for Deployed, delete), OAC
+  `fin-legal-oac`, and the ACM cert for `fin.africanintellect.ai` in us-east-1
+  (`be280be8-…`)
+
+After the teardown, rollback is no longer possible. Remove the blue
+`FIN_CP_FORWARD_TO` instructions above and drop `levi` as a fallback profile in the scripts.
