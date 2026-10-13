@@ -9,7 +9,7 @@
 # Operator credentials (AWS profile), never the control plane: the Lambda only
 # ever hands out presigned GETs for these two keys.
 set -euo pipefail
-PROFILE=${FIN_AWS_PROFILE:-levi}
+PROFILE=${FIN_AWS_PROFILE:-llc}
 BUCKET="${FIN_BUCKET:-fin-agent-directives-$(aws --profile "$PROFILE" sts get-caller-identity --query Account --output text)}"
 KEY=fin/agentd/fin-agentd-macos-arm64
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

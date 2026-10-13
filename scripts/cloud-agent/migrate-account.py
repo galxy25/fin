@@ -14,6 +14,9 @@ exact replica. Every step is idempotent and read-only on the source side.
 
 --delete also removes destination objects/items/keys absent from the source, so
 the final pass leaves green equal to blue rather than a superset of it.
+--missing-only copies only what the destination lacks: the catch-up after the
+old stack starts forwarding, when green is the newer side and must never be
+overwritten by blue's stale copy of the same key.
 
 Profiles: FIN_SRC_PROFILE (default levi), FIN_DST_PROFILE (default llc). Bucket
 names follow the account id, as control-plane/deploy.sh derives them. The
@@ -70,7 +73,7 @@ def listing(s3, bucket):
     return out
 
 
-def copy_bucket(src_s3, dst_s3, src_bucket, dst_bucket, region, delete):
+def copy_bucket(src_s3, dst_s3, src_bucket, dst_bucket, region, delete, missing_only=False):
     """Streams each object through this machine (no cross-account grant on the
     source, so blue's policies never change), keeping Content-Type and user
     metadata. Skips keys whose size and ETag already match: single-part ETags
@@ -80,7 +83,7 @@ def copy_bucket(src_s3, dst_s3, src_bucket, dst_bucket, region, delete):
     dst = listing(dst_s3, dst_bucket)
     copied = skipped = 0
     for key, (size, etag) in sorted(src.items()):
-        if dst.get(key) == (size, etag):
+        if dst.get(key) == (size, etag) or (missing_only and key in dst):
             skipped += 1
             continue
         obj = src_s3.get_object(Bucket=src_bucket, Key=key)
@@ -100,11 +103,11 @@ def copy_bucket(src_s3, dst_s3, src_bucket, dst_bucket, region, delete):
         src_bucket, dst_bucket, copied, skipped, removed))
 
 
-def do_s3(src, dst, delete):
+def do_s3(src, dst, delete, missing_only=False):
     src_acct, dst_acct = account(src), account(dst)
     src_s3, dst_s3 = src.client("s3", region_name=REGION), dst.client("s3", region_name=REGION)
     for stem in ("fin-agent-directives-", "fin-model-factory-"):
-        copy_bucket(src_s3, dst_s3, stem + src_acct, stem + dst_acct, REGION, delete)
+        copy_bucket(src_s3, dst_s3, stem + src_acct, stem + dst_acct, REGION, delete, missing_only)
 
 
 def do_legal(src, dst, delete):
@@ -117,12 +120,24 @@ def key_of(table_desc):
     return [k["AttributeName"] for k in table_desc["KeySchema"]]
 
 
-def do_dynamodb(src, dst, delete):
+def do_dynamodb(src, dst, delete, missing_only=False):
     src_ddb, dst_ddb = src.client("dynamodb", region_name=REGION), dst.client("dynamodb", region_name=REGION)
     for table in TABLES:
         keys = key_of(dst_ddb.describe_table(TableName=table)["Table"])
         items = [i for p in src_ddb.get_paginator("scan").paginate(TableName=table, ConsistentRead=True)
                  for i in p.get("Items", [])]
+        if missing_only:
+            added = 0
+            for item in items:
+                try:
+                    dst_ddb.put_item(TableName=table, Item=item, ConditionExpression="attribute_not_exists(#k)",
+                                     ExpressionAttributeNames={"#k": keys[0]})
+                    added += 1
+                except ClientError as error:
+                    if error.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                        raise
+            print("{}: {} missing items added".format(table, added))
+            continue
         # Raw attribute-value maps through the low-level client keep N/S/B/L/M exactly.
         for start in range(0, len(items), 25):
             batch = {table: [{"PutRequest": {"Item": i}} for i in items[start:start + 25]]}
@@ -167,17 +182,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("what", choices=("s3", "legal", "dynamodb", "secrets", "all"))
     parser.add_argument("--delete", action="store_true")
+    parser.add_argument("--missing-only", action="store_true")
     args = parser.parse_args()
     src = boto3.Session(profile_name=os.environ.get("FIN_SRC_PROFILE", "levi"))
     dst = boto3.Session(profile_name=os.environ.get("FIN_DST_PROFILE", "llc"))
+    if args.delete and args.missing_only:
+        sys.exit("--delete and --missing-only are opposites")
     if account(src) == account(dst):
         sys.exit("source and destination are the same account")
     if args.what in ("s3", "all"):
-        do_s3(src, dst, args.delete)
+        do_s3(src, dst, args.delete, args.missing_only)
     if args.what in ("legal", "all"):
         do_legal(src, dst, args.delete)
     if args.what in ("dynamodb", "all"):
-        do_dynamodb(src, dst, args.delete)
+        do_dynamodb(src, dst, args.delete, args.missing_only)
     if args.what in ("secrets", "all"):
         do_secrets(src, dst)
 

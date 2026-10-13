@@ -24,7 +24,7 @@
 #   {{TRANSCRIPT_PUT_URL}}  presigned PUT  fin/transcripts/<slug>.jsonl
 set -euo pipefail
 
-PROFILE="${FIN_AWS_PROFILE:-levi}"
+PROFILE="${FIN_AWS_PROFILE:-llc}"
 TEMPLATE_KEY=fin/agentd/_template.json
 SOURCE=${1:-nimbus}
 

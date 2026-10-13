@@ -74,7 +74,7 @@ the script or moving the checkout.
 
 Requirements: the interpreter the plist uses (`/usr/bin/python3`) must have `boto3`
 importable (it does on this Mac — user-site for the Command Line Tools python 3.9),
-and AWS profile `levi` in `~/.aws/config` (region `us-west-2`).
+and AWS profile `llc` in `~/.aws/config` (region `us-west-2`).
 
 ## Logs
 
@@ -92,9 +92,9 @@ manual run); defaults are tuned for this iMac:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `FIN_WAKE_PROFILE` | `levi` | AWS profile |
+| `FIN_WAKE_PROFILE` | `llc` | AWS profile |
 | `FIN_WAKE_REGION` | `us-west-2` | AWS region |
-| `FIN_WAKE_BUCKET` | `fin-agent-directives-011183829623` | supervision bucket |
+| `FIN_WAKE_BUCKET` | `fin-agent-directives-623170744161` | supervision bucket |
 | `FIN_WAKE_TABLE` | `fin-cloud-workers` | control-plane table |
 | `FIN_WAKE_POLL_SECONDS` | `30` | poll cadence |
 | `FIN_WAKE_IDLE_SECONDS` | `600` | release after this much idle (10 min) |

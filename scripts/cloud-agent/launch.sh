@@ -21,7 +21,7 @@
 # presigned URL with an expiry.
 set -euo pipefail
 
-PROFILE="${FIN_AWS_PROFILE:-levi}"
+PROFILE="${FIN_AWS_PROFILE:-llc}"
 REGION=us-west-2
 AGENT_NAME="${1:?usage: launch.sh <agent-name> <config-s3-key> [instance-type] [browser]}"
 CONFIG_KEY="${2:?usage: launch.sh <agent-name> <config-s3-key> [instance-type] [browser]}"

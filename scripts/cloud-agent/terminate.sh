@@ -3,7 +3,7 @@
 #   terminate.sh <agent-name>
 set -euo pipefail
 
-PROFILE=levi
+PROFILE="${FIN_AWS_PROFILE:-llc}"
 REGION=us-west-2
 AGENT_NAME="${1:?usage: terminate.sh <agent-name>}"
 

@@ -27,7 +27,7 @@ SHIM_PLIST="$HOME/Library/LaunchAgents/dev.levischoen.fin.llm-shim.plist"
 
 BIN_SRC="$REPO_ROOT/daemon/.build/release/fin-agentd"
 OUT_DIR=""; NAME=""; PRIORITY=""; LLM_URL=""; MODEL=""; FROM_SHIM=0; TRANSPORT=""
-ENDPOINT="${FIN_CONTROL_PLANE_ENDPOINT:-https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com}"
+ENDPOINT="${FIN_CONTROL_PLANE_ENDPOINT:-https://evnlvth1ih.execute-api.us-west-2.amazonaws.com}"
 
 while [ $# -gt 0 ]; do
 	case "$1" in

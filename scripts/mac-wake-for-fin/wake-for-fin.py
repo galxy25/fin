@@ -50,9 +50,9 @@ logged: only booleans, counts and object keys reach the log — never inbox/dire
 content, never config, never a token.
 
 Config via environment (sane defaults for this iMac):
-  FIN_WAKE_PROFILE               AWS profile          (default "levi")
+  FIN_WAKE_PROFILE               AWS profile          (default "llc")
   FIN_WAKE_REGION                AWS region           (default "us-west-2")
-  FIN_WAKE_BUCKET                supervision bucket   (default fin-agent-directives-011183829623)
+  FIN_WAKE_BUCKET                supervision bucket   (default fin-agent-directives-623170744161)
   FIN_WAKE_TABLE                 control-plane table  (default "fin-cloud-workers")
   FIN_WAKE_POLL_SECONDS          poll cadence         (default 30)
   FIN_WAKE_IDLE_SECONDS          release after idle   (default 600 = 10 min)
@@ -72,9 +72,9 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-PROFILE = os.environ.get("FIN_WAKE_PROFILE", "levi")
+PROFILE = os.environ.get("FIN_WAKE_PROFILE", "llc")
 REGION = os.environ.get("FIN_WAKE_REGION", "us-west-2")
-BUCKET = os.environ.get("FIN_WAKE_BUCKET", "fin-agent-directives-011183829623")
+BUCKET = os.environ.get("FIN_WAKE_BUCKET", "fin-agent-directives-623170744161")
 TABLE_NAME = os.environ.get("FIN_WAKE_TABLE", "fin-cloud-workers")
 
 

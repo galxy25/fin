@@ -127,7 +127,7 @@ REQUIRED_DAEMON_VERSION="${FIN_REQUIRED_DAEMON_VERSION:-1.5.0}"
 # checkout (see step 6).
 RUNTIME_SCRIPTS=(refresh.sh provision-config.sh enroll-config.py rotate-logs.sh launch-agentd.sh)
 START=0; SITE8_ARG=""; REPROVISION=0; PROVISION_ARGS=()
-ENROLL_TOKEN=""; ENDPOINT="${FIN_CONTROL_PLANE_ENDPOINT:-https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com}"
+ENROLL_TOKEN=""; ENDPOINT="${FIN_CONTROL_PLANE_ENDPOINT:-https://evnlvth1ih.execute-api.us-west-2.amazonaws.com}"
 MODEL="${FIN_MODEL:-google/gemma-4-12b-qat}"; DISPLAY_NAME="${FIN_DISPLAY_NAME:-}"
 # Dispatch priority (docs/SITES-ANY-MAC.md §5.1). `_elect_primary` preempts only on
 # STRICTLY greater priority, so equal-priority residents never take the role from one

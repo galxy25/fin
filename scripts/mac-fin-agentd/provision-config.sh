@@ -27,7 +27,7 @@
 set -euo pipefail
 
 FIN_AGENTD_HOME="${FIN_AGENTD_HOME:-$HOME/Library/Application Support/fin-agentd}"
-PROFILE="${FIN_AWS_PROFILE:-levi}"
+PROFILE="${FIN_AWS_PROFILE:-llc}"
 REGION="${FIN_AWS_REGION:-us-west-2}"
 # Empty = fin-agent-directives-<account id of PROFILE>, as control-plane/deploy.sh names it.
 BUCKET="${FIN_BUCKET:-}"
@@ -41,7 +41,7 @@ TOKEN_FILE="${FIN_CONTROL_PLANE_TOKEN_FILE:-$HOME/.fin-control-plane-token}"
 # to know which prefix is "this site's" — a real simplification that holds
 # for today's single-operator reality, not a long-term multi-user answer.
 USER_ID_FILE="${FIN_CP_USER_ID_FILE:-$HOME/.fin-control-plane-legacy-user-id}"
-CONTROL_PLANE_URL="${FIN_CONTROL_PLANE_URL:-https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com}"
+CONTROL_PLANE_URL="${FIN_CONTROL_PLANE_URL:-https://evnlvth1ih.execute-api.us-west-2.amazonaws.com}"
 LLM_URL="${FIN_LLM_URL:-http://127.0.0.1:1234/v1}"
 MODEL="${FIN_MODEL:-google/gemma-4-12b-qat}"
 # The brain's bearer token, for a HOSTED endpoint (OpenRouter and friends). Empty for a

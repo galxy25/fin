@@ -95,7 +95,7 @@ def main():
     parser.add_argument("--args", help="JSON object of extra args for the command", default=None)
     parser.add_argument("--command", help="shell command for run-shell (runs under /bin/sh -c on the site)")
     parser.add_argument("--timeout", type=int, help="run-shell timeout in seconds (default 300, max 1800)")
-    parser.add_argument("--profile", default=os.environ.get("FIN_AWS_PROFILE", "levi"), help="AWS profile (default: $FIN_AWS_PROFILE, else levi)")
+    parser.add_argument("--profile", default=os.environ.get("FIN_AWS_PROFILE", "llc"), help="AWS profile (default: $FIN_AWS_PROFILE, else llc)")
     parser.add_argument("--list", action="store_true", help="list every site instead of queuing a command")
     parsed = parser.parse_args()
 
