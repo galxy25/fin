@@ -108,17 +108,16 @@ this repo.
 | Control plane | `vzrf1bf59g`, Lambda env `FIN_CP_FORWARD_TO` = green: relays every request, schedules no-op | `https://evnlvth1ih.execute-api.us-west-2.amazonaws.com`, the live one |
 | EventBridge sweep/wake | DISABLED | ENABLED |
 | Agent bucket | `fin-agent-directives-011183829623`, frozen at 23:59Z | `fin-agent-directives-623170744161` |
-| Legal pages | `fin-africanintellect-legal` + CloudFront E2XD8RL8PK64SX (still holds the alias) | `fin-legal-623170744161` + CloudFront E1HBK154BB5YYF (`d3tvnxu2y5galq.cloudfront.net`, ACM cert issued) |
+| Legal pages | `fin-africanintellect-legal` + CloudFront E2XD8RL8PK64SX (alias removed 2026-10-13) | `fin-legal-623170744161` + CloudFront E1HBK154BB5YYF (`d3tvnxu2y5galq.cloudfront.net`), holds `fin.africanintellect.ai` with green's ACM cert |
 
 - Data: `scripts/cloud-agent/migrate-account.py all --delete` (final) then
   `--missing-only` (catch-up) after the forwarder went live. The relay cert was
   copied, not regenerated, so the shipped pin (`6886b52b…`) holds.
 - Hover: `fin` CNAME now points at green; `_fin` TXT and the ACM validation CNAME
   stay. CloudFront refuses a cross-account `associate-alias` while the source is
-  enabled, so the alias is still on blue's distribution. That still serves, since
-  CloudFront routes by Host. Moving it means editing blue's distribution:
-  remove the alias there, then add it plus the cert on green (~1 min gap). This
-  needs Levi's OK.
+  enabled. With Levi's OK, on 2026-10-13 at 04:29Z the alias was removed from blue's
+  distribution and added to green's 3 s later. Green was Deployed at 04:30Z, and
+  /privacy, /terms and /support serve 200 under green's Oct-12 cert.
 - Sites: iMac re-pointed directly (config.json endpoint plus
   `provision-config.sh --refresh` against the green bucket; backup
   `config.json.bak-pre-llc`), and `wake-for-fin` now defaults to profile `llc`.
@@ -155,6 +154,6 @@ Rollback to blue:
 3. iMac: restore `config.json.bak-pre-llc`, run `FIN_AWS_PROFILE=levi provision-config.sh --refresh`,
    `launchctl kickstart -k gui/$UID/dev.levischoen.fin.agentd`, restart wake with
    `FIN_WAKE_PROFILE=levi`. Neo: queue the reverse endpoint edit.
-4. Hover: `fin` CNAME back to `d1neu32b2sn1ez.cloudfront.net`, if the alias moved.
+4. Legal pages (only if needed; green's distribution can keep serving them): remove the alias from E1HBK154BB5YYF, add it back on E2XD8RL8PK64SX, and point the Hover `fin` CNAME back to `d1neu32b2sn1ez.cloudfront.net`.
 
 After the week, with Levi's explicit OK: delete Fin's resources in 011183829623.
