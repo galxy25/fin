@@ -672,6 +672,11 @@ variables = {
 # this file writes the whole environment, so omitting it IS the rollback.
 if os.environ.get("FIN_CP_FORWARD_TO"):
     variables["FIN_CP_FORWARD_TO"] = os.environ["FIN_CP_FORWARD_TO"]
+# A Free-plan account refuses t4g.nano; export both as t4g.micro there until the
+# account is upgraded to a paid plan. Re-pass on every deploy, like the above.
+for name in ("FIN_CP_RELAY_INSTANCE_TYPE", "FIN_CP_DEFAULT_INSTANCE_TYPE"):
+    if os.environ.get(name):
+        variables[name] = os.environ[name]
 key_file = os.environ.get("APNS_KEY_FILE")
 if key_file:
     with open(key_file) as handle:

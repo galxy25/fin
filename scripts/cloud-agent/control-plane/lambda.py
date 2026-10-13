@@ -200,7 +200,9 @@ RELAY_TLS_KEY_KEY = "fin/relay/key.pem"
 # 443, not a high port: this whole feature exists for a laptop on a network
 # that may not allow much else out.
 RELAY_PORT = 443
-RELAY_INSTANCE_TYPE = "t4g.nano"
+# Overridable per stack: an AWS account on the Free plan refuses t4g.nano outright
+# ("not eligible for Free Tier") and needs t4g.micro until it is upgraded.
+RELAY_INSTANCE_TYPE = os.environ.get("FIN_CP_RELAY_INSTANCE_TYPE") or "t4g.nano"
 RELAY_IDLE_SECONDS = 900
 # A relay row older than this with no instance behind it is stale bookkeeping,
 # not a live relay — re-launch rather than hand out a dead address.
@@ -217,7 +219,7 @@ RELAY_PROBE_TIMEOUT_SECONDS = 2
 _SITE_COMMAND_WRITE_ATTEMPTS = 4
 AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 
-DEFAULT_INSTANCE_TYPE = "t4g.nano"
+DEFAULT_INSTANCE_TYPE = os.environ.get("FIN_CP_DEFAULT_INSTANCE_TYPE") or "t4g.nano"  # see RELAY_INSTANCE_TYPE
 DEFAULT_IDLE_MINUTES = 30
 MAX_IDLE_MINUTES = 24 * 60
 
@@ -286,7 +288,12 @@ MAX_LIST_ITEMS = 100
 _SESSION = boto3.session.Session(region_name=REGION)
 EC2 = _SESSION.client("ec2")
 SSM = _SESSION.client("ssm")
-S3 = _SESSION.client("s3", config=Config(signature_version="s3v4"))
+# Regional virtual-hosted URLs (bucket.s3.us-west-2.amazonaws.com), never the
+# global bucket.s3.amazonaws.com: a bucket younger than ~a day isn't in global
+# DNS yet, so the global host lands in us-east-1 and rejects a us-west-2 SigV4
+# signature with 400 AuthorizationQueryParametersError — every presigned URL the
+# freshly created LLC-account bucket handed out did exactly that on 2026-10-12.
+S3 = _SESSION.client("s3", config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}))
 SECRETS = _SESSION.client("secretsmanager")
 _DYNAMODB = _SESSION.resource("dynamodb")
 TABLE = _DYNAMODB.Table(TABLE_NAME)

@@ -244,7 +244,8 @@ if credentials is None:
 if credentials.token:
     print("warning: profile %r uses TEMPORARY credentials — the URLs die when that session does, "
           "not at the 7-day mark; sign with long-lived operator credentials" % profile, file=sys.stderr)
-s3 = session.client("s3", config=Config(signature_version="s3v4"))
+# Regional host, not the global one: see lambda.py's S3 client for the new-bucket trap.
+s3 = session.client("s3", config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}))
 
 def sign(method, key):
     # Same shape as the control plane's _presign: Bucket + Key only, so the daemon's
