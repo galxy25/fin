@@ -6,8 +6,9 @@ struct MarkdownReaderView: View {
 
     @EnvironmentObject private var sessionManager: SessionManager
 
-    @AppStorage("themeBackgroundHex") private var backgroundHex = AppTheme.default.backgroundHex
-    @AppStorage("themeForegroundHex") private var foregroundHex = AppTheme.default.foregroundHex
+    @AppStorage(ThemeScope.markdown.backgroundKey) private var backgroundHex = ThemeScope.markdown.defaultBackgroundHex
+    @AppStorage(ThemeScope.markdown.foregroundKey) private var foregroundHex = ThemeScope.markdown.defaultForegroundHex
+    @AppStorage(ThemeScope.markdown.fontSizeKey) private var fontSize = AppTheme.defaultMarkdownFontSize
 
     @State private var rawText = ""
     @State private var content: AttributedString?
@@ -26,7 +27,7 @@ struct MarkdownReaderView: View {
     }
 
     private var theme: AppTheme {
-        AppTheme(backgroundHex: backgroundHex, foregroundHex: foregroundHex)
+        AppTheme(backgroundHex: backgroundHex, foregroundHex: foregroundHex, fontSize: fontSize)
     }
 
     private static let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd", "mkdn", "mdwn"]
@@ -42,7 +43,7 @@ struct MarkdownReaderView: View {
                     .scrollContentBackground(.hidden)
                     .background(theme.backgroundColor)
                     .foregroundStyle(theme.foregroundColor)
-                    .font(.system(.body, design: .monospaced))
+                    .font(.system(size: fontSize, design: .monospaced))
                     .autocorrectionDisabled()
                     .padding(4)
                     .accessibilityIdentifier("markdownEditor")
@@ -58,6 +59,7 @@ struct MarkdownReaderView: View {
                     Group {
                         if let content {
                             Text(content)
+                                .font(.system(size: fontSize))
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding()
@@ -145,7 +147,12 @@ struct MarkdownReaderView: View {
             }
         }
         .sheet(isPresented: $showingTheme) {
-            ThemeSettingsView()
+            ThemeSettingsView(scope: .markdown)
+        }
+        // Header/code styling is baked into the attributed string at render time,
+        // so a font-size or color change has to re-render it.
+        .onChange(of: theme) { _, _ in
+            if !rawText.isEmpty { render(rawText) }
         }
         .alert(
             "Couldn't Save",
@@ -238,18 +245,21 @@ struct MarkdownReaderView: View {
             for component in intent.components {
                 switch component.kind {
                 case .header(let level):
-                    let font: Font = switch level {
-                    case 1: .title.bold()
-                    case 2: .title2.bold()
-                    case 3: .title3.bold()
-                    default: .headline
+                    // Same ratios as the system title/title2/title3/headline styles
+                    // to body (28/22/20/17 : 17), scaled off the theme's size.
+                    let scale: Double = switch level {
+                    case 1: 28.0 / 17
+                    case 2: 22.0 / 17
+                    case 3: 20.0 / 17
+                    default: 1
                     }
+                    let font: Font = .system(size: fontSize * scale, weight: .bold)
                     attributed[run.range].font = font
                 case .codeBlock:
-                    attributed[run.range].font = .system(.body, design: .monospaced)
+                    attributed[run.range].font = .system(size: fontSize, design: .monospaced)
                     attributed[run.range].backgroundColor = theme.foregroundColor.opacity(0.12)
                 case .blockQuote:
-                    attributed[run.range].font = (attributed[run.range].font ?? .body).italic()
+                    attributed[run.range].font = (attributed[run.range].font ?? .system(size: fontSize)).italic()
                     attributed[run.range].foregroundColor = theme.foregroundColor.opacity(0.7)
                 default:
                     break

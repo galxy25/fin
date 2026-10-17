@@ -416,6 +416,8 @@ struct FinApp: App {
         // deliberate non-goals (capability URLs, machine-scoped files, telemetry
         // opt-ins).
         SyncedDeviceConfig.activate()
+        // Themes sync only for the scopes this device opted into (ThemeSync).
+        ThemeSync.activate()
 
         let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
         manager.recordLifecycleEvent("[app] launched build \(buildNumber)")

@@ -26,6 +26,13 @@ struct AppTheme: Codable, Equatable {
     #endif
     static let fontSizeRange: ClosedRange<Double> = 8...32
 
+    /// Markdown body text defaults to the platform's body size (13pt on macOS, 17pt elsewhere).
+    #if os(macOS)
+    static let defaultMarkdownFontSize: Double = 13
+    #else
+    static let defaultMarkdownFontSize: Double = 17
+    #endif
+
     var terminalFont: PlatformFont {
         .monospacedSystemFont(ofSize: CGFloat(fontSize), weight: .regular)
     }
@@ -34,6 +41,43 @@ struct AppTheme: Codable, Equatable {
     var foregroundColor: Color { Color(hex: foregroundHex) }
     var backgroundPlatformColor: PlatformColor { PlatformColor(hex: backgroundHex) }
     var foregroundPlatformColor: PlatformColor { PlatformColor(hex: foregroundHex) }
+}
+
+/// Which surface a theme applies to. The terminal and the markdown reader are
+/// themed independently, each under its own set of `@AppStorage` keys.
+enum ThemeScope: CaseIterable {
+    case terminal
+    case markdown
+
+    var title: String {
+        switch self {
+        case .terminal: "Terminal Theme"
+        case .markdown: "Markdown Theme"
+        }
+    }
+
+    // The terminal keeps the original unprefixed keys so existing settings carry over.
+    var backgroundKey: String { self == .terminal ? "themeBackgroundHex" : "markdownThemeBackgroundHex" }
+    var foregroundKey: String { self == .terminal ? "themeForegroundHex" : "markdownThemeForegroundHex" }
+    var fontSizeKey: String { self == .terminal ? "themeFontSize" : "markdownThemeFontSize" }
+    /// Per-device, never synced: whether this scope follows the account (`ThemeSync`).
+    var syncEnabledKey: String { self == .terminal ? "themeSyncEnabled" : "markdownThemeSyncEnabled" }
+    var syncedKeys: [String] { [backgroundKey, foregroundKey, fontSizeKey] }
+
+    // Markdown used to share the terminal's colors, so until it's customized on
+    // its own it starts from whatever the terminal is set to.
+    var defaultBackgroundHex: String {
+        self == .terminal ? AppTheme.default.backgroundHex
+            : UserDefaults.standard.string(forKey: ThemeScope.terminal.backgroundKey) ?? AppTheme.default.backgroundHex
+    }
+    var defaultForegroundHex: String {
+        self == .terminal ? AppTheme.default.foregroundHex
+            : UserDefaults.standard.string(forKey: ThemeScope.terminal.foregroundKey) ?? AppTheme.default.foregroundHex
+    }
+
+    var defaultFontSize: Double {
+        self == .terminal ? AppTheme.defaultFontSize : AppTheme.defaultMarkdownFontSize
+    }
 }
 
 extension PlatformColor {
