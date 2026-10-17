@@ -1,5 +1,14 @@
 .DS_Store
-/fin.xcodeproj/
+/fin.xcodeproj/*
+# ...except the SwiftPM pins: without them a fresh checkout floats SwiftTerm
+# past 1.18.0 (`from:` in project.yml) to a release that doesn't compile.
+!/fin.xcodeproj/project.xcworkspace/
+/fin.xcodeproj/project.xcworkspace/*
+!/fin.xcodeproj/project.xcworkspace/xcshareddata/
+/fin.xcodeproj/project.xcworkspace/xcshareddata/*
+!/fin.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+/fin.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/*
+!/fin.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 xcuserdata/
 DerivedData/
 /build-*/
