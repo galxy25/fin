@@ -3,16 +3,32 @@ import SwiftUI
 #if os(macOS)
 import AppKit
 typealias PlatformColor = NSColor
+typealias PlatformFont = NSFont
 #else
 import UIKit
 typealias PlatformColor = UIColor
+typealias PlatformFont = UIFont
 #endif
 
 struct AppTheme: Codable, Equatable {
     var backgroundHex: String
     var foregroundHex: String
+    /// Terminal font size in points.
+    var fontSize: Double = AppTheme.defaultFontSize
 
     static let `default` = AppTheme(backgroundHex: "#000000", foregroundHex: "#00FF00")
+
+    /// SwiftTerm's own default: the system font size on macOS, 12pt elsewhere.
+    #if os(macOS)
+    static let defaultFontSize: Double = Double(NSFont.systemFontSize)
+    #else
+    static let defaultFontSize: Double = 12
+    #endif
+    static let fontSizeRange: ClosedRange<Double> = 8...32
+
+    var terminalFont: PlatformFont {
+        .monospacedSystemFont(ofSize: CGFloat(fontSize), weight: .regular)
+    }
 
     var backgroundColor: Color { Color(hex: backgroundHex) }
     var foregroundColor: Color { Color(hex: foregroundHex) }

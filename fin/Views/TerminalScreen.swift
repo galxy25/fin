@@ -8,6 +8,7 @@ struct TerminalScreen: View {
 
     @AppStorage("themeBackgroundHex") private var backgroundHex = AppTheme.default.backgroundHex
     @AppStorage("themeForegroundHex") private var foregroundHex = AppTheme.default.foregroundHex
+    @AppStorage("themeFontSize") private var fontSize = AppTheme.defaultFontSize
     /// Persisted so the panel is still open next launch if that's how it was left.
     @AppStorage("agentPanelVisible") private var isAgentPanelVisible = false
 
@@ -16,7 +17,7 @@ struct TerminalScreen: View {
     #endif
 
     private var theme: AppTheme {
-        AppTheme(backgroundHex: backgroundHex, foregroundHex: foregroundHex)
+        AppTheme(backgroundHex: backgroundHex, foregroundHex: foregroundHex, fontSize: fontSize)
     }
 
     /// Wide layouts get the console beside the terminal; compact ones get a sheet, since

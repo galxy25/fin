@@ -27,6 +27,11 @@ struct TerminalViewRepresentable: NSViewRepresentable {
         view.nativeForegroundColor = foreground
         view.nativeBackgroundColor = background
         view.layer?.backgroundColor = background.cgColor
+        // Setting `font` resets SwiftTerm's cell metrics and resizes the PTY, so
+        // only touch it when the size actually changed.
+        if view.font.pointSize != CGFloat(theme.fontSize) {
+            view.font = theme.terminalFont
+        }
     }
 }
 
@@ -51,6 +56,11 @@ struct TerminalViewRepresentable: UIViewRepresentable {
         view.nativeForegroundColor = foreground
         view.nativeBackgroundColor = background
         view.layer.backgroundColor = background.cgColor
+        // Setting `font` resets SwiftTerm's cell metrics and resizes the PTY, so
+        // only touch it when the size actually changed.
+        if view.font.pointSize != CGFloat(theme.fontSize) {
+            view.font = theme.terminalFont
+        }
     }
 }
 

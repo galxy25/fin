@@ -4,6 +4,7 @@ struct ThemeSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("themeBackgroundHex") private var backgroundHex = AppTheme.default.backgroundHex
     @AppStorage("themeForegroundHex") private var foregroundHex = AppTheme.default.foregroundHex
+    @AppStorage("themeFontSize") private var fontSize = AppTheme.defaultFontSize
 
     private var backgroundBinding: Binding<Color> {
         Binding(
@@ -24,9 +25,20 @@ struct ThemeSettingsView: View {
             Form {
                 ColorPicker("Background", selection: backgroundBinding, supportsOpacity: false)
                 ColorPicker("Text", selection: foregroundBinding, supportsOpacity: false)
+                Stepper(value: $fontSize, in: AppTheme.fontSizeRange, step: 1) {
+                    LabeledContent("Font Size", value: "\(Int(fontSize)) pt")
+                }
+                Text("The quick brown fox $ ls -la")
+                    .font(.system(size: fontSize, design: .monospaced))
+                    .foregroundStyle(Color(hex: foregroundHex))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                    .background(Color(hex: backgroundHex))
+                    .accessibilityIdentifier("themeFontPreview")
                 Button("Reset to Classic Green on Black") {
                     backgroundHex = AppTheme.default.backgroundHex
                     foregroundHex = AppTheme.default.foregroundHex
+                    fontSize = AppTheme.defaultFontSize
                 }
             }
             .navigationTitle("Theme")
