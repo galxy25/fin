@@ -352,7 +352,7 @@ final class AgentEngineDispatchTests: XCTestCase {
         var askedQuestions: [String] = []
         var audited: [AgentAuditEvent] = []
         let engine = makeEngine(audit: { audited.append($0) })
-        engine.onRequestInput = { askedQuestions.append($0) }
+        engine.onRequestInput = { askedQuestions.append($0); return nil }
 
         let result = await engine.execute(call(
             AgentToolSpec.requestInput.name,
@@ -366,9 +366,20 @@ final class AgentEngineDispatchTests: XCTestCase {
         }, "the question must be recorded in the audit log")
     }
 
+    func testRequestInputHookCanDeclineWithItsOwnResult() async {
+        let engine = makeEngine()
+        engine.onRequestInput = { _ in "Not asked: goal g-x marked blocked." }
+
+        let result = await engine.execute(call(
+            AgentToolSpec.requestInput.name,
+            #"{"question": "Can't find session foo-bar, what now?"}"#
+        ))
+        XCTAssertEqual(result, "Not asked: goal g-x marked blocked.")
+    }
+
     func testRequestInputRequiresAQuestion() async {
         let engine = makeEngine()
-        engine.onRequestInput = { _ in XCTFail("hook must not fire for an empty question") }
+        engine.onRequestInput = { _ in XCTFail("hook must not fire for an empty question"); return nil }
 
         let result = await engine.execute(call(AgentToolSpec.requestInput.name, "{}"))
         XCTAssertTrue(result.contains("non-empty \"question\""), "got: \(result)")
@@ -579,7 +590,7 @@ final class AgentEngineDispatchTests: XCTestCase {
             XCTFail("no tool other than notify itself may push to the owner")
             return .delivered
         }
-        engine.onRequestInput = { _ in }
+        engine.onRequestInput = { _ in nil }
         engine.onMonitorStart = { _ in 60 }
         engine.onMonitorStop = { }
 

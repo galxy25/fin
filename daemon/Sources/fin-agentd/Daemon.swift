@@ -1769,11 +1769,16 @@ final class Daemon {
         // The model's request_input tool: record + notify — the engine already wrote the
         // question into the audit trail as the tool call, this surfaces it to a human.
         engine.onRequestInput = { [weak self] question in
-            guard let self else { return }
+            guard let self else { return nil }
             self.log("request_input: \(question)")
             // Captured now: by the time the headline is back the turn may have moved on.
             let messageID = self.inFlightSiteMessageID
             let threadID = self.inFlightThreadID
+            // A mission tick asking about a session that isn't running is a blocker,
+            // not a question (Levi, 2026-10-22): block the goal, never ask.
+            if messageID == nil, let declined = self.blockGoalInsteadOfAsking(question) {
+                return declined
+            }
             self.pauseHeartbeatForUserInput(question: question)
             // The push title says WHAT is needed (Levi, 2026-10-22), written by this
             // daemon's own brain — bounded, with a deterministic fallback, so a busy or
@@ -1790,6 +1795,7 @@ final class Daemon {
                     messageID: messageID, threadID: threadID, title: headline
                 )
             }
+            return nil
         }
         // The model's monitor tool drives the daemon's own heartbeat loop.
         engine.onMonitorStart = { [weak self] requested in
@@ -3601,6 +3607,37 @@ final class Daemon {
             why: why, nextAction: nextAction, blockedOn: blockedOn,
             tags: tags ?? [], source: source
         ))
+    }
+
+    /// `MissingSessionQuestion` applied: when a mission tick's question is really "the
+    /// session this goal is about isn't running", the goal goes to blocked (with a
+    /// blocker AND a report entry, so the tick's "surface once" rule treats the ledger
+    /// as the surfacing and stays quiet) and the returned text becomes the tool result.
+    /// Nil → ask the user as usual.
+    private func blockGoalInsteadOfAsking(_ question: String) -> String? {
+        guard let verdict = MissingSessionQuestion.verdict(
+            question: question,
+            ledger: LedgerDocument.loadIfPresent(at: URL(fileURLWithPath: goalsLedgerPath)),
+            liveSessions: Self.liveSessions(paneInventoryFileURL: URL(fileURLWithPath: paneInventoryPath))
+        ), let ledger = goalsLedger else { return nil }
+        let line = "[goals] blocked \(verdict.goalID) instead of asking: \(verdict.blockedOn)"
+        log(line)
+        record(AgentAuditEvent(kind: "notice", text: line))
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            _ = await self.goalUpsert(
+                ledger: ledger, id: verdict.goalID, title: nil, state: .blocked, why: nil,
+                nextAction: nil, blockedOn: verdict.blockedOn, tags: nil, source: nil
+            )
+            _ = await self.goalLog(ledger: ledger, goalID: verdict.goalID, kind: .blocker, text: verdict.blockedOn)
+            _ = await self.goalLog(
+                ledger: ledger, goalID: verdict.goalID, kind: .report,
+                text: "Blocked in the ledger without asking: the session is not running here."
+            )
+        }
+        return "Not asked — the user was NOT notified. \(verdict.session) is not among the "
+            + "running tmux sessions, so goal \(verdict.goalID) is now blocked on that. "
+            + "Do not ask about it again; drive another goal or idle."
     }
 
     /// The model's `goal_log` tool, wired to `engine.onGoalLog`. An unknown `goal_id` is

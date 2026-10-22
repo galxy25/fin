@@ -162,7 +162,10 @@ public final class AgentTurnEngine {
 
     /// Fired when the model calls `request_input`; the runner surfaces the question
     /// (notify hook, push service, …). The tool result mirrors the app's acknowledgment.
-    public var onRequestInput: ((String) -> Void)?
+    /// Returning a string declines the question instead: nothing reached the user, and
+    /// that string is the tool result (the runner says what it did instead — e.g.
+    /// `MissingSessionQuestion` marking the goal blocked). Nil means it was asked.
+    public var onRequestInput: ((String) -> String?)?
     /// Fired on `monitor` start. The argument is the model-requested interval already
     /// clamped to 15...600 seconds, or 0 for "keep the current interval". Returns the
     /// effective interval the runner will actually beat at.
@@ -935,7 +938,10 @@ public final class AgentTurnEngine {
                    toolArguments: rawArguments, isFailure: true)
             return message
         }
-        onRequestInput(question)
+        if let declined = onRequestInput(question) {
+            record("toolResult", declined, toolName: toolName, toolArguments: rawArguments)
+            return declined
+        }
         // The app's canned acknowledgment, verbatim — the model's mental model of the
         // tool must not depend on which runner is hosting it.
         return "The user has been notified. Their next message will answer your question."

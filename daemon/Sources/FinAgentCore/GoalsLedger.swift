@@ -379,7 +379,10 @@ public enum GoalsTick {
         blocked on THEM, remind them what it waits on rather than pretending to act. A \
         surfaced stall goes back to being driven next tick, not re-reported. A goal \
         without a next action never stalls the tick — drive what is drivable; ask about \
-        the vague goal only when nothing else remains. A goal whose why was only ever \
+        the vague goal only when nothing else remains. A goal about a session that is \
+        not in the live session list is blocked on that session, not a question: set it \
+        blocked (blocked_on names the session) and move on — never request_input about a \
+        session you cannot find. A goal whose why was only ever \
         "find out what the user wants" is done, without waiting for a fresh message, \
         the moment any other concrete goal exists in the ledger — that other goal IS \
         the answer. Mark it done and give it its closing report; never keep driving it \
