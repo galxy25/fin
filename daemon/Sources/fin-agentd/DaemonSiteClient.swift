@@ -120,6 +120,10 @@ actor DaemonSiteClient {
     var stateProvider: @Sendable () async -> String = { "idle" }
     /// The heartbeat's `capabilities`; nil entries are omitted.
     var capabilitiesProvider: @Sendable () async -> [String: Any] = { [:] }
+    /// The question a needs-input body is blocked on, and its short headline
+    /// (`InputHeadline`), sent as `pendingQuestion`/`pendingHeadline` so the
+    /// control plane's attention tile can say WHAT is needed. Nil when not blocked.
+    var pendingInputProvider: @Sendable () async -> (question: String, headline: String?)? = { nil }
     var runID: String?
     /// Delivered commands, handled by the daemon (restart = exit 0 under
     /// launchd KeepAlive; drain = stop claiming).
@@ -127,6 +131,10 @@ actor DaemonSiteClient {
 
     func setClaimHandler(_ handler: @escaping @Sendable () async -> Void) {
         onClaimed = handler
+    }
+
+    func setPendingInputProvider(_ provider: @escaping @Sendable () async -> (question: String, headline: String?)?) {
+        pendingInputProvider = provider
     }
 
     func setURLHandler(_ handler: @escaping @Sendable ([String: String]) async -> Void) {
@@ -205,6 +213,9 @@ actor DaemonSiteClient {
         }
     }
 
+    /// The heartbeat's question cap — the tile only shows a line or two of it.
+    static let maxPendingQuestionCharacters = 280
+
     func stop() {
         loop?.cancel()
         loop = nil
@@ -222,6 +233,10 @@ actor DaemonSiteClient {
         ]
         if let urlsExpireAt { body["urlsExpireAt"] = urlsExpireAt }
         if let runID { body["runId"] = runID }
+        if body["state"] as? String == "needs-input", let pending = await pendingInputProvider() {
+            body["pendingQuestion"] = String(MemoryRedactor.redact(pending.question).prefix(Self.maxPendingQuestionCharacters))
+            if let headline = pending.headline { body["pendingHeadline"] = MemoryRedactor.redact(headline) }
+        }
 
         guard let (status, data) = await post("/sites/\(siteID)/heartbeat", body: body) else { return }
         guard (200..<300).contains(status) else {

@@ -86,6 +86,16 @@ final class DaemonNotifyClient {
         }
     }
 
+    /// A caller-supplied title (the request-input headline) wins over the event table,
+    /// redacted and flattened like `sendDirect`'s; blank falls back to the table.
+    static func resolvedTitle(event: String, agentName: String, override: String?) -> String {
+        let cleaned = override.map {
+            MemoryRedactor.redact($0).replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } ?? ""
+        return cleaned.isEmpty ? title(event: event, agentName: agentName) : cleaned
+    }
+
     /// Redacted and capped alert text — this string leaves the machine.
     static func alertBody(_ message: String) -> String {
         let redacted = MemoryRedactor.redact(message)
@@ -139,9 +149,11 @@ final class DaemonNotifyClient {
     /// task-complete push for a claimed message); nil for everything else. `threadID`
     /// is that message's thread, when the daemon knows it.
     @discardableResult
-    func send(event: String, message: String, messageID: String? = nil, threadID: String? = nil) async -> Bool {
+    func send(
+        event: String, message: String, messageID: String? = nil, threadID: String? = nil, title: String? = nil
+    ) async -> Bool {
         await deliver(
-            title: Self.title(event: event, agentName: agentName),
+            title: Self.resolvedTitle(event: event, agentName: agentName, override: title),
             body: Self.alertBody(message),
             event: event,
             messageID: messageID,

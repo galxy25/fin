@@ -2319,6 +2319,46 @@ class StaleSiteNotifyTests(_SitesTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["title"], "Fin lost contact with Levi's iMac")
 
+    def test_a_laptop_that_keeps_waking_is_paged_with_backoff_capped_at_a_day(self):
+        sent = []
+        orig = lam.notify
+        lam.notify = lambda event: sent.append(1)
+        self.addCleanup(setattr, lam, "notify", orig)
+        site = self.enroll(kind="resident", displayName="MacBook Neo")
+        row = lam.SITES_TABLE.items[site["siteId"]]
+
+        def lapse(ago_minutes):
+            row.update({"state": "needs-input", "leaseUntil": _iso(lam._now() - timedelta(minutes=5)),
+                        "lastHeartbeatAt": "2026-01-01T00:00:00Z"})
+            if "lostContactAlert" in row:
+                row["lostContactAlert"]["lastAt"] = _iso(lam._now() - timedelta(minutes=ago_minutes))
+            lam._mark_stale_sites(lam._now())
+
+        lapse(0)            # first: pages
+        lapse(10)           # a dark wake 10 min later: inside the 30 min step
+        lapse(31)           # past 30 min: pages (count 2 → next step 1 h)
+        lapse(45)           # inside 1 h
+        self.assertEqual(len(sent), 2)
+        row["lostContactAlert"]["count"] = 20  # far up the curve…
+        lapse(23 * 60)      # …still capped: 23 h is not enough
+        lapse(24 * 60 + 1)  # a day is
+        self.assertEqual(len(sent), 3)
+
+    def test_alert_backoff_steps_double_to_a_one_day_cap(self):
+        now = lam._now()
+        allowed, rec = lam._alert_backoff(None, "k", now)
+        self.assertTrue(allowed)
+        waits = []
+        for _ in range(8):
+            for minutes in range(1, 3000):
+                ok, nxt = lam._alert_backoff(rec, "k", lam._parse_iso(rec["lastAt"]) + timedelta(minutes=minutes))
+                if ok:
+                    waits.append(minutes)
+                    rec = nxt
+                    break
+        self.assertEqual(waits, [30, 60, 120, 240, 480, 960, 1440, 1440])
+        self.assertTrue(lam._alert_backoff(rec, "other", now)[0])
+
     def test_a_silent_cloud_worker_does_not_page_the_owner(self):
         sent = []
         orig = lam.notify
@@ -3388,6 +3428,44 @@ class LiveActivityPushTests(_MessagesTestCase):
         self.beat(self.cloud, state="idle")
         self.assertNotIn("pendingThreadId", lam.SITES_TABLE.items[self.cloud["siteId"]])
         self.assertNotIn("threadID", self.apns.payloads[-1]["aps"]["content-state"])
+
+    def go_stale(self, site):
+        row = lam.SITES_TABLE.items[site["siteId"]]
+        row["leaseUntil"] = _iso(lam._now() - timedelta(minutes=5))
+        row["state"] = "stale"
+
+    def alerts(self):
+        return [p["aps"].get("alert") for _, _, p in self.apns.sent if p["aps"].get("content-state", {}).get("status") == "needsInput"]
+
+    def test_a_sleeping_site_re_entering_needs_input_alerts_with_backoff(self):
+        # Live 2026-10-22: a closed laptop dark-woke every sweep and re-alerted.
+        ask = {"pendingQuestion": "Which branch should I rebase onto, main or dev?",
+               "pendingHeadline": "Pick a branch for the rebase"}
+        self.beat(self.cloud, state="needs-input", **ask)
+        first = self.alerts()
+        self.assertEqual(first[0]["title"], "Pick a branch for the rebase")
+        self.assertEqual(first[0]["body"], "Cloud computer: Which branch should I rebase onto, main or dev?")
+        self.assertEqual(self.apns.payloads[-1]["aps"]["content-state"]["headline"], "Pick a branch for the rebase")
+        # Sleep, dark wake, same question: the tile updates, nothing alerts.
+        self.go_stale(self.cloud)
+        self.apns.sent.clear()
+        self.beat(self.cloud, state="needs-input", **ask)
+        self.assertEqual(self.alerts(), [None])
+        # 31 minutes later the first backoff step has passed: one more alert.
+        rec = lam.SITES_TABLE.items[self.cloud["siteId"]]["inputAlert"]
+        rec["lastAt"] = _iso(lam._now() - timedelta(minutes=31))
+        self.go_stale(self.cloud)
+        self.apns.sent.clear()
+        self.beat(self.cloud, state="needs-input", **ask)
+        self.assertIsNotNone(self.alerts()[0])
+        # A different question is news straight away.
+        self.go_stale(self.cloud)
+        self.apns.sent.clear()
+        self.beat(self.cloud, state="needs-input", pendingQuestion="Delete build/?")
+        self.assertEqual(self.alerts()[0]["title"], "Fin needs your input")
+        # Leaving needs-input drops the question from the row.
+        self.beat(self.cloud, state="idle")
+        self.assertNotIn("pendingQuestion", lam.SITES_TABLE.items[self.cloud["siteId"]])
 
     def test_a_push_failure_never_fails_the_heartbeat(self):
         self.addCleanup(setattr, lam, "_push_live_activity", lam._push_live_activity)

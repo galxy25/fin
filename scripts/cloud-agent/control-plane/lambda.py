@@ -2204,6 +2204,42 @@ PRESENCE_TEXT = {
 }
 
 
+# Exponential backoff for the two pushes a sleeping laptop can repeat forever:
+# the needs-input alert and "lost contact". Live on 2026-10-22: a closed MacBook
+# Neo parked on an old question dark-woke after every 10-minute sweep, so each
+# sweep paged "lost contact" and each wake re-entered needs-input and alerted
+# again — all night. The first alert for a subject goes out at once, then
+# 30m, 1h, 2h, … capped at one day (Levi: "max 1 day between notifications").
+# A NEW subject (a different question) starts over; so does a subject that has
+# been quiet for two full caps.
+ALERT_BACKOFF_BASE_SECONDS = 30 * 60
+ALERT_BACKOFF_MAX_SECONDS = 24 * 60 * 60
+
+
+def _alert_backoff(record, key, now):
+    """(allowed, record_to_store) for one alert about `key`. `record` is the
+    previous {key, count, lastAt} map from the site row (or None). Pure."""
+    record = record if isinstance(record, dict) else {}
+    last = _parse_iso(record.get("lastAt"))
+    count = int(record.get("count") or 0)
+    fresh = {"key": key, "count": 1, "lastAt": _iso(now)}
+    if record.get("key") != key or last is None or count < 1:
+        return True, fresh
+    elapsed = (now - last).total_seconds()
+    if elapsed >= 2 * ALERT_BACKOFF_MAX_SECONDS:
+        return True, fresh
+    wait = min(ALERT_BACKOFF_BASE_SECONDS * (2 ** (count - 1)), ALERT_BACKOFF_MAX_SECONDS)
+    if elapsed < wait:
+        return False, record
+    return True, {"key": key, "count": count + 1, "lastAt": _iso(now)}
+
+
+def _input_alert_key(site):
+    """What makes a needs-input alert "the same one again": the question when
+    the daemon reports it (1.14.0+), else the pending thread, else the site."""
+    return str(site.get("pendingQuestion") or site.get("pendingThreadId") or "")[:280]
+
+
 def _presence_fold(sites, now=None):
     """(presence, siteName) over a user's site rows — the Lambda's copy of
     `FinPresence.fold`: the first live needs-input site wins, then the first
@@ -2399,10 +2435,43 @@ def _presence_change_push(before, after, now):
     thread_id = (winner or {}).get("pendingThreadId") if presence == "needsInput" else None
     state = _activity_content_state(presence, site_name, now, thread_id=thread_id)
     if presence in ("needsInput", "working"):
-        alert = {"title": state["headline"], "body": state["detail"] or ""} if presence == "needsInput" else None
+        alert = _needs_input_alert(winner, state, site_name, now) if presence == "needsInput" else None
         attributes = {"agentName": str(after.get("agent") or "Fin"), "agentID": ""}
         return _push_live_activity(user_id, state, "update", attributes=attributes, alert=alert, now=now)
     return _push_live_activity(user_id, state, "end", now=now)
+
+
+def _needs_input_alert(site, state, site_name, now):
+    """The alert half of a needs-input tile push, or None when the backoff
+    says this site already alerted about the same question too recently —
+    the tile itself still updates silently. Says WHAT is needed when the
+    daemon reported it: its model-written headline as the title, the question
+    as the body. Stores the backoff on the site row; never raises."""
+    site = site or {}
+    headline = str(site.get("pendingHeadline") or "").strip()
+    question = " ".join(str(site.get("pendingQuestion") or "").split())
+    if headline:
+        state["headline"] = headline[:MAX_ACTIVITY_DETAIL_CHARS]
+    allowed, record = _alert_backoff(site.get("inputAlert"), _input_alert_key(site), now)
+    if site.get("siteId"):
+        try:
+            SITES_TABLE.update_item(
+                Key={"siteId": site["siteId"]},
+                UpdateExpression="SET #alert = :alert",
+                ExpressionAttributeNames={"#alert": "inputAlert"},
+                ExpressionAttributeValues={":alert": record},
+            )
+        except Exception as exc:  # noqa: BLE001 - the backoff is best-effort
+            LOG.warning("input-alert backoff write failed: %s", _scrub(exc))
+    if not allowed:
+        LOG.info("needs-input alert for %s suppressed by backoff (count %s)", site.get("siteId"), record.get("count"))
+        return None
+    if question:
+        body = "{}: {}".format(site_name, question) if site_name else question
+        body = body[:MAX_ACTIVITY_DETAIL_CHARS * 2]
+    else:
+        body = state["detail"] or ""
+    return {"title": state["headline"], "body": body}
 
 
 def _mark_message_pushed(user_id, message_id, now=None):
@@ -4255,6 +4324,22 @@ def site_heartbeat(event, site_id):
     # needs-input the moment its terminal is back (AwaitingUserInputMarker).
     if site.get("state") == "needs-input" and state not in ("needs-input", "unavailable"):
         updated.pop("pendingThreadId", None)
+    # What a needs-input daemon is blocked on (fin-agentd 1.14.0+): the tile
+    # and its alert say it instead of a bare "Fin needs your input". Same
+    # lifetime as pendingThreadId; a stale beat between keeps it.
+    # A beat that reports a question replaces BOTH fields, so a new question
+    # never wears the previous one's headline.
+    question = body.get("pendingQuestion")
+    if state == "needs-input" and isinstance(question, str) and question.strip():
+        updated["pendingQuestion"] = question.strip()[:280]
+        headline = body.get("pendingHeadline")
+        if isinstance(headline, str) and headline.strip():
+            updated["pendingHeadline"] = headline.strip()[:MAX_ACTIVITY_DETAIL_CHARS]
+        else:
+            updated.pop("pendingHeadline", None)
+    elif state not in ("needs-input", "unavailable"):
+        updated.pop("pendingQuestion", None)
+        updated.pop("pendingHeadline", None)
 
     try:
         # Conditional on `rev`: the drain above is a read-modify-write, and an
@@ -5259,14 +5344,18 @@ def _mark_stale_sites(now):
             continue
         if lease is None and site.get("lastHeartbeatAt") is None:
             continue  # enrolled, never beat: not stale, just not started yet
+        # A laptop that sleeps goes stale on every lid close — and its dark
+        # wakes renew it, so without this it is "lost" again every sweep.
+        page, lost_alert = _alert_backoff(site.get("lostContactAlert"), "lost-contact", now)
         try:
             SITES_TABLE.update_item(
                 Key={"siteId": site["siteId"]},
-                UpdateExpression="SET #state = :stale, rev = :next",
+                UpdateExpression="SET #state = :stale, rev = :next, #lost = :lost",
                 ConditionExpression="rev = :rev",
-                ExpressionAttributeNames={"#state": "state"},
+                ExpressionAttributeNames={"#state": "state", "#lost": "lostContactAlert"},
                 ExpressionAttributeValues={
                     ":stale": "stale", ":rev": int(site.get("rev") or 0), ":next": int(site.get("rev") or 0) + 1,
+                    ":lost": lost_alert,
                 },
             )
             marked.append(site["siteId"])
@@ -5278,7 +5367,11 @@ def _mark_stale_sites(now):
         # transition — never per tick, and never for a cloud worker (the EC2
         # sweep owns those) or a phone that simply went to sleep.
         if site.get("kind") in ("resident", "byo") and site.get("userId"):
-            _notify_lost_contact(site)
+            if page:
+                _notify_lost_contact(site)
+            else:
+                LOG.info("lost-contact page for %s suppressed by backoff (count %s)",
+                         site["siteId"], lost_alert.get("count"))
     return marked
 
 

@@ -158,11 +158,12 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
     /// to the plain content when the entitlement is missing or the update throws.
     private func communicationRequest(
         identifier: String, category: String, kind: String,
-        agentName: String, body: String, agentID: UUID
+        agentName: String, body: String, agentID: UUID, subtitle: String? = nil
     ) -> UNNotificationRequest {
         let name = agentName.isEmpty ? "Agent" : agentName
         let content = UNMutableNotificationContent()
         content.title = name
+        if let subtitle { content.subtitle = subtitle }
         content.body = Self.preview(of: body)
         content.sound = .default
         content.categoryIdentifier = category
@@ -215,13 +216,17 @@ final class AgentNotificationService: NSObject, UNUserNotificationCenterDelegate
         recordSignal(.inputRequested, agentID: agentID, agentName: agentName, text: question)
         guard !isAppActive else { return }
 
-        // fin.input: an Answer field, and the same message-style donation.
-        let request = communicationRequest(
-            identifier: "agent-input-\(agentID.uuidString)",
-            category: FinCommunicationNotification.inputCategory, kind: "agentInput",
-            agentName: agentName, body: question, agentID: agentID
-        )
-        UNUserNotificationCenter.current().add(request)
+        // fin.input: an Answer field, and the same message-style donation. The
+        // subtitle says what's needed, from the on-device model when there is one.
+        Task { @MainActor in
+            let headline = await OnDeviceInputHeadline.headline(for: question)
+            let request = self.communicationRequest(
+                identifier: "agent-input-\(agentID.uuidString)",
+                category: FinCommunicationNotification.inputCategory, kind: "agentInput",
+                agentName: agentName, body: question, agentID: agentID, subtitle: headline
+            )
+            try? await UNUserNotificationCenter.current().add(request)
+        }
     }
 
     /// Posts "the agent may need a look" — the watchdog's wedge ping, softer than a

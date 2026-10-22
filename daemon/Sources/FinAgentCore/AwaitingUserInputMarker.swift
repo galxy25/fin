@@ -11,12 +11,17 @@ public struct AwaitingUserInputState: Codable, Equatable, Sendable {
     public var messageID: String?
     public var threadID: String?
     public var since: Date
+    /// The short "what's needed" title (`InputHeadline`) — written once the model (or
+    /// the fallback) produced it, so the heartbeat can carry it and a restart doesn't
+    /// re-generate it. Optional: markers from before 1.14.0 don't have it.
+    public var headline: String?
 
-    public init(question: String, messageID: String?, threadID: String?, since: Date) {
+    public init(question: String, messageID: String?, threadID: String?, since: Date, headline: String? = nil) {
         self.question = question
         self.messageID = messageID
         self.threadID = threadID
         self.since = since
+        self.headline = headline
     }
 }
 

@@ -802,6 +802,10 @@ final class Daemon {
     /// way an answer reaches a headless daemon), mirroring the app's
     /// suppress-on-request_input semantics at daemon scale.
     private(set) var awaitingUserInput = false
+    /// What `awaitingUserInput` is blocked on — the question and its short headline
+    /// (`InputHeadline`, nil until the model or the fallback produced one) — for the
+    /// heartbeat's `pendingQuestion`/`pendingHeadline`. Restored from the marker.
+    private(set) var pendingInput: (question: String, headline: String?)?
     /// The control-plane message the in-flight turn is answering, for the
     /// `answered` ack — and for the request-input push, which names it so the
     /// control plane pushes that message once (the question, not the reply).
@@ -1767,15 +1771,34 @@ final class Daemon {
         engine.onRequestInput = { [weak self] question in
             guard let self else { return }
             self.log("request_input: \(question)")
-            // Names the claimed message (when this turn is answering one) so the
-            // control plane counts THIS time-sensitive question as the message's
-            // one push and suppresses the answered ack's fin.reply — the model's
-            // closing text usually just restates the question (design §3.7.3).
-            self.notify(
-                event: "request-input", message: question,
-                messageID: self.inFlightSiteMessageID, threadID: self.inFlightThreadID
-            )
+            // Captured now: by the time the headline is back the turn may have moved on.
+            let messageID = self.inFlightSiteMessageID
+            let threadID = self.inFlightThreadID
             self.pauseHeartbeatForUserInput(question: question)
+            // The push title says WHAT is needed (Levi, 2026-10-22), written by this
+            // daemon's own brain — bounded, with a deterministic fallback, so a busy or
+            // unloaded model only costs the title, never the push.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let agent = self.config.agent
+                let headline = await InputHeadline.generate(question: question) { question in
+                    try await rawCompletion(
+                        instruction: InputHeadline.instruction, input: question,
+                        endpointURL: agent.endpointURL, model: agent.modelIdentifier, apiKey: agent.apiKey,
+                        temperature: 0.2, maxOutputTokens: 400
+                    )
+                }
+                self.log("request_input headline: \(headline)")
+                self.recordPendingInputHeadline(headline, for: question)
+                // Names the claimed message (when this turn is answering one) so the
+                // control plane counts THIS time-sensitive question as the message's
+                // one push and suppresses the answered ack's fin.reply — the model's
+                // closing text usually just restates the question (design §3.7.3).
+                self.notify(
+                    event: "request-input", message: question,
+                    messageID: messageID, threadID: threadID, title: headline
+                )
+            }
         }
         // The model's monitor tool drives the daemon's own heartbeat loop.
         engine.onMonitorStart = { [weak self] requested in
@@ -2116,6 +2139,7 @@ final class Daemon {
                 transcript?.siteID8 = client.siteID8
                 transcript?.siteName = client.displayName
                 memoryConsolidator?.terminalPanesProvider = { [weak self] in self?.lastPaneObservations ?? [] }
+                await client.setPendingInputProvider { @MainActor [weak self] in self?.pendingInput }
                 siteClient = client
                 await client.start()
                 log("site heartbeat enabled: \(client.displayName) (\(client.siteID8)) every \(client.heartbeatSeconds)s")
@@ -2556,6 +2580,7 @@ final class Daemon {
     /// re-fires the notify hook — live-proven as one push notification per interval,
     /// forever. The daemon stays connected and keeps polling; only beats pause.
     func pauseHeartbeatForUserInput(question: String) {
+        pendingInput = (question, nil)
         // Persisted BEFORE the in-memory flag flips — see `restoreAwaitingUserInput`:
         // a daemon that crashes between the two must still find the marker on restart.
         AwaitingUserInputMarker.write(
@@ -2579,6 +2604,7 @@ final class Daemon {
         // message must still delete the marker so a LATER restart doesn't resurrect a
         // pause that was already answered.
         AwaitingUserInputMarker.clear(at: awaitingUserInputStatePath)
+        pendingInput = nil
         guard awaitingUserInput else { return }
         awaitingUserInput = false
         let line = "[monitor] resumed — user input received"
@@ -2598,11 +2624,24 @@ final class Daemon {
     func restoreAwaitingUserInput() {
         guard let state = AwaitingUserInputMarker.state(at: awaitingUserInputStatePath) else { return }
         awaitingUserInput = true
+        pendingInput = (state.question, state.headline)
         inFlightSiteMessageID = inFlightSiteMessageID ?? state.messageID
         inFlightThreadID = inFlightThreadID ?? state.threadID
         let line = "[monitor] restored paused-awaiting-input from a prior run: \(state.question)"
         log(line)
         record(AgentAuditEvent(kind: "notice", text: line))
+    }
+
+    /// Stores a finished headline in memory and in the marker — only if the daemon is
+    /// still blocked on the SAME question (an answer may have landed while the model
+    /// was writing it).
+    func recordPendingInputHeadline(_ headline: String, for question: String) {
+        guard let pending = pendingInput, pending.question == question else { return }
+        pendingInput = (question, headline)
+        if var marker = AwaitingUserInputMarker.state(at: awaitingUserInputStatePath), marker.question == question {
+            marker.headline = headline
+            AwaitingUserInputMarker.write(marker, at: awaitingUserInputStatePath)
+        }
     }
 
     /// TASK COMPLETE's fork. Returns true when the process should exit; under
@@ -2694,6 +2733,7 @@ final class Daemon {
             },
             onCommand: { @MainActor [weak self] command in self?.handleSiteCommand(command) }
         )
+        await client.setPendingInputProvider { @MainActor [weak self] in self?.pendingInput }
         siteClient = client
         await client.start()
         log("site heartbeat enabled before the terminal is ready: \(client.displayName) "
@@ -3051,10 +3091,12 @@ final class Daemon {
     /// configured, and the shell hook when `notifyCommand` is. Both fire when both are
     /// present; failures on either are logged and swallowed — a broken notifier must
     /// never take down the agent.
-    private func notify(event: String, message: String, messageID: String? = nil, threadID: String? = nil) {
+    private func notify(
+        event: String, message: String, messageID: String? = nil, threadID: String? = nil, title: String? = nil
+    ) {
         if let client = notifyClient {
             lastNotifyTask = Task {
-                await client.send(event: event, message: message, messageID: messageID, threadID: threadID)
+                await client.send(event: event, message: message, messageID: messageID, threadID: threadID, title: title)
             }
         }
         runNotifyCommand(event: event, message: message)
