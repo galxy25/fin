@@ -1780,16 +1780,7 @@ final class Daemon {
             // unloaded model only costs the title, never the push.
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let agent = self.config.agent
-                let headline = await InputHeadline.generate(question: question) { question in
-                    try await rawCompletion(
-                        instruction: InputHeadline.instruction, input: question,
-                        endpointURL: agent.endpointURL, model: agent.modelIdentifier, apiKey: agent.apiKey,
-                        temperature: 0.2, maxOutputTokens: 400
-                    )
-                }
-                self.log("request_input headline: \(headline)")
-                self.recordPendingInputHeadline(headline, for: question)
+                let headline = await self.generateInputHeadline(for: question)
                 // Names the claimed message (when this turn is answering one) so the
                 // control plane counts THIS time-sensitive question as the message's
                 // one push and suppresses the answered ack's fin.reply — the model's
@@ -2630,6 +2621,28 @@ final class Daemon {
         let line = "[monitor] restored paused-awaiting-input from a prior run: \(state.question)"
         log(line)
         record(AgentAuditEvent(kind: "notice", text: line))
+        // A marker from before 1.14.0 (or a crash mid-generation) has no headline yet;
+        // write one now so the heartbeat can say what's needed. No push — the question
+        // was already pushed when it was asked.
+        if state.headline == nil {
+            let question = state.question
+            Task { @MainActor [weak self] in _ = await self?.generateInputHeadline(for: question) }
+        }
+    }
+
+    /// `InputHeadline` from this daemon's own brain; logs and records the result.
+    func generateInputHeadline(for question: String) async -> String {
+        let agent = config.agent
+        let headline = await InputHeadline.generate(question: question) { question in
+            try await rawCompletion(
+                instruction: InputHeadline.instruction, input: question,
+                endpointURL: agent.endpointURL, model: agent.modelIdentifier, apiKey: agent.apiKey,
+                temperature: 0.2, maxOutputTokens: 400
+            )
+        }
+        log("request_input headline: \(headline)")
+        recordPendingInputHeadline(headline, for: question)
+        return headline
     }
 
     /// Stores a finished headline in memory and in the marker — only if the daemon is
