@@ -2421,6 +2421,7 @@ final class Daemon {
                 sessionInventoryScanner?.tickIfDue()
                 sessionActivitySummarizer?.tickIfDue()
                 if let goalsSync { Task { await goalsSync.tickIfDue() } }
+                revalidateAwaitingUserInputIfDue()
                 if heartbeatEnabled, !beatsAreSuspended, Date() >= beatAt { break }
                 try? await Task.sleep(for: .milliseconds(250))
             }
@@ -2643,6 +2644,27 @@ final class Daemon {
         log("request_input headline: \(headline)")
         recordPendingInputHeadline(headline, for: question)
         return headline
+    }
+
+    private var lastAwaitingRevalidation = Date.distantPast
+
+    /// Lifts a mission question's pause once nothing needs its answer any more (see
+    /// `AwaitingUserInputRevalidation`). Silent: no push — the next tick re-decides,
+    /// and asks again itself if it still has to.
+    func revalidateAwaitingUserInputIfDue(now: Date = Date()) {
+        guard awaitingUserInput,
+              now.timeIntervalSince(lastAwaitingRevalidation) >= AwaitingUserInputRevalidation.checkInterval
+        else { return }
+        lastAwaitingRevalidation = now
+        guard let state = AwaitingUserInputMarker.state(at: awaitingUserInputStatePath),
+              let reason = AwaitingUserInputRevalidation.releaseReason(
+                state, ledger: LedgerDocument.loadIfPresent(at: URL(fileURLWithPath: goalsLedgerPath)), now: now
+              )
+        else { return }
+        let line = "[monitor] released stale request_input pause (\(reason)): \(state.question)"
+        log(line)
+        record(AgentAuditEvent(kind: "notice", text: line))
+        resumeHeartbeatAfterUserInput()
     }
 
     /// Stores a finished headline in memory and in the marker — only if the daemon is

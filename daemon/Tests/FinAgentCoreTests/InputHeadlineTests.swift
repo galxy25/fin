@@ -45,3 +45,33 @@ final class InputHeadlineTests: XCTestCase {
         XCTAssertNil(state.headline)
     }
 }
+
+/// The 2026-10-22 Neo case: a mission question about a goal Levi had dropped
+/// two weeks earlier kept the daemon paused (and paging) indefinitely.
+final class AwaitingUserInputRevalidationTests: XCTestCase {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    func state(messageID: String? = nil, ageHours: Double = 2) -> AwaitingUserInputState {
+        AwaitingUserInputState(question: "Where is data-anamoly-reporter-agent?", messageID: messageID,
+                               threadID: nil, since: now.addingTimeInterval(-ageHours * 3600))
+    }
+
+    func ledger(_ states: GoalState...) -> LedgerDocument {
+        LedgerDocument(goals: states.enumerated().map { Goal(id: "g\($0.offset)", title: "t", state: $0.element) })
+    }
+
+    func testAMissionQuestionIsReleasedOnceNoGoalIsOpen() {
+        XCTAssertNotNil(AwaitingUserInputRevalidation.releaseReason(state(), ledger: ledger(.done, .done), now: now))
+        XCTAssertNil(AwaitingUserInputRevalidation.releaseReason(state(), ledger: ledger(.done, .blocked), now: now))
+    }
+
+    func testAMissionQuestionIsReDecidedAfterADay() {
+        XCTAssertNotNil(AwaitingUserInputRevalidation.releaseReason(state(ageHours: 25), ledger: ledger(.open), now: now))
+        XCTAssertNil(AwaitingUserInputRevalidation.releaseReason(state(ageHours: 23), ledger: nil, now: now))
+    }
+
+    func testAQuestionAskedInAConversationWaitsForTheAnswer() {
+        let asked = state(messageID: "m-1", ageHours: 300)
+        XCTAssertNil(AwaitingUserInputRevalidation.releaseReason(asked, ledger: ledger(.done), now: now))
+    }
+}

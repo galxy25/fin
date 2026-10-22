@@ -34,6 +34,36 @@ public struct AwaitingUserInputState: Codable, Equatable, Sendable {
 /// its own thread-reuse dedup — could mint a second "stalled" thread for one stall.
 /// Deleted the moment the block lifts, so a stale marker never survives past the
 /// question it named.
+/// When a request_input pause has outlived its reason. Live on 2026-10-22: the MacBook
+/// Neo sat paused for two weeks on "can't find tmux session data-anamoly-reporter-agent"
+/// — a question its mission tick asked about goal g-kio-rebase, which Levi dropped on
+/// 2026-10-07. Nothing ever re-checked, so the pause (and its needs-input pings)
+/// outlived the goal. Pure, so the rule is testable.
+public enum AwaitingUserInputRevalidation {
+    /// How often a paused daemon re-checks.
+    public static let checkInterval: TimeInterval = 10 * 60
+    /// A mission question still unanswered after this is re-decided from scratch: the
+    /// next tick sees the current ledger and sessions and asks again only if the
+    /// question still matters — at most daily, matching the push backoff cap.
+    public static let maxAge: TimeInterval = 24 * 60 * 60
+
+    /// Why to lift the pause, or nil to keep waiting. Only MISSION questions (no
+    /// `messageID`: asked by a heartbeat tick to drive a goal) are released — a
+    /// question asked inside a conversation with Levi waits for his answer.
+    public static func releaseReason(
+        _ state: AwaitingUserInputState, ledger: LedgerDocument?, now: Date = Date()
+    ) -> String? {
+        guard state.messageID == nil else { return nil }
+        if let ledger, !ledger.goals.contains(where: { $0.state != .done }) {
+            return "no open goal needs an answer any more"
+        }
+        if now.timeIntervalSince(state.since) >= maxAge {
+            return "unanswered for a day; re-deciding with the current ledger and sessions"
+        }
+        return nil
+    }
+}
+
 public enum AwaitingUserInputMarker {
     /// Nil on a missing or corrupt file — the same "unreadable is unblocked" fallback
     /// `StallNotifyMarker` uses: a broken marker must not wedge the daemon permanently
