@@ -54,6 +54,8 @@ struct RootView: View {
                     TerminalTabBarView()
                     routedContent
                 }
+            } else if entitlementStore.isCheckingEntitlements {
+                ProgressView()
             } else {
                 PaywallView()
             }

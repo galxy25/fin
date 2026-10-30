@@ -16,9 +16,17 @@ final class EntitlementStore: ObservableObject {
     @Published private(set) var isSubscribed = false
     @Published private(set) var ownsLifetime = false
     @Published private(set) var isLoadingProducts = false
+    /// False until the first `Transaction.currentEntitlements` pass finishes. Until then
+    /// "not subscribed" means "don't know yet", and the root view must not paywall on it.
+    @Published private(set) var hasResolvedEntitlements = false
     @Published var purchaseErrorMessage: String?
 
     @AppStorage("trialStartedAt") private var trialStartedAtRaw: Double = 0
+    /// Last verified answers, so a launch (or an offline one) after the trial ends doesn't
+    /// flash the paywall at someone who already paid. Overwritten by every real refresh,
+    /// so a revocation still lands the next time StoreKit answers.
+    @AppStorage("entitlementCachedLifetime") private var cachedLifetime = false
+    @AppStorage("entitlementCachedSubscribed") private var cachedSubscribed = false
 
     private var transactionUpdatesTask: Task<Void, Never>?
 
@@ -26,12 +34,16 @@ final class EntitlementStore: ObservableObject {
         if trialStartedAtRaw == 0 {
             trialStartedAtRaw = Date().timeIntervalSince1970
         }
+        ownsLifetime = cachedLifetime
+        isSubscribed = cachedSubscribed
         transactionUpdatesTask = Task { [weak self] in
             await self?.observeTransactionUpdates()
         }
         Task { [weak self] in
-            await self?.loadProducts()
+            // Entitlements first: they're answered from the local StoreKit cache, while
+            // products need the network. Waiting on products held the answer hostage.
             await self?.refreshEntitlements()
+            await self?.loadProducts()
         }
     }
 
@@ -51,6 +63,11 @@ final class EntitlementStore: ObservableObject {
 
     var isUnlocked: Bool {
         isSubscribed || ownsLifetime || isTrialActive
+    }
+
+    /// The root view shows a spinner, not the paywall, while this is true.
+    var isCheckingEntitlements: Bool {
+        !hasResolvedEntitlements && !isUnlocked
     }
 
     var yearlyProduct: Product? { products.first(where: { $0.id == Self.yearlyProductID }) }
@@ -136,5 +153,8 @@ final class EntitlementStore: ObservableObject {
         }
         isSubscribed = subscribed
         ownsLifetime = lifetime
+        cachedSubscribed = subscribed
+        cachedLifetime = lifetime
+        hasResolvedEntitlements = true
     }
 }
