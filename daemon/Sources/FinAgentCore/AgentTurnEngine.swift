@@ -483,7 +483,12 @@ public final class AgentTurnEngine {
     /// turn, when it differs from what the model is sent. The daemon wraps a user's
     /// message in an act-now preamble the model needs; the console, the pending-row
     /// handoff and the mirror match all want the user's exact words.
-    public func submit(_ text: String, displayText: String? = nil) async -> AgentTurnOutcome {
+    ///
+    /// `images`: pictures the model should SEE with this message (`image_url` parts),
+    /// by path — only for a brain configured as able to (`agent.supportsImages`).
+    public func submit(
+        _ text: String, displayText: String? = nil, images: [AgentImageReference] = []
+    ) async -> AgentTurnOutcome {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .failed("Empty message.") }
         guard !isBusy else { return .failed("The engine is already running a turn.") }
@@ -498,7 +503,7 @@ public final class AgentTurnEngine {
         pendingPrefill = nil
 
         turnStartMessageCount = transcript.messages.count
-        transcript.append(AgentMessage(role: .user, text: trimmed))
+        transcript.append(AgentMessage(role: .user, text: trimmed, images: images))
         record("userMessage", displayText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? trimmed)
         // Turn-visibility signal (item 6 of the message-delivery-reliability work): the
         // INSTANT the user message is recorded, before any tool call or LLM round trip —

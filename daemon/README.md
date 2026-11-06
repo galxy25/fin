@@ -53,6 +53,8 @@ Beyond `server`, `agent`, and `task`, every field is optional:
 | `transcript` | — | The cloud transcript (below) |
 | `controlPlane` | — | Endpoint + bearer token of the serverless control plane; turns notify events into APNs pushes (below) |
 | `site` | — | This body's identity on the control plane (below); requires `controlPlane` |
+| `agent.attachmentsDirectory` | `~/Fin/Attachments` | Where message attachments are saved (below: Attachments) |
+| `agent.supportsImages` | `false` | Vision model: image attachments also go to the model as `image_url` parts |
 
 ### Choosing a brain: a local server, or a hosted one
 
@@ -769,6 +771,40 @@ primary bid.
 Transcript lines gain `site_id8`, `site_name`, and — on a user line the daemon
 applied from the queue — `in_reply_to`, which is how the app collapses a message
 two bodies both applied.
+
+### Attachments (Xanadu, docs/XANADU.md)
+
+An offered message may carry `attachments` (`key`, `name`, `mime`, `size`,
+optional audio `transcript`, presigned GET `url`). The claim response's copy —
+freshly signed, and the only place `threadId` comes from — replaces the offer's
+and is kept in the held ledger. The download starts **at claim time**, off the
+heartbeat's path (the urls live an hour at most and a message can wait behind a
+long turn); the turn awaits it, and a message held across a restart is fetched
+at turn start instead. Each file lands in
+`<agent.attachmentsDirectory>/<threadId-or-messageId>/<safeName>` (default
+`~/Fin/Attachments`; `safeName` is the key's last component, `[A-Za-z0-9._-]`,
+≤ 96 chars; a clash becomes `name (2).ext`, `name (3).ext`…), and the user turn
+prompt gains:
+
+```
+Attached files (saved on this machine — work with them using your terminal tools):
+- /Users/…/Fin/Attachments/m-…/Q3_costs.xlsx (spreadsheet, 47 KB)
+- /Users/…/voice-note.m4a (audio, 1.2 MB) — transcript: "…"
+- report.pdf (PDF, 2.0 MB) (download failed: HTTP 403)
+```
+
+A failed download never drops the message — its line says why, so Fin can tell
+the user. The transcript, audit trail and episodic memory record the user's
+words plus one compact line, `[Attached: Q3 costs.xlsx (spreadsheet, 47 KB), …]`,
+never the long prompt.
+
+`agent.supportsImages: true` (default false — only for a vision model) also sends
+each png/jpeg/gif/webp attachment of at most 5 MiB to the model as an `image_url`
+part (base64 data URL) on that user message. Other image types (HEIC, TIFF) stay
+files only: one part the server cannot decode fails the whole request. The
+transcript holds the image as a path and reads the bytes only when a request is
+built; each image counts 1,500 estimated tokens, and history trimming strips
+older messages' images before it drops any text.
 
 ## Cloud transcript
 

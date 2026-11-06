@@ -536,11 +536,26 @@ struct AgentEndpointClient {
         return entries.compactMap { $0["id"] as? String }.sorted()
     }
 
-    private static func wireMessage(_ message: AgentMessage) -> [String: Any] {
+    static func wireMessage(_ message: AgentMessage) -> [String: Any] {
         var wire: [String: Any] = ["role": message.role.rawValue]
         // A tool-call turn legitimately has no prose; some servers reject `null` content
         // but accept an empty string, which is the safer thing to send.
         wire["content"] = message.text
+        // The content-ARRAY form only when an image actually rides along: a text-only
+        // model's chat template may not understand parts at all, so every message
+        // without one stays byte-identical to what was always sent. The bytes are read
+        // here, at wire time, from the path the transcript holds (`AgentImageReference`).
+        let imageURLs = message.images.compactMap { $0.dataURL() }
+        if !imageURLs.isEmpty {
+            var parts: [[String: Any]] = []
+            if !message.text.isEmpty {
+                parts.append(["type": "text", "text": message.text])
+            }
+            for url in imageURLs {
+                parts.append(["type": "image_url", "image_url": ["url": url]])
+            }
+            wire["content"] = parts
+        }
         if !message.toolCalls.isEmpty {
             wire["tool_calls"] = message.toolCalls.map { call in
                 [

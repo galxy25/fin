@@ -37,6 +37,8 @@ actor DaemonSiteClient {
         let id: String
         let text: String
         let source: String
+        /// Files the message carries (docs/XANADU.md), each with a presigned GET `url`.
+        var attachments: [MessageAttachment] = []
     }
 
     struct Command: Equatable {
@@ -67,7 +69,7 @@ actor DaemonSiteClient {
         var held: [HeldMessage]
         var unacked: [String]
 
-        struct HeldMessage: Codable, Equatable {
+        struct HeldMessage: Codable, Equatable, Sendable {
             let id: String
             let text: String
             let source: String
@@ -76,13 +78,23 @@ actor DaemonSiteClient {
             /// a thread of its own. Nil for a ledger written before threads
             /// existed; the daemon then reads the message as its own root.
             var threadID: String?
+            /// The offer's attachments, kept so a message held across a restart still
+            /// brings its files. Nil (absent from the ledger) when there are none — and
+            /// for every ledger written before attachments existed.
+            var attachments: [MessageAttachment]?
 
-            init(id: String, text: String, source: String, threadID: String? = nil) {
+            init(
+                id: String, text: String, source: String, threadID: String? = nil,
+                attachments: [MessageAttachment] = []
+            ) {
                 self.id = id
                 self.text = text
                 self.source = source
                 self.threadID = threadID
+                self.attachments = attachments.isEmpty ? nil : attachments
             }
+
+            var attachmentList: [MessageAttachment] { attachments ?? [] }
 
             /// Whether the sender chose the thread (a reply inside a thread view):
             /// then the control plane keeps that membership whatever the daemon
@@ -141,6 +153,20 @@ actor DaemonSiteClient {
         onURLs = handler
     }
 
+    /// Downloads a just-claimed message's attachments (docs/XANADU.md). Nil = no
+    /// claim-time download; the turn then fetches them itself.
+    func setAttachmentFetcher(_ fetcher: @escaping @Sendable (Ledger.HeldMessage) async -> [FetchedAttachment]) {
+        attachmentFetcher = fetcher
+    }
+
+    /// The claim-time download's result for a message, awaited if still running, and
+    /// forgotten once handed out. Nil when no download was started in this process
+    /// (a message held across a restart) — the caller downloads then.
+    func fetchedAttachments(for messageID: String) async -> [FetchedAttachment]? {
+        guard let task = attachmentDownloads.removeValue(forKey: messageID) else { return nil }
+        return await task.value
+    }
+
     func configure(
         runID: String?,
         transport: (@Sendable (URLRequest) async throws -> (Data, URLResponse))? = nil,
@@ -164,6 +190,8 @@ actor DaemonSiteClient {
     /// Fired after a successful claim so the daemon can preempt a heartbeat turn:
     /// a user's message should never wait behind minutes of reflective model time.
     private var onClaimed: (@Sendable () async -> Void)?
+    private var attachmentFetcher: (@Sendable (Ledger.HeldMessage) async -> [FetchedAttachment])?
+    private var attachmentDownloads: [String: Task<[FetchedAttachment], Never>] = [:]
     private(set) var role: String = "standby"
     private(set) var ledger: Ledger
     private(set) var isDraining = false
@@ -279,13 +307,23 @@ actor DaemonSiteClient {
         switch status {
         case 200..<300:
             // The claim answers with the public row, thread included; the heartbeat's
-            // offer does not carry it.
-            ledger.held.append(.init(
+            // offer does not carry it. Its attachments carry freshly signed urls (they
+            // live an hour at most), so they win over the offer's.
+            let claimed = Self.attachments(inResponse: data)
+            let held = Ledger.HeldMessage(
                 id: offer.id, text: offer.text, source: offer.source,
-                threadID: Self.threadID(inResponse: data)
-            ))
+                threadID: Self.threadID(inResponse: data),
+                attachments: claimed.isEmpty ? offer.attachments : claimed
+            )
+            ledger.held.append(held)
             persistLedger()
             audit("[site] claimed \(offer.id)")
+            // Download NOW, not when the turn starts: a message can wait behind a long
+            // turn, and the urls lapse. Off the heartbeat's path — the beat never waits
+            // on a 25 MiB file; the turn awaits the result (`fetchedAttachments`).
+            if !held.attachmentList.isEmpty, let attachmentFetcher {
+                attachmentDownloads[held.id] = Task { await attachmentFetcher(held) }
+            }
             await onClaimed?()
         case 409:
             // Another body won. Forget it; the row is theirs.
@@ -380,6 +418,11 @@ actor DaemonSiteClient {
     /// The `threadId` of a claim or ack response body, nil when absent — an older
     /// control plane answers without one and the daemon treats the message as
     /// its own root.
+    nonisolated static func attachments(inResponse data: Data) -> [MessageAttachment] {
+        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        return MessageAttachment.decodeList(object?["attachments"])
+    }
+
     nonisolated static func threadID(inResponse data: Data) -> String? {
         guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let threadID = object["threadId"] as? String, !threadID.isEmpty
@@ -449,8 +492,14 @@ actor DaemonSiteClient {
     nonisolated static func decodeHeartbeat(_ data: Data) -> HeartbeatResponse {
         let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         let messages = (object["messages"] as? [[String: Any]] ?? []).compactMap { entry -> Offer? in
-            guard let id = entry["id"] as? String, let text = entry["text"] as? String else { return nil }
-            return Offer(id: id, text: text, source: entry["source"] as? String ?? "app")
+            guard let id = entry["id"] as? String else { return nil }
+            // `text` may be empty — or, from a terse control plane, absent — when the
+            // message is only files (docs/XANADU.md); a message with neither is nothing.
+            let attachments = MessageAttachment.decodeList(entry["attachments"])
+            guard let text = entry["text"] as? String ?? (attachments.isEmpty ? nil : "") else { return nil }
+            return Offer(
+                id: id, text: text, source: entry["source"] as? String ?? "app", attachments: attachments
+            )
         }
         let commands = (object["commands"] as? [[String: Any]] ?? []).compactMap { entry -> Command? in
             guard let id = entry["id"] as? String, let kind = entry["kind"] as? String else { return nil }
