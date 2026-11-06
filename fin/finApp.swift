@@ -288,6 +288,14 @@ struct FinApp: App {
         }
 
         AgentNotificationService.shared.onOpenAgent = { [weak manager] agentID, originDeviceID8, threadID in
+            // A reply in a thread opens that thread in Xanadu — the one place a
+            // conversation lives (docs/XANADU.md). Thread-less taps (stall pages,
+            // needs-input) still open the console for that agent.
+            if let threadID,
+               let agent = try? container.mainContext.fetch(FetchDescriptor<Agent>()).first(where: { $0.id == agentID }) {
+                XanaduNavigator.shared.open(agentName: agent.name, threadID: threadID)
+                return
+            }
             manager?.pendingAgentOpen = SessionManager.PendingAgentOpen(
                 agentID: agentID, originDeviceID8: originDeviceID8, threadID: threadID
             )
@@ -442,6 +450,10 @@ struct FinApp: App {
             ?? agents.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
             ?? (agents.count == 1 ? agents.first : nil)
         guard let agent = match else { return }
+        if let threadID = target.threadID {
+            XanaduNavigator.shared.open(agentName: agent.name, threadID: threadID)
+            return
+        }
         sessionManager.pendingAgentOpen = SessionManager.PendingAgentOpen(
             agentID: agent.id, originDeviceID8: nil, threadID: target.threadID, forcesRemote: true
         )
