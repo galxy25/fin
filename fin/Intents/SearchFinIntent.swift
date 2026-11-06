@@ -32,7 +32,10 @@ struct SearchFinIntent: ShowInAppSearchResultsIntent {
         case .failure:
             return .result()
         case .ready(let agentID, let agentName, let text):
-            _ = await FinVoiceIntentCore.deliver(agentID: agentID, agentName: agentName, text: text)
+            // The app comes forward anyway (the system search intent requires
+            // it): land on Xanadu, on the thread the question went into.
+            let sent = await FinVoiceIntentCore.deliver(agentID: agentID, agentName: agentName, text: text)
+            XanaduNavigator.shared.open(agentName: agentName, threadID: sent.threadID)
             return .result()
         }
     }

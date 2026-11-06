@@ -35,6 +35,19 @@ struct AgentKeyView: View {
 
     private var agentKey: KeyMetadata? { agentKeys.first }
 
+    /// One interpolated literal per line, joined — a single `+` chain of
+    /// literals and interpolations timed out the type checker under load.
+    private static let cloudWorkersFooter: String = [
+        "Sends the private key to the write-only credential vault in",
+        "your own AWS Secrets Manager (as \u{201c}\(AgentSSHKey.secretService)\u{201d}, shared scope).",
+        "This app can never read it back — only cloud workers can,",
+        "at boot, where it is installed at \(AgentSSHKey.workerKeyPath)",
+        "before the agent starts, so a worker can reach the same",
+        "computers you granted above. Provision again any time to",
+        "replace it; to pull it back out of the cloud, delete",
+        "\u{201c}\(AgentSSHKey.secretService)\u{201d} in Connected Services.",
+    ].joined(separator: " ")
+
     var body: some View {
         Form {
             keySection
@@ -213,16 +226,7 @@ struct AgentKeyView: View {
         } header: {
             Text("Cloud Workers")
         } footer: {
-            Text("Sends the private key to the write-only credential vault in "
-                + "your own AWS Secrets Manager (as "
-                + "\u{201c}\(AgentSSHKey.secretService)\u{201d}, shared scope). "
-                + "This app can never read it back — only cloud workers can, "
-                + "at boot, where it is installed at \(AgentSSHKey.workerKeyPath) "
-                + "before the agent starts, so a worker can reach the same "
-                + "computers you granted above. Provision again any time to "
-                + "replace it; to pull it back out of the cloud, delete "
-                + "\u{201c}\(AgentSSHKey.secretService)\u{201d} in Connected "
-                + "Services.")
+            Text(Self.cloudWorkersFooter)
         }
     }
 
