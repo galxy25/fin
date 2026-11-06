@@ -2064,6 +2064,15 @@ class _FakeS3:
         keys = sorted(k for k in self.objects if k.startswith(prefix))
         return {"Contents": [{"Key": k} for k in keys]}
 
+    def head_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise lam.ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+        return {"ContentLength": len(self.objects[Key])}
+
+    def generate_presigned_url(self, method, Params, ExpiresIn):
+        self.presigned = getattr(self, "presigned", []) + [(method, Params, ExpiresIn)]
+        return "https://signed.invalid/{}?{}".format(Params["Key"], method)
+
 
 class MemoryProfileTests(unittest.TestCase):
     """updatedAt only advances when content actually changes (2026-09-17: a
@@ -3568,8 +3577,6 @@ class ForwardTests(unittest.TestCase):
         self.assertFalse(out["forwarded"])
         self.assertEqual(self.seen, {})
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class AccountDeletionTests(_SitesTestCase):
@@ -4107,3 +4114,222 @@ class ClientEventTests(unittest.TestCase):
         # No 403 from _require_site_scope's allow-list — a daemon must be able
         # to report a relay failure the same as the app can.
         lam._require_site_scope({"_siteId": "a4a1d987-0000-4000-8000-000000000000"}, "POST", ["client-events"])
+
+
+
+# --- message attachments (docs/XANADU.md) -------------------------------------
+
+
+class AttachmentSafeNameTests(unittest.TestCase):
+    def test_spaces_and_symbols_become_underscores_extension_kept(self):
+        self.assertEqual(lam._attachment_safe_name("Q3 costs.xlsx"), "Q3_costs.xlsx")
+        self.assertEqual(lam._attachment_safe_name("a  (final) é.pdf"), "a_final_.pdf")
+
+    def test_never_empty_and_never_a_dot_name(self):
+        for name in ("", "   ", "..", ".", "日本語", "___"):
+            self.assertEqual(lam._attachment_safe_name(name), "file", name)
+        self.assertEqual(lam._attachment_safe_name(".bashrc"), "bashrc")
+
+    def test_long_names_are_cut_to_96_keeping_the_extension(self):
+        safe = lam._attachment_safe_name("x" * 300 + ".numbers")
+        self.assertEqual(len(safe), 96)
+        self.assertTrue(safe.endswith(".numbers"))
+        self.assertEqual(len(lam._attachment_safe_name("y" * 300)), 96)
+
+
+class _AttachmentsTestCase(_ThreadsTestCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, lam, "S3", lam.S3)
+        self.s3 = _FakeS3()
+        lam.S3 = self.s3
+
+    def create(self, user="user-1", **body):
+        payload = {"agent": "Fin", "name": "Q3 costs.xlsx", "mime": "application/vnd.ms-excel", "size": 5}
+        payload.update(body)
+        return json.loads(lam.create_attachment({"_userId": user, "body": json.dumps(payload)})["body"])
+
+    def upload(self, user="user-1", data=b"bytes", **body):
+        """POST /attachments, then 'PUT' the bytes; returns the message entry."""
+        created = self.create(user=user, **body)
+        self.s3.objects[created["key"]] = data
+        return {"key": created["key"], "name": body.get("name", "Q3 costs.xlsx"),
+                "mime": body.get("mime", "application/vnd.ms-excel"), "size": len(data)}
+
+
+class CreateAttachmentTests(_AttachmentsTestCase):
+    def test_returns_a_caller_scoped_key_a_put_url_and_the_content_type_header(self):
+        result = self.create()
+        self.assertRegex(result["key"], r"^users/user-1/fin/attachments/fin/[0-9a-f-]{36}/Q3_costs\.xlsx$")
+        self.assertEqual(result["headers"], {"Content-Type": "application/vnd.ms-excel"})
+        method, params, _ttl = self.s3.presigned[-1]
+        self.assertEqual(method, "put_object")
+        # The signature binds Content-Type, so the client's header must match.
+        self.assertEqual(params["ContentType"], "application/vnd.ms-excel")
+        self.assertEqual(params["Key"], result["key"])
+        self.assertTrue(result["putUrl"])
+
+    def test_every_upload_gets_its_own_key(self):
+        self.assertNotEqual(self.create()["key"], self.create()["key"])
+
+    def test_bad_requests_are_400_and_oversize_is_413(self):
+        cases = (
+            ({"agent": "../x"}, 400),
+            ({"name": ""}, 400),
+            ({"name": 7}, 400),
+            ({"name": "a\nb"}, 400),
+            ({"mime": "excel"}, 400),
+            ({"mime": "text/plain\r\nX-Evil: 1"}, 400),
+            ({"size": -1}, 400),
+            ({"size": "5"}, 400),
+            ({"size": True}, 400),
+            ({"size": lam.MAX_ATTACHMENT_BYTES + 1}, 413),
+        )
+        for override, status in cases:
+            with self.assertRaises(lam.ApiError, msg=override) as caught:
+                self.create(**override)
+            self.assertEqual(caught.exception.status, status, override)
+
+    def test_exactly_the_cap_and_mime_parameters_are_fine(self):
+        self.create(size=lam.MAX_ATTACHMENT_BYTES, mime="text/plain; charset=utf-8")
+
+    def test_the_router_reaches_it_and_sites_cannot(self):
+        event = {"_userId": "user-1", "rawPath": "/attachments", "requestContext": {"http": {"method": "POST"}},
+                 "body": json.dumps({"agent": "Fin", "name": "a.png", "mime": "image/png", "size": 1})}
+        self.assertEqual(lam._route(event)["statusCode"], 200)
+        with self.assertRaises(lam.ApiError) as caught:
+            lam._require_site_scope({"_siteId": "s"}, "POST", ["attachments"])
+        self.assertEqual(caught.exception.status, 403)
+
+
+class MessageAttachmentTests(_AttachmentsTestCase):
+    def test_an_attachment_only_message_is_accepted_and_read_back_with_a_url(self):
+        entry = self.upload()
+        sent = self.send("", attachments=[entry])
+        self.assertEqual(sent["text"], "")
+        self.assertEqual(len(sent["attachments"]), 1)
+        got = sent["attachments"][0]
+        self.assertEqual({k: got[k] for k in entry}, entry)
+        self.assertEqual(got["url"], "https://example.invalid/" + entry["key"])
+        # Stored as-is, without a URL (a stored URL would expire).
+        self.assertEqual(self.row(sent["messageId"])["attachments"], [entry])
+        fetched = json.loads(lam.get_message({"_userId": "user-1"}, sent["messageId"])["body"])
+        self.assertEqual(fetched["attachments"][0]["url"], got["url"])
+
+    def test_text_may_be_omitted_entirely_when_attachments_are_present(self):
+        entry = self.upload()
+        payload = {"agent": "Fin", "attachments": [entry]}
+        sent = json.loads(lam.send_message({"_userId": "user-1", "body": json.dumps(payload)})["body"])
+        self.assertEqual(sent["text"], "")
+
+    def test_a_message_without_attachments_reads_back_an_empty_list(self):
+        self.assertEqual(self.send("hello")["attachments"], [])
+
+    def test_empty_text_without_attachments_is_still_400(self):
+        for extra in ({}, {"attachments": []}):
+            with self.assertRaises(lam.ApiError) as caught:
+                self.send("  ", **extra)
+            self.assertEqual(caught.exception.status, 400)
+
+    def test_transcript_is_kept_and_capped(self):
+        entry = dict(self.upload(name="voice note.m4a", mime="audio/mp4"), transcript="give me costs by quarter")
+        sent = self.send("", attachments=[entry])
+        self.assertEqual(sent["attachments"][0]["transcript"], "give me costs by quarter")
+        too_long = dict(entry, transcript="x" * (lam.MAX_ATTACHMENT_TRANSCRIPT_CHARS + 1))
+        with self.assertRaises(lam.ApiError) as caught:
+            self.send("", attachments=[too_long])
+        self.assertEqual(caught.exception.status, 413)
+
+    def test_a_foreign_key_a_key_never_uploaded_or_outside_the_prefix_is_400(self):
+        theirs = self.upload(user="user-2")
+        never = dict(self.upload(), key="users/user-1/fin/attachments/fin/nope/a.png")
+        outside = dict(self.upload(), key="users/user-1/fin/memory/x.json")
+        self.s3.objects["users/user-1/fin/memory/x.json"] = b"{}"
+        for bad in (theirs, never, outside):
+            with self.assertRaises(lam.ApiError, msg=bad["key"]) as caught:
+                self.send("look", attachments=[bad])
+            self.assertEqual(caught.exception.status, 400)
+        with self.assertRaises(lam.ApiError) as caught:
+            self.send("look", attachments=[never])
+        self.assertIn("attachment not uploaded", caught.exception.message)
+        self.assertEqual(len(lam.MESSAGES_TABLE.items), 0)
+
+    def test_more_than_eight_or_a_malformed_entry_is_400(self):
+        entry = self.upload()
+        many = [self.upload() for _ in range(lam.MAX_ATTACHMENTS_PER_MESSAGE + 1)]
+        for bad in (many, [entry, entry], "nope", [dict(entry, size="5")], [dict(entry, mime="bad")], ["x"]):
+            with self.assertRaises(lam.ApiError, msg=bad) as caught:
+                self.send("x", attachments=bad)
+            self.assertEqual(caught.exception.status, 400, bad)
+
+    def test_bytes_over_the_cap_are_refused_whatever_size_was_declared(self):
+        entry = self.upload()
+        self.s3.objects[entry["key"]] = b"x" * (lam.MAX_ATTACHMENT_BYTES + 1)
+        with self.assertRaises(lam.ApiError) as caught:
+            self.send("", attachments=[entry])
+        self.assertEqual(caught.exception.status, 413)
+
+    def test_a_retry_with_the_same_id_stays_a_no_op(self):
+        entry = self.upload()
+        first = self.send("", attachments=[entry], messageId="m-22222222-attach")
+        second = self.send("", attachments=[entry], messageId="m-22222222-attach")
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(first["attachments"][0]["key"], second["attachments"][0]["key"])
+        self.assertEqual(len(lam.MESSAGES_TABLE.items), 1)
+
+    def test_the_heartbeat_offer_and_the_claim_carry_signed_urls(self):
+        self.beat(self.imac)
+        entry = self.upload()
+        sent = self.send("", attachments=[entry])
+        offer = self.beat(self.imac)["messages"][0]
+        self.assertEqual(offer["id"], sent["messageId"])
+        self.assertEqual(offer["attachments"][0]["url"], "https://example.invalid/" + entry["key"])
+        self.assertEqual(offer["attachments"][0]["name"], "Q3 costs.xlsx")
+        _status, claimed = self.claim(self.imac, sent["messageId"])
+        self.assertEqual(claimed["attachments"][0]["key"], entry["key"])
+        plain = self.send("hello")
+        offers = {m["id"]: m for m in self.beat(self.imac, held=[sent["messageId"]])["messages"]}
+        self.assertEqual(offers[plain["messageId"]]["attachments"], [])
+
+    def test_an_attachment_only_thread_is_titled_by_its_file(self):
+        sent = self.send("", attachments=[self.upload()])
+        _status, body = self.list_threads()
+        titles = {t["threadId"]: t["title"] for t in body["threads"]}
+        self.assertEqual(titles[sent["messageId"]], "📎 Q3 costs.xlsx")
+        two = self.send("", attachments=[self.upload(), self.upload(name="b.png", mime="image/png")])
+        _status, thread = self.get_thread(two["messageId"])
+        self.assertEqual(thread["thread"]["title"], "📎 Q3 costs.xlsx +1")
+        self.assertEqual(len(thread["messages"][0]["attachments"]), 2)
+        texted = self.send("break down cost by quarter", attachments=[self.upload()])
+        _status, thread = self.get_thread(texted["messageId"])
+        self.assertEqual(thread["thread"]["title"], "break down cost by quarter")
+
+    def test_deleting_the_thread_deletes_its_files(self):
+        root = self.send("", attachments=[self.upload()])
+        self.send("and this", threadId=root["messageId"], attachments=[self.upload()])
+        kept = self.upload()
+        self.assertEqual(len(self.s3.objects), 3)
+        lam.delete_thread({"_userId": "user-1"}, root["messageId"])
+        self.assertEqual(list(self.s3.objects), [kept["key"]])
+
+
+class AttachmentDeployTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(_HERE, "deploy.sh")) as f:
+            cls.deploy_sh = f.read()
+
+    def test_the_route_is_registered(self):
+        self.assertIn("POST /attachments\n", self.deploy_sh)
+
+    def test_the_lambda_may_sign_puts_under_the_attachment_prefix(self):
+        block = self.deploy_sh.split('"Sid": "MessageAttachmentsWrite"', 1)[1].split("}", 1)[0]
+        self.assertIn("s3:PutObject", block)
+        resource = re.search(r'"Resource": "([^"]+)"', block).group(1)
+        key = lam.ATTACHMENT_KEY.format(user="u-1", agent="fin", uuid="abc", name="a.png")
+        pattern = DeviceStatusIamPolicySanityTests._arn_to_regex(resource)
+        self.assertRegex("arn:aws:s3:::test-bucket/" + key, pattern)
+
+
+if __name__ == "__main__":
+    unittest.main()

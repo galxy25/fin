@@ -229,7 +229,7 @@ failure never fails the route that caused it.
 
 | kind | actor | written by | detail |
 |---|---|---|---|
-| `message.queued` | device id8 / `user` | `POST /messages`, `/register` | messageId, source, routedBy, targetSiteId, authorSiteId8 |
+| `message.queued` | device id8 / `user` | `POST /messages`, `/register` | messageId, source, routedBy, targetSiteId, authorSiteId8, attachmentCount |
 | `message.claimed` | site id8 | `/claim` (first claim only; renewals are not transitions) | messageId, siteId8, claimedBy |
 | `message.applied` | site id8 | `/ack applied`, heartbeat `unacked` | messageId, siteId8, runId |
 | `thread.assigned` | `system` | `/ack applied` | messageId, threadId, reason |

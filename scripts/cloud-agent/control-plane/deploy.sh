@@ -551,6 +551,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/vault/*"
     },
     {
+      "Sid": "MessageAttachmentsWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/attachments/*"
+    },
+    {
       "Sid": "ArtifactsReadWrite",
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:DeleteObject"],
@@ -782,6 +788,7 @@ GET /sites
 POST /sites/{siteId}/heartbeat
 POST /sites/{siteId}/commands
 DELETE /sites/{siteId}
+POST /attachments
 POST /messages
 GET /messages
 GET /messages/{messageId}

@@ -4500,6 +4500,177 @@ MESSAGES_PER_HEARTBEAT = 10
 MAX_LISTED_MESSAGES = 50
 
 
+# --- message attachments (docs/XANADU.md "Wire contract") ---------------------
+# The app asks POST /attachments for a presigned PUT, uploads the bytes straight
+# to S3, then names the key in POST /messages. Rows store only the entry
+# ({key, name, mime, size, transcript?}); every read re-signs a GET, because a
+# stored URL would be dead long before the 14-day row is.
+ATTACHMENT_KEY = "users/{user}/fin/attachments/{agent}/{uuid}/{name}"
+ATTACHMENT_PREFIX = "users/{user}/fin/attachments/"
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_ATTACHMENTS_PER_MESSAGE = 8
+MAX_ATTACHMENT_TRANSCRIPT_CHARS = 8000
+MAX_ATTACHMENT_NAME_CHARS = 255
+MAX_ATTACHMENT_SAFE_NAME_CHARS = 96
+MAX_ATTACHMENT_KEY_CHARS = 1024
+# type/subtype, optionally followed by parameters ("text/plain; charset=utf-8").
+# No CR/LF anywhere: the value is replayed verbatim as a signed request header.
+ATTACHMENT_MIME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}(;[ \t]*[!-~][ -~]*)?$"
+)
+MAX_ATTACHMENT_MIME_CHARS = 255
+_UNSAFE_NAME_RUN = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _attachment_safe_name(name):
+    """`name` reduced to [A-Za-z0-9._-] (each run of anything else → "_"),
+    ≤ 96 chars with the extension kept, never empty ("file") and never a
+    dot-name ("." / ".." / ".hidden" lose their leading dots). The site uses
+    the same rule for the on-disk file name, so it is pinned by tests."""
+    safe = _UNSAFE_NAME_RUN.sub("_", str(name or "")).lstrip(".")
+    if not safe.strip("._-"):
+        safe = "file"
+    if len(safe) > MAX_ATTACHMENT_SAFE_NAME_CHARS:
+        stem, dot, ext = safe.rpartition(".")
+        if dot and stem and 0 < len(ext) <= 16:
+            safe = stem[:MAX_ATTACHMENT_SAFE_NAME_CHARS - len(ext) - 1] + "." + ext
+        else:
+            safe = safe[:MAX_ATTACHMENT_SAFE_NAME_CHARS]
+    return safe
+
+
+def _attachment_name(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError(400, "attachment name must be a non-empty string")
+    if len(value) > MAX_ATTACHMENT_NAME_CHARS:
+        raise ApiError(400, "attachment name exceeds {} characters".format(MAX_ATTACHMENT_NAME_CHARS))
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ApiError(400, "attachment name must not contain control characters")
+    return value
+
+
+def _attachment_mime(value):
+    if not isinstance(value, str) or len(value) > MAX_ATTACHMENT_MIME_CHARS or not ATTACHMENT_MIME_RE.match(value):
+        raise ApiError(400, "attachment mime must be a type/subtype media type")
+    return value
+
+
+def _attachment_size(value):
+    # bool is an int in Python; `true` is not a size.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ApiError(400, "attachment size must be a non-negative integer")
+    if value > MAX_ATTACHMENT_BYTES:
+        raise ApiError(413, "attachment exceeds {} bytes".format(MAX_ATTACHMENT_BYTES))
+    return value
+
+
+def _presign_put(key, content_type):
+    """A presigned PUT that binds Content-Type: the signature covers the
+    header, so the client must send exactly `content_type` (the route hands it
+    back in `headers`), and the stored object carries it for later GETs."""
+    return S3.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=PRESIGN_TTL_SECONDS,
+    )
+
+
+def create_attachment(event):
+    """POST /attachments — {agent, name, mime, size} → {key, putUrl, headers}.
+    Nothing is written here: the key is only reserved by its uuid, and
+    POST /messages checks the object actually landed (HEAD) before it will
+    reference it."""
+    body = _body(event)
+    agent = str(body.get("agent") or "").strip()
+    if not AGENT_NAME.match(agent):
+        raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    name = _attachment_name(body.get("name"))
+    mime = _attachment_mime(body.get("mime"))
+    _attachment_size(body.get("size"))
+    key = ATTACHMENT_KEY.format(
+        user=event["_userId"], agent=_key_slug(agent), uuid=str(uuid.uuid4()), name=_attachment_safe_name(name),
+    )
+    return _response(200, {"key": key, "putUrl": _presign_put(key, mime), "headers": {"Content-Type": mime}})
+
+
+def _validated_attachments(user_id, raw):
+    """POST /messages' `attachments`, each entry checked against the contract
+    and HEADed so a message can never point at bytes that were never uploaded.
+    Returns the entries to store (only the contract's fields, as given)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ApiError(400, "attachments must be an array")
+    if len(raw) > MAX_ATTACHMENTS_PER_MESSAGE:
+        raise ApiError(400, "at most {} attachments per message".format(MAX_ATTACHMENTS_PER_MESSAGE))
+    prefix = ATTACHMENT_PREFIX.format(user=user_id)
+    entries, seen = [], set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ApiError(400, "each attachment must be an object")
+        key = item.get("key")
+        if (not isinstance(key, str) or not key.startswith(prefix) or len(key) > MAX_ATTACHMENT_KEY_CHARS
+                or len(key) == len(prefix)):
+            raise ApiError(400, "attachment key must come from POST /attachments")
+        if key in seen:
+            raise ApiError(400, "the same attachment is listed twice")
+        seen.add(key)
+        entry = {
+            "key": key,
+            "name": _attachment_name(item.get("name")),
+            "mime": _attachment_mime(item.get("mime")),
+            "size": _attachment_size(item.get("size")),
+        }
+        transcript = item.get("transcript")
+        if transcript is not None:
+            if not isinstance(transcript, str):
+                raise ApiError(400, "attachment transcript must be a string")
+            if len(transcript) > MAX_ATTACHMENT_TRANSCRIPT_CHARS:
+                raise ApiError(413, "attachment transcript exceeds {} characters".format(MAX_ATTACHMENT_TRANSCRIPT_CHARS))
+            if transcript.strip():
+                entry["transcript"] = transcript
+        try:
+            head = S3.head_object(Bucket=BUCKET, Key=key)
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code") or "")
+            if code in ("404", "NoSuchKey", "NotFound", "403", "AccessDenied", "Forbidden"):
+                raise ApiError(400, "attachment not uploaded: {}".format(entry["name"]))
+            raise
+        # The presigned PUT cannot cap the body, so the real cap is enforced here.
+        if int(head.get("ContentLength") or 0) > MAX_ATTACHMENT_BYTES:
+            raise ApiError(413, "attachment exceeds {} bytes: {}".format(MAX_ATTACHMENT_BYTES, entry["name"]))
+        entries.append(entry)
+    return entries
+
+
+def _public_attachments(row):
+    """The stored entries, each with a fresh presigned GET. [] when none. A
+    shapeless entry (never written by send_message) is skipped, not fatal."""
+    out = []
+    for entry in row.get("attachments") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("key"), str):
+            continue
+        public = {k: entry[k] for k in ("key", "name", "mime", "size", "transcript") if k in entry}
+        public["url"] = _presign("get_object", entry["key"])
+        out.append(public)
+    return out
+
+
+def _message_label(row):
+    """What a message is called in a title or summary: its text, or for an
+    attachment-only message "📎 Q3 costs.xlsx" (+ "+N" for the rest)."""
+    text = str(row.get("text") or "").strip()
+    if text:
+        return text
+    names = [str(e.get("name") or "file") for e in (row.get("attachments") or []) if isinstance(e, dict)]
+    if not names:
+        return ""
+    label = "📎 " + names[0]
+    if len(names) > 1:
+        label += " +{}".format(len(names) - 1)
+    return label
+
+
 def _agent_key(user_id, agent):
     """fin-agents is keyed per (user, agent): an agent name is only unique
     within one user's account, never globally."""
@@ -4769,6 +4940,7 @@ def _public_message(row):
         "replyPreview": row.get("replyPreview"),
         "pushedAt": row.get("pushedAt"),
         "threadId": _thread_of(row),
+        "attachments": _public_attachments(row),
     }
 
 
@@ -4787,9 +4959,11 @@ def _owned_message(event, message_id):
 
 
 def send_message(event):
-    """POST /messages — {agent, text, messageId?, source?, context?}. Idempotent
-    on messageId: a retry with the same id is a no-op that returns the row as
-    it stands, so a flaky network can never double-send."""
+    """POST /messages — {agent, text, messageId?, source?, context?, threadId?,
+    attachments?}. Idempotent on messageId: a retry with the same id is a no-op
+    that returns the row as it stands, so a flaky network can never
+    double-send. `text` may be empty only when `attachments` is not
+    (docs/XANADU.md)."""
     body = _body(event)
     user_id = event["_userId"]
 
@@ -4797,10 +4971,15 @@ def send_message(event):
     if not AGENT_NAME.match(agent):
         raise ApiError(400, "agent must match [A-Za-z0-9][A-Za-z0-9._-]{0,62}")
     text = body.get("text")
-    if not isinstance(text, str) or not text.strip():
-        raise ApiError(400, "text must be a non-empty string")
+    if text is None and body.get("attachments"):
+        text = ""
+    if not isinstance(text, str):
+        raise ApiError(400, "text must be a string")
     if len(text) > MAX_MESSAGE_CHARS:
         raise ApiError(413, "text exceeds {} characters".format(MAX_MESSAGE_CHARS))
+    attachments = _validated_attachments(user_id, body.get("attachments"))
+    if not text.strip() and not attachments:
+        raise ApiError(400, "text must be a non-empty string")
     source = str(body.get("source") or "app").strip()
     if source not in MESSAGE_SOURCES:
         raise ApiError(400, "source must be one of {}".format(", ".join(MESSAGE_SOURCES)))
@@ -4844,6 +5023,8 @@ def send_message(event):
         "clarifyCandidates": candidates,
         "threadId": thread_id or message_id,
     }
+    if attachments:
+        row["attachments"] = attachments
     if thread_id:
         row["threadReason"] = "explicit"
     if pin:
@@ -4869,6 +5050,7 @@ def send_message(event):
         "routedBy": routed_by,
         "targetSiteId": pin or target,
         "authorSiteId8": row.get("authorSiteId8"),
+        "attachmentCount": len(attachments),
     }, now=now)
     return _response(200, _public_message(row))
 
@@ -4961,6 +5143,7 @@ def claim_message(event, message_id):
         "source": row.get("source"),
         "createdAt": row.get("createdAt"),
         "threadId": _thread_of(row),
+        "attachments": _public_attachments(row),
     })
 
 
@@ -5321,6 +5504,7 @@ def _heartbeat_dispatch(site, body, now):
                 "source": row.get("source"),
                 "createdAt": row.get("createdAt"),
                 "pinSiteId": row.get("pinSiteId"),
+                "attachments": _public_attachments(row),
             })
         if len(offers) >= MESSAGES_PER_HEARTBEAT:
             break
@@ -5863,7 +6047,7 @@ def _thread_summary(thread_id, messages, events):
     messages = sorted(messages, key=lambda r: r.get("createdAt") or "")
     root = next((m for m in messages if m.get("messageId") == thread_id), messages[0] if messages else {})
     stamps = [_message_activity_at(m) for m in messages] + [e.get("at") or "" for e in events]
-    title = str(root.get("text") or "").strip()
+    title = _message_label(root)
     if len(title) > MAX_THREAD_TITLE_CHARS:
         title = title[:MAX_THREAD_TITLE_CHARS - 1].rstrip() + "…"
     summary = {
@@ -5995,6 +6179,19 @@ def delete_thread(event, thread_id):
             deleted_messages += 1
         except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
             LOG.warning("thread delete: message %s: %s", message_id, _scrub(exc))
+    # The thread's uploaded files go with it (docs/XANADU.md). Only keys under
+    # the caller's own attachments prefix — send_message already enforced
+    # that, this re-checks rather than trusting a stored row.
+    prefix = ATTACHMENT_PREFIX.format(user=event["_userId"])
+    for member in members:
+        for entry in member.get("attachments") or []:
+            key = entry.get("key") if isinstance(entry, dict) else None
+            if not isinstance(key, str) or not key.startswith(prefix):
+                continue
+            try:
+                S3.delete_object(Bucket=BUCKET, Key=key)
+            except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
+                LOG.warning("thread delete: attachment %s: %s", key, _scrub(exc))
     LOG.info("thread deleted: %s (%d messages, %d events)", thread_id, deleted_messages, deleted_events)
     return _response(200, {"threadId": thread_id, "deletedMessages": deleted_messages, "deletedEvents": deleted_events})
 
@@ -6292,6 +6489,8 @@ def _route(event):
         return queue_site_command(event, parts[1])
     if method == "DELETE" and len(parts) == 2 and parts[0] == "sites":
         return delete_site(event, parts[1])
+    if method == "POST" and parts == ["attachments"]:
+        return create_attachment(event)
     if method == "POST" and parts == ["messages"]:
         return send_message(event)
     if method == "GET" and parts == ["messages"]:
