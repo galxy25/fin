@@ -35,23 +35,31 @@ enum FinVoiceIntentCore {
     /// `source` is the control plane's provenance tag: `"voice"` for anything
     /// Siri dictated (the App Intents, an Announce reply in the car), `"app"`
     /// for a reply typed into a notification's text field.
-    /// `threadID` (docs/THREADS.md §2): explicit thread membership, carried
-    /// from a notification whose payload named `fin.threadId`; nil roots a
-    /// new thread.
+    /// `threadID` (docs/THREADS.md §2): explicit thread membership — a
+    /// notification whose payload named `fin.threadId`, or a thread Siri was
+    /// told about. nil follows docs/XANADU.md's current-thread rule: the
+    /// message is a follow-up in the agent's current thread, unless
+    /// `startNewThread` asks for a new one. Whatever thread the message lands
+    /// in becomes current. Returns that thread too (nil without a control plane,
+    /// where threads don't exist).
     static func deliver(
-        agentID: UUID, agentName: String, text: String, source: String = "voice", threadID: String? = nil
-    ) async -> (delivered: Bool, messageID: String?) {
+        agentID: UUID, agentName: String, text: String, source: String = "voice", threadID: String? = nil,
+        startNewThread: Bool = false
+    ) async -> (delivered: Bool, messageID: String?, threadID: String?) {
         if CloudControlPlaneConfig.isConfigured {
             let id = ControlPlaneClient.newMessageID()
+            let target = XanaduCurrentThread.target(explicit: threadID, startNewThread: startNewThread, agent: agentName)
             var context = ControlPlaneClient.MessageContext(source: source)
-            context.threadID = threadID
+            context.threadID = target
             switch await ControlPlaneClient.sendMessage(agent: agentName, text: text, messageID: id, context: context) {
-            case .success: return (true, id)
-            case .failure: return (false, nil)
+            case .success(let row):
+                let landed = XanaduCurrentThread.adoptSend(messageID: id, sentThreadID: target, row: row, agent: agentName)
+                return (true, id, landed)
+            case .failure: return (false, nil, nil)
             }
         }
         let delivered = await CloudAgentChannel.sendMessage(agentID: agentID, agentName: agentName, text: text)
-        return (delivered, nil)
+        return (delivered, nil, nil)
     }
 
     /// Validates the dictated text and resolves the delivery target once, for
@@ -73,15 +81,22 @@ enum FinVoiceIntentCore {
         guard trimmed.count <= CloudAgentChannel.maxTextLength else {
             return .failure("That message is too long to send.")
         }
-        let candidates = candidateAgents(container: container)
-        guard let index = requestedTargetIndex(agents: candidates, requested: requested)
-                ?? preferredTargetIndex(cloudAgentNames: candidates.map(\.name)) else {
+        guard let agent = resolveAgent(container: container, preferringAgent: requested) else {
             return .failure(CloudControlPlaneConfig.isConfigured
                 ? "No agent is set up yet. Open Fin and add one first."
                 : "No cloud-hosted agent is set up. In Fin, set an agent's hosting to Fin's sites first.")
         }
-        let agent = candidates[index]
         return .ready(agentID: agent.id, agentName: agent.name, text: trimmed)
+    }
+
+    /// The delivery target alone — an explicit match on `requested`, else the
+    /// default rule — for intents whose payload is not dictated text (files).
+    @MainActor
+    static func resolveAgent(container: ModelContainer?, preferringAgent requested: String? = nil) -> (id: UUID, name: String)? {
+        let candidates = candidateAgents(container: container)
+        guard let index = requestedTargetIndex(agents: candidates, requested: requested)
+                ?? preferredTargetIndex(cloudAgentNames: candidates.map(\.name)) else { return nil }
+        return candidates[index]
     }
 
     /// The agents a voice message can be addressed to, as plain `(id, name)`
@@ -172,7 +187,7 @@ enum FinVoiceIntentCore {
     /// enough that a warm agent's reply is spoken back, short enough that the
     /// assistant session never appears to stall.
     @MainActor
-    static func askAndSpeak(message: String) async -> IntentDialog {
+    static func askAndSpeak(message: String, threadID: String? = nil) async -> IntentDialog {
         switch prepare(message: message, container: FinSharedState.modelContainer) {
         case .failure(let dialog):
             return dialog
@@ -185,8 +200,8 @@ enum FinVoiceIntentCore {
                     .filter { $0.kind == .assistantMessage }
                     .map(\.id)
             )
-            let (delivered, messageID) = await deliver(
-                agentID: agentID, agentName: agentName, text: text
+            let (delivered, messageID, _) = await deliver(
+                agentID: agentID, agentName: agentName, text: text, threadID: threadID
             )
             guard delivered else {
                 return IntentDialog("Couldn't reach \(agentName) — check the app's cloud settings and try again.")
@@ -241,18 +256,35 @@ struct SendToFinIntent: AppIntent {
     @Parameter(title: "Message", requestValueDialog: "What should I tell Fin?")
     var message: String
 
+    /// docs/XANADU.md: the thread this goes into. None ⇒ the current thread
+    /// (what Xanadu is showing), so a spoken follow-up continues the
+    /// conversation instead of rooting a new one.
+    @Parameter(title: "Thread", description: "The conversation to continue. Leave empty for the current one.")
+    var thread: FinThreadEntity?
+
+    init() {}
+
+    init(message: String, thread: FinThreadEntity? = nil) {
+        self.message = message
+        self.thread = thread
+    }
+
     static var parameterSummary: some ParameterSummary {
-        Summary("Send \(\.$message) to Fin")
+        Summary("Send \(\.$message) to Fin") {
+            \.$thread
+        }
     }
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        switch FinVoiceIntentCore.prepare(message: message, container: FinSharedState.modelContainer) {
+        switch FinVoiceIntentCore.prepare(
+            message: message, container: FinSharedState.modelContainer, preferringAgent: thread?.agentName
+        ) {
         case .failure(let dialog):
             return .result(dialog: dialog)
         case .ready(let agentID, let agentName, let text):
             let delivered = await FinVoiceIntentCore.deliver(
-                agentID: agentID, agentName: agentName, text: text
+                agentID: agentID, agentName: agentName, text: text, threadID: thread?.id
             ).delivered
             return .result(
                 dialog: delivered
@@ -284,13 +316,26 @@ struct AskFinIntent: AppIntent {
     @Parameter(title: "Question", requestValueDialog: "What do you want to ask Fin?")
     var message: String
 
+    /// None ⇒ the current thread; the answer lands there too.
+    @Parameter(title: "Thread", description: "The conversation to ask in. Leave empty for the current one.")
+    var thread: FinThreadEntity?
+
+    init() {}
+
+    init(message: String, thread: FinThreadEntity? = nil) {
+        self.message = message
+        self.thread = thread
+    }
+
     static var parameterSummary: some ParameterSummary {
-        Summary("Ask Fin \(\.$message)")
+        Summary("Ask Fin \(\.$message)") {
+            \.$thread
+        }
     }
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        .result(dialog: await FinVoiceIntentCore.askAndSpeak(message: message))
+        .result(dialog: await FinVoiceIntentCore.askAndSpeak(message: message, threadID: thread?.id))
     }
 }
 
@@ -344,6 +389,43 @@ struct FinAppShortcuts: AppShortcutsProvider {
             ],
             shortTitle: "Talk to Fin",
             systemImageName: "waveform.badge.mic"
+        )
+        // docs/XANADU.md — Siri as a participant in the current thread.
+        // "Share … with <name>" is deliberately NOT a phrase: it is the system
+        // share grammar ("share this with Mom"), the same trap "Tell Fin …" fell
+        // into in the car. "Give Fin a file" / "Have Fin analyze a file" are
+        // shaped like nothing in Siri's system domains; on 27.3 the intent is
+        // also a Siri AI tool, which is where "share this file with Fin and …"
+        // in free speech resolves.
+        AppShortcut(
+            intent: ShareFilesWithFinIntent(),
+            phrases: [
+                "Give \(.applicationName) a file",
+                "Have \(.applicationName) analyze a file",
+                "Hand \(.applicationName) some files",
+            ],
+            shortTitle: "Give Fin Files",
+            systemImageName: "paperclip"
+        )
+        AppShortcut(
+            intent: StartFinThreadIntent(),
+            phrases: [
+                "Start a new \(.applicationName) thread",
+                "New \(.applicationName) thread",
+                "Start a new thread in \(.applicationName)",
+            ],
+            shortTitle: "New Thread",
+            systemImageName: "plus.bubble"
+        )
+        AppShortcut(
+            intent: OpenXanaduIntent(),
+            phrases: [
+                "Show my \(.applicationName) conversation",
+                "Open \(.applicationName) Xanadu",
+                "Show the \(.applicationName) thread",
+            ],
+            shortTitle: "Open Conversation",
+            systemImageName: "bubble.left.and.text.bubble.right"
         )
     }
 }

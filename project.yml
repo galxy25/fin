@@ -154,6 +154,13 @@ targets:
         # not declared — there is no Intents extension.
         NSUserActivityTypes:
           - INSendMessageIntent
+          # Xanadu's onscreen context (docs/XANADU.md "Siri"): the visible
+          # thread as a FinThreadEntity, so "reply to this" resolves to it.
+          - dev.levischoen.fin.xanadu-thread
+        # Xanadu's composer: voice notes are recorded and transcribed ON the
+        # device; the transcript travels with the file (docs/XANADU.md).
+        NSMicrophoneUsageDescription: "Fin records voice notes you attach to a conversation."
+        NSSpeechRecognitionUsageDescription: "Fin transcribes your voice notes on this device so the text travels with the recording."
         # Live Activities (design §3.4): the attention tile the fin-widgets
         # extension renders. Declared on the app, not the extension — this is
         # the key ActivityKit checks before Activity.request and before a

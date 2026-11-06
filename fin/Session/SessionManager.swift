@@ -46,6 +46,15 @@ final class SessionManager: ObservableObject {
     /// server button — and one flag is what keeps them from presenting two.
     @Published var isServerPickerPresented = false
 
+    /// docs/XANADU.md decision 1: the conversation pane is the LANDING — true
+    /// at launch even with terminal tabs restored, so the app opens on Xanadu.
+    /// Every explicit terminal / browser gesture (`open`, tab selection, a
+    /// browser tab) clears it; Siri, an intent and the control strip's
+    /// conversation button set it again. Not persisted: every launch lands here.
+    @Published var showsXanadu = true
+
+    func showXanadu() { showsXanadu = true }
+
     /// One queued notification tap: which agent to open, and — when the payload
     /// carried it — which device the signal originated on. Origin is what the
     /// routing fork trusts first: every device keeps its OWN transcript for the
@@ -364,6 +373,7 @@ final class SessionManager: ObservableObject {
     /// that tab is the explicit gesture that revives it.
     func selectTab(offset: Int) {
         guard tabOrder.count > 1 else { return }
+        showsXanadu = false
         activeBrowserTabID = nil
         let current = activeServerID.flatMap { tabOrder.firstIndex(of: $0) } ?? 0
         let count = tabOrder.count
@@ -374,12 +384,14 @@ final class SessionManager: ObservableObject {
     /// Safari convention for ⌘9.
     func selectTab(at index: Int) {
         guard !tabOrder.isEmpty, index >= 0 else { return }
+        showsXanadu = false
         activeBrowserTabID = nil
         activeServerID = tabOrder[index >= 8 ? tabOrder.count - 1 : min(index, tabOrder.count - 1)]
     }
 
     @discardableResult
     func open(_ server: Server) -> TerminalSession {
+        showsXanadu = false
         activeBrowserTabID = nil
         activeServerID = server.id
         let session = session(for: server)
@@ -696,11 +708,13 @@ final class SessionManager: ObservableObject {
                 inputAvailable: inputAvailable
             ))
         }
+        showsXanadu = false
         activeBrowserTabID = id
     }
 
     func selectBrowserTab(_ id: String) {
         guard browserTabs.contains(where: { $0.id == id }) else { return }
+        showsXanadu = false
         activeBrowserTabID = id
     }
 

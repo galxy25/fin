@@ -299,6 +299,10 @@ enum ControlPlaneClient {
         let pushedAt: Date?
         let claimedAt: Date?
         let appliedRunId: String?
+        /// docs/XANADU.md: the files riding on this message, each with a fresh
+        /// presigned GET `url`. `[]` (or absent, from an older control plane)
+        /// when there are none.
+        var attachments: [MessageAttachment]? = nil
 
         /// The thread the row belongs to, resolved the way the control plane
         /// resolves it: a row with no `threadId` is its own root.
@@ -321,7 +325,9 @@ enum ControlPlaneClient {
 
     /// The `POST /messages` body. Pure so the shape — `threadId` present only
     /// when the context names one — is pinned by a test without a transport.
-    static func sendMessageBody(agent: String, text: String, messageID: String, context: MessageContext) -> [String: Any] {
+    static func sendMessageBody(
+        agent: String, text: String, messageID: String, context: MessageContext, attachments: [MessageAttachment] = []
+    ) -> [String: Any] {
         var ctx: [String: Any] = ["device_id8": context.deviceID8, "activeSessionNames": context.activeSessionNames]
         if let hint = context.siteHint { ctx["siteHint"] = hint }
         var body: [String: Any] = [
@@ -330,11 +336,19 @@ enum ControlPlaneClient {
         if let thread = context.threadID?.trimmingCharacters(in: .whitespacesAndNewlines), !thread.isEmpty {
             body["threadId"] = thread
         }
+        // docs/XANADU.md: only when there are any — an attachment-less body is
+        // exactly what it was before attachments existed.
+        if !attachments.isEmpty {
+            body["attachments"] = attachments.prefix(MessageAttachment.maxPerMessage).map(\.requestFields)
+        }
         return body
     }
 
-    static func sendMessage(agent: String, text: String, messageID: String, context: MessageContext = .init()) async -> Result<Message, Failure> {
-        let body = sendMessageBody(agent: agent, text: text, messageID: messageID, context: context)
+    static func sendMessage(
+        agent: String, text: String, messageID: String, context: MessageContext = .init(),
+        attachments: [MessageAttachment] = []
+    ) async -> Result<Message, Failure> {
+        let body = sendMessageBody(agent: agent, text: text, messageID: messageID, context: context, attachments: attachments)
         return await perform(request("POST", path: "/messages", body: body))
             .flatMap { decode(Message.self, status: $0.0, body: $0.1) }
     }
@@ -350,6 +364,63 @@ enum ControlPlaneClient {
         await perform(request("GET", path: "/messages", query: ["agent": agent]))
             .flatMap { decode(MessagesResponse.self, status: $0.0, body: $0.1) }
             .map(\.messages)
+    }
+
+    // MARK: - Attachments (docs/XANADU.md "Wire contract")
+
+    /// `POST /attachments`'s answer: where the bytes go and with which headers.
+    struct AttachmentUpload: Decodable, Equatable {
+        let key: String
+        let putUrl: String
+        let headers: [String: String]
+
+        enum CodingKeys: String, CodingKey { case key, putUrl, headers }
+
+        init(key: String, putUrl: String, headers: [String: String]) {
+            self.key = key; self.putUrl = putUrl; self.headers = headers
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            key = try c.decode(String.self, forKey: .key)
+            putUrl = try c.decode(String.self, forKey: .putUrl)
+            headers = try c.decodeIfPresent([String: String].self, forKey: .headers) ?? [:]
+        }
+    }
+
+    /// A 25 MiB PUT over a phone connection takes far longer than a JSON call.
+    static let attachmentPutTimeout: TimeInterval = 300
+
+    static func attachmentUploadBody(agent: String, name: String, mime: String, size: Int) -> [String: Any] {
+        ["agent": agent, "name": name, "mime": mime, "size": size]
+    }
+
+    static func requestAttachmentUpload(agent: String, name: String, mime: String, size: Int) async -> Result<AttachmentUpload, Failure> {
+        await perform(request("POST", path: "/attachments", body: attachmentUploadBody(agent: agent, name: name, mime: mime, size: size)))
+            .flatMap { decode(AttachmentUpload.self, status: $0.0, body: $0.1) }
+    }
+
+    /// The presigned PUT: exactly the headers the control plane named and
+    /// NOTHING else — above all never the bearer token, which must not travel
+    /// to S3. nil for a URL that is not http(s).
+    static func attachmentPutRequest(_ upload: AttachmentUpload, body: Data) -> URLRequest? {
+        guard let url = URL(string: upload.putUrl), let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http" else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.timeoutInterval = attachmentPutTimeout
+        for (name, value) in upload.headers.sorted(by: { $0.key < $1.key }) {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        request.httpBody = body
+        return request
+    }
+
+    static func putAttachment(_ upload: AttachmentUpload, body: Data) async -> Result<Void, Failure> {
+        guard let request = attachmentPutRequest(upload, body: body) else { return .failure(.http(0, "bad upload URL")) }
+        return await perform(request).flatMap { status, _ in
+            (200...299).contains(status) ? .success(()) : .failure(.http(status, "upload rejected (HTTP \(status))"))
+        }
     }
 
     // MARK: - Threads (docs/THREADS.md §3; README "Threads")

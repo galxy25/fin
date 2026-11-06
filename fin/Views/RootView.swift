@@ -83,6 +83,14 @@ struct RootView: View {
         }
         .onChange(of: sessionManager.activeServerID) { _, _ in focusActiveTerminal() }
         .onChange(of: sessionManager.pendingAgentOpen) { _, _ in openPendingRemoteAgentIfNeeded() }
+        // Opening a file is an explicit gesture away from the conversation.
+        .onChange(of: lastActiveMarkdownTouchedAt) { _, _ in sessionManager.showsXanadu = false }
+        // Siri / an App Intent asked for the conversation (XanaduNavigator).
+        .onReceive(XanaduNavigator.shared.$request) { request in
+            guard request != nil else { return }
+            sessionManager.showXanadu()
+            sessionManager.isServerPickerPresented = false
+        }
         .onAppear { openPendingRemoteAgentIfNeeded() }
         // A tap queued while the paywall was up gets claimed the moment the
         // entitlement unlocks (see the isUnlocked guard in the claim itself).
@@ -289,6 +297,11 @@ struct RootView: View {
     }
 
     private var route: Route {
+        // docs/XANADU.md decision 1: the conversation pane is the landing, and
+        // where Siri brings the app. Any explicit terminal / browser / file
+        // gesture clears the flag (SessionManager, and the markdown observer
+        // below), handing the route back to the rules that follow.
+        if sessionManager.showsXanadu { return .home }
         // A browser tab in front wins: it only becomes active by an explicit tap, and
         // every terminal-tab gesture clears it (SessionManager.activeBrowserTabID).
         if let tab = sessionManager.activeBrowserTab { return .browser(tab) }

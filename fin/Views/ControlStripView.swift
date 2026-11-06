@@ -42,6 +42,14 @@ struct ControlStripView: View {
                 Image(systemName: "server.rack")
             }
             .accessibilityIdentifier("controlStrip_servers")
+            // docs/XANADU.md: the conversation pane, one tap from any terminal.
+            Button {
+                sessionManager.showXanadu()
+            } label: {
+                Image(systemName: "bubble.left.and.text.bubble.right")
+            }
+            .accessibilityLabel("Fin conversation")
+            .accessibilityIdentifier("controlStrip_xanadu")
             if let agent = agents.first {
                 Button {
                     // A cloud-hosted agent has no local runtime to panel-embed;

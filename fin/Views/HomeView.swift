@@ -1,13 +1,16 @@
 import SwiftUI
 
 struct HomeView: View {
-    private enum Mode: String, CaseIterable {
+    enum Mode: String, CaseIterable {
+        /// docs/XANADU.md: the conversation pane — first, and the landing.
+        case xanadu = "Fin"
         case terminal = "Terminal"
         case markdown = "Files"
         case agents = "Agents"
 
         var title: String {
             switch self {
+            case .xanadu: return "Fin"
             case .terminal: return "Servers"
             case .markdown: return "Files"
             case .agents: return "Agents"
@@ -23,18 +26,29 @@ struct HomeView: View {
     var isSheet: Bool = false
 
     @EnvironmentObject private var entitlementStore: EntitlementStore
+    @EnvironmentObject private var sessionManager: SessionManager
     @Environment(\.dismiss) private var dismiss
-    @State private var mode: Mode = .terminal
+    @State private var mode: Mode
     @State private var showsPaywall = false
     #if os(iOS)
     @State private var showsVoiceSetup = false
     #endif
 
+    /// The root route lands on Xanadu; the server-picker sheet (⌘T, the
+    /// control strip) is about terminals and has no conversation segment —
+    /// Xanadu is a pane, not something to open over a live terminal.
+    init(isSheet: Bool = false) {
+        self.isSheet = isSheet
+        _mode = State(initialValue: isSheet ? .terminal : .xanadu)
+    }
+
+    private var modes: [Mode] { isSheet ? Mode.allCases.filter { $0 != .xanadu } : Mode.allCases }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 Picker("Mode", selection: $mode) {
-                    ForEach(Mode.allCases, id: \.self) { mode in
+                    ForEach(modes, id: \.self) { mode in
                         Text(mode.rawValue)
                             .tag(mode)
                             .accessibilityIdentifier("homeMode_\(mode.rawValue)")
@@ -46,6 +60,9 @@ struct HomeView: View {
                 .accessibilityIdentifier("homeModePicker")
 
                 switch mode {
+                case .xanadu:
+                    XanaduView()
+                        .accessibilityIdentifier("xanaduView")
                 case .terminal:
                     ServerListView()
                 case .markdown:
@@ -59,6 +76,26 @@ struct HomeView: View {
             #if os(iOS) || os(visionOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            // Siri / an intent asked for the conversation: show it.
+            .onChange(of: sessionManager.showsXanadu) { _, shows in
+                if shows && !isSheet { mode = .xanadu }
+            }
+            .onReceive(XanaduNavigator.shared.$request) { request in
+                if request != nil && !isSheet { mode = .xanadu }
+            }
+            .toolbar {
+                // From Xanadu back to the terminal that was open underneath.
+                if mode == .xanadu, !isSheet, sessionManager.activeServerID != nil {
+                    ToolbarItem(placement: .navigation) {
+                        Button {
+                            sessionManager.showsXanadu = false
+                        } label: {
+                            Label("Terminal", systemImage: "terminal")
+                        }
+                        .accessibilityIdentifier("xanaduBackToTerminal")
+                    }
+                }
+            }
             // Always-available way to reach the Fin Pro subscription — the paywall
             // otherwise only appears once the 14-day trial lapses, so during the
             // trial (or for a reviewer on a fresh install) there was no way to see

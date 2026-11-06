@@ -301,3 +301,108 @@ enum ThreadMembership {
         TranscriptTurns.turns(from: records).contains { self.threadID(of: $0, threadOfMessage: threadOfMessage) == threadID }
     }
 }
+
+// MARK: - Attachments (docs/XANADU.md "Wire contract")
+
+/// One file riding on a control-plane message: what `POST /messages` takes
+/// (`key`, `name`, `mime`, `size`, optional audio `transcript`) and what the
+/// read routes hand back (the same entry plus a fresh presigned GET `url`).
+/// Foundation-only and shared with tvOS, which shows attachments read-only.
+struct MessageAttachment: Decodable, Equatable, Hashable, Identifiable {
+    /// `MAX_ATTACHMENT_BYTES` on the control plane (25 MiB).
+    static let maxBytes = 25 * 1024 * 1024
+    /// At most this many entries per message.
+    static let maxPerMessage = 8
+    /// An audio attachment's transcript is capped at this many characters.
+    static let maxTranscriptCharacters = 8000
+
+    let key: String
+    let name: String
+    let mime: String
+    let size: Int
+    let transcript: String?
+    /// The presigned GET — present on rows read back, never sent.
+    let url: URL?
+
+    var id: String { key }
+
+    init(key: String, name: String, mime: String, size: Int, transcript: String? = nil, url: URL? = nil) {
+        self.key = key; self.name = name; self.mime = mime; self.size = size
+        self.transcript = transcript; self.url = url
+    }
+
+    enum CodingKeys: String, CodingKey { case key, name, mime, size, transcript, url }
+
+    /// Lenient: only `key` is required, so a row a future control plane
+    /// shapes slightly differently still renders as a file rather than
+    /// failing the whole thread.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = try c.decode(String.self, forKey: .key)
+        let fallbackName = key.split(separator: "/").last.map(String.init) ?? "file"
+        let decodedName = (try? c.decodeIfPresent(String.self, forKey: .name)) ?? nil
+        name = (decodedName?.isEmpty == false ? decodedName : nil) ?? fallbackName
+        let decodedMIME = (try? c.decodeIfPresent(String.self, forKey: .mime)) ?? nil
+        mime = (decodedMIME?.isEmpty == false ? decodedMIME : nil) ?? "application/octet-stream"
+        if let whole = try? c.decodeIfPresent(Int.self, forKey: .size) {
+            size = whole
+        } else if let real = try? c.decodeIfPresent(Double.self, forKey: .size) {
+            size = Int(real)
+        } else {
+            size = 0
+        }
+        let text = (try? c.decodeIfPresent(String.self, forKey: .transcript)) ?? nil
+        transcript = text?.isEmpty == false ? text : nil
+        let link = (try? c.decodeIfPresent(String.self, forKey: .url)) ?? nil
+        url = link.flatMap(URL.init(string:))
+    }
+
+    enum Kind: Equatable { case image, audio, video, pdf, file }
+
+    var kind: Kind { Self.kind(ofMIME: mime) }
+
+    static func kind(ofMIME mime: String) -> Kind {
+        let lower = mime.lowercased()
+        if lower.hasPrefix("image/") { return .image }
+        if lower.hasPrefix("audio/") { return .audio }
+        if lower.hasPrefix("video/") { return .video }
+        if lower == "application/pdf" { return .pdf }
+        return .file
+    }
+
+    var systemImage: String {
+        switch kind {
+        case .image: return "photo"
+        case .audio: return "waveform"
+        case .video: return "film"
+        case .pdf: return "doc.richtext"
+        case .file: return "doc"
+        }
+    }
+
+    /// The `POST /messages` entry: never the `url` (that is the server's to
+    /// mint), the transcript only when there is one, capped to the contract.
+    var requestFields: [String: Any] {
+        var fields: [String: Any] = ["key": key, "name": name, "mime": mime, "size": size]
+        if let transcript = transcript?.trimmingCharacters(in: .whitespacesAndNewlines), !transcript.isEmpty {
+            fields["transcript"] = String(transcript.prefix(Self.maxTranscriptCharacters))
+        }
+        return fields
+    }
+
+    /// The control plane's `safeName` rule, mirrored for local staging paths:
+    /// `[A-Za-z0-9._-]` only, at most 96 characters, never empty, extension kept.
+    static func safeName(_ name: String) -> String {
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+        let reduced = String(name.map { allowed.contains($0) ? $0 : "_" })
+        guard reduced.contains(where: { $0 != "_" && $0 != "." }) else { return "file" }
+        guard reduced.count > 96 else { return reduced }
+        if let dot = reduced.lastIndex(of: "."), reduced.distance(from: dot, to: reduced.endIndex) <= 16 {
+            let ext = String(reduced[dot...])
+            return String(reduced.prefix(96 - ext.count)) + ext
+        }
+        return String(reduced.prefix(96))
+    }
+
+    var sizeLabel: String { ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file) }
+}

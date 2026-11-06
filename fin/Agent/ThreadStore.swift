@@ -76,6 +76,13 @@ final class ThreadStore: ObservableObject {
 
     func select(_ threadID: String?, byUser: Bool = true) {
         if byUser { userChoseSelection = true }
+        // docs/XANADU.md: opening a thread anywhere in the app makes it the
+        // current one — the thread Siri's follow-ups and Xanadu land on. Only a
+        // real choice (a tap, a notification, the hub sidebar) counts, never the
+        // default rule picking for the user.
+        if byUser, let threadID, !agentName.isEmpty {
+            XanaduCurrentThread.set(threadID, agent: agentName)
+        }
         guard threadID != selectedThreadID else { return }
         selectedThreadID = threadID
         let label = threadID.map { "thread " + String($0.prefix(8)) } ?? "all"
@@ -299,6 +306,13 @@ struct ThreadItem: Identifiable, Equatable {
     let source: Source
     /// Records keep their run/sequence so ties inside a second sort correctly.
     let sequence: Int
+    /// docs/XANADU.md: the control-plane message this item renders (a row, or
+    /// the transcript line that applied it), its files, and how it was sent
+    /// (`voice` = Siri, `app`, `agent`) — what Xanadu needs to show a prompt's
+    /// attachments and mark the ones Siri carried.
+    var messageID: String? = nil
+    var attachments: [MessageAttachment] = []
+    var origin: String? = nil
 }
 
 /// Pure: merge a thread's three sources — control-plane rows, transcript
@@ -340,7 +354,8 @@ enum ThreadTimeline {
                 items.append(ThreadItem(
                     id: "r:" + record.id, party: .levi(deviceID8: row?.authorSiteId8), kind: .prompt,
                     text: record.text, timestamp: record.timestamp,
-                    status: row.map { messageChips($0) } ?? [], source: .record, sequence: record.sequence
+                    status: row.map { messageChips($0) } ?? [], source: .record, sequence: record.sequence,
+                    messageID: record.inReplyTo, attachments: row?.attachments ?? [], origin: row?.source
                 ))
             case .assistantMessage:
                 guard !record.text.isEmpty, record.text != "(tool call only)" else { continue }
@@ -380,14 +395,18 @@ enum ThreadTimeline {
         // A row Fin authored (`source: "agent"` — a heartbeat question that
         // rooted its own thread) is Fin asking, not Levi prompting.
         for message in messages where !appliedMessageIDs.contains(message.messageId) {
-            guard let text = message.text, !text.isEmpty else { continue }
+            // docs/XANADU.md: a message may be files alone, with no text.
+            let files = message.attachments ?? []
+            let text = message.text ?? ""
+            guard !text.isEmpty || !files.isEmpty else { continue }
             let asked = message.source == "agent"
             items.append(ThreadItem(
                 id: "m:" + message.messageId,
                 party: asked ? .fin(siteID8: message.authorSiteId8) : .levi(deviceID8: message.authorSiteId8),
                 kind: asked ? .notify : .prompt,
                 text: text, timestamp: message.createdAt ?? .distantPast,
-                status: asked ? [] : messageChips(message), source: .message, sequence: 0
+                status: asked ? [] : messageChips(message), source: .message, sequence: 0,
+                messageID: message.messageId, attachments: files, origin: message.source
             ))
 
             // THE ANSWER, WHEN THE TRANSCRIPT HASN'T ARRIVED TO CARRY IT.
@@ -489,7 +508,8 @@ enum ThreadTimeline {
 
     private static func withStatus(_ item: ThreadItem, _ status: [String]) -> ThreadItem {
         ThreadItem(id: item.id, party: item.party, kind: item.kind, text: item.text, timestamp: item.timestamp,
-                   status: status, source: item.source, sequence: item.sequence)
+                   status: status, source: item.source, sequence: item.sequence,
+                   messageID: item.messageID, attachments: item.attachments, origin: item.origin)
     }
 
     /// The chips for a message row: its state, and who has it.
