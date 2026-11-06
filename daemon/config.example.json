@@ -14,7 +14,10 @@
     "contextWindowTokens": 8192,
     "maxOutputTokens": 640,
     "temperature": 0.2,
-    "heartbeatSeconds": 60
+    "heartbeatSeconds": 60,
+    "_attachments_note": "Optional. Files sent with a message (Xanadu) are saved under attachmentsDirectory/<threadId-or-messageId>/ (default ~/Fin/Attachments). supportsImages: true ONLY for a vision model — png/jpeg/gif/webp images up to 5 MiB then also ride to the model as image_url parts; a text-only model rejects them. See README: Attachments.",
+    "attachmentsDirectory": "~/Fin/Attachments",
+    "supportsImages": false
   },
   "task": "Watch the build in this terminal; if it fails, summarize the first error. When the build has finished successfully, end your reply with TASK COMPLETE.",
   "notifyCommand": "echo \"$FIN_EVENT :: $FIN_MESSAGE\" >> ~/fin-agentd-notify.log",

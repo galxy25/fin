@@ -188,6 +188,14 @@ struct DaemonConfig: Decodable {
         /// `AgentEngineConfiguration.historyTokenBudget`). Absent = the daemon default;
         /// 0 = no cap, fill the window.
         var historyTokenBudget: Int?
+        /// Where a message's attachments are saved (docs/XANADU.md):
+        /// `<this>/<threadId-or-messageId>/<safeName>`. Absent = `~/Fin/Attachments`.
+        var attachmentsDirectory: String?
+        /// Whether the brain can SEE: true sends each png/jpeg/gif/webp attachment of
+        /// at most 5 MiB to the model as an `image_url` part on that user message.
+        /// Absent/false = images are files on disk like everything else — the safe
+        /// default, since a text-only model rejects a request carrying image parts.
+        var supportsImages: Bool?
 
         /// `apiKey` in the file still decodes into `rawAPIKey`; everything else keeps
         /// its own name.
@@ -196,7 +204,7 @@ struct DaemonConfig: Decodable {
             case rawAPIKey = "apiKey"
             case contextWindowTokens, maxOutputTokens, temperature, systemPrompt
             case terminalContextLines, heartbeatSeconds, requestTimeoutSeconds
-            case historyTokenBudget
+            case historyTokenBudget, attachmentsDirectory, supportsImages
         }
     }
 
@@ -1077,8 +1085,11 @@ final class Daemon {
             log(line)
             record(AgentAuditEvent(kind: "notice", text: line))
         }
+        // What the transcript, audit trail and memory record: the user's words plus a
+        // compact `[Attached: …]` line — never the long prompt with its paths.
+        let displayText = DaemonAttachments.displayText(text, attachments: message.attachmentList)
         inFlightSiteMessageID = message.id
-        inFlightSiteMessageText = message.text
+        inFlightSiteMessageText = displayText
         retriedDecisionAnswer = false
         isTurnInFlight = true
         // Ack `applied` right after submit begins, not after the turn ends: the
@@ -1086,9 +1097,28 @@ final class Daemon {
         // admits, and the shorter it is the rarer a double apply.
         let runID = transcript?.runID.uuidString
         async let ack: String? = siteClient?.markApplied(message.id, runID: runID, thread: preTurn) ?? nil
+        // Attachments (docs/XANADU.md): normally already downloaded at claim time;
+        // a message held across a restart is fetched here from its ledger urls.
+        var fetched: [FetchedAttachment] = []
+        if !message.attachmentList.isEmpty {
+            if let early = await siteClient?.fetchedAttachments(for: message.id) {
+                fetched = early
+            } else {
+                fetched = await Self.attachmentFetcher(root: attachmentsRoot)(message)
+            }
+            let failed = fetched.filter { $0.path == nil }
+            let line = "[attachments] \(message.id.prefix(10)): \(fetched.count - failed.count) saved"
+                + (failed.isEmpty ? "" : ", \(failed.count) failed (\(failed.compactMap(\.failure).joined(separator: "; ")))")
+            log(line)
+            record(AgentAuditEvent(kind: "notice", text: line, isFailure: !failed.isEmpty))
+        }
+        let images = config.agent.supportsImages == true ? DaemonAttachments.imageReferences(fetched) : []
         sendSessionTargetsThisTurn = []
         setPromptMode?(.task)
-        let outcome = await engine.submit(Self.userTurnPrompt(text, source: message.source), displayText: text)
+        let outcome = await engine.submit(
+            Self.userTurnPrompt(text, source: message.source, attachments: fetched),
+            displayText: displayText, images: images
+        )
         setPromptMode?(.mission)
         // The control plane's answer to the applied ack is the thread the lines were
         // effectively stamped with (an explicit membership it kept, a proposal it
@@ -1190,13 +1220,46 @@ final class Daemon {
     /// Why: under the mission-tick rules a bare message was read as an ingest-only
     /// tick — goal_upsert, then "I am ready, what are the goals?" (live, three
     /// times on 2026-09-12). Said plainly, up front, every time.
-    nonisolated static func userTurnPrompt(_ text: String, source: String?) -> String {
+    ///
+    /// `attachments` (docs/XANADU.md): the message's files as saved on this machine,
+    /// appended as the "Attached files …" block. A message that is only files says so
+    /// in place of the empty text, so the model reads the files as the request.
+    nonisolated static func userTurnPrompt(
+        _ text: String, source: String?, attachments: [FetchedAttachment] = []
+    ) -> String {
         let via = source == "voice" ? "by voice" : (source.map { "via \($0)" } ?? "")
-        return "The user just sent you this message\(via.isEmpty ? "" : " " + via). Do exactly what it "
+        var body = text
+        if body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !attachments.isEmpty {
+            body = "(no text — the user sent only the attached files; look at them and tell the user what they are)"
+        }
+        var prompt = "The user just sent you this message\(via.isEmpty ? "" : " " + via). Do exactly what it "
             + "asks, NOW, in this turn, with your tools (read_session to find the pane, send_session to "
             + "talk to another agent's pane, send_input for your own shell). Then reply with what you "
             + "did and what you saw. Do not create or update ledger goals before acting, and never "
-            + "answer by asking what the mission is.\n\nMessage from the user:\n\(text)"
+            + "answer by asking what the mission is.\n\nMessage from the user:\n\(body)"
+        if let block = DaemonAttachments.promptBlock(attachments) {
+            prompt += "\n\n" + block
+        }
+        return prompt
+    }
+
+    /// `agent.attachmentsDirectory`, tilde-expanded; `~/Fin/Attachments` when unset.
+    var attachmentsRoot: String { DaemonAttachments.resolvedRoot(config.agent.attachmentsDirectory) }
+
+    /// Saves a held message's attachments under `<root>/<threadId-or-messageId>/`.
+    /// The thread is the one the claim response named (the heartbeat offer carries
+    /// none); a message with no thread yet is its own root, so its id is the folder.
+    nonisolated static func attachmentFetcher(
+        root: String, transport: @escaping DaemonAttachments.Transport = DaemonAttachments.defaultTransport
+    ) -> @Sendable (DaemonSiteClient.Ledger.HeldMessage) async -> [FetchedAttachment] {
+        { message in
+            let id = (message.threadID?.isEmpty == false ? message.threadID : nil) ?? message.id
+            return await DaemonAttachments.download(
+                message.attachmentList,
+                into: DaemonAttachments.folderPath(root: root, threadOrMessageID: id),
+                transport: transport
+            )
+        }
     }
 
     /// "Terminal panes right now" for the prompt, from the file `siteCapabilities`
@@ -2137,6 +2200,7 @@ final class Daemon {
                 transcript?.siteName = client.displayName
                 memoryConsolidator?.terminalPanesProvider = { [weak self] in self?.lastPaneObservations ?? [] }
                 await client.setPendingInputProvider { @MainActor [weak self] in self?.pendingInput }
+                await client.setAttachmentFetcher(Self.attachmentFetcher(root: attachmentsRoot))
                 siteClient = client
                 await client.start()
                 log("site heartbeat enabled: \(client.displayName) (\(client.siteID8)) every \(client.heartbeatSeconds)s")
@@ -2163,7 +2227,7 @@ final class Daemon {
             // launch task: the user is waiting on it, and "say hello and wait" is not.
             let text = held.text.trimmingCharacters(in: .whitespacesAndNewlines)
             log("applying held message \(held.id) before the launch task: \(text)")
-            pendingUserMessageForDigest = text
+            pendingUserMessageForDigest = DaemonAttachments.displayText(text, attachments: held.attachmentList)
             outcome = await runMessageTurn(held, text: text, engine: engine)
         } else if config.task.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // No launch turn at all. A resident site has nothing to say at boot, and a
@@ -2454,7 +2518,7 @@ final class Daemon {
                 if !heartbeatEnabled { _ = armMonitor(requestedSeconds: 0) }
                 let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 log("applying message \(message.id) (\(message.source)): \(text)")
-                pendingUserMessageForDigest = text
+                pendingUserMessageForDigest = DaemonAttachments.displayText(text, attachments: message.attachmentList)
                 outcome = await runMessageTurn(message, text: text, engine: engine)
                 inFlightDirectiveID = nil
                 continue
@@ -2775,6 +2839,7 @@ final class Daemon {
             onCommand: { @MainActor [weak self] command in self?.handleSiteCommand(command) }
         )
         await client.setPendingInputProvider { @MainActor [weak self] in self?.pendingInput }
+        await client.setAttachmentFetcher(Self.attachmentFetcher(root: attachmentsRoot))
         siteClient = client
         await client.start()
         log("site heartbeat enabled before the terminal is ready: \(client.displayName) "

@@ -35,6 +35,34 @@ struct AgentToolCall: Identifiable, Equatable {
     }
 }
 
+/// An image the model sees as an OpenAI-style `image_url` content part on a user
+/// message (docs/XANADU.md, "Site"). Held as a PATH, never as bytes: the bytes are read
+/// and base64-encoded only when a request is built (`dataURL()`), so a long-running
+/// transcript never carries megabytes of base64 from turn to turn, and once history
+/// trimming strips the reference nothing of the image is left in memory at all.
+public struct AgentImageReference: Codable, Equatable, Sendable {
+    public var path: String
+    public var mimeType: String
+
+    /// The largest image sent inline. A bigger image/* attachment is still on disk and
+    /// named in the prompt; it just does not ride to the model as pixels.
+    public static let maxBytes = 5 * 1024 * 1024
+
+    public init(path: String, mimeType: String) {
+        self.path = path
+        self.mimeType = mimeType
+    }
+
+    /// `data:<mime>;base64,<bytes>`, or nil when the file is gone, empty, or over
+    /// `maxBytes` — a vanished file costs the model the picture, never the request.
+    public func dataURL() -> String? {
+        guard let data = FileManager.default.contents(atPath: path),
+              !data.isEmpty, data.count <= Self.maxBytes
+        else { return nil }
+        return "data:\(mimeType);base64,\(data.base64EncodedString())"
+    }
+}
+
 struct AgentMessage: Identifiable {
     enum Role: String {
         case system, user, assistant, tool
@@ -62,6 +90,10 @@ struct AgentMessage: Identifiable {
     /// real recorded time (see `loadAgentHistory`), so the watchdog's staleness
     /// gate can tell an old restored conversation from live work.
     var timestamp: Date = Date()
+    /// Images sent with this (user) message as `image_url` parts. Empty for every
+    /// message that has none — the wire form is then the plain string content every
+    /// endpoint already accepts. History trimming strips these before dropping text.
+    var images: [AgentImageReference] = []
 
     mutating func setToolCallDuration(_ durationMS: Int, forCallID callID: String) {
         guard let index = toolCalls.firstIndex(where: { $0.id == callID }) else { return }
@@ -88,9 +120,16 @@ struct AgentTranscript {
     /// across a long transcript, and under-counting is what blows a request.
     private static let messageOverheadTokens = 4
 
+    /// Fixed, deliberately generous estimate for one image part. Real costs vary by
+    /// model and resolution (~765 tokens for a high-detail 1024px image on OpenAI, more
+    /// for a large photo on Qwen-VL); over-counting only trims sooner, under-counting
+    /// is what blows a request.
+    public static let estimatedTokensPerImage = 1_500
+
     var estimatedTokenCount: Int {
         wireMessages.reduce(0) { total, message in
             var cost = Self.estimatedTokens(message.text) + Self.messageOverheadTokens
+                + message.images.count * Self.estimatedTokensPerImage
             for call in message.toolCalls {
                 cost += Self.estimatedTokens(call.name) + Self.estimatedTokens(call.arguments)
             }
@@ -235,6 +274,13 @@ struct AgentTranscript {
         guard budget > 0, estimatedTokenCount > budget else { return false }
         let target = min(budget, max(1, target ?? budget))
 
+        // Images go first: an old picture costs as much as a page of text, and the
+        // prompt that carried it still names its path on disk, so losing the pixels
+        // loses the least. Oldest first; never the turn in progress, never the newest
+        // real user message (the same protection the text drop below keeps).
+        let strippedImages = stripImages(downTo: target, protectingLast: protectingLast)
+        guard estimatedTokenCount > target else { return strippedImages }
+
         // Anything before this index is preserved verbatim: the system prompt, plus the
         // compaction note itself once one exists.
         let preservedPrefix = messages.first?.role == .system && !(messages.first?.isLocalOnly ?? false) ? 1 : 0
@@ -279,10 +325,26 @@ struct AgentTranscript {
             if messages.count <= preservedPrefix + 1 { break }
         }
 
-        guard dropped > 0 else { return false }
+        guard dropped > 0 else { return strippedImages }
         droppedMessageCount += dropped
         updateCompactionNote(preservedPrefix: preservedPrefix)
         return true
+    }
+
+    /// Removes image parts from the oldest unprotected messages until the estimate fits
+    /// `target` or no strippable image is left. Returns whether any were removed.
+    private mutating func stripImages(downTo target: Int, protectingLast: Int) -> Bool {
+        let protectedStart = min(
+            max(0, messages.count - protectingLast),
+            messages.lastIndex { $0.role == .user && !$0.isLocalOnly } ?? messages.count
+        )
+        var stripped = false
+        for index in 0..<protectedStart where !messages[index].images.isEmpty {
+            guard estimatedTokenCount > target else { break }
+            messages[index].images = []
+            stripped = true
+        }
+        return stripped
     }
 
     private func isCompactionNote(_ message: AgentMessage) -> Bool {
