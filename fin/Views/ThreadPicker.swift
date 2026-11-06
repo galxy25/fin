@@ -10,17 +10,22 @@ struct ThreadPicker: View {
     /// Compact: chip glyph and a short title, for a header strip. Otherwise the
     /// full label with the chip's words.
     var compact = false
+    /// Xanadu shows ONE thread: there, no selection means "a new thread", not
+    /// "All activity", so the item is left out and the label says so.
+    var allowsAllActivity = true
 
     @State private var showsDebug = false
 
     var body: some View {
         Menu {
-            Button {
-                store.select(nil)
-            } label: {
-                Label("All activity", systemImage: store.selectedThreadID == nil ? "checkmark" : "list.bullet")
+            if allowsAllActivity {
+                Button {
+                    store.select(nil)
+                } label: {
+                    Label("All activity", systemImage: store.selectedThreadID == nil ? "checkmark" : "list.bullet")
+                }
             }
-            if !store.threads.isEmpty { Divider() }
+            if !store.threads.isEmpty && allowsAllActivity { Divider() }
             ForEach(store.threads) { thread in
                 Button {
                     store.select(thread.threadId)
@@ -75,9 +80,12 @@ struct ThreadPicker: View {
                 Image(systemName: "number")
                 Text("thread \(id.prefix(8))")
                     .lineLimit(1)
-            } else {
+            } else if allowsAllActivity {
                 Image(systemName: "list.bullet")
                 Text("All activity")
+            } else {
+                Image(systemName: "plus.bubble")
+                Text("New thread")
             }
             Image(systemName: "chevron.up.chevron.down")
                 .font(.caption2)

@@ -48,6 +48,12 @@ struct FinCommands: Commands {
             }
             .keyboardShortcut("t", modifiers: .command)
 
+            // docs/XANADU.md: back to the conversation pane from any terminal.
+            Button("Fin Conversation") {
+                sessionManager.showXanadu()
+            }
+            .keyboardShortcut("0", modifiers: .command)
+
             // ⌘W, the chord every Mac user already has in their fingers, and the one
             // Terminal.app spends on exactly this. It deliberately shadows the
             // standard Close only while a tab is actually open in the front window;
