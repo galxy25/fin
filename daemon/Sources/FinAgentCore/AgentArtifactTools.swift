@@ -40,3 +40,12 @@ public enum AgentArtifactDeleteOutcome: Equatable, Sendable {
     case deleted
     case failed(String)
 }
+
+/// What a runner's `attach_file` hook hands back (docs/XANADU.md "Fin replies with
+/// files"): the file was queued to go back with the reply under `name` (`size` bytes),
+/// or `refused` with a reason the model can act on (too big, not a regular file, not
+/// readable, the per-turn cap…).
+public enum AgentAttachFileOutcome: Equatable, Sendable {
+    case queued(name: String, size: Int)
+    case refused(String)
+}

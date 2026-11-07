@@ -410,10 +410,36 @@ public struct AgentToolSpec {
         ]
     )
 
+    /// Fin replies with files (docs/XANADU.md v1.1): queue a file on this machine to go
+    /// back to the user with the reply. Only offered in a turn answering a user's
+    /// message (the runner installs the hook for exactly that turn).
+    static let attachFile = AgentToolSpec(
+        name: "attach_file",
+        description: "Send a file on this machine back to the user with your reply — a chart, "
+            + "an export, a report you made. It is uploaded when you finish your reply and "
+            + "shows up under it on the user's devices. Up to 8 files, 25 MB each.",
+        parameters: [
+            "type": "object",
+            "properties": [
+                "path": [
+                    "type": "string",
+                    "description": "Path of the file on this machine (absolute, or ~/…).",
+                ],
+                "name": [
+                    "type": "string",
+                    "description": "Optional name to show the user, e.g. \"Q3 costs by quarter.png\". "
+                        + "Defaults to the file's own name.",
+                ],
+            ],
+            "required": ["path"],
+        ]
+    )
+
     static let all: [AgentToolSpec] = [
         readTerminal, sendInput, readSession, sendSession, goalUpsert, goalLog,
         remember, recall, requestInput, monitor, notify,
         writeArtifact, readArtifact, listArtifacts, deleteArtifact,
+        attachFile,
     ]
 
     /// The roster MINUS the tools a runtime cannot actually provide.
@@ -433,13 +459,14 @@ public struct AgentToolSpec {
     static func roster(
         readSession readAvailable: Bool, sendSession sendAvailable: Bool,
         goalsLedger ledgerAvailable: Bool = false, memory memoryAvailable: Bool = false,
-        artifacts artifactsAvailable: Bool = false
+        artifacts artifactsAvailable: Bool = false, attachFile attachAvailable: Bool = false
     ) -> [AgentToolSpec] {
         let artifactNames: Set<String> = [
             writeArtifact.name, readArtifact.name, listArtifacts.name, deleteArtifact.name,
         ]
         return all.filter { spec in
-            (readAvailable || spec.name != readSession.name)
+            (attachAvailable || spec.name != attachFile.name)
+                && (readAvailable || spec.name != readSession.name)
                 && (sendAvailable || spec.name != sendSession.name)
                 && (ledgerAvailable || (spec.name != goalUpsert.name && spec.name != goalLog.name))
                 && (memoryAvailable || (spec.name != remember.name && spec.name != recall.name))

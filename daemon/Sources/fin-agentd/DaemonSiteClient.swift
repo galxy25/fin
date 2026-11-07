@@ -382,13 +382,30 @@ actor DaemonSiteClient {
     /// and `threadId` / `threadReason` when the turn's pane relays settled the
     /// thread only after the applied ack had gone (the turn-end fallback).
     /// Pure and tested (`DaemonSiteClientTests`).
+    ///
+    /// `replyAttachments` (docs/XANADU.md "Answered ack"): the files uploaded through
+    /// `uploadReplyFile`, as `{key, name, mime, size}`; omitted when none. `trailer`
+    /// (the "(couldn't attach …)" notes) is appended to the preview and survives its
+    /// 500-character cut — the reply text is cut, never the note saying a file is missing.
     static func answeredAckBody(
-        replyPreview: String, agentID: UUID?, originDeviceID8: String, thread: ThreadProposal? = nil
+        replyPreview: String, agentID: UUID?, originDeviceID8: String, thread: ThreadProposal? = nil,
+        replyAttachments: [MessageAttachment] = [], trailer: String = ""
     ) -> [String: Any] {
+        let note = String(MemoryRedactor.redact(trailer.trimmingCharacters(in: .whitespacesAndNewlines)).prefix(400))
+        let room = note.isEmpty ? maxReplyPreviewCharacters : max(0, maxReplyPreviewCharacters - note.count - 1)
+        let text = String(MemoryRedactor.redact(replyPreview).prefix(room))
+        let preview = note.isEmpty
+            ? text
+            : (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? note : text + "\n" + note)
         var body: [String: Any] = [
             "state": "answered",
-            "replyPreview": String(MemoryRedactor.redact(replyPreview).prefix(500)),
+            "replyPreview": preview,
         ]
+        if !replyAttachments.isEmpty {
+            body["replyAttachments"] = replyAttachments.map { file -> [String: Any] in
+                ["key": file.key, "name": file.name, "mime": file.mime, "size": file.size ?? 0]
+            }
+        }
         if let agentID { body["agentID"] = agentID.uuidString }
         if !originDeviceID8.isEmpty { body["originDeviceID8"] = originDeviceID8 }
         if let thread {
@@ -401,11 +418,15 @@ actor DaemonSiteClient {
     /// Returns the thread the control plane settled on, nil when the ack did
     /// not go through (same contract as `markApplied`).
     @discardableResult
-    func markAnswered(_ id: String, replyPreview: String, thread: ThreadProposal? = nil) async -> String? {
+    func markAnswered(
+        _ id: String, replyPreview: String, thread: ThreadProposal? = nil,
+        replyAttachments: [MessageAttachment] = [], trailer: String = ""
+    ) async -> String? {
         guard let (status, data) = await post(
             "/messages/\(id)/ack",
             body: Self.answeredAckBody(
-                replyPreview: replyPreview, agentID: agentID, originDeviceID8: originDeviceID8, thread: thread
+                replyPreview: replyPreview, agentID: agentID, originDeviceID8: originDeviceID8, thread: thread,
+                replyAttachments: replyAttachments, trailer: trailer
             )
         ) else { return nil }
         if (200..<300).contains(status) || status == 409 {
@@ -413,6 +434,58 @@ actor DaemonSiteClient {
         }
         registerFailure("[site] ack answered \(id) failed: HTTP \(status)")
         return nil
+    }
+
+    /// The control plane's `MAX_REPLY_PREVIEW_CHARS`.
+    static let maxReplyPreviewCharacters = 500
+    /// A 25 MiB PUT over a slow uplink: the 10s control-plane timeout would kill it.
+    static let replyFileUploadTimeout: TimeInterval = 120
+
+    /// One `attach_file` file up to the control plane (docs/XANADU.md "Site upload"):
+    /// `POST /sites/{siteId}/attachments` for a presigned PUT under the message
+    /// owner's prefix, then the bytes, with exactly the headers it named. Returns the
+    /// entry the answered ack's `replyAttachments` carries, or the reason it failed —
+    /// short, for the "(couldn't attach …)" note.
+    func uploadReplyFile(
+        messageID: String, file: QueuedReplyFile
+    ) async -> Result<MessageAttachment, DaemonAttachments.ReplyFileRefusal> {
+        let data: Data
+        do {
+            data = try Data(contentsOf: URL(fileURLWithPath: file.path))
+        } catch {
+            return .failure(.init("could not read the file"))
+        }
+        guard data.count <= DaemonAttachments.maxReplyFileBytes else {
+            return .failure(.init("over the 25 MB limit"))
+        }
+        guard let (status, response) = await post(
+            "/sites/\(siteID)/attachments",
+            body: ["messageId": messageID, "name": file.name, "mime": file.mime, "size": data.count]
+        ) else { return .failure(.init("the control plane is unreachable")) }
+        guard (200..<300).contains(status) else {
+            registerFailure("[site] reply file upload slot for \(messageID) failed: HTTP \(status)")
+            return .failure(.init("upload refused (HTTP \(status))"))
+        }
+        guard let object = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any],
+              let key = object["key"] as? String, !key.isEmpty,
+              let putURL = (object["putUrl"] as? String).flatMap(URL.init(string:))
+        else { return .failure(.init("the control plane answered without an upload link")) }
+        var request = URLRequest(url: putURL)
+        request.httpMethod = "PUT"
+        request.timeoutInterval = Self.replyFileUploadTimeout
+        for (header, value) in (object["headers"] as? [String: Any] ?? [:]) {
+            if let value = value as? String { request.setValue(value, forHTTPHeaderField: header) }
+        }
+        request.httpBody = data
+        do {
+            let (_, putResponse) = try await transport(request)
+            let putStatus = (putResponse as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(putStatus) else { return .failure(.init("upload failed (HTTP \(putStatus))")) }
+        } catch {
+            let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return .failure(.init("upload failed: \(text.prefix(120))"))
+        }
+        return .success(MessageAttachment(key: key, name: file.name, mime: file.mime, size: data.count))
     }
 
     /// The `threadId` of a claim or ack response body, nil when absent — an older

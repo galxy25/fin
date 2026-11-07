@@ -346,6 +346,41 @@ final class AgentEngineDispatchTests: XCTestCase {
             .contains { $0.name == "write_artifact" })
     }
 
+    // MARK: - attach_file (docs/XANADU.md "Fin replies with files")
+
+    /// Offered only while the runner has a hook — the daemon installs it for a message
+    /// turn alone — and never by default, so the app's roster is unchanged.
+    func testTheRosterOffersAttachFileOnlyWithItsHook() {
+        XCTAssertFalse(AgentToolSpec.roster(readSession: true, sendSession: true, memory: true, artifacts: true)
+            .contains { $0.name == "attach_file" })
+        XCTAssertTrue(AgentToolSpec.roster(readSession: false, sendSession: false, attachFile: true)
+            .contains { $0.name == "attach_file" })
+        XCTAssertTrue(AgentToolSpec.knownToolNames.contains("attach_file"))
+    }
+
+    func testAttachFileHandsPathAndNameToTheHookAndConfirms() async {
+        let engine = makeEngine()
+        var seen: [(String, String?)] = []
+        engine.onAttachFile = { path, name in seen.append((path, name)); return .queued(name: "Q3.png", size: 42) }
+        let result = await engine.execute(call(AgentToolSpec.attachFile.name, #"{"path": " ~/c.png ", "name": "Q3.png"}"#))
+        XCTAssertEqual(seen.map(\.0), ["~/c.png"])
+        XCTAssertEqual(seen.map(\.1), ["Q3.png"])
+        XCTAssertTrue(result.hasPrefix("Queued Q3.png (42 bytes)"), "got: \(result)")
+        _ = await engine.execute(call(AgentToolSpec.attachFile.name, #"{"path": "/c.png", "name": "  "}"#))
+        XCTAssertNil(seen.last?.1, "a blank name is no name")
+    }
+
+    func testAttachFileRefusalsAndMissingPathAreErrors() async {
+        let engine = makeEngine()
+        let noHook = await engine.execute(call(AgentToolSpec.attachFile.name, #"{"path": "/c.png"}"#))
+        XCTAssertTrue(noHook.contains("only available while answering"), "got: \(noHook)")
+        engine.onAttachFile = { _, _ in .refused("no such file") }
+        let refused = await engine.execute(call(AgentToolSpec.attachFile.name, #"{"path": "/c.png"}"#))
+        XCTAssertEqual(refused, "Error: attach_file refused \"/c.png\": no such file")
+        let empty = await engine.execute(call(AgentToolSpec.attachFile.name, "{}"))
+        XCTAssertTrue(empty.contains("Error") && empty.contains("path"), "got: \(empty)")
+    }
+
     // MARK: - request_input
 
     func testRequestInputFiresHookAndReturnsCannedAcknowledgment() async {
@@ -811,7 +846,9 @@ final class AgentEngineDispatchTests: XCTestCase {
             AgentToolSpec.roster(readSession: false, sendSession: true, goalsLedger: true, memory: true, artifacts: true).count + 1
         )
         XCTAssertEqual(
-            AgentToolSpec.roster(readSession: true, sendSession: true, goalsLedger: true, memory: true, artifacts: true).map(\.name),
+            AgentToolSpec.roster(
+                readSession: true, sendSession: true, goalsLedger: true, memory: true, artifacts: true, attachFile: true
+            ).map(\.name),
             AgentToolSpec.all.map(\.name)
         )
         // …and the dispatch keeps its honest error for a model that names it anyway.

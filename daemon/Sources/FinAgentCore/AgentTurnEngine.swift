@@ -247,6 +247,11 @@ public final class AgentTurnEngine {
     /// Fired when the model calls `delete_artifact`. `path` has already been checked
     /// non-empty. Nil hook → unavailable, exactly like `onReadSession`.
     public var onDeleteArtifact: ((_ path: String) async -> AgentArtifactDeleteOutcome)?
+    /// Fired when the model calls `attach_file` (docs/XANADU.md "Fin replies with
+    /// files"). `path` has already been checked non-empty; `name` is the optional
+    /// display name. The runner installs this only for a turn answering a user's
+    /// message, so the roster offers the tool exactly then. Nil → not advertised.
+    public var onAttachFile: ((_ path: String, _ name: String?) async -> AgentAttachFileOutcome)?
 
     /// The tmux guard (see `TmuxCommandGuard`). NOT an optional hook, on purpose: a nil
     /// hook reads as "allow", and a guard must never be disarmed by omission.
@@ -695,7 +700,7 @@ public final class AgentTurnEngine {
                     tools: AgentToolSpec.roster(
                         readSession: onReadSession != nil, sendSession: onSendSession != nil,
                         goalsLedger: onGoalUpsert != nil && !hideGoalTools, memory: onRemember != nil,
-                        artifacts: onWriteArtifact != nil
+                        artifacts: onWriteArtifact != nil, attachFile: onAttachFile != nil
                     )
                 )
                 lastBrainOutage = nil
@@ -853,6 +858,11 @@ public final class AgentTurnEngine {
         case AgentToolSpec.deleteArtifact.name:
             return await executeDeleteArtifact(path: call.argument("path"), rawArguments: call.arguments)
 
+        case AgentToolSpec.attachFile.name:
+            return await executeAttachFile(
+                path: call.argument("path"), name: call.argument("name"), rawArguments: call.arguments
+            )
+
         case AgentToolSpec.requestInput.name:
             return executeRequestInput(
                 question: call.argument("question") ?? "",
@@ -914,7 +924,7 @@ public final class AgentTurnEngine {
                 + AgentToolSpec.roster(
                     readSession: onReadSession != nil, sendSession: onSendSession != nil,
                     goalsLedger: onGoalUpsert != nil && !hideGoalTools, memory: onRemember != nil,
-                    artifacts: onWriteArtifact != nil
+                    artifacts: onWriteArtifact != nil, attachFile: onAttachFile != nil
                 ).map(\.name).joined(separator: ", ") + "."
             record("error", message, toolName: call.name, isFailure: true)
             return message
@@ -1463,6 +1473,32 @@ public final class AgentTurnEngine {
             return entries.map { "- \($0.path) (\($0.size) bytes)" }.joined(separator: "\n")
         case .failed(let reason):
             let message = "Error: list_artifacts failed: \(reason)"
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+    }
+
+    /// The model's `attach_file` tool: validate `path` (non-empty), then hand off to the
+    /// runner, which checks the file and queues it for the reply.
+    private func executeAttachFile(path rawPath: String?, name rawName: String?, rawArguments: String) async -> String {
+        let toolName = AgentToolSpec.attachFile.name
+        guard let path = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else {
+            let message = "Error: attach_file requires a non-empty \"path\"."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        record("toolCall", "attach_file: \(path)", toolName: toolName, toolArguments: rawArguments)
+        guard let onAttachFile else {
+            let message = "Error: attach_file is only available while answering a user's message."
+            record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
+            return message
+        }
+        let name = rawName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch await onAttachFile(path, (name?.isEmpty ?? true) ? nil : name) {
+        case .queued(let shown, let size):
+            return "Queued \(shown) (\(size) bytes) to go back with your reply. Mention it in your reply."
+        case .refused(let reason):
+            let message = "Error: attach_file refused \"\(path)\": \(reason)"
             record("error", message, toolName: toolName, toolArguments: rawArguments, isFailure: true)
             return message
         }

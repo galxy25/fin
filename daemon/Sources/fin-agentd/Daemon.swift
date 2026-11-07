@@ -470,6 +470,12 @@ final class Daemon {
     /// carried on the answered ack — the fallback when no pre-turn signal named the
     /// pane. Nil when the applied ack already said everything.
     private var inFlightThreadProposal: DaemonSiteClient.ThreadProposal?
+    /// Files the message turn in flight queued with `attach_file` (docs/XANADU.md
+    /// "Fin replies with files"), uploaded at the answered ack. Empty between turns.
+    private var replyFiles: [QueuedReplyFile] = []
+    /// The engine whose `onAttachFile` the message turn in flight installed — so the
+    /// hook (and with it the tool in the roster) lives exactly as long as that turn.
+    private weak var attachFileEngine: AgentTurnEngine?
     /// Which thread last relayed into which pane, for the pane match (§2). Loaded
     /// from its sibling file on first use, written after every message turn that
     /// sent to a pane.
@@ -836,19 +842,71 @@ final class Daemon {
         let line = "[site] message \(id.prefix(10)) settled without an answer: \(preview)"
         log(line)
         record(AgentAuditEvent(kind: "notice", text: line))
+        // Files Fin attached before the turn went wrong still go back: they exist,
+        // and the user asked for them.
+        let delivered = await deliverReplyFiles(for: id)
         clearInFlightMessage()
-        await siteClient?.markAnswered(id, replyPreview: preview, thread: proposal)
+        await siteClient?.markAnswered(
+            id, replyPreview: preview, thread: proposal,
+            replyAttachments: delivered.attachments, trailer: delivered.trailer
+        )
     }
 
     /// The message turn is over, whatever its outcome: nothing recorded from here
     /// on belongs to it — the next transcript line carries no thread, the next push
-    /// names no message.
+    /// names no message, and `attach_file` leaves the roster.
     private func clearInFlightMessage() {
         inFlightSiteMessageID = nil
         inFlightSiteMessageText = nil
         inFlightThreadID = nil
         inFlightThreadProposal = nil
+        replyFiles = []
+        attachFileEngine?.onAttachFile = nil
+        attachFileEngine = nil
         transcript?.endMessageTurn()
+    }
+
+    /// `attach_file`'s hook for the message turn in flight: validate, then queue.
+    private func queueReplyFile(path: String, name: String?) -> AgentAttachFileOutcome {
+        switch DaemonAttachments.validateReplyFile(path: path, name: name, queued: replyFiles) {
+        case .success(let file):
+            replyFiles.append(file)
+            log("[attachments] reply file queued: \(file.path) as \(file.name) (\(file.size) bytes)")
+            return .queued(name: file.name, size: file.size)
+        case .failure(let refusal):
+            return .refused(refusal.reason)
+        }
+    }
+
+    /// Uploads the turn's queued reply files through the site route (docs/XANADU.md
+    /// "Daemon"), and stamps the cloud transcript's reply line with the same
+    /// `[Attached: …]` line a user turn carries. A failed upload never drops the reply:
+    /// it becomes a "(couldn't attach <name>: <reason>)" note in the reply text
+    /// (`trailer`). Must run before `clearInFlightMessage` (the transcript's turn lines
+    /// are dropped there). Consumes the queue.
+    private func deliverReplyFiles(for messageID: String) async -> (attachments: [MessageAttachment], trailer: String) {
+        let files = replyFiles
+        replyFiles = []
+        guard !files.isEmpty else { return ([], "") }
+        var uploaded: [MessageAttachment] = []
+        var notes: [String] = []
+        for file in files {
+            let result = await siteClient?.uploadReplyFile(messageID: messageID, file: file)
+                ?? .failure(.init("no control plane on this machine"))
+            switch result {
+            case .success(let entry): uploaded.append(entry)
+            case .failure(let refusal):
+                notes.append(DaemonAttachments.replyFailureNote(name: file.name, reason: refusal.reason))
+            }
+        }
+        let line = "[attachments] \(messageID.prefix(10)): \(uploaded.count) reply file(s) uploaded"
+            + (notes.isEmpty ? "" : ", \(notes.count) failed: \(notes.joined(separator: " "))")
+        log(line)
+        record(AgentAuditEvent(kind: "notice", text: line, isFailure: !notes.isEmpty))
+        if let display = DaemonAttachments.displayLine(uploaded) {
+            await transcript?.appendToFinalAssistantLine(display)
+        }
+        return (uploaded, notes.joined(separator: " "))
     }
     /// True after TASK COMPLETE under `stayResident`: the work is done, so beats would
     /// only re-run a finished task, but the process, the SSH session and the poll loop
@@ -1020,6 +1078,8 @@ final class Daemon {
         + "tick: never answer with a decision JSON — answer the person in plain language. If they ask "
         + "you (Fin) something you can answer from what you know, answer it directly rather than "
         + "relaying it anywhere."
+        + " When the answer is a file you made (a chart, an export, a report), hand it back with "
+        + "attach_file and its path — it arrives under your reply on the user's devices."
         + "\n\nWhen the question is what is HAPPENING — on the machine, in a session, for another "
         + "agent — answer with the WORK, not the window. Read every pane the question covers "
         + "(read_session with no arguments lists them; the pane list above names them), read each "
@@ -1091,6 +1151,14 @@ final class Daemon {
         inFlightSiteMessageID = message.id
         inFlightSiteMessageText = displayText
         retriedDecisionAnswer = false
+        // `attach_file` (docs/XANADU.md "Fin replies with files"): offered for exactly
+        // this message's turn — and its one corrective retry — and withdrawn by
+        // `clearInFlightMessage` whichever way the message settles.
+        replyFiles = []
+        attachFileEngine = engine
+        engine.onAttachFile = { [weak self] path, name in
+            self?.queueReplyFile(path: path, name: name) ?? .refused("Fin is shutting down")
+        }
         isTurnInFlight = true
         // Ack `applied` right after submit begins, not after the turn ends: the
         // window between submit and ack is the one at-least-once window the design
@@ -2308,8 +2376,12 @@ final class Daemon {
                 }
                 if let id = inFlightSiteMessageID {
                     let proposal = inFlightThreadProposal
+                    let delivered = await deliverReplyFiles(for: id)
                     clearInFlightMessage()
-                    await siteClient?.markAnswered(id, replyPreview: text, thread: proposal)
+                    await siteClient?.markAnswered(
+                        id, replyPreview: text, thread: proposal,
+                        replyAttachments: delivered.attachments, trailer: delivered.trailer
+                    )
                 }
                 if let userMessage = pendingUserMessageForDigest {
                     recordTurnInEpisodicMemory(userMessage: userMessage, answer: text)

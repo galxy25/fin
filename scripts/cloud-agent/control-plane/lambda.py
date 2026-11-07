@@ -3053,6 +3053,96 @@ def _adopt(now, known_instance_ids):
     return adopted
 
 
+# --- orphaned uploads (docs/XANADU.md "Orphaned uploads") ----------------------
+# Message rows live MESSAGE_RETENTION_DAYS after answering, then DynamoDB TTL
+# reaps them — but their files (and uploads that were never sent) stay in S3
+# forever. The sweep deletes anything under users/*/fin/attachments/ older than
+# a day past the retention, at most once a day: the marker records the last
+# run, and the sweep schedule (every 10 minutes) only pays a GET otherwise.
+ATTACHMENT_SWEEP_MARKER_KEY = "fin/sweep/attachments-cleanup.json"
+ATTACHMENT_SWEEP_INTERVAL = timedelta(days=1)
+
+
+def _attachment_sweep_due(marker, now):
+    """Pure: run when no marker / unreadable marker, or the last run is ≥ a
+    day old. A marker from the future (clock skew) counts as not due."""
+    last = _parse_iso((marker or {}).get("ranAt"))
+    return last is None or now - last >= ATTACHMENT_SWEEP_INTERVAL
+
+
+def _list_user_ids():
+    """Every users/<id>/ prefix in the bucket (a Delimiter listing, so one
+    entry per user, not per object)."""
+    user_ids, token = [], None
+    while True:
+        kwargs = {"Bucket": BUCKET, "Prefix": "users/", "Delimiter": "/", "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = S3.list_objects_v2(**kwargs)
+        for common in page.get("CommonPrefixes") or []:
+            parts = str(common.get("Prefix") or "").split("/")
+            if len(parts) == 3 and parts[0] == "users" and parts[1]:
+                user_ids.append(parts[1])
+        token = page.get("NextContinuationToken")
+        if not token:
+            return user_ids
+
+
+def _delete_old_objects(prefix, cutoff):
+    """Delete everything under `prefix` last modified before `cutoff`,
+    paginating the listing and deleting 1000 keys per call. Returns the count."""
+    deleted, token = 0, None
+    while True:
+        kwargs = {"Bucket": BUCKET, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = S3.list_objects_v2(**kwargs)
+        old = [{"Key": o["Key"]} for o in page.get("Contents") or []
+               if o.get("LastModified") is not None and o["LastModified"] < cutoff]
+        if old:
+            S3.delete_objects(Bucket=BUCKET, Delete={"Objects": old, "Quiet": True})
+            deleted += len(old)
+        token = page.get("NextContinuationToken")
+        if not token:
+            return deleted
+
+
+def _sweep_orphaned_attachments(now):
+    """{deleted, users} when it ran, {skipped: "not due"} otherwise. One
+    user's listing/deleting failure is logged and the rest still run; the
+    marker is written either way so a persistent failure retries daily, not
+    every sweep."""
+    if not _attachment_sweep_due(_read_lock(ATTACHMENT_SWEEP_MARKER_KEY), now):
+        return {"skipped": "not due"}
+    cutoff = now - timedelta(days=MESSAGE_RETENTION_DAYS + 1)
+    deleted, users, failures = 0, 0, 0
+    try:
+        user_ids = _list_user_ids()
+    except Exception as exc:  # noqa: BLE001 - the sweep's other halves must still report
+        LOG.warning("attachment sweep: listing users: %s", _scrub(exc))
+        user_ids, failures = [], 1
+    for user_id in user_ids:
+        try:
+            count = _delete_old_objects(ATTACHMENT_PREFIX.format(user=user_id), cutoff)
+        except Exception as exc:  # noqa: BLE001 - one user never blocks the rest
+            LOG.warning("attachment sweep: user %s: %s", user_id, _scrub(exc))
+            failures += 1
+            continue
+        users += 1
+        deleted += count
+    try:
+        S3.put_object(
+            Bucket=BUCKET, Key=ATTACHMENT_SWEEP_MARKER_KEY,
+            Body=json.dumps({"ranAt": _iso(now), "deleted": deleted}, sort_keys=True).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("attachment sweep: writing marker: %s", _scrub(exc))
+    if deleted:
+        LOG.info("attachment sweep: deleted %d orphaned uploads across %d users", deleted, users)
+    return {"deleted": deleted, "users": users, "failures": failures}
+
+
 def sweep(_event=None):
     now = _now()
     live = _live_workers()
@@ -3088,6 +3178,7 @@ def sweep(_event=None):
         "reconciled": reconciled,
         "staleSites": stale_sites,
         "retiredMessages": _retire_abandoned_messages(now),
+        "orphanedAttachments": _sweep_orphaned_attachments(now),
         "adopted": [{"workerId": w["workerId"], "agent": w["agent"], "instanceId": w["instanceId"]} for w in adopted],
     }
 
@@ -4593,6 +4684,61 @@ def create_attachment(event):
     return _response(200, {"key": key, "putUrl": _presign_put(key, mime), "headers": {"Content-Type": mime}})
 
 
+# A reply file may only be minted while the turn that produces it is running:
+# the message is claimed (or applied) by THIS site. Once answered/expired the
+# ack that would reference the file can no longer land.
+SITE_ATTACHMENT_STATES = ("claimed", "applied")
+
+
+def create_site_attachment(event, site_id):
+    """POST /sites/{siteId}/attachments — {messageId, name, mime, size} →
+    {key, putUrl, headers} (docs/XANADU.md "Fin replies with files"). The
+    site-side twin of create_attachment: a body hands a file back with its
+    reply. Site-authenticated like the heartbeat (the scope check pins a site
+    token to its own id; an operator token must own the site), and the message
+    must belong to the site's user AND agent and be claimed by this site. The
+    key lands under the message OWNER's attachments prefix, so the answered
+    ack's `replyAttachments` validates exactly like a user upload."""
+    site = _owned_site(event, site_id)
+    body = _body(event)
+    message_id = str(body.get("messageId") or "").strip()
+    row = _owned_message(event, message_id)
+    if not _same_agent(site, row):
+        raise ApiError(404, "no such message")
+    if row.get("claimedBy") != site["siteId"] or row.get("state") not in SITE_ATTACHMENT_STATES:
+        raise ApiError(409, "the message is not claimed by this site")
+    name = _attachment_name(body.get("name"))
+    mime = _attachment_mime(body.get("mime"))
+    _attachment_size(body.get("size"))
+    key = ATTACHMENT_KEY.format(
+        user=row["userId"], agent=_key_slug(row.get("agent") or ""), uuid=str(uuid.uuid4()),
+        name=_attachment_safe_name(name),
+    )
+    return _response(200, {"key": key, "putUrl": _presign_put(key, mime), "headers": {"Content-Type": mime}})
+
+
+def _validated_reply_attachments(user_id, raw):
+    """The answered ack's `replyAttachments`: the same validation as a user's
+    attachments (owner prefix + HEAD, ≤ 8, sizes/names/mimes), stored as
+    {key, name, mime, size} only — a reply file has no transcript."""
+    entries = _validated_attachments(user_id, raw)
+    return [{k: e[k] for k in ("key", "name", "mime", "size")} for e in entries]
+
+
+def _reply_push_text(preview, reply_attachments):
+    """What the answered push / Live Activity shows: the reply text, plus
+    "📎 <first name>" (+N) when the reply carries files — alone when the
+    reply text is empty."""
+    preview = str(preview or "").strip()
+    names = [str(e.get("name") or "file") for e in (reply_attachments or []) if isinstance(e, dict)]
+    if not names:
+        return preview
+    clip = "📎 " + names[0]
+    if len(names) > 1:
+        clip += " +{}".format(len(names) - 1)
+    return (preview + " " + clip) if preview else clip
+
+
 def _validated_attachments(user_id, raw):
     """POST /messages' `attachments`, each entry checked against the contract
     and HEADed so a message can never point at bytes that were never uploaded.
@@ -4643,11 +4789,12 @@ def _validated_attachments(user_id, raw):
     return entries
 
 
-def _public_attachments(row):
+def _public_attachments(row, field="attachments"):
     """The stored entries, each with a fresh presigned GET. [] when none. A
-    shapeless entry (never written by send_message) is skipped, not fatal."""
+    shapeless entry (never written by send_message) is skipped, not fatal.
+    `field` is "replyAttachments" for the files Fin sent back."""
     out = []
-    for entry in row.get("attachments") or []:
+    for entry in row.get(field) or []:
         if not isinstance(entry, dict) or not isinstance(entry.get("key"), str):
             continue
         public = {k: entry[k] for k in ("key", "name", "mime", "size", "transcript") if k in entry}
@@ -4941,6 +5088,7 @@ def _public_message(row):
         "pushedAt": row.get("pushedAt"),
         "threadId": _thread_of(row),
         "attachments": _public_attachments(row),
+        "replyAttachments": _public_attachments(row, "replyAttachments"),
     }
 
 
@@ -5196,6 +5344,12 @@ def ack_message(event, message_id):
         if isinstance(preview, str) and preview.strip():
             update += ", replyPreview = :preview"
             values[":preview"] = preview.strip()[:MAX_REPLY_PREVIEW_CHARS]
+        # Files Fin sent back (docs/XANADU.md "Answered ack"), validated before
+        # the write so a bad entry 400s without half-answering the row.
+        reply_attachments = _validated_reply_attachments(row["userId"], body.get("replyAttachments"))
+        if reply_attachments:
+            update += ", replyAttachments = :replyFiles"
+            values[":replyFiles"] = reply_attachments
         # The turn-end fallback of docs/THREADS.md §2: the pane a turn relayed
         # into is only known once the turn has run, so the site may propose the
         # thread on the answered ack too. Same validation and precedence as at
@@ -5235,12 +5389,14 @@ def ack_message(event, message_id):
         }, now=now)
         return _response(200, {"messageId": message_id, "state": state, "threadId": thread_id})
     pushed = False
-    if ":preview" in values:
-        pushed = _push_answered_reply(row, message_id, values[":preview"], body, now)
+    reply_attachments = values.get(":replyFiles") or []
+    push_text = _reply_push_text(values.get(":preview", ""), reply_attachments)
+    if push_text:
+        pushed = _push_answered_reply(row, message_id, push_text, body, now)
         # The attention tile (design §3.4) shows the reply too — no dedupe
         # against the alert push: an activity update is not a notification.
         _push_live_activity(
-            row["userId"], _answered_content_state(values[":preview"], now), "update", now=now,
+            row["userId"], _answered_content_state(push_text, now), "update", now=now,
             start_if_missing=False,
         )
     if thread_reason is not None:
@@ -5253,6 +5409,7 @@ def ack_message(event, message_id):
         "messageId": message_id,
         "siteId8": site.get("siteId8"),
         "replyPreview": values.get(":preview", "")[:MAX_THREAD_PREVIEW_CHARS],
+        "replyAttachmentCount": len(reply_attachments),
         "pushed": bool(pushed),
     }, now=now)
     return _response(200, {"messageId": message_id, "state": state, "threadId": thread_id})
@@ -6184,7 +6341,7 @@ def delete_thread(event, thread_id):
     # that, this re-checks rather than trusting a stored row.
     prefix = ATTACHMENT_PREFIX.format(user=event["_userId"])
     for member in members:
-        for entry in member.get("attachments") or []:
+        for entry in (member.get("attachments") or []) + (member.get("replyAttachments") or []):
             key = entry.get("key") if isinstance(entry, dict) else None
             if not isinstance(key, str) or not key.startswith(prefix):
                 continue
@@ -6420,10 +6577,11 @@ def _require_site_scope(event, method, parts):
     site_id = event.get("_siteId")
     if not site_id:
         return
-    # Its own row: heartbeat and retire-self. Not /sites (enumerating its
+    # Its own row: heartbeat, reply-file uploads (docs/XANADU.md) and
+    # retire-self. Not /sites (enumerating its
     # siblings), not /sites/enroll (minting new bodies), not another site's id.
     if len(parts) >= 2 and parts[0] == "sites" and parts[1] == site_id:
-        if (method == "POST" and len(parts) == 3 and parts[2] == "heartbeat") or (
+        if (method == "POST" and len(parts) == 3 and parts[2] in ("heartbeat", "attachments")) or (
             method == "DELETE" and len(parts) == 2
         ):
             return
@@ -6485,6 +6643,8 @@ def _route(event):
         return list_sites(event)
     if method == "POST" and len(parts) == 3 and parts[0] == "sites" and parts[2] == "heartbeat":
         return site_heartbeat(event, parts[1])
+    if method == "POST" and len(parts) == 3 and parts[0] == "sites" and parts[2] == "attachments":
+        return create_site_attachment(event, parts[1])
     if method == "POST" and len(parts) == 3 and parts[0] == "sites" and parts[2] == "commands":
         return queue_site_command(event, parts[1])
     if method == "DELETE" and len(parts) == 2 and parts[0] == "sites":

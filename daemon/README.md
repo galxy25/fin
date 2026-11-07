@@ -806,6 +806,16 @@ transcript holds the image as a path and reads the bytes only when a request is
 built; each image counts 1,500 estimated tokens, and history trimming strips
 older messages' images before it drops any text.
 
+**Fin replies with files.** A message turn (and only a message turn) offers the
+`attach_file` tool (`{path, name?}`): a regular, readable file of at most
+25 MiB, at most 8 per reply, queued in memory — the task-mode prompt tells Fin
+to use it for charts, exports and reports. At the answered ack each queued file
+goes up through `POST /sites/{siteId}/attachments` (a presigned PUT under the
+message owner's attachments prefix) and the ack carries
+`replyAttachments: [{key, name, mime, size}]`. A failed upload never drops the
+reply: the reply text gains `(couldn't attach <name>: <reason>)`. The cloud
+transcript's reply line gains the same `[Attached: …]` line a user turn has.
+
 ## Cloud transcript
 
 ```json

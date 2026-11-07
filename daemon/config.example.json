@@ -15,7 +15,7 @@
     "maxOutputTokens": 640,
     "temperature": 0.2,
     "heartbeatSeconds": 60,
-    "_attachments_note": "Optional. Files sent with a message (Xanadu) are saved under attachmentsDirectory/<threadId-or-messageId>/ (default ~/Fin/Attachments). supportsImages: true ONLY for a vision model — png/jpeg/gif/webp images up to 5 MiB then also ride to the model as image_url parts; a text-only model rejects them. See README: Attachments.",
+    "_attachments_note": "Optional. Files sent with a message (Xanadu) are saved under attachmentsDirectory/<threadId-or-messageId>/ (default ~/Fin/Attachments). supportsImages: true ONLY for a vision model — png/jpeg/gif/webp images up to 5 MiB then also ride to the model as image_url parts; a text-only model rejects them. Message turns also offer the attach_file tool: Fin hands files on this machine (charts, exports, reports; 25 MiB, 8 per reply) back with its reply. See README: Attachments.",
     "attachmentsDirectory": "~/Fin/Attachments",
     "supportsImages": false
   },
