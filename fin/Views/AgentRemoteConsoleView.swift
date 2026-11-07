@@ -559,6 +559,43 @@ struct AgentRemoteConsoleView: View {
         return map
     }
 
+    /// docs/XANADU.md: a turn's files, from its row — the prompt's own
+    /// `attachments` and Fin's `replyAttachments` — joined through the prompt's
+    /// `in_reply_to`. Thread detail rows first (freshest presigned urls),
+    /// then the open-message poll.
+    private func files(for turn: Turn) -> TurnFiles {
+        guard let messageID = turn.prompt?.inReplyTo else { return TurnFiles() }
+        let row = threadStore.details.values.lazy.flatMap(\.messages).first { $0.messageId == messageID }
+            ?? remoteMessages[messageID]
+        return Self.turnFiles(row)
+    }
+
+    /// A turn's text without the daemon's trailing "[Attached: …]" line — the
+    /// chips render the files. A files-only turn renders no text when chips
+    /// show (nil); with no row to draw chips from (the transcript outran the
+    /// poll) the line becomes a plain "Attached: …" so the files still show
+    /// up somewhere. Pure.
+    static func consoleText(_ text: String, hasFiles: Bool = false) -> String? {
+        let stripped = XanaduText.displayText(text)
+        if !stripped.isEmpty { return stripped }
+        if hasFiles { return nil }
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard raw.hasPrefix("["), raw.hasSuffix("]") else { return raw }
+        return String(raw.dropFirst().dropLast())
+    }
+
+    static func turnFiles(_ row: ControlPlaneClient.Message?) -> TurnFiles {
+        TurnFiles(prompt: row?.attachments ?? [], reply: row?.replyAttachments ?? [])
+    }
+
+    /// A presigned GET lapsed: refetch the rows that mint fresh ones.
+    private func refreshAttachmentURLs() {
+        Task {
+            await refreshThreads()
+            await refreshPresenceAndPending()
+        }
+    }
+
     /// The cached merge. `rebuildTranscript()` is the only writer.
     private var turns: [Turn] { turnsCache }
 
@@ -679,21 +716,28 @@ struct AgentRemoteConsoleView: View {
                 turnSteps(turn)
             }
         } else {
+            let files = files(for: turn)
             VStack(alignment: .leading, spacing: 10) {
                 if let prompt = turn.prompt {
-                    promptRow(prompt)
+                    promptRow(prompt, attachments: files.prompt)
                 }
                 if expandedTurns.contains(turn.id) {
                     turnSteps(turn)
                 }
                 if let reply = turn.reply {
                     Button { toggle(turn) } label: {
-                        recordRow(reply)
+                        recordRow(reply, hasFiles: !files.reply.isEmpty)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("turnReply")
+                    // Fin's files (docs/XANADU.md "Fin replies with files"), the
+                    // same views Xanadu uses — outside the toggle button so a
+                    // tap opens the file rather than the steps.
+                    if !files.reply.isEmpty {
+                        XanaduAttachmentList(attachments: files.reply, onExpired: refreshAttachmentURLs)
+                    }
                 } else if !turn.steps.isEmpty {
                     Button { toggle(turn) } label: {
                         Label(expandedTurns.contains(turn.id) ? "working…" : "working… · \(turn.steps.count) steps so far",
@@ -736,12 +780,18 @@ struct AgentRemoteConsoleView: View {
     /// "You · voice · from Levi's iPhone · 4:27 PM": when, from which device, and
     /// by what input — joined to the control-plane row via in_reply_to; a line
     /// with no row still shows its time and the body that applied it.
-    private func promptRow(_ record: AgentMirrorRecord) -> some View {
+    private func promptRow(_ record: AgentMirrorRecord, attachments: [MessageAttachment] = []) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(Self.provenance(for: record, messages: remoteMessages, sites: sites.sites))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            Text(record.text)
+            if let text = Self.consoleText(record.text, hasFiles: !attachments.isEmpty) {
+                Text(text)
+            }
+            if !attachments.isEmpty {
+                XanaduAttachmentList(attachments: attachments, onExpired: refreshAttachmentURLs)
+                    .padding(.top, 4)
+            }
         }
         .accessibilityIdentifier("promptRow")
     }
@@ -770,7 +820,7 @@ struct AgentRemoteConsoleView: View {
     }
 
     @ViewBuilder
-    private func recordRow(_ record: AgentMirrorRecord) -> some View {
+    private func recordRow(_ record: AgentMirrorRecord, hasFiles: Bool = false) -> some View {
         switch record.kind {
         case .userMessage where record.text.hasPrefix("[heartbeat]"):
             Label("heartbeat check", systemImage: "waveform.path.ecg")
@@ -779,7 +829,7 @@ struct AgentRemoteConsoleView: View {
         case .userMessage:
             VStack(alignment: .leading, spacing: 2) {
                 Text("You").font(.caption2).foregroundStyle(.secondary)
-                Text(record.text)
+                Text(Self.consoleText(record.text) ?? "")
             }
         case .assistantMessage:
             if let siteName = record.siteName ?? record.siteID8 {
@@ -789,10 +839,10 @@ struct AgentRemoteConsoleView: View {
                         .foregroundStyle(.tertiary)
                         .padding(.top, 3)
                         .help("on \(siteName) · \(record.timestamp.formatted(.relative(presentation: .named)))")
-                    Text(record.text)
+                    if let text = Self.consoleText(record.text, hasFiles: hasFiles) { Text(text) }
                 }
-            } else {
-                Text(record.text)
+            } else if let text = Self.consoleText(record.text, hasFiles: hasFiles) {
+                Text(text)
             }
         case .toolCall where record.toolName == "notify":
             // A notification the agent sent the owner is the whole point of this

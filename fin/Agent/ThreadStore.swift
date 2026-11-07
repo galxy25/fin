@@ -337,12 +337,21 @@ enum ThreadTimeline {
         var items: [ThreadItem] = []
         var appliedMessageIDs = Set<String>()
         var seenRecordIDs = Set<String>()
+        // docs/XANADU.md "Fin replies with files": a row's `replyAttachments`
+        // ride under the turn's reply — the last assistant line after the
+        // row's prompt (TranscriptTurns' reply rule), set once records are in.
+        var currentPromptMessageID: String?
+        var replyIndexByMessageID: [String: Int] = [:]
         // A `read_session` result carries no target of its own; it shows what
         // the pane the run last addressed said.
         var lastPaneTargetByRun: [String: String] = [:]
 
         // Records first: they carry the actual conversation.
+        var itemsAtPrompt = 0
         for record in records {
+            // A turn with no user line (TranscriptTurns: a turnStarted after
+            // steps) is not the prompt's turn — its reply is not the row's.
+            if record.kind == .turnStarted, items.count > itemsAtPrompt { currentPromptMessageID = nil }
             guard record.kind != .notice, record.kind != .turnStarted, record.kind != .turnProgress else { continue }
             guard seenRecordIDs.insert(record.id).inserted else { continue }
             switch record.kind {
@@ -350,6 +359,8 @@ enum ThreadTimeline {
                 if let reply = record.inReplyTo {
                     guard appliedMessageIDs.insert(reply).inserted else { continue }
                 }
+                currentPromptMessageID = record.text.hasPrefix("[heartbeat]") ? nil : record.inReplyTo
+                itemsAtPrompt = items.count + 1
                 let row = record.inReplyTo.flatMap { byMessageID[$0] }
                 items.append(ThreadItem(
                     id: "r:" + record.id, party: .levi(deviceID8: row?.authorSiteId8), kind: .prompt,
@@ -359,6 +370,7 @@ enum ThreadTimeline {
                 ))
             case .assistantMessage:
                 guard !record.text.isEmpty, record.text != "(tool call only)" else { continue }
+                if let current = currentPromptMessageID { replyIndexByMessageID[current] = items.count }
                 items.append(ThreadItem(
                     id: "r:" + record.id, party: .fin(siteID8: record.siteID8), kind: .reply,
                     text: record.text, timestamp: record.timestamp, status: [], source: .record, sequence: record.sequence
@@ -389,6 +401,10 @@ enum ThreadTimeline {
                     text: record.text, timestamp: record.timestamp, status: [], source: .record, sequence: record.sequence
                 ))
             }
+        }
+
+        for (messageID, index) in replyIndexByMessageID {
+            items[index].attachments = byMessageID[messageID]?.replyAttachments ?? []
         }
 
         // Message rows not yet in the transcript: queued / claimed / in flight.
@@ -423,8 +439,10 @@ enum ThreadTimeline {
             // Only for rows with no record: once the transcript arrives it is the better
             // copy — full text rather than the ack's 500-character preview — and it lands
             // in `appliedMessageIDs`, so this branch stops firing for that message.
-            if let reply = message.replyPreview?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !reply.isEmpty, !asked {
+            let replyFiles = message.replyAttachments ?? []
+            if let reply = message.replyPreview?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? (replyFiles.isEmpty ? nil : ""),
+               !reply.isEmpty || !replyFiles.isEmpty, !asked {
                 items.append(ThreadItem(
                     id: "mr:" + message.messageId,
                     party: .fin(siteID8: message.claimedBy.map { String($0.prefix(8)) }),
@@ -434,7 +452,8 @@ enum ThreadTimeline {
                     // the prompt, so the reply never sorts above the question it answers.
                     timestamp: message.answeredAt
                         ?? (message.createdAt ?? .distantPast).addingTimeInterval(1),
-                    status: [], source: .message, sequence: 1
+                    status: [], source: .message, sequence: 1,
+                    messageID: message.messageId, attachments: replyFiles
                 ))
             }
         }

@@ -334,25 +334,44 @@ struct TVTranscriptView: View {
                 .font(.footnote)
                 .foregroundStyle(.tertiary)
         } else {
+            let files = client.files(for: turn)
             VStack(alignment: .leading, spacing: 10) {
                 if let prompt = turn.prompt {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("You · \(prompt.timestamp.formatted(date: .omitted, time: .shortened))")
                             .font(.caption).foregroundStyle(.secondary)
-                        Text(prompt.text).font(.callout)
+                        turnText(prompt.text, hasFiles: !files.prompt.isEmpty)
+                        if !files.prompt.isEmpty { TVAttachmentList(attachments: files.prompt) }
                     }
                 }
                 if let reply = turn.reply {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Fin · \(reply.timestamp.formatted(date: .omitted, time: .shortened))")
                             .font(.caption).foregroundStyle(.secondary)
-                        Text(reply.text).font(.callout)
+                        turnText(reply.text, hasFiles: !files.reply.isEmpty)
+                        if !files.reply.isEmpty { TVAttachmentList(attachments: files.reply) }
                     }
                 } else if !turn.steps.isEmpty {
                     Text(turn.steps.count == 1 ? "1 step, no reply yet" : "\(turn.steps.count) steps, no reply yet")
                         .font(.footnote).foregroundStyle(.tertiary)
                 }
             }
+        }
+    }
+
+    /// The turn's text without the daemon's trailing "[Attached: …]" line —
+    /// the rows below show the files. Files-only with no row to show them
+    /// (All activity, or the rows not loaded yet): the line, unbracketed.
+    @ViewBuilder
+    private func turnText(_ text: String, hasFiles: Bool) -> some View {
+        let stripped = XanaduText.displayText(text)
+        if !stripped.isEmpty {
+            Text(stripped).font(.callout)
+        } else if !hasFiles {
+            let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            Text(raw.hasPrefix("[") && raw.hasSuffix("]") ? String(raw.dropFirst().dropLast()) : raw)
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -363,5 +382,61 @@ struct TVTranscriptView: View {
                 .foregroundStyle(row.state == "failed" ? .orange : .secondary)
             Text(row.text).font(.callout)
         }
+    }
+}
+
+/// docs/XANADU.md (tvOS): a turn's files, read-only — image thumbnails from
+/// the presigned url, every other file a row with its name, kind and size. No
+/// open / share / download on the TV.
+struct TVAttachmentList: View {
+    let attachments: [MessageAttachment]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            let images = attachments.filter { $0.kind == .image && $0.url != nil }
+            if !images.isEmpty {
+                HStack(spacing: 12) {
+                    ForEach(images) { attachment in thumbnail(attachment) }
+                }
+            }
+            ForEach(attachments.filter { !($0.kind == .image && $0.url != nil) }) { attachment in
+                fileRow(attachment)
+            }
+        }
+    }
+
+    private func thumbnail(_ attachment: MessageAttachment) -> some View {
+        AsyncImage(url: attachment.url) { phase in
+            switch phase {
+            case .success(let image):
+                image.resizable().scaledToFill()
+            case .failure:
+                Image(systemName: "photo").font(.title2).foregroundStyle(.secondary)
+            default:
+                ProgressView()
+            }
+        }
+        .frame(width: 240, height: 160)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .accessibilityLabel("\(attachment.name), image")
+    }
+
+    private func fileRow(_ attachment: MessageAttachment) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: attachment.systemImage).font(.title3).frame(width: 36)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attachment.name).font(.callout).lineLimit(1)
+                Text("\(attachment.kindLabel) · \(attachment.sizeLabel)")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let transcript = attachment.transcript {
+                    Text(transcript).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+        .accessibilityElement(children: .combine)
     }
 }

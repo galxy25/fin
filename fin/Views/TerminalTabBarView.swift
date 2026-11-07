@@ -22,7 +22,8 @@ struct TerminalTabBarView: View {
                             TerminalTabChip(
                                 server: server,
                                 session: session,
-                                isActive: sessionManager.activeBrowserTabID == nil
+                                isActive: !sessionManager.showsXanadu
+                                    && sessionManager.activeBrowserTabID == nil
                                     && sessionManager.activeServerID == server.id,
                                 // A click is the explicit gesture, so it goes through
                                 // `open` — which reconnects a dropped tab — where the
@@ -36,7 +37,7 @@ struct TerminalTabBarView: View {
                         BrowserTabChip(
                             tab: tab,
                             session: tab.session,
-                            isActive: sessionManager.activeBrowserTabID == tab.id,
+                            isActive: !sessionManager.showsXanadu && sessionManager.activeBrowserTabID == tab.id,
                             select: { sessionManager.selectBrowserTab(tab.id) },
                             close: { sessionManager.closeBrowserTab(tab.id) }
                         )

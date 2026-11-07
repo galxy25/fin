@@ -46,14 +46,19 @@ final class SessionManager: ObservableObject {
     /// server button — and one flag is what keeps them from presenting two.
     @Published var isServerPickerPresented = false
 
-    /// docs/XANADU.md decision 1: the conversation pane is the LANDING — true
-    /// at launch even with terminal tabs restored, so the app opens on Xanadu.
-    /// Every explicit terminal / browser gesture (`open`, tab selection, a
-    /// browser tab) clears it; Siri, an intent and the control strip's
-    /// conversation button set it again. Not persisted: every launch lands here.
+    /// docs/XANADU.md decision 1 (revised 2026-11-06): Xanadu in front of the
+    /// terminals. At launch it is true only when no tab survived (`LaunchLanding`)
+    /// — otherwise the app reopens on the last open terminal. Every explicit
+    /// terminal / browser gesture (`open`, tab selection, a browser tab) clears
+    /// it; a notification / Live Activity tap, Siri, an intent, the control
+    /// strip's agent button (cloud agents) and ⌘0 set it. Not persisted.
     @Published var showsXanadu = true
 
     func showXanadu() { showsXanadu = true }
+
+    /// The `XanaduNavigator` request RootView last acted on — so a view that
+    /// subscribes late (a second Mac window) doesn't replay a stale tap.
+    var handledXanaduRequestID: UUID?
 
     /// One queued notification tap: which agent to open, and — when the payload
     /// carried it — which device the signal originated on. Origin is what the
@@ -270,6 +275,16 @@ final class SessionManager: ObservableObject {
            let uuid = UUID(uuidString: stored) {
             activeServerID = uuid
             if !tabOrder.contains(uuid) { tabOrder.append(uuid) }
+        }
+        // Landing: the last open terminal when any tab survived (a tab lives
+        // until its X — relaunch, backgrounding and disconnects keep it), else
+        // Xanadu. docs/XANADU.md decision 1.
+        switch LaunchLanding.route(openTabs: tabOrder, lastActive: activeServerID) {
+        case .terminal(let id):
+            activeServerID = id
+            showsXanadu = false
+        case .xanadu:
+            showsXanadu = true
         }
         isRestoringFromStorage = false
         directiveChannel.liveTargets = { [weak self] in
@@ -724,5 +739,31 @@ final class SessionManager: ObservableObject {
         browserTabs.first(where: { $0.id == id })?.session.close()
         browserTabs.removeAll { $0.id == id }
         if activeBrowserTabID == id { activeBrowserTabID = nil }
+    }
+}
+
+/// docs/XANADU.md decision 1 (Levi, 2026-11-06): "the default screen should
+/// still be the last open terminal; its notification opens should go to Xanadu
+/// mode, or default if no active sessions (a session is active until the user
+/// explicitly clicks the X)". Pure, so the rule is pinned by a test.
+enum LaunchLanding: Equatable {
+    case terminal(UUID)
+    case xanadu
+
+    enum Context: Equatable {
+        /// A plain launch (cold start, a relaunch after the system killed it).
+        case launch
+        /// A notification / Live Activity tap, a `fin://` link, a Siri intent
+        /// that opens the app (`XanaduNavigator.open`).
+        case externalOpen
+    }
+
+    /// `openTabs` are the persisted tabs (only `SessionManager.close` — the X,
+    /// ⌘W, deleting the server — removes one); `lastActive` the focused one.
+    static func route(openTabs: [UUID], lastActive: UUID?, context: Context = .launch) -> LaunchLanding {
+        if context == .externalOpen { return .xanadu }
+        guard let last = openTabs.last else { return .xanadu }
+        if let lastActive, openTabs.contains(lastActive) { return .terminal(lastActive) }
+        return .terminal(last)
     }
 }

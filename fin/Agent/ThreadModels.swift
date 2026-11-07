@@ -405,4 +405,52 @@ struct MessageAttachment: Decodable, Equatable, Hashable, Identifiable {
     }
 
     var sizeLabel: String { ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file) }
+
+    /// A short human kind for a file row ("image", "PDF", "XLSX file"). Pure.
+    var kindLabel: String {
+        switch kind {
+        case .image: return "image"
+        case .audio: return "audio"
+        case .video: return "video"
+        case .pdf: return "PDF"
+        case .file:
+            let ext = (name as NSString).pathExtension
+            return ext.isEmpty ? "file" : ext.uppercased() + " file"
+        }
+    }
+}
+
+/// The files on one transcript turn, from its control-plane row: what Levi
+/// sent (`attachments`) and what Fin handed back (`replyAttachments`,
+/// docs/XANADU.md "Fin replies with files"). The remote console and tvOS
+/// render turns, not `ThreadItem`s, and join them to rows through the
+/// prompt's `in_reply_to`.
+struct TurnFiles: Equatable {
+    var prompt: [MessageAttachment] = []
+    var reply: [MessageAttachment] = []
+
+    var isEmpty: Bool { prompt.isEmpty && reply.isEmpty }
+
+    /// Lenient decode of raw rows (`GET /threads/{id}` → `messages`, as tvOS
+    /// reads them through JSONSerialization): `messageId → files`, rows with
+    /// none left out; a malformed entry drops only that entry. Pure.
+    static func byMessageID(rows: [[String: Any]]) -> [String: TurnFiles] {
+        var map: [String: TurnFiles] = [:]
+        for row in rows {
+            guard let id = row["messageId"] as? String else { continue }
+            let files = TurnFiles(prompt: decodeList(row["attachments"]), reply: decodeList(row["replyAttachments"]))
+            if !files.isEmpty { map[id] = files }
+        }
+        return map
+    }
+
+    static func decodeList(_ value: Any?) -> [MessageAttachment] {
+        guard let entries = value as? [Any] else { return [] }
+        return entries.compactMap { entry in
+            guard let object = entry as? [String: Any],
+                  JSONSerialization.isValidJSONObject(object),
+                  let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+            return try? JSONDecoder().decode(MessageAttachment.self, from: data)
+        }
+    }
 }
