@@ -183,6 +183,22 @@ Xanadu thread through the same upload-then-send flow. Needs the app's
 control-plane credentials and the current-thread key shared through an App
 Group + shared keychain access group.
 
+Built (`fin-share/`, `fin/Agent/FinAppGroup.swift`):
+
+- The app mirrors, one-way, into App Group `group.dev.levischoen.fin`:
+  endpoint, primary agent name, device id (`FinShareMirror`, refreshed at
+  launch, on credential changes, and on every activate/resign-active). The
+  bearer token goes to a device-only, non-synced COPY in keychain access group
+  `<team>.dev.levischoen.fin.shared`; the app's own synced item is untouched,
+  so the mirror can never sign anyone out. App signs out → copies cleared.
+- `XanaduCurrentThread` lives in the group's defaults. The app copies the v1
+  standard-defaults map in once at launch (group entries win; legacy copy kept).
+- The extension compiles `XanaduSend`, `ControlPlaneClient`,
+  `XanaduCurrentThread`, `ThreadModels` and `XanaduMedia` (HEIC → JPEG) as-is;
+  `fin-share/ShareShims.swift` stands in for the app types they name. No
+  SwiftData/CloudKit in the extension. Shared links ride in the message text;
+  text that would overflow the 8000-char cap becomes `shared-text.txt`.
+
 ## Not in v1
 
 - The app's local (in-process) runtime path: attachments need the control
