@@ -98,6 +98,7 @@ enum CloudControlPlaneConfig {
     static func setEndpointURL(_ url: String) {
         UserDefaults.standard.set(url, forKey: endpointURLKey)
         SyncedDeviceConfig.push(url, forKey: endpointURLKey)
+        FinShareMirror.mirrorCredentials()
     }
 
     static func setToken(_ token: String) {
@@ -111,6 +112,8 @@ enum CloudControlPlaneConfig {
             // feature still works on this device alone.
             UserDefaults.standard.set(token, forKey: tokenKey)
         }
+        // The share extension's device-only copy follows (signs out with it).
+        FinShareMirror.mirrorCredentials()
     }
 
     /// Editor display form for the token. `RemoteSupervisionConfig.redactedDisplay`

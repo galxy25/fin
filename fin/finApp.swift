@@ -424,6 +424,9 @@ struct FinApp: App {
         // deliberate non-goals (capability URLs, machine-scoped files, telemetry
         // opt-ins).
         SyncedDeviceConfig.activate()
+        // The share extension's view of the app (docs/XANADU.md "Share
+        // extension"): endpoint, token copy, primary agent, current thread.
+        FinShareMirror.activate()
         // Themes sync only for the scopes this device opted into (ThemeSync).
         ThemeSync.activate()
 

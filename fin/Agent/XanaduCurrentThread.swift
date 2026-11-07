@@ -12,12 +12,15 @@ import Foundation
 /// - A brand-new thread's id is its root message id, so the sender knows it
 ///   the moment the send returns and makes it current.
 ///
-/// Storage: the spec says "App Group defaults". Fin has no App Group today and
-/// every intent runs in the app's own process (no Intents extension — see
-/// `FinSharedState`), so the app's standard defaults ARE the shared store. The
-/// one `defaults` seam is where a group suite goes the day an extension needs
-/// it. Keyed by agent NAME, the control plane's identity for an agent (the
-/// intents and `ThreadStore` both have it; neither always has the UUID).
+/// Storage: the App Group's defaults (`FinAppGroup`), so the `fin-share`
+/// extension sends into the same current thread and the app sees a thread the
+/// share sheet started. v1 kept the map in the app's standard defaults (there
+/// was no App Group); the first read in the APP copies that map into the group
+/// once (`migrate`) — a group value always wins, and the legacy copy is left in
+/// place so a downgrade still finds it. No group container (an un-entitled
+/// build) → standard defaults, the v1 behaviour. Keyed by agent NAME, the
+/// control plane's identity for an agent (the intents and `ThreadStore` both
+/// have it; neither always has the UUID).
 enum XanaduCurrentThread {
     static let defaultsKey = "xanadu.currentThreadByAgent"
     /// Posted (object: agent name) whenever an agent's current thread changes,
@@ -26,9 +29,28 @@ enum XanaduCurrentThread {
 
     /// Unit tests run inside the app's process on macOS — never let them
     /// overwrite the real current thread of whoever runs the suite.
-    nonisolated(unsafe) static var defaults: UserDefaults = TestHost.isUnitTest
-        ? (UserDefaults(suiteName: "dev.levischoen.fin.tests.xanadu") ?? .standard)
-        : .standard
+    nonisolated(unsafe) static var defaults: UserDefaults = {
+        if TestHost.isUnitTest { return UserDefaults(suiteName: "dev.levischoen.fin.tests.xanadu") ?? .standard }
+        guard let group = FinAppGroup.defaults else { return .standard }
+        if !FinAppGroup.isAppExtension { migrate(from: .standard, to: group) }
+        return group
+    }()
+
+    static let migratedKey = "xanadu.currentThreadByAgent.migratedToGroup"
+
+    /// One-time copy of the v1 map into the group. An entry already in the
+    /// group (written by the share extension, or a later app run) is never
+    /// overwritten. Returns whether it ran.
+    @discardableResult
+    static func migrate(from legacy: UserDefaults, to group: UserDefaults) -> Bool {
+        guard !group.bool(forKey: migratedKey) else { return false }
+        let old = legacy.dictionary(forKey: defaultsKey) as? [String: String] ?? [:]
+        var map = group.dictionary(forKey: defaultsKey) as? [String: String] ?? [:]
+        for (agent, thread) in old where map[agent] == nil { map[agent] = thread }
+        if !map.isEmpty { group.set(map, forKey: defaultsKey) }
+        group.set(true, forKey: migratedKey)
+        return true
+    }
 
     private static func normalized(_ agent: String) -> String {
         agent.trimmingCharacters(in: .whitespacesAndNewlines)

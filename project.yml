@@ -61,6 +61,12 @@ targets:
       - target: fin-widgets
         embed: true
         platformFilter: iOS
+      # Share extension (docs/XANADU.md "Share extension (v1.1)"): the system
+      # share sheet → a Xanadu message. iOS + macOS only; it reads what the app
+      # mirrors into the App Group / shared keychain group (FinAppGroup.swift).
+      - target: fin-share
+        embed: true
+        destinationFilters: [iOS, macOS]
     info:
       path: Generated/Info.plist
       properties:
@@ -166,6 +172,10 @@ targets:
         # the key ActivityKit checks before Activity.request and before a
         # push-to-start token is ever minted. Harmless on macOS/visionOS.
         NSSupportsLiveActivities: true
+        # The shared keychain access group's full name (team prefix resolved at
+        # build time) — FinAppGroup.keychainGroup reads it; fin-share declares
+        # the same value.
+        FinSharedKeychainGroup: "$(AppIdentifierPrefix)dev.levischoen.fin.shared"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin
@@ -276,6 +286,70 @@ targets:
         SKIP_INSTALL: "YES"
         IPHONEOS_DEPLOYMENT_TARGET: "18.0"
         CODE_SIGN_ENTITLEMENTS: fin/fin-widgets.entitlements
+  fin-share:
+    # Share extension — docs/XANADU.md "Share extension (v1.1)". Files, images,
+    # movies, audio, links and text from the system share sheet → one message
+    # (optional note) into the current Xanadu thread, through the same
+    # upload-then-send flow the app uses. iOS + macOS; embedded by the fin
+    # target's dependency above. No SwiftData/CloudKit: the app mirrors the
+    # endpoint, a token copy, the primary agent and the current thread into
+    # the App Group + shared keychain group, and fin-share/ShareShims.swift
+    # stands in for the app types the shared files name.
+    type: app-extension
+    supportedDestinations: [iOS, macOS]
+    sources:
+      - path: fin-share
+      - path: fin/Agent
+        includes:
+          - XanaduSend.swift
+          - ControlPlaneClient.swift
+          - XanaduCurrentThread.swift
+          - FinAppGroup.swift
+          - ShareIntake.swift
+          - ThreadModels.swift
+          - AgentMirrorRecord.swift
+          - TranscriptTurns.swift
+      - path: fin/Models
+        includes:
+          - AgentLogKind.swift
+      # HEIC → JPEG, the same normalizer Xanadu's composer uses.
+      - path: fin/Views/Xanadu
+        includes:
+          - XanaduMedia.swift
+    info:
+      path: Generated/Info-share.plist
+      properties:
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleDisplayName: "Fin"
+        FinSharedKeychainGroup: "$(AppIdentifierPrefix)dev.levischoen.fin.shared"
+        ITSAppUsesNonExemptEncryption: false
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
+          NSExtensionAttributes:
+            # Up to MessageAttachment.maxPerMessage (8) of each kind; audio
+            # arrives as a file (Voice Memos, Files) or a generic attachment.
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsAttachmentsWithMaxCount: 8
+              NSExtensionActivationSupportsFileWithMaxCount: 8
+              NSExtensionActivationSupportsImageWithMaxCount: 8
+              NSExtensionActivationSupportsMovieWithMaxCount: 8
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsText: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.levischoen.fin.share
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: EC27UF79GL
+        # Version numbers must match the containing app's (App Store validation).
+        MARKETING_VERSION: "1.2.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: "YES"
+        CODE_SIGN_ENTITLEMENTS: fin/fin-share.entitlements
+        "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": fin/fin-share-macOS.entitlements
   fin-tv:
     type: application
     platform: tvOS

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- fin-share (iOS): reads what the app mirrors for it (FinAppGroup.swift) —
+	     the App Group's defaults (endpoint, primary agent, current thread) and
+	     the token copy in the shared keychain access group. Nothing else: no
+	     iCloud, no push, no Sign in with Apple (it never signs in itself). -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.dev.levischoen.fin</string>
+	</array>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)dev.levischoen.fin.shared</string>
+	</array>
+</dict>
+</plist>
