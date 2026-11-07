@@ -17,8 +17,14 @@ a thread mention opens that thread.
 
 Decisions (Levi, 2026-11-06):
 
-1. **Default landing** on iPhone, iPad, Mac, Vision Pro. Terminal / Markdown /
-   Agents stay one tap away. Siri always lands on the current thread here.
+1. **Landing** (revised by Levi 2026-11-06, superseding "always land on
+   Xanadu"): launch returns to the **last open terminal session**. A session
+   stays active until the user explicitly closes it with its X — backgrounding,
+   relaunch or a dropped connection never closes it. Xanadu is the launch
+   default only when there are **no** active sessions. Notification / Live
+   Activity taps and Siri intents that open the app go to Xanadu (on the
+   thread). Xanadu stays one tap away (the "Fin" segment / control-strip button
+   / ⌘0).
 2. **Files go to disk, the agent works them.** An attachment is uploaded to S3,
    the site that claims the message downloads it into a per-thread folder, and
    the turn prompt names the path; Fin uses its terminal tools (python, pandas,
