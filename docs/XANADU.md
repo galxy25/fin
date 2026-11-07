@@ -122,11 +122,63 @@ On claiming a message with attachments, before the turn:
 - 27.3 SDK only: `ToolIntent` conformances for Ask, Tell, Share, Start Thread;
   `SnippetRepresentableEntity` for `FinThreadEntity`.
 
+## Fin replies with files (v1.1, 2026-11-06)
+
+### Site upload — `POST /sites/{siteId}/attachments`
+
+Site-authenticated (bearer + `X-Fin-Site`, like the heartbeat). Request
+`{messageId, name, mime, size}`; the message must be claimed by this site.
+Response is the same shape as `POST /attachments` (`key`, `putUrl`,
+`headers`), key under the message owner's
+`users/<user>/fin/attachments/<agentSlug>/<uuid>/<safeName>`.
+
+### Answered ack
+
+The site's `answered` state update gains optional `replyAttachments` (≤ 8,
+entries `{key, name, mime, size}`, same validation as user attachments: owner
+prefix + HEAD). Stored on the row as `replyAttachments`.
+
+- `_public_message` returns `replyAttachments` (each with a fresh `url`; `[]`
+  when none) beside `attachments`.
+- The `message.answered` thread event carries `replyAttachmentCount`.
+- The reply push / Live Activity preview appends `📎 <first name>` (+N) when
+  the reply text is empty or the reply carries files.
+
+### Daemon
+
+- New tool `attach_file` (`{path, name?}`) available in message turns: queues a
+  file on this machine to go back with the reply (≤ 25 MiB, regular file,
+  readable; refusal text otherwise). Max 8 per turn.
+- On the answered ack: upload each queued file via the site route, include
+  `replyAttachments`. An upload failure is reported in the reply text
+  (`(couldn't attach <name>: <reason>)`), never drops the reply.
+- The cloud transcript's assistant turn gets the same trailing
+  `[Attached: <name> (<kind>, <size>), …]` line as user turns.
+- System prompt: one line telling Fin it can hand files back with
+  `attach_file` (charts, exports, reports).
+
+### App
+
+Xanadu, the remote console and tvOS render `replyAttachments` under Fin's
+reply exactly like user attachments (tvOS read-only: images + file rows, no
+open/share).
+
+## Orphaned uploads
+
+The sweep deletes objects under `users/*/fin/attachments/` older than
+`MESSAGE_RETENTION_DAYS + 1` days (the rows that referenced them are gone by
+then; never-sent uploads die the same way). Runs at most once a day.
+
+## Share extension (v1.1)
+
+`fin-share` (iOS + macOS share extension): system share sheet → Fin. Takes
+files / images / URLs / text, optional note, sends into the user's current
+Xanadu thread through the same upload-then-send flow. Needs the app's
+control-plane credentials and the current-thread key shared through an App
+Group + shared keychain access group.
+
 ## Not in v1
 
-- Fin replying *with* files (an `attach_file` tool uploading from the site).
-- A Share Extension (system share sheet → Fin); Siri's Share intent covers
-  the voice path.
 - The app's local (in-process) runtime path: attachments need the control
   plane; Xanadu says so instead of silently dropping them.
-- tvOS: shows attachments read-only, no composer attachments.
+- tvOS: attachments read-only, no composer attachments.
