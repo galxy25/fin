@@ -347,6 +347,9 @@ fi
 # 404/NoSuchKey instead of 403 Forbidden — without it the auto-provision
 # head-check can never see a miss. Also what lets wake()'s _inbox_candidates
 # list the bare "users/" prefix to discover every user's inbox.
+# SweepMarkers holds the sweep's own once-a-day markers (the orphaned
+# attachment cleanup, docs/XANADU.md); a missing marker reads as 403, which
+# the Lambda treats as "never ran".
 cat > "$BUILD/policy.json" <<JSON
 {
   "Version": "2012-10-17",
@@ -555,6 +558,12 @@ cat > "$BUILD/policy.json" <<JSON
       "Effect": "Allow",
       "Action": "s3:PutObject",
       "Resource": "arn:aws:s3:::$BUCKET/users/*/fin/attachments/*"
+    },
+    {
+      "Sid": "SweepMarkers",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::$BUCKET/fin/sweep/*"
     },
     {
       "Sid": "ArtifactsReadWrite",
@@ -786,6 +795,7 @@ POST /auth/apple
 POST /sites/enroll
 GET /sites
 POST /sites/{siteId}/heartbeat
+POST /sites/{siteId}/attachments
 POST /sites/{siteId}/commands
 DELETE /sites/{siteId}
 POST /attachments

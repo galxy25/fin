@@ -44,6 +44,17 @@ struct MessageAttachment: Codable, Equatable, Sendable {
     }
 }
 
+/// A file Fin queued with `attach_file` to go back with its reply (docs/XANADU.md
+/// "Fin replies with files"): validated at queue time, uploaded at the answered ack.
+struct QueuedReplyFile: Equatable, Sendable {
+    /// Absolute, tilde-expanded, symlinks resolved.
+    var path: String
+    /// What the user sees — the tool's `name`, else the file's own name.
+    var name: String
+    var mime: String
+    var size: Int
+}
+
 /// What became of one attachment on this machine: saved at `path`, or `failure`.
 struct FetchedAttachment: Equatable, Sendable {
     var attachment: MessageAttachment
@@ -197,6 +208,86 @@ enum DaemonAttachments {
             else { return nil }
             return AgentImageReference(path: path, mimeType: mime == "image/jpg" ? "image/jpeg" : mime)
         }
+    }
+
+    // MARK: Reply files (attach_file)
+
+    /// The contract's caps: the same 25 MiB as a user upload, at most 8 per reply.
+    static let maxReplyFileBytes = 25 * 1024 * 1024
+    static let maxReplyFilesPerTurn = 8
+
+    /// The checks `attach_file` makes before queueing: a regular, readable file (a
+    /// symlink is followed to one) of at most 25 MiB, not already queued, within the
+    /// per-turn cap. `.failure` carries the refusal the model reads. Touches only the
+    /// file system's metadata — the bytes are read at upload time.
+    static func validateReplyFile(
+        path rawPath: String, name rawName: String?, queued: [QueuedReplyFile],
+        fileManager: FileManager = .default
+    ) -> Result<QueuedReplyFile, ReplyFileRefusal> {
+        guard queued.count < maxReplyFilesPerTurn else {
+            return .failure(.init("at most \(maxReplyFilesPerTurn) files go back with one reply"))
+        }
+        let expanded = (rawPath.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else {
+            return .failure(.init("give the file's full path (absolute or ~/…)"))
+        }
+        let path = URL(fileURLWithPath: expanded).resolvingSymlinksInPath().path
+        guard let attributes = try? fileManager.attributesOfItem(atPath: path) else {
+            return .failure(.init("no such file"))
+        }
+        guard (attributes[.type] as? FileAttributeType) == .typeRegular else {
+            return .failure(.init("not a regular file (a folder? zip it first)"))
+        }
+        let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        guard size <= maxReplyFileBytes else {
+            return .failure(.init("\(formattedSize(size)) is over the 25 MB limit"))
+        }
+        guard fileManager.isReadableFile(atPath: path) else {
+            return .failure(.init("not readable"))
+        }
+        guard !queued.contains(where: { $0.path == path }) else {
+            return .failure(.init("already attached to this reply"))
+        }
+        var name = (rawName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            .filter { !$0.isNewline && $0.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7F } }
+        if name.isEmpty { name = (path as NSString).lastPathComponent }
+        name = String(name.prefix(255))
+        // The mime follows the FILE (its real extension), not a display name the model made up.
+        let mime = mimeType(forFileName: (path as NSString).lastPathComponent)
+        return .success(QueuedReplyFile(path: path, name: name, mime: mime, size: size))
+    }
+
+    struct ReplyFileRefusal: Error, Equatable {
+        let reason: String
+        init(_ reason: String) { self.reason = reason }
+    }
+
+    /// A media type from the extension — portable (no UniformTypeIdentifiers, which a
+    /// Linux cloud worker does not have); anything unknown is application/octet-stream.
+    static func mimeType(forFileName name: String) -> String {
+        let types: [String: String] = [
+            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+            "webp": "image/webp", "heic": "image/heic", "tif": "image/tiff", "tiff": "image/tiff",
+            "svg": "image/svg+xml", "bmp": "image/bmp",
+            "pdf": "application/pdf", "json": "application/json", "xml": "application/xml",
+            "csv": "text/csv", "tsv": "text/tab-separated-values", "txt": "text/plain", "log": "text/plain",
+            "md": "text/markdown", "html": "text/html", "htm": "text/html",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xls": "application/vnd.ms-excel",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "doc": "application/msword",
+            "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "ppt": "application/vnd.ms-powerpoint", "rtf": "application/rtf",
+            "zip": "application/zip", "gz": "application/gzip", "tgz": "application/gzip", "tar": "application/x-tar",
+            "mp3": "audio/mpeg", "m4a": "audio/mp4", "wav": "audio/wav", "aac": "audio/aac",
+            "mp4": "video/mp4", "mov": "video/quicktime",
+        ]
+        return types[(name as NSString).pathExtension.lowercased()] ?? "application/octet-stream"
+    }
+
+    /// The reply-text note for a file that could not go up (the contract's wording).
+    static func replyFailureNote(name: String, reason: String) -> String {
+        "(couldn't attach \(name): \(reason))"
     }
 
     // MARK: Downloading

@@ -312,6 +312,39 @@ final class DaemonTranscriptUplink {
         return restamped
     }
 
+    /// Appends `suffix` on its own line to the turn's FINAL assistant line — the reply
+    /// — and sends the rewritten line up again under the same id (the chunk merge is
+    /// last-write-wins per id, as for `restampThread`). This is how the cloud
+    /// transcript's assistant turn gets its `[Attached: …]` line (docs/XANADU.md "Fin
+    /// replies with files"): the files are uploaded only after the engine recorded the
+    /// reply. Must run before `endMessageTurn`. Returns whether a line was rewritten.
+    @discardableResult
+    func appendToFinalAssistantLine(_ suffix: String) async -> Bool {
+        let addition = suffix.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !addition.isEmpty else { return false }
+        for position in turnLines.indices.reversed() {
+            let entry = turnLines[position]
+            guard var object = (try? JSONSerialization.jsonObject(with: Data(entry.line.utf8))) as? [String: Any],
+                  object["kind"] as? String == "assistantMessage"
+            else { continue }
+            let text = (object["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            object["text"] = MemoryRedactor.redact(text.isEmpty ? addition : text + "\n" + addition)
+            guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            else { return false }
+            let rewritten = String(decoding: data, as: UTF8.self)
+            turnLines[position] = (entry.id, entry.hour, rewritten)
+            if entry.hour == currentHour,
+               let index = lines.firstIndex(where: { Self.lineID($0) == entry.id }) {
+                lines[index] = rewritten
+                isDirty = true
+            } else {
+                await flush(hour: entry.hour, lines: [rewritten])
+            }
+            return true
+        }
+        return false
+    }
+
     /// The `id` of one mirror line, nil for anything unparseable.
     static func lineID(_ line: String) -> String? {
         guard let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]

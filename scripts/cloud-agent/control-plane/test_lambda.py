@@ -2062,7 +2062,29 @@ class _FakeS3:
     def list_objects_v2(self, **kwargs):
         prefix = kwargs.get("Prefix", "")
         keys = sorted(k for k in self.objects if k.startswith(prefix))
-        return {"Contents": [{"Key": k} for k in keys]}
+        delimiter = kwargs.get("Delimiter")
+        if delimiter:
+            common = sorted({prefix + k[len(prefix):].split(delimiter, 1)[0] + delimiter
+                             for k in keys if delimiter in k[len(prefix):]})
+            keys = [k for k in keys if delimiter not in k[len(prefix):]]
+        else:
+            common = []
+        # MaxKeys pages (the token is the last key returned, like real S3 a
+        # deletion between pages shifts nothing), so pagination is exercised;
+        # LastModified from `modified` when a test set one.
+        after = kwargs.get("ContinuationToken")
+        if after:
+            keys = [k for k in keys if k > after]
+        limit = int(kwargs.get("MaxKeys") or 1000)
+        page = keys[:limit]
+        modified = getattr(self, "modified", {})
+        out = {"Contents": [dict({"Key": k}, **({"LastModified": modified[k]} if k in modified else {}))
+                            for k in page]}
+        if common:
+            out["CommonPrefixes"] = [{"Prefix": c} for c in common]
+        if len(keys) > limit:
+            out["NextContinuationToken"] = page[-1]
+        return out
 
     def head_object(self, Bucket, Key):
         if Key not in self.objects:
@@ -4313,6 +4335,232 @@ class MessageAttachmentTests(_AttachmentsTestCase):
         self.assertEqual(list(self.s3.objects), [kept["key"]])
 
 
+class _ReplyFilesTestCase(_AttachmentsTestCase):
+    """Fin replies with files (docs/XANADU.md v1.1)."""
+
+    def site_upload(self, site, message_id, user="user-1", **body):
+        payload = {"messageId": message_id, "name": "chart.png", "mime": "image/png", "size": 5}
+        payload.update(body)
+        event = {"_userId": user, "_siteId": site["siteId"], "body": json.dumps(payload)}
+        return lam.create_site_attachment(event, site["siteId"])
+
+    def applied(self, site=None, text="chart my costs"):
+        site = site or self.imac
+        sent = self.send(text)
+        self.claim(site, sent["messageId"])
+        self.ack(site, sent["messageId"], "applied", runId="run-1")
+        return sent["messageId"]
+
+    def reply_file(self, message_id, site=None, data=b"bytes", **body):
+        """Site route, then 'PUT' the bytes; returns the ack entry."""
+        response = self.site_upload(site or self.imac, message_id, **body)
+        created = json.loads(response["body"])
+        self.s3.objects[created["key"]] = data
+        return {"key": created["key"], "name": body.get("name", "chart.png"),
+                "mime": body.get("mime", "image/png"), "size": len(data)}
+
+
+class SiteAttachmentTests(_ReplyFilesTestCase):
+    def test_the_claimant_gets_a_presigned_put_under_the_owner_prefix(self):
+        message_id = self.applied()
+        response = self.site_upload(self.imac, message_id, name="Q3 chart.png")
+        self.assertEqual(response["statusCode"], 200)
+        body = json.loads(response["body"])
+        self.assertRegex(body["key"], r"^users/user-1/fin/attachments/fin/[0-9a-f-]{36}/Q3_chart\.png$")
+        self.assertEqual(body["headers"], {"Content-Type": "image/png"})
+        self.assertEqual(self.s3.presigned[-1][1]["ContentType"], "image/png")
+        self.assertIn("put_object", body["putUrl"])
+
+    def test_a_claimed_but_not_yet_applied_message_may_upload(self):
+        sent = self.send("x")
+        self.claim(self.imac, sent["messageId"])
+        self.assertEqual(self.site_upload(self.imac, sent["messageId"])["statusCode"], 200)
+
+    def test_only_the_claimant_and_only_while_the_turn_runs(self):
+        message_id = self.applied()
+        with self.assertRaises(lam.ApiError) as caught:
+            self.site_upload(self.cloud, message_id)
+        self.assertEqual(caught.exception.status, 409)
+        queued = self.send("never claimed")
+        with self.assertRaises(lam.ApiError) as caught:
+            self.site_upload(self.imac, queued["messageId"])
+        self.assertEqual(caught.exception.status, 409)
+        self.ack(self.imac, message_id, "answered", replyPreview="done")
+        with self.assertRaises(lam.ApiError) as caught:
+            self.site_upload(self.imac, message_id)
+        self.assertEqual(caught.exception.status, 409)
+
+    def test_another_users_message_or_site_is_a_404(self):
+        message_id = self.applied()
+        for site_user, msg in (("user-2", message_id), ("user-1", "m-00000000-nope")):
+            with self.assertRaises(lam.ApiError) as caught:
+                self.site_upload(self.imac, msg, user=site_user)
+            self.assertEqual(caught.exception.status, 404)
+
+    def test_the_contract_validates_name_mime_and_size(self):
+        message_id = self.applied()
+        for bad in ({"name": ""}, {"mime": "png"}, {"size": -1}, {"size": True}):
+            with self.assertRaises(lam.ApiError):
+                self.site_upload(self.imac, message_id, **bad)
+        with self.assertRaises(lam.ApiError) as caught:
+            self.site_upload(self.imac, message_id, size=lam.MAX_ATTACHMENT_BYTES + 1)
+        self.assertEqual(caught.exception.status, 413)
+
+    def test_a_site_token_may_use_only_its_own_upload_route(self):
+        lam._require_site_scope({"_siteId": "s-1"}, "POST", ["sites", "s-1", "attachments"])
+        with self.assertRaises(lam.ApiError) as caught:
+            lam._require_site_scope({"_siteId": "s-1"}, "POST", ["sites", "s-2", "attachments"])
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_the_route_dispatches(self):
+        message_id = self.applied()
+        event = {"_userId": "user-1", "_siteId": self.imac["siteId"],
+                 "rawPath": "/sites/{}/attachments".format(self.imac["siteId"]),
+                 "requestContext": {"http": {"method": "POST"}},
+                 "body": json.dumps({"messageId": message_id, "name": "a.csv", "mime": "text/csv", "size": 3})}
+        self.assertEqual(lam._route(event)["statusCode"], 200)
+
+
+class ReplyAttachmentAckTests(_ReplyFilesTestCase):
+    def setUp(self):
+        super().setUp()
+        self.pushes, self.activities = [], []
+        self.addCleanup(setattr, lam, "_push_answered_reply", lam._push_answered_reply)
+        self.addCleanup(setattr, lam, "_push_live_activity", lam._push_live_activity)
+        lam._push_answered_reply = lambda row, mid, text, body, now: self.pushes.append(text) or True
+        lam._push_live_activity = lambda user, state, *a, **k: self.activities.append(state)
+
+    def test_reply_files_are_stored_and_read_back_with_urls(self):
+        message_id = self.applied()
+        entry = self.reply_file(message_id, name="Q3 chart.png")
+        self.ack(self.imac, message_id, "answered", replyPreview="here you go", replyAttachments=[entry])
+        self.assertEqual(self.row(message_id)["replyAttachments"], [entry])
+        public = json.loads(lam.get_message({"_userId": "user-1"}, message_id)["body"])
+        self.assertEqual(public["attachments"], [])
+        self.assertEqual(len(public["replyAttachments"]), 1)
+        got = public["replyAttachments"][0]
+        self.assertEqual({k: got[k] for k in ("key", "name", "mime", "size")}, entry)
+        self.assertIn(entry["key"], got["url"])
+        _status, thread = self.get_thread(message_id)
+        self.assertEqual(thread["messages"][0]["replyAttachments"][0]["key"], entry["key"])
+
+    def test_a_reply_without_files_reads_back_an_empty_list(self):
+        message_id = self.lifecycle()
+        self.assertEqual(json.loads(lam.get_message({"_userId": "user-1"}, message_id)["body"])["replyAttachments"], [])
+        self.assertNotIn("replyAttachments", self.row(message_id))
+
+    def test_the_answered_event_counts_the_files(self):
+        message_id = self.applied()
+        files = [self.reply_file(message_id), self.reply_file(message_id, name="b.csv", mime="text/csv")]
+        self.ack(self.imac, message_id, "answered", replyPreview="done", replyAttachments=files)
+        answered = [e for e in self.events.for_thread(message_id) if e["kind"] == "message.answered"]
+        self.assertEqual(answered[0]["detail"]["replyAttachmentCount"], 2)
+        plain = self.lifecycle()
+        answered = [e for e in self.events.for_thread(plain) if e["kind"] == "message.answered"]
+        self.assertEqual(answered[0]["detail"]["replyAttachmentCount"], 0)
+
+    def test_the_push_and_activity_name_the_files(self):
+        message_id = self.applied()
+        files = [self.reply_file(message_id), self.reply_file(message_id, name="b.csv", mime="text/csv")]
+        self.ack(self.imac, message_id, "answered", replyPreview="here", replyAttachments=files)
+        self.assertEqual(self.pushes, ["here \U0001F4CE chart.png +1"])
+        self.assertEqual(len(self.activities), 1)
+
+    def test_a_files_only_reply_still_pushes(self):
+        message_id = self.applied()
+        files = [self.reply_file(message_id)]
+        self.ack(self.imac, message_id, "answered", replyAttachments=files)
+        self.assertEqual(self.pushes, ["\U0001F4CE chart.png"])
+        self.assertNotIn("replyPreview", self.row(message_id))
+
+    def test_a_bad_entry_400s_without_answering_the_row(self):
+        message_id = self.applied()
+        foreign = dict(self.upload(user="user-2"))
+        never = {"key": "users/user-1/fin/attachments/fin/nope/a.png", "name": "a.png", "mime": "image/png", "size": 1}
+        for bad in ([foreign], [never], "nope", [self.reply_file(message_id) for _ in range(9)]):
+            with self.assertRaises(lam.ApiError) as caught:
+                self.ack(self.imac, message_id, "answered", replyPreview="x", replyAttachments=bad)
+            self.assertEqual(caught.exception.status, 400, bad)
+        self.assertEqual(self.row(message_id)["state"], "applied")
+        self.assertEqual(self.pushes, [])
+
+    def test_a_transcript_is_not_stored_on_a_reply_file(self):
+        message_id = self.applied()
+        entry = dict(self.reply_file(message_id), transcript="hi")
+        self.ack(self.imac, message_id, "answered", replyAttachments=[entry])
+        self.assertNotIn("transcript", self.row(message_id)["replyAttachments"][0])
+
+    def test_deleting_the_thread_deletes_reply_files_too(self):
+        message_id = self.applied()
+        entry = self.reply_file(message_id)
+        self.ack(self.imac, message_id, "answered", replyPreview="x", replyAttachments=[entry])
+        lam.delete_thread({"_userId": "user-1"}, message_id)
+        self.assertNotIn(entry["key"], self.s3.objects)
+
+
+class ReplyPushTextTests(unittest.TestCase):
+    def test_text_alone_files_alone_and_both(self):
+        files = [{"name": "a.png"}, {"name": "b.csv"}, {"name": "c.pdf"}]
+        self.assertEqual(lam._reply_push_text("done", []), "done")
+        self.assertEqual(lam._reply_push_text("", files[:1]), "\U0001F4CE a.png")
+        self.assertEqual(lam._reply_push_text("  ", files), "\U0001F4CE a.png +2")
+        self.assertEqual(lam._reply_push_text("done", files[:2]), "done \U0001F4CE a.png +1")
+        self.assertEqual(lam._reply_push_text(None, None), "")
+
+
+class OrphanedAttachmentSweepTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, lam, "S3", lam.S3)
+        self.s3 = _FakeS3()
+        self.s3.modified = {}
+        lam.S3 = self.s3
+
+    def put(self, key, age_days):
+        self.s3.objects[key] = b"x"
+        self.s3.modified[key] = NOW - timedelta(days=age_days)
+
+    def test_due_logic(self):
+        self.assertTrue(lam._attachment_sweep_due(None, NOW))
+        self.assertTrue(lam._attachment_sweep_due({"ranAt": "garbage"}, NOW))
+        self.assertTrue(lam._attachment_sweep_due({"ranAt": _iso(NOW - timedelta(days=1))}, NOW))
+        self.assertFalse(lam._attachment_sweep_due({"ranAt": _iso(NOW - timedelta(hours=23))}, NOW))
+
+    def test_deletes_only_old_attachment_objects_and_runs_once_a_day(self):
+        limit = lam.MESSAGE_RETENTION_DAYS + 1
+        self.put("users/u1/fin/attachments/fin/a/old.png", limit + 1)
+        self.put("users/u1/fin/attachments/fin/b/new.png", limit - 1)
+        self.put("users/u2/fin/attachments/fin/c/old.csv", limit + 30)
+        self.put("users/u2/fin/memory/fin.json", limit + 30)  # not an attachment
+        self.put("fin/agentd/fin-agentd", limit + 30)
+        result = lam._sweep_orphaned_attachments(NOW)
+        self.assertEqual(result, {"deleted": 2, "users": 2, "failures": 0})
+        self.assertEqual(sorted(k for k in self.s3.objects if k != lam.ATTACHMENT_SWEEP_MARKER_KEY), [
+            "fin/agentd/fin-agentd", "users/u1/fin/attachments/fin/b/new.png", "users/u2/fin/memory/fin.json",
+        ])
+        self.assertIn(lam.ATTACHMENT_SWEEP_MARKER_KEY, self.s3.objects)
+        self.put("users/u1/fin/attachments/fin/d/old.png", limit + 1)
+        self.assertEqual(lam._sweep_orphaned_attachments(NOW + timedelta(hours=1)), {"skipped": "not due"})
+        self.assertIn("users/u1/fin/attachments/fin/d/old.png", self.s3.objects)
+        self.assertEqual(lam._sweep_orphaned_attachments(NOW + timedelta(days=1))["deleted"], 1)
+
+    def test_paginates_past_one_listing_page(self):
+        for i in range(2503):
+            self.put("users/u1/fin/attachments/fin/{:05d}/f.bin".format(i), 40)
+        self.assertEqual(lam._sweep_orphaned_attachments(NOW)["deleted"], 2503)
+
+    def test_the_sweep_reports_it(self):
+        self.addCleanup(setattr, lam, "_sweep_orphaned_attachments", lam._sweep_orphaned_attachments)
+        lam._sweep_orphaned_attachments = lambda now: {"skipped": "not due"}
+        for name in ("_live_workers", "_adopt", "_instance_states", "_mark_stale_sites", "_retire_abandoned_messages"):
+            self.addCleanup(setattr, lam, name, getattr(lam, name))
+        lam._live_workers = lambda: []
+        lam._adopt = lambda now, known: []
+        lam._instance_states = lambda ids: {}
+        lam._mark_stale_sites = lambda now: []
+        lam._retire_abandoned_messages = lambda now: []
+        self.assertEqual(lam.sweep()["orphanedAttachments"], {"skipped": "not due"})
+
+
 class AttachmentDeployTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -4321,6 +4569,17 @@ class AttachmentDeployTests(unittest.TestCase):
 
     def test_the_route_is_registered(self):
         self.assertIn("POST /attachments\n", self.deploy_sh)
+
+    def test_the_site_upload_route_is_registered(self):
+        self.assertIn("POST /sites/{siteId}/attachments\n", self.deploy_sh)
+
+    def test_the_sweep_may_read_and_write_its_marker(self):
+        block = self.deploy_sh.split('"Sid": "SweepMarkers"', 1)[1].split("}", 1)[0]
+        self.assertIn("s3:GetObject", block)
+        self.assertIn("s3:PutObject", block)
+        resource = re.search(r'"Resource": "([^"]+)"', block).group(1)
+        pattern = DeviceStatusIamPolicySanityTests._arn_to_regex(resource)
+        self.assertRegex("arn:aws:s3:::test-bucket/" + lam.ATTACHMENT_SWEEP_MARKER_KEY, pattern)
 
     def test_the_lambda_may_sign_puts_under_the_attachment_prefix(self):
         block = self.deploy_sh.split('"Sid": "MessageAttachmentsWrite"', 1)[1].split("}", 1)[0]
