@@ -303,6 +303,10 @@ enum ControlPlaneClient {
         /// presigned GET `url`. `[]` (or absent, from an older control plane)
         /// when there are none.
         var attachments: [MessageAttachment]? = nil
+        /// docs/XANADU.md "Fin replies with files": what Fin handed back with
+        /// its answer (`attach_file`), same entry shape, each with a fresh
+        /// `url`. Absent from an older control plane ⇒ none.
+        var replyAttachments: [MessageAttachment]? = nil
 
         /// The thread the row belongs to, resolved the way the control plane
         /// resolves it: a row with no `threadId` is its own root.

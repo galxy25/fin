@@ -42,31 +42,31 @@ struct ControlStripView: View {
                 Image(systemName: "server.rack")
             }
             .accessibilityIdentifier("controlStrip_servers")
-            // docs/XANADU.md: the conversation pane, one tap from any terminal.
+            // ONE agent button (Levi, 2026-11-06: Xanadu and the cloud console
+            // merged, so the strip spends no extra width): a cloud-hosted agent —
+            // or none yet — opens Xanadu, the conversation pane; a locally-hosted
+            // one keeps its in-process console (side panel / sheet), which Xanadu
+            // can't drive (it talks to the control plane, not this runtime).
             Button {
-                sessionManager.showXanadu()
-            } label: {
-                Image(systemName: "bubble.left.and.text.bubble.right")
-            }
-            .accessibilityLabel("Fin conversation")
-            .accessibilityIdentifier("controlStrip_xanadu")
-            if let agent = agents.first {
-                Button {
-                    // A cloud-hosted agent has no local runtime to panel-embed;
-                    // its console is the remote view, always a sheet.
-                    if prefersSidePanel, agent.hostsLocally {
+                if let agent = agents.first, agent.hostsLocally {
+                    if prefersSidePanel {
                         isAgentPanelVisible.toggle()
                     } else {
                         showingAgent = true
                     }
-                } label: {
-                    Image(systemName: agent.hostsLocally ? "sparkles" : "cloud")
-                        .foregroundStyle(
-                            prefersSidePanel && isAgentPanelVisible ? Color.accentColor : Color.white
-                        )
+                } else {
+                    sessionManager.showXanadu()
                 }
-                .accessibilityIdentifier("controlStrip_agent")
-                .sheet(isPresented: $showingAgent) {
+            } label: {
+                Image(systemName: agents.first?.hostsLocally == true ? "sparkles" : "cloud")
+                    .foregroundStyle(
+                        prefersSidePanel && isAgentPanelVisible ? Color.accentColor : Color.white
+                    )
+            }
+            .accessibilityLabel(agents.first?.hostsLocally == true ? "Agent console" : "Fin conversation")
+            .accessibilityIdentifier("controlStrip_agent")
+            .sheet(isPresented: $showingAgent) {
+                if let agent = agents.first {
                     if let runtime = sessionManager.agentRuntime(
                         for: session,
                         agent: agent,

@@ -2,7 +2,7 @@ import SwiftUI
 
 struct HomeView: View {
     enum Mode: String, CaseIterable {
-        /// docs/XANADU.md: the conversation pane — first, and the landing.
+        /// docs/XANADU.md: the conversation pane — first, and the landing with no terminal open.
         case xanadu = "Fin"
         case terminal = "Terminal"
         case markdown = "Files"
@@ -34,7 +34,8 @@ struct HomeView: View {
     @State private var showsVoiceSetup = false
     #endif
 
-    /// The root route lands on Xanadu; the server-picker sheet (⌘T, the
+    /// The root route opens on Xanadu (no tab open, or a tap / Siri asked for
+    /// it — docs/XANADU.md decision 1); the server-picker sheet (⌘T, the
     /// control strip) is about terminals and has no conversation segment —
     /// Xanadu is a pane, not something to open over a live terminal.
     init(isSheet: Bool = false) {

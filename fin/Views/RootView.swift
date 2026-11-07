@@ -85,11 +85,17 @@ struct RootView: View {
         .onChange(of: sessionManager.pendingAgentOpen) { _, _ in openPendingRemoteAgentIfNeeded() }
         // Opening a file is an explicit gesture away from the conversation.
         .onChange(of: lastActiveMarkdownTouchedAt) { _, _ in sessionManager.showsXanadu = false }
-        // Siri / an App Intent asked for the conversation (XanaduNavigator).
+        // A notification / Live Activity tap, a fin:// link or Siri asked for the
+        // conversation (XanaduNavigator): Xanadu comes forward even over a live
+        // terminal (LaunchLanding.Context.externalOpen). `$request` replays its
+        // current value on subscribe — that is what catches a cold-launch tap —
+        // so a request already acted on (by another window) is not replayed.
         .onReceive(XanaduNavigator.shared.$request) { request in
-            guard request != nil else { return }
+            guard let request, sessionManager.handledXanaduRequestID != request.id else { return }
+            sessionManager.handledXanaduRequestID = request.id
             sessionManager.showXanadu()
             sessionManager.isServerPickerPresented = false
+            remoteAgentTarget = nil
         }
         .onAppear { openPendingRemoteAgentIfNeeded() }
         // A tap queued while the paywall was up gets claimed the moment the
@@ -297,10 +303,13 @@ struct RootView: View {
     }
 
     private var route: Route {
-        // docs/XANADU.md decision 1: the conversation pane is the landing, and
-        // where Siri brings the app. Any explicit terminal / browser / file
-        // gesture clears the flag (SessionManager, and the markdown observer
-        // below), handing the route back to the rules that follow.
+        // docs/XANADU.md decision 1: Xanadu when asked for (a tap, Siri, ⌘0,
+        // the strip's agent button) and at a launch with no open tab
+        // (LaunchLanding); otherwise the last open terminal. Any explicit
+        // terminal / browser / file gesture clears the flag (SessionManager, and
+        // the markdown observer above), handing the route to the rules below —
+        // and with no tab left those land on HomeView, whose first segment is
+        // Xanadu again.
         if sessionManager.showsXanadu { return .home }
         // A browser tab in front wins: it only becomes active by an explicit tap, and
         // every terminal-tab gesture clears it (SessionManager.activeBrowserTabID).

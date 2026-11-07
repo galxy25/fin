@@ -344,6 +344,103 @@ final class XanaduTests: XCTestCase {
         XCTAssertEqual(FinThreadDirectory.matching("the deploy thread", in: threads).map(\.id), ["a"])
         XCTAssertEqual(FinThreadDirectory.matching("costs", in: threads).map(\.id), ["b"])
     }
+
+    // MARK: - Landing (decision 1, revised 2026-11-06)
+
+    func testLaunchReturnsToTheLastOpenTerminalAndXanaduOnlyWithNone() {
+        let a = UUID(), b = UUID(), stray = UUID()
+        XCTAssertEqual(LaunchLanding.route(openTabs: [], lastActive: nil), .xanadu)
+        XCTAssertEqual(LaunchLanding.route(openTabs: [], lastActive: a), .xanadu,
+                       "a focused id whose tab was closed with its X is not an active session")
+        XCTAssertEqual(LaunchLanding.route(openTabs: [a, b], lastActive: a), .terminal(a))
+        XCTAssertEqual(LaunchLanding.route(openTabs: [a, b], lastActive: nil), .terminal(b))
+        XCTAssertEqual(LaunchLanding.route(openTabs: [a, b], lastActive: stray), .terminal(b))
+    }
+
+    func testAnExternalOpenAlwaysLandsOnXanaduEvenOverATerminal() {
+        let a = UUID()
+        XCTAssertEqual(LaunchLanding.route(openTabs: [a], lastActive: a, context: .externalOpen), .xanadu)
+        XCTAssertEqual(LaunchLanding.route(openTabs: [], lastActive: nil, context: .externalOpen), .xanadu)
+    }
+
+    // MARK: - Fin replies with files
+
+    private let photo: [String: Any] = ["key": "users/u/fin/attachments/fin/a/chart.png", "name": "chart.png",
+                                        "mime": "image/png", "size": 4096, "url": "https://s3.example.com/c?sig=1"]
+    private let report: [String: Any] = ["key": "users/u/fin/attachments/fin/b/report.csv", "name": "report.csv",
+                                         "mime": "text/csv", "size": 12]
+
+    func testReplyAttachmentsDecodeAndAbsentMeansNone() throws {
+        XCTAssertNil(try decodeMessage(row("m-1")).replyAttachments)
+        var json = row("m-2")
+        json["replyAttachments"] = [photo, report]
+        let files = try XCTUnwrap(try decodeMessage(json).replyAttachments)
+        XCTAssertEqual(files.map(\.name), ["chart.png", "report.csv"])
+        XCTAssertEqual(files[0].url?.host, "s3.example.com")
+        XCTAssertEqual(files.map(\.kind), [.image, .file])
+        XCTAssertEqual(files[1].kindLabel, "CSV file")
+    }
+
+    func testReplyAttachmentsRideUnderFinsReplyInTheTimeline() throws {
+        var json = row("m-1", thread: "m-1", text: "chart the costs")
+        json["state"] = "answered"
+        json["replyAttachments"] = [photo]
+        let message = try decodeMessage(json)
+        let t = Date(timeIntervalSince1970: 1_800_000_000)
+        let records = [
+            AgentMirrorRecord(id: "u", kind: .userMessage, text: "chart the costs", timestamp: t, sequence: 1,
+                              runID: "r", inReplyTo: "m-1", threadID: "m-1"),
+            AgentMirrorRecord(id: "a1", kind: .assistantMessage, text: "working on it", timestamp: t + 1, sequence: 2, runID: "r"),
+            AgentMirrorRecord(id: "a2", kind: .assistantMessage, text: "Here it is.\n[Attached: chart.png (image, 4 KB)]",
+                              timestamp: t + 2, sequence: 3, runID: "r"),
+        ]
+        let items = ThreadTimeline.build(thread: nil, messages: [message], records: records, events: [])
+        let replies = items.filter { $0.kind == .reply }
+        XCTAssertEqual(replies.map(\.id), ["r:a1", "r:a2"])
+        XCTAssertEqual(replies[0].attachments, [], "only the turn's reply (its last line) carries the files")
+        XCTAssertEqual(replies[1].attachments.map(\.name), ["chart.png"])
+        XCTAssertEqual(XanaduText.displayText(replies[1].text), "Here it is.")
+        XCTAssertEqual(items.first { $0.kind == .prompt }?.attachments, [], "the prompt keeps its own (none)")
+    }
+
+    func testAFilesOnlyReplyShowsBeforeTheTranscriptArrives() throws {
+        var json = row("m-1", thread: "m-1", text: "export it")
+        json["state"] = "answered"
+        json["replyAttachments"] = [report]
+        let items = ThreadTimeline.build(thread: nil, messages: [try decodeMessage(json)], records: [], events: [])
+        let reply = try XCTUnwrap(items.first { $0.kind == .reply })
+        XCTAssertEqual(reply.id, "mr:m-1")
+        XCTAssertEqual(reply.text, "")
+        XCTAssertEqual(reply.attachments.map(\.name), ["report.csv"])
+    }
+
+    func testTurnFilesFromRawRowsForTheConsoleAndTV() {
+        let map = TurnFiles.byMessageID(rows: [
+            ["messageId": "m-1", "attachments": [report], "replyAttachments": [photo]],
+            ["messageId": "m-2", "text": "no files"],
+            ["messageId": "m-3", "replyAttachments": [["name": "keyless"], photo]],
+        ])
+        XCTAssertEqual(map["m-1"]?.prompt.map(\.name), ["report.csv"])
+        XCTAssertEqual(map["m-1"]?.reply.map(\.name), ["chart.png"])
+        XCTAssertNil(map["m-2"])
+        XCTAssertEqual(map["m-3"]?.reply.map(\.name), ["chart.png"], "a malformed entry drops only itself")
+    }
+
+    func testTheConsoleDropsTheAttachedLine() throws {
+        XCTAssertEqual(AgentRemoteConsoleView.consoleText("Here it is.\n[Attached: chart.png (image, 4 KB)]"), "Here it is.")
+        XCTAssertNil(AgentRemoteConsoleView.consoleText("[Attached: chart.png (image, 4 KB)]", hasFiles: true),
+                     "files-only with chips: no text at all")
+        XCTAssertEqual(AgentRemoteConsoleView.consoleText("[Attached: chart.png (image, 4 KB)]"),
+                       "Attached: chart.png (image, 4 KB)", "no chips to show: the files still show up, unbracketed")
+        XCTAssertEqual(AgentRemoteConsoleView.consoleText("plain"), "plain")
+        var json = row("m-1")
+        json["attachments"] = [report]
+        json["replyAttachments"] = [photo]
+        let files = AgentRemoteConsoleView.turnFiles(try decodeMessage(json))
+        XCTAssertEqual(files.prompt.map(\.name), ["report.csv"])
+        XCTAssertEqual(files.reply.map(\.name), ["chart.png"])
+        XCTAssertTrue(AgentRemoteConsoleView.turnFiles(nil).isEmpty)
+    }
 }
 
 private extension Result {

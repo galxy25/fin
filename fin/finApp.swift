@@ -440,6 +440,14 @@ struct FinApp: App {
     /// device is known, so the residence rule decides local vs. remote console.
     @MainActor
     private func openActivityLink(_ url: URL) {
+        // `fin://thread?id=<m-…>` (a thread mention, from anywhere): that thread
+        // in Xanadu, on the agent Xanadu would show (the voice rule's primary).
+        if let threadID = XanaduText.threadID(fromLink: url) {
+            let agents = (try? modelContainer.mainContext.fetch(FetchDescriptor<Agent>(sortBy: [SortDescriptor(\.createdAt)]))) ?? []
+            let primary = FinVoiceIntentCore.preferredTargetIndex(cloudAgentNames: agents.map(\.name)).map { agents[$0] }
+            XanaduNavigator.shared.open(agentName: primary?.name, threadID: threadID)
+            return
+        }
         guard let target = FinActivityLink.target(of: url) else { return }
         // The name comes from a site heartbeat, not the synced record, so match
         // loosely — and with a single agent, any tap is for it. An exact-match miss

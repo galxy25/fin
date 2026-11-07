@@ -27,6 +27,10 @@ final class TVAgentClient: ObservableObject {
     /// `messageId → threadId` from the selected thread's detail, so a legacy
     /// `in_reply_to`-only line still lands in its thread.
     private var threadOfMessage: [String: String] = [:]
+    /// docs/XANADU.md: each row's files — what was sent and what Fin handed
+    /// back (`replyAttachments`) — from the selected thread's rows, re-read
+    /// every poll so the presigned urls stay fresh. Read-only on the TV.
+    @Published private(set) var filesByMessageID: [String: TurnFiles] = [:]
     private var userChoseThread = false
     @Published private(set) var lastError: String?
     @Published private(set) var lastRefreshAt: Date?
@@ -95,7 +99,10 @@ final class TVAgentClient: ObservableObject {
         pending.removeAll { applied.contains($0.id) }
         lastRefreshAt = Date()
         lastError = nil
+        let selectionBefore = selectedThreadID
         await refreshThreads()
+        // A changed selection already loaded its rows inside refreshThreads.
+        if selectionBefore == selectedThreadID { await loadThreadMessages() }
         applyThreadFilter()
         await refreshPendingStates()
     }
@@ -137,10 +144,17 @@ final class TVAgentClient: ObservableObject {
               (response as? HTTPURLResponse)?.statusCode == 200,
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return }
-        for row in object["messages"] as? [[String: Any]] ?? [] {
+        let rows = object["messages"] as? [[String: Any]] ?? []
+        for row in rows {
             guard let id = row["messageId"] as? String else { continue }
             threadOfMessage[id] = (row["threadId"] as? String) ?? id
         }
+        filesByMessageID.merge(TurnFiles.byMessageID(rows: rows)) { _, fresh in fresh }
+    }
+
+    /// A turn's files, joined through its prompt's `in_reply_to`.
+    func files(for turn: TranscriptTurns.Turn) -> TurnFiles {
+        turn.prompt?.inReplyTo.flatMap { filesByMessageID[$0] } ?? TurnFiles()
     }
 
     private func applyThreadFilter() {
