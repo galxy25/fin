@@ -179,6 +179,9 @@ struct XanaduThreadPane: View {
                 try? await Task.sleep(for: .seconds(10))
                 guard !Task.isCancelled else { return }
                 await refreshRecords()
+                // Presence too (cache-limited inside SiteDirectory): one failed
+                // fetch at appear must not pin the header on "asleep".
+                if usesControlPlane { await sites.refresh() }
                 await refreshSelectedDetail()
             }
         }

@@ -49,7 +49,7 @@ final class TVCloudAccount: ObservableObject {
     }
 
     var endpoint: String {
-        NSUbiquitousKeyValueStore.default.string(forKey: KeyVault.endpointURLKey) ?? ""
+        KeyVault.liveEndpoint(NSUbiquitousKeyValueStore.default.string(forKey: KeyVault.endpointURLKey) ?? "")
     }
 
     var sessionToken: String {

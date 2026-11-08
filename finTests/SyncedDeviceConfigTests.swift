@@ -78,6 +78,27 @@ final class SyncedDeviceConfigTests: XCTestCase {
 
     // MARK: - Non-empty synced always wins
 
+    func testPullRepairsRetiredEndpointInSyncedStoreAndLocally() {
+        let dead = "https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com"
+        let live = "https://evnlvth1ih.execute-api.us-west-2.amazonaws.com"
+        kvs.set(dead, forKey: endpointKey)
+        defaults.set(live, forKey: endpointKey)
+
+        let changed = SyncedDeviceConfig.pull(defaults: defaults, kvs: kvs)
+
+        XCTAssertEqual(kvs.string(forKey: endpointKey), live)
+        XCTAssertEqual(defaults.string(forKey: endpointKey), live)
+        XCTAssertEqual(changed, [])
+    }
+
+    func testLiveEndpointMapsOnlyRetiredHosts() {
+        let live = "https://evnlvth1ih.execute-api.us-west-2.amazonaws.com"
+        XCTAssertEqual(KeyVault.liveEndpoint("https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com/"), live)
+        XCTAssertEqual(KeyVault.liveEndpoint(live), live)
+        XCTAssertEqual(KeyVault.liveEndpoint("https://example.com"), "https://example.com")
+        XCTAssertEqual(KeyVault.liveEndpoint(""), "")
+    }
+
     func testPullNeverClobbersNonEmptySyncedValueWithLocalOne() {
         kvs.set("https://synced.example.com/prod", forKey: endpointKey)
         defaults.set("https://stale-local.example.com", forKey: endpointKey)

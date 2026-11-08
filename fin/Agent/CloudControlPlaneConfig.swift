@@ -30,7 +30,7 @@ enum CloudControlPlaneConfig {
     /// account (setter push, launch pull, external-change pull).
     static var endpointURL: String {
         if let capture = captureCredentials { return capture.endpointURL }
-        return UserDefaults.standard.string(forKey: endpointURLKey) ?? ""
+        return KeyVault.liveEndpoint(UserDefaults.standard.string(forKey: endpointURLKey) ?? "")
     }
 
     /// A screenshot capture that dials a REAL relay (`ScreenshotFixtures.liveSiteID`)

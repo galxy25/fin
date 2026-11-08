@@ -25,6 +25,24 @@ enum KeyVault {
     /// same slot the iPhone wrote.
     static let endpointURLKey = "fin.cloudcp.endpointURL"
 
+    /// Control-plane endpoints that no longer exist, mapped to their successor.
+    /// Live 2026-11-07: the 2026-10-13 AWS account move deleted the old API, but
+    /// the account's iCloud KVS slot still held its URL — and the synced value
+    /// wins every pull — so every device that launched a new build adopted a
+    /// dead host and showed "Fin is asleep" while both Macs heartbeat fine.
+    static let retiredEndpoints: [String: String] = [
+        "https://vzrf1bf59g.execute-api.us-west-2.amazonaws.com":
+            "https://evnlvth1ih.execute-api.us-west-2.amazonaws.com",
+    ]
+
+    /// `url` with a retired endpoint replaced by its successor (a trailing slash
+    /// is ignored); anything else unchanged.
+    static func liveEndpoint(_ url: String) -> String {
+        var trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasSuffix("/") { trimmed.removeLast() }
+        return retiredEndpoints[trimmed] ?? url
+    }
+
     /// iCloud Key-Value Storage mirror of the account's vault key (base64).
     /// The CloudKit record (`RemoteInputPairing`) stays the source of truth for
     /// sealing devices; the mirror exists because a device that only OPENS

@@ -89,7 +89,16 @@ enum SyncedDeviceConfig {
         guard let kvs else { return [] }
         var changedLocally: Set<String> = []
         for key in stringKeys {
-            let synced = kvs.string(forKey: key) ?? ""
+            var synced = kvs.string(forKey: key) ?? ""
+            // A retired endpoint in the account slot is repaired there, not just
+            // locally — otherwise it wins again on every device's next pull.
+            if key == CloudControlPlaneConfig.endpointURLKey, !synced.isEmpty {
+                let live = KeyVault.liveEndpoint(synced)
+                if live != synced {
+                    kvs.set(live, forKey: key)
+                    synced = live
+                }
+            }
             let local = defaults.string(forKey: key) ?? ""
             if !synced.isEmpty {
                 if synced != local {
