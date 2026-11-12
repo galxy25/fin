@@ -270,21 +270,6 @@ final class ScreenshotCaptureUITests: XCTestCase {
                 goBackIfPossible(app)
             }
         }
-
-        // 6 — The paywall. Doubles as the Guideline 3.1.2(c) evidence: title,
-        // length, price, renewal terms, and both policy links on one screen.
-        // The toolbar item is a Label("Fin Pro", systemImage: "crown") carrying an
-        // explicit accessibilityLabel, and which of the two strings actually lands
-        // on the AX element differs by platform — so try both rather than guessing.
-        for key in ["Fin Pro subscription", "Fin Pro"] {
-            let proButton = app.buttons[key].firstMatch
-            if proButton.waitForExistence(timeout: 5) {
-                proButton.tapCenter()
-                sleep(3)
-                shoot(app, "06-paywall")
-                break
-            }
-        }
     }
 
     #if os(macOS)
@@ -447,32 +432,6 @@ final class ScreenshotCaptureUITests: XCTestCase {
             sleep(3)
             shootWindow(hub, name)
         }
-
-        // The paywall last, from the picker sheet still open in the main window:
-        // dismissing it with Escape mid-flow also unsettled the sheet the agent
-        // row lives in, and the hub never opened (run 4).
-        // A window screenshot on macOS is a screen-region grab of that window's
-        // frame, and the hub is sized to the SAME frame as the main window — so
-        // while the hub is up, "the main window" photographs the hub (runs 6, 9,
-        // 10). Close the hub first; the main window is then the only one there.
-        hub.buttons[XCUIIdentifierCloseWindow].firstMatch.click()
-        sleep(2)
-        // SwiftUI names a WindowGroup's windows "<id>-AppWindow-N"; the hub is
-        // its own group ("agent-hub-AppWindow-1"), so this cannot resolve to it.
-        let mainAgain = app.windows.matching(identifier: "main-AppWindow-1").firstMatch
-        XCTAssertTrue(mainAgain.waitForExistence(timeout: 10), "main window lost")
-        XCTAssertFalse(hub.exists, "the hub window is still open; the paywall shot would photograph it")
-        mainAgain.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02)).click()
-        sleep(1)
-        for key in ["Fin Pro subscription", "Fin Pro"] {
-            let proButton = app.buttons[key].firstMatch
-            if proButton.waitForExistence(timeout: 5) {
-                proButton.tapCenter()
-                sleep(3)
-                shootWindow(mainAgain, "story-08-paywall")
-                break
-            }
-        }
     }
 
     /// The features the product page leads with besides the local terminal: a terminal
@@ -582,29 +541,6 @@ final class ScreenshotCaptureUITests: XCTestCase {
         add(attachment)
     }
     #endif
-
-    /// A short, focused drive to the paywall, for screen-recording it as the
-    /// Guideline 3.1.2(c) evidence App Review asked for ("reply to this message
-    /// with a screen recording to confirm"). Kept separate from the product-page
-    /// capture so the recording isn't 30 seconds of unrelated navigation.
-    func testCapturePaywallForReview() throws {
-        let app = app()
-
-        let terminalTab = element(app, id: "homeMode_Terminal")
-        XCTAssertTrue(terminalTab.waitForExistence(timeout: 20))
-        sleep(2)
-
-        for key in ["Fin Pro subscription", "Fin Pro"] {
-            let proButton = app.buttons[key].firstMatch
-            if proButton.waitForExistence(timeout: 5) {
-                proButton.tapCenter()
-                break
-            }
-        }
-        // Hold on the disclosure long enough to be legible in the recording.
-        sleep(8)
-        shoot(app, "paywall-review-evidence")
-    }
 
     /// Back out of a pushed screen when the platform has a back affordance;
     /// a no-op where there isn't one (a macOS window, for instance).

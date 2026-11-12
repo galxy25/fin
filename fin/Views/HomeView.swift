@@ -25,11 +25,9 @@ struct HomeView: View {
     /// adds a visible close button for anyone who doesn't reach for it.
     var isSheet: Bool = false
 
-    @EnvironmentObject private var entitlementStore: EntitlementStore
     @EnvironmentObject private var sessionManager: SessionManager
     @Environment(\.dismiss) private var dismiss
     @State private var mode: Mode
-    @State private var showsPaywall = false
     #if os(iOS)
     @State private var showsVoiceSetup = false
     #endif
@@ -97,22 +95,7 @@ struct HomeView: View {
                     }
                 }
             }
-            // Always-available way to reach the Fin Pro subscription — the paywall
-            // otherwise only appears once the 14-day trial lapses, so during the
-            // trial (or for a reviewer on a fresh install) there was no way to see
-            // or buy the subscription. Hidden once the user already has Pro.
             .toolbar {
-                if !entitlementStore.isSubscribed && !entitlementStore.ownsLifetime {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            showsPaywall = true
-                        } label: {
-                            Label("Fin Pro", systemImage: "crown")
-                        }
-                        .labelStyle(.titleAndIcon)
-                        .accessibilityLabel("Fin Pro subscription")
-                    }
-                }
                 if isSheet {
                     ToolbarItem(placement: .cancellationAction) {
                         Button {
@@ -124,10 +107,6 @@ struct HomeView: View {
                         .accessibilityIdentifier("homeSheetCloseButton")
                     }
                 }
-            }
-            .sheet(isPresented: $showsPaywall) {
-                PaywallView()
-                    .environmentObject(entitlementStore)
             }
             #if os(iOS)
             // The voice-first pillar's discovery point: how to make "press the

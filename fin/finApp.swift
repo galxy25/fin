@@ -78,7 +78,6 @@ extension FinAppDelegate: UIApplicationDelegate {
 @main
 struct FinApp: App {
     @StateObject private var sessionManager: SessionManager
-    @StateObject private var entitlementStore = EntitlementStore()
     private let modelContainer: ModelContainer
     #if os(macOS)
     @NSApplicationDelegateAdaptor(FinAppDelegate.self) private var appDelegate
@@ -474,7 +473,6 @@ struct FinApp: App {
         WindowGroup(id: FinScene.main) {
             RootView()
                 .environmentObject(sessionManager)
-                .environmentObject(entitlementStore)
                 .preferredColorScheme(.dark)
                 .onOpenURL { url in
                     #if os(macOS)
@@ -517,7 +515,6 @@ struct FinApp: App {
         WindowGroup(id: FinScene.agentHub, for: UUID.self) { $agentID in
             AgentHubWindowView(agentID: agentID)
                 .environmentObject(sessionManager)
-                .environmentObject(entitlementStore)
                 .preferredColorScheme(.dark)
         }
         .modelContainer(modelContainer)
@@ -531,7 +528,6 @@ struct FinApp: App {
         WindowGroup(id: FinScene.markdownReader, for: UUID.self) { $documentID in
             MarkdownReaderWindowView(documentID: documentID)
                 .environmentObject(sessionManager)
-                .environmentObject(entitlementStore)
                 .preferredColorScheme(.dark)
         }
         .modelContainer(modelContainer)
