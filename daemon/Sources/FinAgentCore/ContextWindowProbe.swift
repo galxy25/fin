@@ -297,6 +297,7 @@ public extension ContextWindowProbe {
     /// unknown path with HTTP 200 and an `{"error": …}` body, so only a parse that finds
     /// what it needs counts — the callers above decide that.
     private static func fetch(_ url: URL, apiKey: String?, timeout: TimeInterval) async -> Data? {
+        if AgentEndpointClient.brainParked { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = timeout

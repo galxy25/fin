@@ -111,7 +111,7 @@ quiesce_agentd() {
   # Only now can the unload stick. Give a turn already in flight a moment to die
   # with its process rather than racing the unload.
   sleep 2
-  command -v lms >/dev/null 2>&1 || return 0
+  lms_is_up || return 0
   # Remember what was loaded, AT WHAT CONTEXT, so restore can put it back exactly.
   # Left to JIT, the daemon's first request reloads the model at LM Studio's global
   # default context (8192 here), not the 42k it was loaded with — and the daemon then
@@ -220,8 +220,14 @@ trap 'release' EXIT INT TERM HUP
 # which a JIT load honors immediately, with LM Studio running. gemma-4-12b-qat is
 # set to 32768 there. Check with `lms ps` (CONTEXT column) after any unload/reload,
 # and see `ContextWindowProbe` for the in-daemon clamp that catches it if it slips.
+# ANY `lms` call starts LM Studio's background service if it is not running — so asking
+# "what is loaded?" of a stopped LM Studio boots it (2026-11-11, with the brain parked).
+# Nothing is loaded in an LM Studio that is not running, so only ask a running one.
+lms_is_up() {
+  command -v lms >/dev/null 2>&1 && pgrep -f "/Applications/LM Studio.app/Contents/MacOS/LM Studio" >/dev/null 2>&1
+}
 resident_model_gb() {
-  command -v lms >/dev/null 2>&1 || { echo 0; return; }
+  lms_is_up || { echo 0; return; }
   lms ps 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9.]+$/ && $(i+1) == "GB") s += $i } END { printf "%d", s + 0 }'
 }
 [ "$QUIESCE" = "1" ] && quiesce_agentd

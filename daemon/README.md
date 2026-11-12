@@ -55,6 +55,7 @@ Beyond `server`, `agent`, and `task`, every field is optional:
 | `site` | — | This body's identity on the control plane (below); requires `controlPlane` |
 | `agent.attachmentsDirectory` | `~/Fin/Attachments` | Where message attachments are saved (below: Attachments) |
 | `agent.supportsImages` | `false` | Vision model: image attachments also go to the model as `image_url` parts |
+| `agent.brainParked` | `false` | Run with no brain: relay, inbox, pane scans and site heartbeat stay up, but the endpoint is never contacted (no beats; messages get a fixed "brain is parked" reply) and `launch-agentd.sh` skips its brain preflight |
 
 ### Choosing a brain: a local server, or a hosted one
 
