@@ -24,6 +24,9 @@ public enum BrainOutage: String, Sendable, Equatable {
     case credentials
     /// 402 — the account is out of credit.
     case payment
+    /// The operator parked the brain on purpose (`agent.brainParked`). Not a failure to
+    /// page about — the owner chose it — but handled the same way: suspend beats, stay up.
+    case parked
 
     /// The outage a provider status implies, or nil when a restart or a retry could
     /// plausibly help. Deliberately narrow: only codes whose meaning is "this exact
@@ -40,6 +43,7 @@ public enum BrainOutage: String, Sendable, Equatable {
     /// or, on a hosted endpoint, a frame inside a stream that already returned 200.
     public static func forError(_ error: Error) -> BrainOutage? {
         guard let endpointError = error as? AgentEndpointError else { return nil }
+        if case .parked = endpointError { return .parked }
         return forStatus(endpointError.statusCode)
     }
 
@@ -54,12 +58,18 @@ public enum BrainOutage: String, Sendable, Equatable {
         case .payment:
             return "Fin's brain is out of credit (HTTP 402). The agent is up but not thinking. "
                 + "Add credit, or point agent.endpointURL at a local model to keep working."
+        case .parked:
+            return "Fin's brain is parked (agent.brainParked). The agent is up but not thinking."
         }
     }
 
     /// The log line, which says plainly why the daemon is staying up instead of exiting.
     public var logLine: String {
-        "[brain] \(rawValue) failure — no restart can fix this, so beats are suspended and "
+        if self == .parked {
+            return "[brain] parked (agent.brainParked) — no model is contacted; beats stay "
+                + "suspended and the process stays up. Unpark in the config and kickstart."
+        }
+        return "[brain] \(rawValue) failure — no restart can fix this, so beats are suspended and "
             + "the process stays up to keep reporting. Fix the config and kickstart."
     }
 }

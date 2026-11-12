@@ -196,6 +196,13 @@ struct DaemonConfig: Decodable {
         /// Absent/false = images are files on disk like everything else — the safe
         /// default, since a text-only model rejects a request carrying image parts.
         var supportsImages: Bool?
+        /// True parks the brain: the daemon runs (relay, inbox, pane scans, site
+        /// heartbeat) but never contacts the endpoint — no heartbeat turns, and a message
+        /// is answered with a fixed "brain is parked" reply instead of a model turn.
+        /// `launch-agentd.sh` skips its brain preflight too. Exists because the preflight
+        /// and every turn are requests, and LM Studio JIT-loads the model a request names:
+        /// 2026-11-11 a parked 27B was loaded overnight by exactly that and froze the iMac.
+        var brainParked: Bool?
 
         /// `apiKey` in the file still decodes into `rawAPIKey`; everything else keeps
         /// its own name.
@@ -205,6 +212,7 @@ struct DaemonConfig: Decodable {
             case contextWindowTokens, maxOutputTokens, temperature, systemPrompt
             case terminalContextLines, heartbeatSeconds, requestTimeoutSeconds
             case historyTokenBudget, attachmentsDirectory, supportsImages
+            case brainParked
         }
     }
 
@@ -528,6 +536,7 @@ final class Daemon {
         var brain: [String: Any] = [
             "kind": "openai-compatible",
             "model": config.agent.modelIdentifier,
+            "parked": config.agent.brainParked == true,
             "context_configured": configuredContextWindowTokens,
             "max_output_tokens": config.agent.maxOutputTokens ?? Self.defaultMaxOutputTokens,
         ]
@@ -1379,6 +1388,7 @@ final class Daemon {
         self.auditLog = writer
         self.heartbeatSeconds = max(5, config.agent.heartbeatSeconds ?? 60)
         AgentEndpointDefaults.setRequestTimeout(seconds: config.agent.requestTimeoutSeconds ?? 300)
+        AgentEndpointDefaults.setBrainParked(config.agent.brainParked == true)
         // Already validated by `DaemonConfig.load`; a nil here is an absent field.
         let parsedAgentID = try? config.parsedAgentID()
         self.agentID = parsedAgentID
@@ -2456,7 +2466,8 @@ final class Daemon {
                 if let outage = engine.lastBrainOutage {
                     let now = Date()
                     let stallState = StallNotifyMarker.state(at: stallNotifyStatePath)
-                    if StallNotifyGate.shouldNotify(state: stallState, failure: outage.rawValue, now: now) {
+                    // Parked is the owner's own choice: nothing to page about.
+                    if outage != .parked, StallNotifyGate.shouldNotify(state: stallState, failure: outage.rawValue, now: now) {
                         notify(
                             event: "agent-stalled", message: outage.ownerMessage,
                             messageID: failedMessageID, threadID: failedThreadID
@@ -2467,8 +2478,10 @@ final class Daemon {
                         )
                     }
                     log(outage.logLine)
-                    record(AgentAuditEvent(kind: "error", text: outage.logLine, isFailure: true))
-                    suspendedAfterCompletion = true
+                    record(AgentAuditEvent(kind: "error", text: outage.logLine, isFailure: outage != .parked))
+                    // Parked already suspends beats (`beatsAreSuspended`); marking it
+                    // "completed" would make the status read task-complete.
+                    if outage != .parked { suspendedAfterCompletion = true }
                     consecutiveFailures = 0
                     continue
                 }
@@ -2857,7 +2870,7 @@ final class Daemon {
 
     /// Both gates the beat loop honors.
     var beatsAreSuspended: Bool {
-        awaitingUserInput || suspendedAfterCompletion
+        awaitingUserInput || suspendedAfterCompletion || config.agent.brainParked == true
     }
 
     /// The state name for a between-turns status uplink: a resident daemon that finished

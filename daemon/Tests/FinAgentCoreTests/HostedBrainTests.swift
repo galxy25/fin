@@ -113,6 +113,35 @@ final class HostedBrainTests: XCTestCase {
         XCTAssertNil(BrainOutage.forError(AgentEndpointError.transport("connection reset")))
     }
 
+    // MARK: - A parked brain never touches the network
+
+    func testAParkedBrainIsItsOwnOutage() {
+        XCTAssertEqual(BrainOutage.forError(AgentEndpointError.parked), .parked)
+    }
+
+    func testAParkedBrainThrowsBeforeAnyRequest() async {
+        AgentEndpointDefaults.setBrainParked(true)
+        defer { AgentEndpointDefaults.setBrainParked(false) }
+        // Port 9 (discard) would hang or refuse; .parked proves nothing was dialed.
+        do {
+            _ = try await rawCompletion(
+                instruction: "x", input: "y", endpointURL: "http://127.0.0.1:9/v1",
+                model: "m", apiKey: nil, temperature: 0, maxOutputTokens: 1
+            )
+            XCTFail("a parked brain must not complete")
+        } catch AgentEndpointError.parked {
+        } catch {
+            XCTFail("expected .parked, got \(error)")
+        }
+        do {
+            _ = try await AgentEndpointClient.listModels(baseURL: "http://127.0.0.1:9/v1", apiKey: nil)
+            XCTFail("a parked brain must not list models")
+        } catch AgentEndpointError.parked {
+        } catch {
+            XCTFail("expected .parked, got \(error)")
+        }
+    }
+
     func testAnOutageIsClassifiedFromAMidStreamFailureToo() {
         // The whole point: on a hosted endpoint this arrives inside a 200.
         XCTAssertEqual(

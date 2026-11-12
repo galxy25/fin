@@ -70,6 +70,10 @@ enum AgentEndpointError: LocalizedError {
     /// carries the provider's code when it gives one, so the retry rules can treat a
     /// mid-stream 429 exactly like a 429 in a status line.
     case streamFailure(status: Int?, message: String)
+    /// The operator parked the brain (`AgentEndpointDefaults.setBrainParked`): no request
+    /// was sent. Thrown before any socket opens, so a parked brain can never wake a local
+    /// model server — LM Studio JIT-loads whatever model a request names (2026-11-11).
+    case parked
 
     var errorDescription: String? {
         switch self {
@@ -87,6 +91,8 @@ enum AgentEndpointError: LocalizedError {
             let code = status.map { " \($0)" } ?? ""
             return "The endpoint accepted the request and then failed mid-response"
                 + "\(code.isEmpty ? "" : " (provider error\(code))") — \(message.prefix(400))"
+        case .parked:
+            return "Fin's brain is parked (agent.brainParked), so no model is running to answer this."
         }
     }
 
@@ -156,6 +162,13 @@ public enum AgentEndpointDefaults {
     }
 
     public static var requestTimeoutSeconds: Int { Int(AgentEndpointClient.defaultRequestTimeout) }
+
+    /// Parks the brain process-wide: every completion and model listing throws
+    /// `AgentEndpointError.parked` without touching the network. The daemon keeps its
+    /// relay, inbox and pane scans up with no model behind them.
+    public static func setBrainParked(_ parked: Bool) {
+        AgentEndpointClient.brainParked = parked
+    }
 }
 
 struct AgentEndpointClient {
@@ -175,6 +188,9 @@ struct AgentEndpointClient {
     /// `agent.requestTimeoutSeconds` through `AgentEndpointDefaults`); the app
     /// keeps the historical 120 s.
     nonisolated(unsafe) static var defaultRequestTimeout: TimeInterval = 120
+
+    /// See `AgentEndpointDefaults.setBrainParked`.
+    nonisolated(unsafe) static var brainParked = false
 
     private var completionsURL: URL? {
         var trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -210,6 +226,7 @@ struct AgentEndpointClient {
         tools: [AgentToolSpec],
         requestUsage: Bool
     ) async throws -> AgentCompletion {
+        if Self.brainParked { throw AgentEndpointError.parked }
         guard let url = completionsURL else { throw AgentEndpointError.badURL(baseURL) }
 
         var request = URLRequest(url: url)
@@ -500,6 +517,7 @@ struct AgentEndpointClient {
     /// Lists the model identifiers an endpoint is currently serving. Used by the agent
     /// editor to turn "what exactly is this model called?" from guesswork into a picker.
     static func listModels(baseURL: String, apiKey: String?) async throws -> [String] {
+        if brainParked { throw AgentEndpointError.parked }
         var trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while trimmed.hasSuffix("/") { trimmed.removeLast() }
         if trimmed.hasSuffix("/chat/completions") {

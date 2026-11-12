@@ -234,6 +234,7 @@ for name, value in (
     # The key itself is never printed — only whether there is one.
     ("HAS_API_KEY", "yes" if (agent.get("apiKey") or "").strip() else "no"),
     ("TRANSPORT", server.get("transport") or "ssh"),
+    ("BRAIN_PARKED", "yes" if agent.get("brainParked") is True else "no"),
 ):
     print("%s=%s" % (name, shlex.quote(str(value))))
 PY
@@ -255,7 +256,13 @@ else
 	[ -n "$SSH_USER" ] && [ -n "$KEY_PATH" ] || refuse "config has no server.username / server.privateKeyPath"
 fi
 
-if [ "${FIN_SKIP_BRAIN_CHECK:-0}" != "1" ]; then
+# A PARKED brain (agent.brainParked) skips the probe outright: the probe is a completion
+# request, and LM Studio JIT-loads whatever model a request names — 2026-11-11 this very
+# probe loaded a parked 27B overnight and froze the iMac. The daemon itself never contacts
+# the endpoint while parked.
+if [ "$BRAIN_PARKED" = "yes" ]; then
+	note "brain parked (agent.brainParked): skipping the brain preflight"
+elif [ "${FIN_SKIP_BRAIN_CHECK:-0}" != "1" ]; then
 	# -f: without it curl exits 0 on a 404/500, so an LM Studio that is listening with no
 	# model loaded would pass. The model id must actually appear in the /models payload.
 	#
