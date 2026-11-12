@@ -20,11 +20,6 @@ REPLACEMENTS = [
     ("never carries terminal traffic)", "carries terminal traffic only for the optional \"via Fin relay\" transport of enrolled computers)"),
 ]
 
-SUBS = ("SUBSCRIPTION INFORMATION (3.1.2(c)): the paywall shows, live from StoreKit and before any purchase: \"Fin Pro Annual\", "
-        "1 year, the localized price, the renewal terms (\"Renews automatically unless canceled at least 24 hours before the end of the "
-        "current period. Manage or cancel in your Apple Account settings.\"), a non-renewing \"Fin Pro Lifetime\" option, and tappable "
-        "Terms of Use and Privacy Policy links. Privacy Policy URL: https://fin.africanintellect.ai/privacy. License: Apple's Standard EULA.")
-
 DELETE = ("ACCOUNT DELETION (5.1.1(v)): Sign in with Apple creates a Fin account; delete it in the app at Settings > iCloud Sync > "
           "\"Fin Account\" > \"Delete Fin Account\" (Apple TV: the \"Fin Account\" section of the server list). It erases the account's "
           "messages, transcripts, memory, goals, stored keys and credentials from our servers, shuts down cloud computers, unlinks every "
@@ -46,8 +41,9 @@ def main():
             notes = notes.replace(old, new)
         # Older paragraph about a resolved 1.0 rejection, shortened to make room (limit 4000).
         notes = re.sub(r"GUIDELINE 5 \(China\):.*?(\n\n|$)", "GUIDELINE 5: no ChatGPT/OpenAI integration; inference is on-device or the user's own model server.\\1", notes, flags=re.S)
-        # The subscription block, repeated in full per platform, compressed to fit (limit 4000).
-        notes = re.sub(r"SUBSCRIPTION INFORMATION \(Guideline 3\.1\.2\(c\)\)[\s:]+All required.*?(?=\n\n)", SUBS, notes, flags=re.S)
+        # Fin has no in-app purchases any more (2026-11-12): drop the subscription block,
+        # in either its original long form or the compressed one this script used to write.
+        notes = re.sub(r"\n*SUBSCRIPTION INFORMATION \((?:Guideline )?3\.1\.2\(c\)\).*?(?=\n\n|$)", "", notes, flags=re.S)
         notes = re.sub(r"HOW TO DELETE THE ACCOUNT \(Guideline 5\.1\.1\(v\)\):.*?(?=\n\n|$)", DELETE, notes, flags=re.S)
         if "NEW IN 1.1.0" not in notes:
             notes += NEW

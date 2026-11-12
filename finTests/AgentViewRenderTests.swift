@@ -521,9 +521,6 @@ final class AgentViewRenderTests: XCTestCase {
             HomeView()
                 .modelContainer(container)
                 .environmentObject(SessionManager())
-                // HomeView's Fin Pro toolbar reads the entitlement store; without
-                // one injected, the render traps (field-observed suite crash).
-                .environmentObject(EntitlementStore())
         )
     }
 }

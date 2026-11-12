@@ -112,9 +112,6 @@ enum ScreenshotFixtures {
 
     static func seedIfNeeded(_ context: ModelContext) {
         guard isEnabled else { return }
-        // A fresh trial, so the paywall shot reads as a new install's would
-        // (EntitlementStore's @AppStorage("trialStartedAt")).
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "trialStartedAt")
         // The console side panel's toggle persists (TerminalScreen's
         // @AppStorage("agentPanelVisible")); a capture must start with it closed
         // or every other run's "open the console" click closes it instead.

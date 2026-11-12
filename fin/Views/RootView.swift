@@ -15,7 +15,6 @@ struct RootView: View {
     }
 
     @EnvironmentObject private var sessionManager: SessionManager
-    @EnvironmentObject private var entitlementStore: EntitlementStore
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Server.createdAt) private var servers: [Server]
     @Query(sort: \Agent.createdAt) private var agents: [Agent]
@@ -45,20 +44,12 @@ struct RootView: View {
     @State private var remoteAgentThreadID: String?
 
     var body: some View {
-        Group {
-            if isUnlocked {
-                VStack(spacing: 0) {
-                    // Above the route switch, because it must stay on screen on the
-                    // home and markdown routes too — tabs can be open while the user
-                    // is picking a server or reading a file.
-                    TerminalTabBarView()
-                    routedContent
-                }
-            } else if entitlementStore.isCheckingEntitlements {
-                ProgressView()
-            } else {
-                PaywallView()
-            }
+        VStack(spacing: 0) {
+            // Above the route switch, because it must stay on screen on the
+            // home and markdown routes too — tabs can be open while the user
+            // is picking a server or reading a file.
+            TerminalTabBarView()
+            routedContent
         }
         // Tells FinCommands that THIS scene is the one holding terminal tabs, so ⌘W
         // closes a tab here while still closing the window over the Agent Hub or a
@@ -70,13 +61,7 @@ struct RootView: View {
         // this flag, and it lives on RootView rather than the control strip because
         // ⌘T must work on the home and markdown routes, where no strip exists.
         .sheet(isPresented: $sessionManager.isServerPickerPresented) {
-            // Same gate as the root switch: a lapse mid-presentation must not leave
-            // a working picker over the paywall.
-            if isUnlocked {
-                HomeView(isSheet: true)
-            } else {
-                PaywallView()
-            }
+            HomeView(isSheet: true)
         }
         .onChange(of: sessionManager.isServerPickerPresented) { _, isPresented in
             if !isPresented { focusActiveTerminal() }
@@ -98,9 +83,6 @@ struct RootView: View {
             remoteAgentTarget = nil
         }
         .onAppear { openPendingRemoteAgentIfNeeded() }
-        // A tap queued while the paywall was up gets claimed the moment the
-        // entitlement unlocks (see the isUnlocked guard in the claim itself).
-        .onChange(of: isUnlocked) { _, _ in openPendingRemoteAgentIfNeeded() }
         // A cold launch from a killed state (the common case for a notification
         // tap) can reach this view before CloudKit's initial import has delivered
         // the tapped agent's own record — the claim's `agents.first(where:)`
@@ -109,14 +91,7 @@ struct RootView: View {
         // in. Retrying on every `agents` change closes that race.
         .onChange(of: agents) { _, _ in openPendingRemoteAgentIfNeeded() }
         .sheet(item: $remoteAgentTarget) { agent in
-            // Same entitlement gate as the root switch: the target can only be
-            // set while unlocked, but a lapse mid-presentation must not leave a
-            // working remote console (compose bar included) over the paywall.
-            if isUnlocked {
-                AgentRemoteConsoleView(agent: agent, initialThreadID: remoteAgentThreadID)
-            } else {
-                PaywallView()
-            }
+            AgentRemoteConsoleView(agent: agent, initialThreadID: remoteAgentThreadID)
         }
         .onChange(of: scenePhase) { _, newPhase in
             sessionManager.isAppActive = newPhase == .active
@@ -231,17 +206,6 @@ struct RootView: View {
         Task { @MainActor in session.focusTerminalView() }
     }
 
-    /// Release builds gate on entitlements alone. The Debug-only auto-session mode
-    /// also bypasses the paywall — a scripted install must land in a live terminal
-    /// without StoreKit — and that bypass must not exist in Release, so it is
-    /// compile-time conditional, not a runtime flag.
-    private var isUnlocked: Bool {
-        #if DEBUG
-        if Self.autoSessionEnabled { return true }
-        #endif
-        return entitlementStore.isUnlocked
-    }
-
     #if DEBUG
     /// FinAutoSession == "1" (stamped from the FIN_AUTO_SESSION build setting):
     /// auto-connect at launch so a freshly-installed Debug build reaches the
@@ -282,11 +246,8 @@ struct RootView: View {
     /// `.localConsole` case of the same fork, so the two consumers never race
     /// for the same tap, and locally-originated taps keep their
     /// pre-cross-device behavior (open or stay queued for the console).
-    /// Gated on `isUnlocked` like everything else: a lapsed entitlement must not
-    /// reach the mirrored transcript or its compose bar over the paywall.
     private func openPendingRemoteAgentIfNeeded() {
-        guard isUnlocked,
-              let pending = sessionManager.pendingAgentOpen,
+        guard let pending = sessionManager.pendingAgentOpen,
               let agent = agents.first(where: { $0.id == pending.agentID }),
               // Cloud-hosted agents are remote UNCONDITIONALLY — the console
               // half declines them outright, so the fork's residence fallback
